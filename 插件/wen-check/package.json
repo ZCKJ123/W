@@ -1,0 +1,27 @@
+{
+  "name": "dsh-wen-check",
+  "version": "0.3.0",
+  "private": false,
+  "type": "module",
+  "description": "DSH plugin: expose the wen language compiler as a structured-diagnostic tool (wen_check)."
+  ,"license": "MIT"
+  ,"repository": { "type": "git", "url": "https://gitee.com/zhuchen_1/wen-check.git" }
+  ,"keywords": ["dsh", "dsh-plugin", "wen", "diagnostics"],
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
+

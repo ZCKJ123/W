@@ -1,0 +1,12 @@
+- insert:
+    - id: dsh-wen-check
+      name: dsh-wen-check
+      config:
+        # 首次使用时自动下载 wen.exe（指向 Gitee Release 直链）
+        downloadUrl: https://gitee.com/zhuchen_1/wen/releases/download/v0.1.0/wen.exe
+        sha256: 0884eae4d545386db4c1207601356cb862f264b20961c6f7e10c2a8b08e495ff
+        # 也可以改成你自己的缓存目录；默认 %USERPROFILE%\.dsh-wen-check
+        # cacheDir: D:\wen-cache
+        #
+        # 如果本机已经装了 wen.exe，优先用本机的（想强制用本机就设 exePath）
+        # exePath: D:\tools\wen\wen.exe

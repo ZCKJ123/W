@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Wen Language Checker",
+    "description": "Exposes the wen compiler as a structured-diagnostics tool: check a .wen script and get line, column, reason, and source line as JSON."
+  }
+}

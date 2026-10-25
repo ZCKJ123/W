@@ -10983,8 +10983,32 @@ static vector<StmtPtr> parseDiagnostic(const string& src, vector<WenError>& erro
     }
 }
 
+static bool gJsonDiagnostics = false;  // --json：诊断以 JSON 输出到 stdout
+
 static void printDiagnostics(const vector<WenError>& errors, const string& filename,
                              const vector<string>& lines) {
+    if (gJsonDiagnostics) {
+        string out = "{\"ok\":false,\"file\":" + jsonQuote(filename) +
+                     ",\"count\":" + std::to_string(errors.size()) + ",\"diagnostics\":[";
+        for (size_t i = 0; i < errors.size(); ++i) {
+            const WenError& e = errors[i];
+            if (i) out += ",";
+            out += "{\"kind\":" + jsonQuote(e.kind) +
+                   ",\"line\":" + std::to_string(e.line) +
+                   ",\"column\":" + std::to_string(e.col) +
+                   ",\"reason\":" + jsonQuote(e.what()) +
+                   ",\"detail\":" + jsonQuote(errorExplanation(e.kind));
+            if (e.line >= 1 && (size_t)e.line <= lines.size()) {
+                out += ",\"sourceLine\":{\"number\":" + std::to_string(e.line) +
+                       ",\"text\":" + jsonQuote(lines[(size_t)e.line - 1]) + "}";
+            }
+            out += "}";
+        }
+        out += "]}";
+        std::cout << out << "\n";
+        std::cout.flush();
+        return;
+    }
     std::cout.flush();
     std::cerr << "发现 " << errors.size() << " 个错误：\n\n";
     for (size_t i = 0; i < errors.size(); ++i) {
@@ -11056,6 +11080,12 @@ static int checkFile(const string& path) {
         if (!errors.empty()) {
             printDiagnostics(errors, path, lines);
             return 1;
+        }
+        if (gJsonDiagnostics) {
+            std::cout << "{\"ok\":true,\"file\":" << jsonQuote(path)
+                      << ",\"count\":0,\"statementCount\":" << program.size()
+                      << ",\"diagnostics\":[]}\n";
+            return 0;
         }
         std::cout << "语法通过：顶层 " << program.size() << " 条语句\n";
         return 0;
@@ -11282,6 +11312,9 @@ static int runMain(const vector<string>& args) {
         return 0;
     }
     const string& cmd = args[1];
+    for (const auto& a : args) {
+        if (a == "--json" || a == "--诊断JSON") gJsonDiagnostics = true;
+    }
     if (cmd == "--版本" || cmd == "-v") {
         std::cout << "文语言 v0.1 · 作者 Akm / 筑宸科技 · 2026-10-25 首次发布\n";
         return 0;
@@ -11309,11 +11342,18 @@ static int runMain(const vector<string>& args) {
         return 0;
     }
     if (cmd == "--检查") {
-        if (args.size() < 3) {
-            std::cerr << "用法：wen.exe --检查 文件.wen\n";
+        string target;
+        for (size_t i = 2; i < args.size(); ++i) {
+            if (args[i].rfind("--", 0) != 0) {
+                target = args[i];
+                break;
+            }
+        }
+        if (target.empty()) {
+            std::cerr << "用法：wen.exe --检查 [--json] 文件.wen\n";
             return 1;
         }
-        return checkFile(args[2]);
+        return checkFile(target);
     }
     if (cmd == "--生成库") {
         if (args.size() < 3) {
