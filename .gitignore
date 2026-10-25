@@ -1,0 +1,23 @@
+# 构建产物
+wen.exe
+*.exe
+*.o
+*.obj
+
+# 例子生成的临时文件
+例子/*.exe
+例子/*.svg
+例子/笔记.txt
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+
+# 旧版 Python 残留
+__pycache__/
+*.pyc
+
+# 本地临时测试
+_*.wen

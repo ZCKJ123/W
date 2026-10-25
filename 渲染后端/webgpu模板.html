@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="generator" content="文语言（wen） WEN-LANG-0.1">
+<title>文渲染 · WebGPU</title>
+<style>
+html, body { margin: 0; height: 100%; background: #0b1020; }
+canvas { display: block; margin: 0 auto; }
+</style>
+</head>
+<body>
+<canvas id="c" width="@W@" height="@H@"></canvas>
+<script type="module">
+const DATA = [@DATA@];
+const W = @W@, H = @H@;
+const canvas = document.getElementById('c');
+if (!navigator.gpu) {
+  document.body.innerHTML = '<p style="color:#fff;font-family:sans-serif;padding:20px">这个浏览器不支持 WebGPU。</p>';
+} else {
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) {
+    document.body.innerHTML = '<p style="color:#fff;font-family:sans-serif;padding:20px">没有可用的 WebGPU 适配器。</p>';
+  } else {
+    const device = await adapter.requestDevice();
+    const ctx = canvas.getContext('webgpu');
+    const format = navigator.gpu.getPreferredCanvasFormat();
+    ctx.configure({ device, format, alphaMode: 'opaque' });
+    const data = new Float32Array(DATA);
+    const buf = device.createBuffer({
+      size: data.byteLength,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST
+    });
+    device.queue.writeBuffer(buf, 0, data);
+    const shader = device.createShaderModule({
+      code: `
+        struct VSOut {
+          @builtin(position) pos: vec4<f32>,
+          @location(0) col: vec4<f32>,
+        };
+        @vertex fn vs(@location(0) p: vec2<f32>, @location(1) c: vec4<f32>) -> VSOut {
+          var o: VSOut;
+          o.pos = vec4<f32>(p, 0.0, 1.0);
+          o.col = c;
+          return o;
+        }
+        @fragment fn fs(i: VSOut) -> @location(0) vec4<f32> {
+          return i.col;
+        }
+      `
+    });
+    const pipeline = device.createRenderPipeline({
+      layout: 'auto',
+      vertex: {
+        module: shader,
+        entryPoint: 'vs',
+        buffers: [{
+          arrayStride: 24,
+          attributes: [
+            { shaderLocation: 0, offset: 0, format: 'float32x2' },
+            { shaderLocation: 1, offset: 8, format: 'float32x4' }
+          ]
+        }]
+      },
+      fragment: { module: shader, entryPoint: 'fs', targets: [{ format }] },
+      primitive: { topology: 'triangle-list' }
+    });
+    function frame() {
+      const enc = device.createCommandEncoder();
+      const pass = enc.beginRenderPass({
+        colorAttachments: [{
+          view: ctx.getCurrentTexture().createView(),
+          clearValue: { r: 1, g: 1, b: 1, a: 1 },
+          loadOp: 'clear',
+          storeOp: 'store'
+        }]
+      });
+      pass.setPipeline(pipeline);
+      pass.setVertexBuffer(0, buf);
+      pass.draw(data.length / 6);
+      pass.end();
+      device.queue.submit([enc.finish()]);
+      requestAnimationFrame(frame);
+    }
+    frame();
+  }
+}
+</script>
+</body>
+</html>

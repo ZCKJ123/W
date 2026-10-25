@@ -1,0 +1,9 @@
+依赖 网页库
+将 页 变成 "<html><head><title>测试 &amp; 标题</title></head><body><h1>你好</h1><p>第一段</p><a href=\"/甲\">甲</a><a href=\"https://例子\">乙</a></body></html>"
+打印 取标题 页
+打印 去标签 页
+打印 取标签(页, "a")
+打印 取属性(页, "a", "href")
+打印 取链接 页
+打印 解码实体 "&lt;你好&gt; &amp; &#20013; &#x6587;"
+打印 取标签("<div><div>内</div></div>", "div")
