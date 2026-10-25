@@ -2851,7 +2851,7 @@ static const std::map<string, string>& functionModules() {
 
         // 翻译器
         {"翻译支持", "兼容库"}, {"翻译目标", "兼容库"}, {"翻译检查", "兼容库"},
-        {"兼容支持", "兼容库"}, {"兼容翻译", "兼容库"},
+        {"兼容支持", "兼容库"}, {"兼容翻译", "兼容库"}, {"兼容运行", "兼容库"},
         {"翻译", "兼容库"}, {"执行字节码", "兼容库"},
         {"反汇编", "兼容库"}, {"反汇编文本", "兼容库"},
         {"二进制头", "兼容库"}, {"二进制字符串", "兼容库"}, {"二进制反汇编", "兼容库"},
@@ -6273,6 +6273,40 @@ Interpreter::Interpreter() {
             fs::remove(tmp, ec);
             throw;
         }
+    });
+    registerBuiltin("兼容运行", 2, 2, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+        string src = needStr(a[0], "兼容运行", line);
+        string target = lowerAscii(needStr(a[1], "兼容运行", line));
+        if (target == "js") target = "javascript";
+        if (target != "python" && target != "字节码")
+            throw WenError("运行时错误", line, 0,
+                           "兼容运行目前只支持 python / 字节码；其他目标需先装对应运行时");
+        auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+        string ext = target == "python" ? ".py" : ".json";
+        fs::path out = fs::temp_directory_path() /
+                       fs::u8path("wen_compat_run_" + std::to_string((long long)stamp) + ext);
+        Value trans;
+        if (!globals->lookup("兼容翻译", trans))
+            throw WenError("运行时错误", line, 0, "缺少兼容翻译");
+        vector<Value> targs{vStr(src), vStr(target), vStr(out.u8string())};
+        callValue(trans, targs, line);
+        int rc = 0;
+        if (target == "python") {
+            string cmd = "python \"" + out.u8string() + "\"";
+            rc = std::system(cmd.c_str());
+        } else {
+            Value exec;
+            if (!globals->lookup("执行字节码", exec)) {
+                std::error_code ec;
+                fs::remove(out, ec);
+                throw WenError("运行时错误", line, 0, "缺少执行字节码");
+            }
+            vector<Value> eargs{vStr(out.u8string())};
+            callValue(exec, eargs, line);
+        }
+        std::error_code ec;
+        fs::remove(out, ec);
+        return vNum((double)rc);
     });
     registerBuiltin("执行字节码", 1, 1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
         string path = needStr(a[0], "执行字节码", line);
