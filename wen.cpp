@@ -2852,6 +2852,7 @@ static const std::map<string, string>& functionModules() {
         // 翻译器
         {"翻译支持", "兼容库"}, {"翻译目标", "兼容库"}, {"翻译检查", "兼容库"},
         {"兼容支持", "兼容库"}, {"兼容翻译", "兼容库"}, {"兼容运行", "兼容库"},
+        {"兼容语言", "兼容库"}, {"兼容解析", "兼容库"},
         {"翻译", "兼容库"}, {"执行字节码", "兼容库"},
         {"反汇编", "兼容库"}, {"反汇编文本", "兼容库"},
         {"二进制头", "兼容库"}, {"二进制字符串", "兼容库"}, {"二进制反汇编", "兼容库"},
@@ -5764,6 +5765,78 @@ static vector<string> binaryStrings(const string& bytes, size_t minLen, size_t l
 static Value binaryHeader(const string& path, int line);
 static Value binaryStringsValue(const string& path, int line, size_t minLen, size_t limit,
                                 const string& filter);
+static std::pair<int, string> runCapture(const string& cmd) {
+    FILE* p = _popen((cmd + " 2>&1").c_str(), "r");
+    if (!p) return {-1, "无法启动命令"};
+    string out;
+    char buf[4096];
+    while (std::fgets(buf, sizeof(buf), p)) out += buf;
+    int rc = _pclose(p);
+    return {rc, out};
+}
+
+static Value compatParse(const string& lang0, const string& code, int line) {
+    string lang = lowerAscii(lang0);
+    if (lang == "json") {
+        try {
+            JsonReader reader(code, line);
+            reader.parse();
+            auto d = std::make_shared<Dict>();
+            d->items["语言"] = vStr("json");
+            d->items["ok"] = vBool(true);
+            d->items["退出码"] = vNum(0);
+            d->items["输出"] = vStr("");
+            return vDict(d);
+        } catch (WenError& e) {
+            auto d = std::make_shared<Dict>();
+            d->items["语言"] = vStr("json");
+            d->items["ok"] = vBool(false);
+            d->items["退出码"] = vNum(1);
+            d->items["输出"] = vStr(e.what());
+            return vDict(d);
+        }
+    }
+    string ext, cmd;
+    if (lang == "python") { ext = ".py"; cmd = "python -m py_compile"; }
+    else if (lang == "javascript" || lang == "js") { ext = ".js"; cmd = "node --check"; }
+    else if (lang == "typescript" || lang == "ts") { ext = ".ts"; cmd = "tsc --noEmit"; }
+    else if (lang == "java") { ext = ".java"; cmd = "javac -d"; }
+    else if (lang == "c") { ext = ".c"; cmd = "gcc -fsyntax-only"; }
+    else if (lang == "cpp" || lang == "c++") { ext = ".cpp"; cmd = "g++ -fsyntax-only"; }
+    else if (lang == "lua") { ext = ".lua"; cmd = "luac -p"; }
+    else if (lang == "ruby") { ext = ".rb"; cmd = "ruby -c"; }
+    else if (lang == "php") { ext = ".php"; cmd = "php -l"; }
+    else if (lang == "bash" || lang == "shell") { ext = ".sh"; cmd = "bash -n"; }
+    else if (lang == "rust") { ext = ".rs"; cmd = "rustc --emit=metadata --crate-type lib"; }
+    else if (lang == "go") { ext = ".go"; cmd = "gofmt -e"; }
+    else throw WenError("运行时错误", line, 0, "不支持的解析语言：" + lang0);
+    auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    fs::path tmp = fs::temp_directory_path() /
+                   fs::u8path("wen_parse_" + std::to_string((long long)stamp) + ext);
+    try {
+        writeWholeFile(tmp.u8string(), code, false);
+        string full;
+        if (lang == "java") {
+            fs::path dir = tmp.parent_path();
+            full = cmd + " \"" + dir.u8string() + "\" \"" + tmp.u8string() + "\"";
+        } else {
+            full = cmd + " \"" + tmp.u8string() + "\"";
+        }
+        auto [rc, out] = runCapture(full);
+        auto d = std::make_shared<Dict>();
+        d->items["语言"] = vStr(lang);
+        d->items["ok"] = vBool(rc == 0);
+        d->items["退出码"] = vNum((double)rc);
+        d->items["输出"] = vStr(out);
+        std::error_code ec;
+        fs::remove(tmp, ec);
+        return vDict(d);
+    } catch (...) {
+        std::error_code ec;
+        fs::remove(tmp, ec);
+        throw;
+    }
+}
 Interpreter::Interpreter() {
     globals = std::make_shared<Scope>();
     rng.seed(std::random_device{}());
@@ -6223,6 +6296,17 @@ Interpreter::Interpreter() {
         return vStr(outPath);
     });
 
+    registerBuiltin("兼容语言", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+        auto l = std::make_shared<List>();
+        for (const char* s : {"python", "javascript", "typescript", "json", "java",
+                              "c", "cpp", "lua", "ruby", "php", "bash", "rust", "go"})
+            l->items.push_back(vStr(s));
+        return vList(l);
+    });
+    registerBuiltin("兼容解析", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        return compatParse(needStr(a[0], "兼容解析", line),
+                           needStr(a[1], "兼容解析", line), line);
+    });
     registerBuiltin("兼容支持", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
         auto l = std::make_shared<List>();
         for (const char* s : {"python", "javascript", "json", "java", "字节码", "C++", "汇编"})
