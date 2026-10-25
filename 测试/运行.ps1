@@ -9,6 +9,7 @@
 param([switch]$Build)
 
 $ErrorActionPreference = 'Stop'
+$env:WEN_ADMIN_TOKEN = 'wen-test'
 $root = Split-Path -Parent $PSScriptRoot
 $exe = Join-Path $root 'wen.exe'
 

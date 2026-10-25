@@ -2845,6 +2845,10 @@ static const std::map<string, string>& functionModules() {
         {"开启加速", "跃迁库"}, {"关闭加速", "跃迁库"}, {"清空缓存", "跃迁库"},
         {"缓存大小", "跃迁库"}, {"加速命中", "跃迁库"},
 
+        // 管理员库
+        {"申请管理员", "管理员库"}, {"是否管理员", "管理员库"},
+        {"退出管理员", "管理员库"}, {"危险模式", "管理员库"},
+
         // 翻译器
         {"翻译支持", "翻译器"}, {"翻译目标", "翻译器"}, {"翻译检查", "翻译器"},
         {"翻译", "翻译器"}, {"执行字节码", "翻译器"},
@@ -2934,6 +2938,7 @@ static const std::map<string, string>& functionModules() {
         // 网络库
         {"抓取", "网络库"}, {"下载", "网络库"}, {"抓取JSON", "网络库"},
         {"安全抓取", "网络库"}, {"限速抓取", "网络库"}, {"乱码解析", "网络库"},
+        {"二进制破坏", "网络库"}, {"二进制恢复", "网络库"},
 
         // JSON 库
         {"解析JSON", "数据格式库"}, {"生成JSON", "数据格式库"},
@@ -2981,6 +2986,8 @@ public:
     std::set<string> loadedModules;
     std::map<string, string> symbolOwner;  // 名字 -> 库/用户，防止静默覆盖
     bool callStats = false;                // 调用统计：只在开启时计数
+    bool adminGranted = false;             // 管理员权限
+    bool dangerousMode = false;            // 危险模式：允许二进制破坏
     std::map<string, long long> callCounts;
     std::map<string, std::map<string, Value>> libraryFunctions;  // 库名 -> 函数表
     std::vector<Value> renderScene;  // 渲染场景：面/涂鸦/渐变/体积光，供各后端使用
@@ -7065,6 +7072,33 @@ Interpreter::Interpreter() {
         for (const char* suf : WEN_SOURCE_SUFFIXES) l->items.push_back(vStr(suf));
         return vList(l);
     });
+    registerBuiltin("申请管理员", 1, 1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+        const char* env = std::getenv("WEN_ADMIN_TOKEN");
+        string token = env ? env : "";
+        if (token.empty())
+            throw WenError("权限错误", line, 0,
+                           "未配置管理员口令：先设置环境变量 WEN_ADMIN_TOKEN");
+        if (needStr(a[0], "申请管理员", line) != token)
+            throw WenError("权限错误", line, 0, "管理员口令不正确");
+        adminGranted = true;
+        return vBool(true);
+    });
+    registerBuiltin("是否管理员", 0, 0, [this](Interpreter&, vector<Value>&, int) -> Value {
+        return vBool(adminGranted);
+    });
+    registerBuiltin("退出管理员", 0, 0, [this](Interpreter&, vector<Value>&, int) -> Value {
+        adminGranted = false;
+        dangerousMode = false;
+        return vBool(true);
+    });
+    registerBuiltin("危险模式", 0, 1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (!a.empty()) {
+            if (!adminGranted)
+                throw WenError("权限错误", line, 0, "危险模式需要先申请管理员");
+            dangerousMode = truthy(a[0]);
+        }
+        return vBool(dangerousMode);
+    });
     registerBuiltin("签名", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
         return vStr(WEN_SIGNATURE);
     });
@@ -7078,6 +7112,7 @@ Interpreter::Interpreter() {
             {"跃迁库", "自动/纯函数缓存、统计、快照"},
             {"内存库", "常驻/临时内存、函数缓存、压缩、牵引"},
             {"翻译器", "翻译到 Python/JS/JSON/Java/字节码/C++/汇编"},
+            {"管理员库", "管理员权限、危险模式"},
             {"函数库", "映射、过滤、折叠、排序、积分"},
             {"文件库", "读写、复制、重命名、目录"},
             {"输入库", "读整数/小数/按键、清屏"},
@@ -8046,6 +8081,44 @@ Interpreter::Interpreter() {
             if (!fixed.empty() && fixed != s && validUtf8(fixed)) return vStr(fixed);
         }
         return vStr(s);
+    });
+    registerBuiltin("二进制破坏", 1, 2, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (!adminGranted || !dangerousMode)
+            throw WenError("权限错误", line, 0, "二进制破坏需要管理员 + 危险模式");
+        string s = needStr(a[0], "二进制破坏", line);
+        string key = a.size() > 1 ? needStr(a[1], "二进制破坏", line) : "wen";
+        if (key.empty()) key = "wen";
+        static const char* H = "0123456789ABCDEF";
+        string out = "WENB:";
+        for (size_t i = 0; i < s.size(); ++i) {
+            unsigned char c = (unsigned char)s[i] ^ (unsigned char)key[i % key.size()];
+            out += H[c >> 4];
+            out += H[c & 15];
+        }
+        return vStr(out);
+    });
+    registerBuiltin("二进制恢复", 1, 2, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (!adminGranted || !dangerousMode)
+            throw WenError("权限错误", line, 0, "二进制恢复需要管理员 + 危险模式");
+        string s = needStr(a[0], "二进制恢复", line);
+        if (s.rfind("WENB:", 0) != 0)
+            throw WenError("运行时错误", line, 0, "不是二进制破坏数据");
+        string key = a.size() > 1 ? needStr(a[1], "二进制恢复", line) : "wen";
+        if (key.empty()) key = "wen";
+        auto val = [&](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            throw WenError("运行时错误", line, 0, "破坏数据含非法字符");
+        };
+        string hex = s.substr(5);
+        if (hex.size() % 2) throw WenError("运行时错误", line, 0, "破坏数据长度错误");
+        string out;
+        for (size_t i = 0; i < hex.size(); i += 2) {
+            unsigned char c = (unsigned char)((val(hex[i]) << 4) | val(hex[i + 1]));
+            out += (char)(c ^ (unsigned char)key[(i / 2) % key.size()]);
+        }
+        return vStr(out);
     });
     registerBuiltin("抓取", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         string url = needStr(a[0], "抓取", line);
@@ -10921,6 +10994,8 @@ static string errorExplanation(const string& kind) {
         return "文件路径不存在、没有读写权限，或目录创建失败。";
     if (kind == "库冲突")
         return "两个库或用户代码定义了同名函数；改名，或去掉其中一个依赖。";
+    if (kind == "权限错误")
+        return "需要管理员权限或危险模式；先设置 WEN_ADMIN_TOKEN 并申请管理员。";
     return "解释器内部异常。";
 }
 
