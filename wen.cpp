@@ -7835,6 +7835,18 @@ Interpreter::Interpreter() {
         return vBool(true);
     });
     registerBuiltin("新建布局", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (a[0].type == VT::List && a[0].list) {
+            string spec;
+            for (const auto& item : a[0].list->items) {
+                auto pair = needList(item, "布局字段", line);
+                if (pair->items.size() != 2)
+                    throw WenError("运行时错误", line, 0, "布局字段要写成 [名字, 类型]");
+                string name = needStr(pair->items[0], "字段名", line);
+                string type = needStr(pair->items[1], "字段类型", line);
+                spec += type + " " + name + ",";
+            }
+            return makeLayout(spec, line);
+        }
         return makeLayout(needStr(a[0], "新建布局", line), line);
     });
     registerBuiltin("布局大小", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
