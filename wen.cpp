@@ -1606,7 +1606,7 @@ private:
 // 5. 运行时值
 // ============================================================
 
-enum class VT { None, Bool, Num, Str, List, Dict, Func, Set, Bytes };
+enum class VT { None, Bool, Num, Str, List, Dict, Func, Set, Bytes, Range };
 
 struct List;
 struct Dict;
@@ -1622,6 +1622,7 @@ struct Value {
     shared_ptr<Dict> dict;
     shared_ptr<Callable> callable;
     shared_ptr<vector<unsigned char>> bytes;
+    double rstart = 0, rstop = 0, rstep = 1;
 };
 
 struct List { vector<Value> items; };
@@ -1683,6 +1684,7 @@ static Value vFunc(shared_ptr<Callable> c) { Value v; v.type = VT::Func; v.calla
 static Value vSet() { Value v; v.type = VT::Set; v.list = std::make_shared<List>(); return v; }
 static Value vSet(shared_ptr<List> l) { Value v; v.type = VT::Set; v.list = std::move(l); return v; }
 static Value vBytes(shared_ptr<vector<unsigned char>> b) { Value v; v.type = VT::Bytes; v.bytes = std::move(b); return v; }
+static Value vRange(double a, double b, double c) { Value v; v.type = VT::Range; v.rstart = a; v.rstop = b; v.rstep = c; return v; }
 
 // ============================================================
 // 6. 值工具
@@ -1699,6 +1701,7 @@ static string typeName(const Value& v) {
         case VT::Func: return "函数";
         case VT::Set: return "集合";
         case VT::Bytes: return "缓冲";
+        case VT::Range: return "范围";
     }
     return "未知";
 }
@@ -1714,6 +1717,7 @@ static bool truthy(const Value& v) {
         case VT::Func: return true;
         case VT::Set: return v.list && !v.list->items.empty();
         case VT::Bytes: return v.bytes && !v.bytes->empty();
+        case VT::Range: return (v.rstep > 0 ? v.rstart < v.rstop : v.rstart > v.rstop);
     }
     return false;
 }
@@ -3379,44 +3383,49 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
         case Stmt::K::For: {
             Value iter = eval(s->expr, scope);
             bool two = !s->name2.empty();
-            vector<Value> keys, vals;
-            auto add = [&](const Value& k, const Value& v) {
-                keys.push_back(k);
-                vals.push_back(v);
+            auto runOne = [&](const Value& k, const Value& v) -> bool {
+                scope->vars[s->name] = k;
+                if (two) scope->vars[s->name2] = v;
+                try {
+                    for (const auto& st : s->body) exec(st, scope);
+                } catch (ContinueSignal&) {
+                    return true;
+                } catch (BreakSignal&) {
+                    return false;
+                }
+                return true;
             };
             if ((iter.type == VT::List || iter.type == VT::Set) && iter.list) {
                 for (size_t i = 0; i < iter.list->items.size(); ++i) {
-                    if (two) add(vNum((double)i), iter.list->items[i]);
-                    else add(iter.list->items[i], vNone());
+                    if (!runOne(two ? vNum((double)i) : iter.list->items[i],
+                                two ? iter.list->items[i] : vNone()))
+                        break;
                 }
             } else if (iter.type == VT::Str) {
                 auto chars = utf8Chars(iter.str);
                 for (size_t i = 0; i < chars.size(); ++i) {
-                    if (two) add(vNum((double)i), vStr(chars[i]));
-                    else add(vStr(chars[i]), vNone());
+                    if (!runOne(two ? vNum((double)i) : vStr(chars[i]),
+                                two ? vStr(chars[i]) : vNone()))
+                        break;
                 }
             } else if (iter.type == VT::Dict && iter.dict) {
                 for (const auto& kv : iter.dict->items) {
-                    if (two) add(vStr(kv.first), kv.second);
-                    else add(vStr(kv.first), vNone());
+                    if (!runOne(vStr(kv.first), two ? kv.second : vNone())) break;
+                }
+            } else if (iter.type == VT::Range) {
+                long long n = 0;
+                for (double x = iter.rstart; iter.rstep > 0 ? x < iter.rstop : x > iter.rstop;
+                     x += iter.rstep) {
+                    if (!runOne(two ? vNum((double)n) : vNum(x), two ? vNum(x) : vNone()))
+                        break;
+                    ++n;
                 }
             } else {
-                rtError(s->line, "「对于」只能遍历列表、文本、字典或集合，收到" + typeName(iter));
-            }
-            for (size_t i = 0; i < keys.size(); ++i) {
-                scope->vars[s->name] = keys[i];
-                if (two) scope->vars[s->name2] = vals[i];
-                try {
-                    for (const auto& st : s->body) exec(st, scope);
-                } catch (ContinueSignal&) {
-                    continue;
-                } catch (BreakSignal&) {
-                    break;
-                }
+                rtError(s->line, "「对于」只能遍历列表、文本、字典、集合或范围，收到" +
+                                     typeName(iter));
             }
             break;
-        }
-        case Stmt::K::Try: {
+        }        case Stmt::K::Try: {
             auto runFinally = [&]() {
                 for (const auto& st : s->finallyBody) exec(st, scope);
             };
@@ -3729,6 +3738,14 @@ Value Interpreter::getIndex(const Value& obj, const Value& idx, int line) {
         if (it == obj.dict->items.end())
             rtError(line, "字典里没有键「" + idx.str + "」");
         return it->second;
+    }
+    if (obj.type == VT::Range) {
+        double span = (obj.rstop - obj.rstart) / obj.rstep;
+        long long n = span <= 0 ? 0 : (long long)std::ceil(span - 1e-12);
+        long long i = needIndex(idx, "范围下标", line);
+        if (i < 0) i += n;
+        if (i < 0 || i >= n) rtError(line, "范围下标越界");
+        return vNum(obj.rstart + (double)i * obj.rstep);
     }
     rtError(line, typeName(obj) + "不能用 [ ] 取下标");
 }
@@ -5470,6 +5487,10 @@ Interpreter::Interpreter() {
         if (v.type == VT::Set && v.list) return vNum((double)v.list->items.size());
         if (v.type == VT::Dict && v.dict) return vNum((double)v.dict->items.size());
         if (v.type == VT::Bytes && v.bytes) return vNum((double)v.bytes->size());
+        if (v.type == VT::Range) {
+            double span = (v.rstop - v.rstart) / v.rstep;
+            return vNum(span <= 0 ? 0.0 : std::ceil(span - 1e-12));
+        }
         throw WenError("运行时错误", line, 0, "「长度」不支持" + typeName(v));
     });
     registerBuiltin("类型", 1, 1, [](Interpreter&, vector<Value>& a, int) -> Value {
@@ -5561,6 +5582,18 @@ Interpreter::Interpreter() {
         auto l = std::make_shared<List>();
         for (long long i = 0; i < n; ++i) l->items.push_back(vNum(start + i * step));
         return vList(l);
+    });
+    registerBuiltin("范围流", 1, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        double start = 0, stop = 0, step = 1;
+        if (a.size() == 1) {
+            stop = needNum(a[0], "范围流", line);
+        } else {
+            start = needNum(a[0], "范围流", line);
+            stop = needNum(a[1], "范围流", line);
+            if (a.size() == 3) step = needNum(a[2], "范围流", line);
+        }
+        if (step == 0) throw WenError("运行时错误", line, 0, "范围流的步长不能为 0");
+        return vRange(start, stop, step);
     });
 
     registerBuiltin("追加", 1, -1, [](Interpreter&, vector<Value>& a, int line) -> Value {
