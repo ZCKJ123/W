@@ -5617,9 +5617,18 @@ struct StackEmitter {
                 else diag(e->line, "字节码/汇编不支持的运算符「" + op + "」");
                 break;
             }
-            case Expr::K::Call:
-                diag(e->line, "字节码/汇编暂不支持函数调用");
+            case Expr::K::Call: {
+                if (e->args[0]->k != Expr::K::Var) {
+                    diag(e->line, "字节码/汇编只支持按名字调用");
+                    break;
+                }
+                for (size_t i = 1; i < e->args.size(); ++i) expr(e->args[i]);
+                string name = e->args[0]->text;
+                emit("call", "\"name\":" + quoteText(name) + ",\"n\":" +
+                                  std::to_string(e->args.size() - 1),
+                     "CALL " + name + " " + std::to_string(e->args.size() - 1));
                 break;
+            }
             case Expr::K::Index:
             case Expr::K::Slice:
             case Expr::K::List:
@@ -6211,7 +6220,7 @@ Interpreter::Interpreter() {
         return vStr(outPath);
     });
 
-    registerBuiltin("执行字节码", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+    registerBuiltin("执行字节码", 1, 1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
         string path = needStr(a[0], "执行字节码", line);
         string text;
         try {
@@ -6288,6 +6297,15 @@ Interpreter::Interpreter() {
                 Value b = pop(), aa = pop();
                 if (op == "and") stack.push_back(vBool(truthy(aa) && truthy(b)));
                 else stack.push_back(vBool(truthy(aa) || truthy(b)));
+            } else if (op == "call") {
+                string fname = needStr(arg("name"), "字节码 call", line);
+                int n = (int)needIndex(arg("n"), "字节码 call", line);
+                vector<Value> args((size_t)n);
+                for (int i = n - 1; i >= 0; --i) args[(size_t)i] = pop();
+                Value fn;
+                if (!globals->lookup(fname, fn))
+                    throw WenError("运行时错误", line, 0, "字节码调用不存在的名字：" + fname);
+                stack.push_back(callValue(fn, args, line));
             } else if (op == "print") {
                 int n = (int)needIndex(arg("n"), "字节码 print", line);
                 vector<Value> vals;
