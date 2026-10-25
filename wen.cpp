@@ -6519,8 +6519,8 @@ Interpreter::Interpreter() {
             ++memoryHits;
             return v;
         }
-        vector<Value> args(a.begin() + 2, a.end());
-        Value out = callValue(a[1], args, line);
+        vector<Value> args(a.begin() + 1, a.end());
+        Value out = callValue(a[0], args, line);
         if (out.type == VT::Num || out.type == VT::Str || out.type == VT::Bool ||
             out.type == VT::None) {
             if (memoryCompress && isPulled(key)) {
@@ -6861,27 +6861,48 @@ Interpreter::Interpreter() {
         unsigned n = std::thread::hardware_concurrency();
         return vNum(n ? (double)n : 1);
     });
-    registerBuiltin("CPU并行求和", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+    auto rangeLen = [](const Value& v) -> long long {
+        double span = (v.rstop - v.rstart) / v.rstep;
+        return span <= 0 ? 0 : (long long)std::ceil(span - 1e-12);
+    };
+    registerBuiltin("CPU并行求和", 1, 1, [rangeLen](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (a[0].type == VT::Range) {
+            long long n = rangeLen(a[0]);
+            if (n <= 0) return vNum(0);
+            return vNum((double)n *
+                        (2.0 * a[0].rstart + (double)(n - 1) * a[0].rstep) / 2.0);
+        }
         auto l = needList(a[0], "CPU并行求和", line);
         vector<double> xs;
         for (const auto& v : l->items) xs.push_back(needNum(v, "CPU并行求和", line));
         return vNum(parallelReduceNums(xs, 0));
     });
-    registerBuiltin("CPU并行最大", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+    registerBuiltin("CPU并行最大", 1, 1, [rangeLen](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (a[0].type == VT::Range) {
+            long long n = rangeLen(a[0]);
+            if (n <= 0) throw WenError("运行时错误", line, 0, "范围不能为空");
+            double last = a[0].rstart + (double)(n - 1) * a[0].rstep;
+            return vNum(a[0].rstep > 0 ? last : a[0].rstart);
+        }
         auto l = needList(a[0], "CPU并行最大", line);
         vector<double> xs;
         for (const auto& v : l->items) xs.push_back(needNum(v, "CPU并行最大", line));
         if (xs.empty()) throw WenError("运行时错误", line, 0, "列表不能为空");
         return vNum(parallelReduceNums(xs, 1));
     });
-    registerBuiltin("CPU并行最小", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+    registerBuiltin("CPU并行最小", 1, 1, [rangeLen](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (a[0].type == VT::Range) {
+            long long n = rangeLen(a[0]);
+            if (n <= 0) throw WenError("运行时错误", line, 0, "范围不能为空");
+            double last = a[0].rstart + (double)(n - 1) * a[0].rstep;
+            return vNum(a[0].rstep > 0 ? a[0].rstart : last);
+        }
         auto l = needList(a[0], "CPU并行最小", line);
         vector<double> xs;
         for (const auto& v : l->items) xs.push_back(needNum(v, "CPU并行最小", line));
         if (xs.empty()) throw WenError("运行时错误", line, 0, "列表不能为空");
         return vNum(parallelReduceNums(xs, 2));
-    });
-    // ---------- 数学 ----------
+    });    // ---------- 数学 ----------
     auto m1 = [this](const string& name, double (*f)(double)) {
         registerBuiltin(name, 1, 1,
                         [name, f](Interpreter&, vector<Value>& a, int line) -> Value {
