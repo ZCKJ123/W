@@ -13,7 +13,7 @@ cmd /c 轻量构建.bat | Out-Null
 if ($LASTEXITCODE -ne 0) { 失败 "轻量构建失败" }
 
 Write-Host "3/5 版本 / 签名"
-$version = .\wen_full.exe --版本
+$version = (.\wen_full.exe --版本) -join "`n"
 if ($version -notmatch '文语言 v0\.1 · 作者 Akm / 筑宸科技 · 2026-10-25 首次发布') { 失败 "版本签名不对：$version" }
 $sign = .\wen_full.exe --签名
 if ($sign -notmatch 'WEN-LANG-0\.1') { 失败 "内置签名不对" }

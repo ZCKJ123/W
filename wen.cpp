@@ -12013,6 +12013,7 @@ static int runMain(const vector<string>& args) {
     }
     if (cmd == "--版本" || cmd == "-v") {
         std::cout << "文语言 v0.1 · 作者 Akm / 筑宸科技 · 2026-10-25 首次发布\n";
+        std::cout << "版本: " << WEN_VERSION << "\n";
         return 0;
     }
     if (cmd == "--后缀") {
