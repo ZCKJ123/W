@@ -2850,11 +2850,12 @@ static const std::map<string, string>& functionModules() {
         {"退出管理员", "管理员库"}, {"危险模式", "管理员库"},
 
         // 翻译器
-        {"翻译支持", "翻译器"}, {"翻译目标", "翻译器"}, {"翻译检查", "翻译器"},
-        {"翻译", "翻译器"}, {"执行字节码", "翻译器"},
-        {"反汇编", "翻译器"}, {"反汇编文本", "翻译器"},
-        {"二进制头", "翻译器"}, {"二进制字符串", "翻译器"}, {"二进制反汇编", "翻译器"},
-        {"反二进制", "翻译器"}, {"暴力还原", "翻译器"},
+        {"翻译支持", "兼容库"}, {"翻译目标", "兼容库"}, {"翻译检查", "兼容库"},
+        {"兼容支持", "兼容库"}, {"兼容翻译", "兼容库"},
+        {"翻译", "兼容库"}, {"执行字节码", "兼容库"},
+        {"反汇编", "兼容库"}, {"反汇编文本", "兼容库"},
+        {"二进制头", "兼容库"}, {"二进制字符串", "兼容库"}, {"二进制反汇编", "兼容库"},
+        {"反二进制", "兼容库"}, {"暴力还原", "兼容库"},
 
         // CPU / GPU
         {"CPU核心数", "CPU库"}, {"CPU并行求和", "CPU库"}, {"CPU并行最大", "CPU库"},
@@ -2875,8 +2876,8 @@ static const std::map<string, string>& functionModules() {
         {"内存清场", "内存库"}, {"内存压缩阈值", "内存库"}, {"压缩", "内存库"}, {"压缩率", "内存库"}, {"清空", "内存库"},
 
         // 外派库
-        {"外派支持", "翻译器"}, {"外派目标", "翻译器"}, {"外派检查", "翻译器"},
-        {"外派翻译", "翻译器"},
+        {"外派支持", "兼容库"}, {"外派目标", "兼容库"}, {"外派检查", "兼容库"},
+        {"外派翻译", "兼容库"},
 
         // 跃迁库
         {"跃迁查", "跃迁库"}, {"跃迁记", "跃迁库"}, {"跃迁清空", "跃迁库"},
@@ -3278,7 +3279,8 @@ void Interpreter::加载模块(const string& rawName, int line) {
     if (name == "JSON库") name = "数据格式库";
     else if (name == "HTML库") name = "网页库";
     else if (name == "加速库") name = "跃迁库";
-    else if (name == "外派库") name = "翻译器";
+    else if (name == "外派库") name = "兼容库";
+    else if (name == "翻译器") name = "兼容库";
     if (loadedModules.count(name)) return;
     auto lib = libraryFunctions.find(name);
     if (lib == libraryFunctions.end()) {
@@ -3329,7 +3331,8 @@ bool Interpreter::是内置库(const string& rawName) const {
     if (name == "JSON库") name = "数据格式库";
     else if (name == "HTML库") name = "网页库";
     else if (name == "加速库") name = "跃迁库";
-    else if (name == "外派库") name = "翻译器";
+    else if (name == "外派库") name = "兼容库";
+    else if (name == "翻译器") name = "兼容库";
     return libraryFunctions.count(name) > 0;
 }
 
@@ -6220,6 +6223,57 @@ Interpreter::Interpreter() {
         return vStr(outPath);
     });
 
+    registerBuiltin("兼容支持", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+        auto l = std::make_shared<List>();
+        for (const char* s : {"python", "javascript", "json", "java", "字节码", "C++", "汇编"})
+            l->items.push_back(vStr(s));
+        return vList(l);
+    });
+    registerBuiltin("兼容翻译", 3, 3, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+        string srcPath = needStr(a[0], "兼容翻译", line);
+        string target = needStr(a[1], "兼容翻译", line);
+        string outPath = needStr(a[2], "兼容翻译", line);
+        string t = lowerAscii(target);
+        if (t == "js") t = "javascript";
+        if (t == "cpp") t = "C++";
+        bool external = t == "python" || t == "javascript" || t == "json" || t == "java";
+        bool internal = t == "字节码" || t == "C++" || t == "汇编";
+        if (!external && !internal)
+            throw WenError("运行时错误", line, 0, "不支持的兼容目标：" + target);
+        string src;
+        try {
+            src = readWholeFile(resolveWenPath(srcPath));
+        } catch (IoError& e) {
+            throw WenError("文件错误", line, 0, e.what());
+        }
+        std::ostringstream body;
+        for (const auto& raw : splitLines(src)) {
+            size_t b = raw.find_first_not_of(" \t");
+            if (b == string::npos) { body << raw << "\n"; continue; }
+            string head = raw.substr(b);
+            if (head.rfind("# 翻译:", 0) == 0 || head.rfind("# 外派:", 0) == 0) continue;
+            body << raw << "\n";
+        }
+        auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+        fs::path tmp = fs::temp_directory_path() /
+                       fs::u8path("wen_compat_" + std::to_string((long long)stamp) + ".wen");
+        string text = (external ? "# 外派: " : "# 翻译: ") + t + "\n" + body.str();
+        try {
+            writeWholeFile(tmp.u8string(), text, false);
+            Value fn;
+            string bridge = external ? "外派翻译" : "翻译";
+            if (!globals->lookup(bridge, fn))
+                throw WenError("运行时错误", line, 0, "缺少翻译入口：" + bridge);
+            vector<Value> args{vStr(tmp.u8string()), vStr(outPath)};
+            Value result = callValue(fn, args, line);
+            fs::remove(tmp);
+            return result;
+        } catch (...) {
+            std::error_code ec;
+            fs::remove(tmp, ec);
+            throw;
+        }
+    });
     registerBuiltin("执行字节码", 1, 1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
         string path = needStr(a[0], "执行字节码", line);
         string text;
@@ -7172,7 +7226,7 @@ Interpreter::Interpreter() {
             {"渲染库", "面、涂鸦、渐变、体积光、导出后端"},
             {"跃迁库", "自动/纯函数缓存、统计、快照"},
             {"内存库", "常驻/临时内存、函数缓存、压缩、牵引"},
-            {"翻译器", "翻译到 Python/JS/JSON/Java/字节码/C++/汇编"},
+            {"兼容库", "翻译到 Python/JS/JSON/Java/字节码/C++/汇编"},
             {"管理员库", "管理员权限、危险模式"},
             {"函数库", "映射、过滤、折叠、排序、积分"},
             {"文件库", "读写、复制、重命名、目录"},
