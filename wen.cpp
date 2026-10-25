@@ -6546,7 +6546,11 @@ Interpreter::Interpreter() {
     });
     registerBuiltin("跃迁查", 1, 1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
         string key = leapKey(a[0], line);
-        return vBool(leapCache.count(key) > 0);
+        if (leapCache.count(key)) return vBool(true);
+        string prefix = key + "|";
+        for (const auto& kv : leapCache)
+            if (kv.first.compare(0, prefix.size(), prefix) == 0) return vBool(true);
+        return vBool(false);
     });
     registerBuiltin("跃迁记", 2, 2, [this](Interpreter&, vector<Value>& a, int line) -> Value {
         string key = leapKey(a[0], line);
@@ -6560,14 +6564,16 @@ Interpreter::Interpreter() {
         return vNone();
     });
     registerBuiltin("跃迁调用", 2, -1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
-        string key = leapKey(a[0], line);
+        string label = leapKey(a[0], line);
+        vector<Value> args(a.begin() + 2, a.end());
+        // 用户键只作标签；真正的缓存身份是“标签 + 参数”，不会再拿旧参数的结果。
+        string key = label + accelKey("", args);
         auto it = leapCache.find(key);
         if (it != leapCache.end()) {
             ++leapHits;
             return it->second;
         }
         ++leapMisses;
-        vector<Value> args(a.begin() + 2, a.end());
         Value out = callValue(a[1], args, line);
         if (out.type == VT::Num || out.type == VT::Str || out.type == VT::Bool ||
             out.type == VT::None) {
