@@ -1761,6 +1761,45 @@ static Value asInt(const Value& v, int line) {
     if (v.type == VT::Int) return v;
     return vInt(intFromValue(v, 64, true, line), 64, true);
 }
+static string trimNumericText(const string& s) {
+    size_t b = 0, e = s.size();
+    while (b < e && std::isspace((unsigned char)s[b])) ++b;
+    while (e > b && std::isspace((unsigned char)s[e - 1])) --e;
+    return s.substr(b, e - b);
+}
+
+static double parseNumberText(const string& raw, bool integer, int base, int line) {
+    string s = trimNumericText(raw);
+    if (s.empty()) throw WenError("运行时错误", line, 0, "空文本不能转成数字");
+    try {
+        size_t used = 0;
+        if (integer) {
+            int b = base;
+            bool neg = false;
+            size_t p = 0;
+            if (s[p] == '+' || s[p] == '-') { neg = s[p] == '-'; ++p; }
+            if (b == 0) {
+                b = 10;
+                if (p + 1 < s.size() && s[p] == '0' && (s[p + 1] == 'x' || s[p + 1] == 'X')) { b = 16; p += 2; }
+                else if (p + 1 < s.size() && s[p] == '0' && (s[p + 1] == 'b' || s[p + 1] == 'B')) { b = 2; p += 2; }
+                else if (p + 1 < s.size() && s[p] == '0' && (s[p + 1] == 'o' || s[p + 1] == 'O')) { b = 8; p += 2; }
+            }
+            if (b < 2 || b > 36) throw WenError("运行时错误", line, 0, "进制必须在 2..36");
+            unsigned long long v = std::stoull(s.substr(p), &used, b);
+            if (p + used != s.size())
+                throw WenError("运行时错误", line, 0, "数字后面有多余字符：" + s.substr(p + used));
+            return neg ? -(double)v : (double)v;
+        }
+        double d = std::stod(s, &used);
+        if (used != s.size())
+            throw WenError("运行时错误", line, 0, "数字后面有多余字符：" + s.substr(used));
+        return d;
+    } catch (WenError&) {
+        throw;
+    } catch (...) {
+        throw WenError("运行时错误", line, 0, "不是有效数字：" + raw);
+    }
+}
 static string intText(const Value& v) {
     if (v.isSigned) return std::to_string(intSigned(v));
     return std::to_string(v.i & intMask(v.width));
@@ -6175,10 +6214,15 @@ Interpreter::Interpreter() {
         while (e > b && std::isspace((unsigned char)s[e - 1])) --e;
         return vStr(s.substr(b, e - b));
     });
-    registerBuiltin("整数", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+    registerBuiltin("整数", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (a[0].type == VT::Str) {
+            int base = a.size() == 2 ? (int)needIndex(a[1], "整数", line) : 0;
+            return vNum(std::trunc(parseNumberText(a[0].str, true, base, line)));
+        }
         return vNum(std::trunc(needNum(a[0], "整数", line)));
     });
     registerBuiltin("小数", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (a[0].type == VT::Str) return vNum(parseNumberText(a[0].str, false, 10, line));
         return vNum(needNum(a[0], "小数", line));
     });
     registerBuiltin("布尔", 1, 1, [](Interpreter&, vector<Value>& a, int) -> Value {
