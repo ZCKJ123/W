@@ -1654,6 +1654,7 @@ struct Callable {
     virtual string display() const = 0;
     // 零参数函数：名字后面不写括号也直接调用（少括号写法）。
     virtual bool zeroArgCall() const { return false; }
+    virtual bool cacheable() const { return false; }
 };
 
 struct Function : Callable {
@@ -1670,12 +1671,18 @@ struct Function : Callable {
 struct Builtin : Callable {
     int minArgs = 0;
     int maxArgs = -1;
+    string module;
+    bool moduleKnown = false;
+    bool cacheableFn = false;
     std::function<Value(Interpreter&, vector<Value>&, int)> fn;
 
     Value call(Interpreter& vm, vector<Value>& args, int line) override;
     string display() const override { return "<内置函数 " + name + ">"; }
     bool zeroArgCall() const override { return minArgs == 0; }
+    bool cacheable() const override { return cacheableFn; }
 };
+
+static bool cacheableBuiltin(const string& name);
 
 static Value vNone() { return Value{}; }
 static Value vBool(bool b) { Value v; v.type = VT::Bool; v.b = b; return v; }
@@ -2841,6 +2848,8 @@ static const std::map<string, string>& functionModules() {
         // 翻译器
         {"翻译支持", "翻译器"}, {"翻译目标", "翻译器"}, {"翻译检查", "翻译器"},
         {"翻译", "翻译器"}, {"执行字节码", "翻译器"},
+        {"反字节码", "翻译器"}, {"反字节码文本", "翻译器"},
+        {"反汇编", "翻译器"}, {"反二进制", "翻译器"}, {"暴力还原", "翻译器"},
 
         // CPU / GPU
         {"CPU核心数", "CPU库"}, {"CPU并行求和", "CPU库"}, {"CPU并行最大", "CPU库"},
@@ -3282,6 +3291,11 @@ void Interpreter::加载模块(const string& rawName, int line) {
                                "」占用；依赖「" + name + "」会覆盖它，请改名或去掉其中一个库");
         globals->vars[kv.first] = kv.second;
         symbolOwner[kv.first] = name;
+        if (auto b = std::dynamic_pointer_cast<Builtin>(kv.second.callable)) {
+            b->module = name;
+            b->moduleKnown = true;
+            b->cacheableFn = cacheableBuiltin(kv.first);
+        }
     }
     if (name == "数学库") {
         const double pi = std::acos(-1.0);
@@ -3768,7 +3782,7 @@ Value Interpreter::callValue(const Value& callee, vector<Value>& args, int line)
         rtError(line, "这个值不能调用：" + typeName(callee));
     if (!accelEnabled && !leapAuto && !memoryAuto)
         return callee.callable->call(*this, args, line);
-    if (accelEnabled && cacheableBuiltin(callee.callable->name)) {
+    if (accelEnabled && callee.callable->cacheable()) {
         string key = accelKey(callee.callable->name, args);
         auto it = accelCache.find(key);
         if (it != accelCache.end()) {
@@ -3943,11 +3957,17 @@ Value Function::call(Interpreter& vm, vector<Value>& args, int callLine) {
 
 Value Builtin::call(Interpreter& vm, vector<Value>& args, int line) {
     if (vm.callStats && !name.empty()) ++vm.callCounts[name];
-    auto mit = functionModules().find(name);
-    if (mit != functionModules().end() && !vm.loadedModules.count(mit->second)) {
+    string lib;
+    if (moduleKnown) {
+        lib = module;
+    } else {
+        auto mit = functionModules().find(name);
+        if (mit != functionModules().end()) lib = mit->second;
+    }
+    if (!lib.empty() && !vm.loadedModules.count(lib)) {
         throw WenError("运行时错误", line, 0,
-                       "「" + name + "」属于「" + mit->second +
-                       "」，请先在文件开头写「依赖 " + mit->second + "」");
+                       "「" + name + "」属于「" + lib +
+                       "」，请先在文件开头写「依赖 " + lib + "」");
     }
     if ((int)args.size() < minArgs ||
         (maxArgs >= 0 && (int)args.size() > maxArgs)) {
