@@ -1938,6 +1938,17 @@ static vector<string> splitLines(const string& s) {
     return lines;
 }
 
+static const char* WEN_SOURCE_SUFFIXES[] = {
+    ".wen", ".w", ".文", ".言", ".语", ".中文", ".文言", ".wenx", ".wx"};
+static string resolveWenPath(const string& path) {
+    if (fs::exists(fs::u8path(path))) return path;
+    for (const char* suf : WEN_SOURCE_SUFFIXES) {
+        string p = path + suf;
+        if (fs::exists(fs::u8path(p))) return p;
+    }
+    return path;
+}
+
 static string readWholeFile(const string& path) {
     std::ifstream in(fs::u8path(path), std::ios::binary);
     if (!in) throw IoError("打不开文件：" + path);
@@ -3262,7 +3273,7 @@ bool Interpreter::是内置库(const string& rawName) const {
 void Interpreter::加载外部库(const string& name, int line) {
     if (loadedModules.count(name)) return;
 
-    static const char* suffixes[] = {".wen", ".w", ".文", ".中文", ".库", ".wenlib"};
+    static const char* suffixes[] = {".wen", ".w", ".文", ".言", ".语", ".中文", ".文言", ".wenx", ".wx", ".库", ".wenlib"};
     vector<fs::path> dirs;
     std::error_code ec;
     if (!filename.empty() && filename[0] != '<') {
@@ -3292,7 +3303,7 @@ void Interpreter::加载外部库(const string& name, int line) {
         throw WenError("运行时错误", line, 0,
                        "找不到库「" + name +
                        "」：不是内置库，也没找到 库/" + name +
-                       ".wen（或 .w/.文/.中文/.库/.wenlib，或目录 " + name + "/主.wen）");
+                       ".wen（或 .w/.文/.言/.语/.中文/.文言/.wenx/.wx/.库/.wenlib，或目录 " + name + "/主.wen）");
     }
 
     loadedModules.insert(name);
@@ -3513,7 +3524,7 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
             fn->body = s->body;
             fn->closure = scope;
             fn->line = s->line;
-            if (scope == globals || (scope->parent && scope->parent == globals)) {
+            if (!inLibrary_ && (scope == globals || (scope->parent && scope->parent == globals))) {
                 auto owner = symbolOwner.find(s->name);
                 if (owner != symbolOwner.end() && owner->second != "用户")
                     throw WenError("库冲突", s->line, 0,
@@ -5936,7 +5947,7 @@ Interpreter::Interpreter() {
         string path = needStr(a[0], "运行", line);
         string src;
         try {
-            src = readWholeFile(path);
+            src = readWholeFile(resolveWenPath(path));
         } catch (IoError& e) {
             throw WenError("文件错误", line, 0, e.what());
         }
@@ -5971,7 +5982,7 @@ Interpreter::Interpreter() {
         string name = needStr(a[1], "调用外部", line);
         string src;
         try {
-            src = readWholeFile(path);
+            src = readWholeFile(resolveWenPath(path));
         } catch (IoError& e) {
             throw WenError("文件错误", line, 0, e.what());
         }
@@ -6008,7 +6019,7 @@ Interpreter::Interpreter() {
         string path = needStr(a[0], "翻译目标", line);
         string src;
         try {
-            src = readWholeFile(path);
+            src = readWholeFile(resolveWenPath(path));
         } catch (IoError& e) {
             throw WenError("文件错误", line, 0, e.what());
         }
@@ -6020,7 +6031,7 @@ Interpreter::Interpreter() {
         string path = needStr(a[0], "翻译检查", line);
         string src;
         try {
-            src = readWholeFile(path);
+            src = readWholeFile(resolveWenPath(path));
         } catch (IoError& e) {
             throw WenError("文件错误", line, 0, e.what());
         }
@@ -6063,7 +6074,7 @@ Interpreter::Interpreter() {
         string outPath = needStr(a[1], "翻译", line);
         string src;
         try {
-            src = readWholeFile(path);
+            src = readWholeFile(resolveWenPath(path));
         } catch (IoError& e) {
             throw WenError("文件错误", line, 0, e.what());
         }
@@ -6240,7 +6251,7 @@ Interpreter::Interpreter() {
         string path = needStr(a[0], "外派目标", line);
         string src;
         try {
-            src = readWholeFile(path);
+            src = readWholeFile(resolveWenPath(path));
         } catch (IoError& e) {
             throw WenError("文件错误", line, 0, e.what());
         }
@@ -6251,7 +6262,7 @@ Interpreter::Interpreter() {
         string path = needStr(a[0], "外派检查", line);
         string src;
         try {
-            src = readWholeFile(path);
+            src = readWholeFile(resolveWenPath(path));
         } catch (IoError& e) {
             throw WenError("文件错误", line, 0, e.what());
         }
@@ -6304,7 +6315,7 @@ Interpreter::Interpreter() {
         string outPath = needStr(a[1], "外派翻译", line);
         string src;
         try {
-            src = readWholeFile(path);
+            src = readWholeFile(resolveWenPath(path));
         } catch (IoError& e) {
             throw WenError("文件错误", line, 0, e.what());
         }
@@ -6877,6 +6888,11 @@ Interpreter::Interpreter() {
         globals->vars.erase(name);
         symbolOwner.erase(owner);
         return vBool(true);
+    });
+    registerBuiltin("源文件后缀", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+        auto l = std::make_shared<List>();
+        for (const char* suf : WEN_SOURCE_SUFFIXES) l->items.push_back(vStr(suf));
+        return vList(l);
     });
     registerBuiltin("签名", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
         return vStr(WEN_SIGNATURE);
@@ -10818,7 +10834,7 @@ static void printDiagnostics(const vector<WenError>& errors, const string& filen
 static int runFile(const string& path) {
     Interpreter vm;
     try {
-        string src = readWholeFile(path);
+        string src = readWholeFile(resolveWenPath(path));
         vector<WenError> errors;
         string expanded;
         processSaveBlocks(src, false, expanded, errors);
@@ -10862,7 +10878,7 @@ static int runFile(const string& path) {
 static int checkFile(const string& path) {
     vector<string> lines;
     try {
-        string src = readWholeFile(path);
+        string src = readWholeFile(resolveWenPath(path));
         vector<WenError> errors;
         string expanded;
         processSaveBlocks(src, false, expanded, errors);
@@ -10921,7 +10937,7 @@ static int runCommand(const string& cmd) {
 static int dumpTokens(const string& path) {
     vector<string> lines;
     try {
-        string src = readWholeFile(path);
+        string src = readWholeFile(resolveWenPath(path));
         lines = splitLines(src);
         Lexer lex(src);
         auto toks = lex.scan();
@@ -10997,7 +11013,7 @@ static int createLibrary(const string& name, const string& output) {
 static int compileFile(const string& path, const string& output, bool build) {
     vector<string> lines;
     try {
-        string src = readWholeFile(path);
+        string src = readWholeFile(resolveWenPath(path));
         vector<WenError> errors;
         string expanded;
         int blocks = processSaveBlocks(src, false, expanded, errors);
@@ -11104,6 +11120,10 @@ static int runMain(const vector<string>& args) {
     const string& cmd = args[1];
     if (cmd == "--版本" || cmd == "-v") {
         std::cout << "文语言 v0.1 · 作者 Akm / 筑宸科技 · 2026-10-25 首次发布\n";
+        return 0;
+    }
+    if (cmd == "--后缀") {
+        for (const char* suf : WEN_SOURCE_SUFFIXES) std::cout << suf << "\n";
         return 0;
     }
     if (cmd == "--签名") {
