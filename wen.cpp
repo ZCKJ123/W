@@ -2023,6 +2023,25 @@ static bool looksLikeGbk(const string& body) {
 #endif
 
 // 抓取网页正文。Windows 用 WinHTTP（支持 https 与重定向）。
+static bool unsafeNetHost(const string& url) {
+    auto p = url.find("://");
+    if (p == string::npos) return true;
+    size_t start = p + 3;
+    size_t end = url.find_first_of("/:", start);
+    string host = url.substr(start, end == string::npos ? string::npos : end - start);
+    std::transform(host.begin(), host.end(), host.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    if (host.empty() || host == "localhost" || host == "0.0.0.0" || host == "::1") return true;
+    if (host.rfind("127.", 0) == 0 || host.rfind("10.", 0) == 0 ||
+        host.rfind("192.168.", 0) == 0 || host.rfind("169.254.", 0) == 0)
+        return true;
+    if (host.rfind("172.", 0) == 0) {
+        int second = std::atoi(host.c_str() + 4);
+        if (second >= 16 && second <= 31) return true;
+    }
+    if (host.size() > 6 && host.substr(host.size() - 6) == ".local") return true;
+    return false;
+}
 static string httpGetText(const string& url, int timeoutMs, int line) {
 #ifdef _WIN32
     if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0)
@@ -2904,6 +2923,7 @@ static const std::map<string, string>& functionModules() {
 
         // 网络库
         {"抓取", "网络库"}, {"下载", "网络库"}, {"抓取JSON", "网络库"},
+        {"安全抓取", "网络库"}, {"限速抓取", "网络库"},
 
         // JSON 库
         {"解析JSON", "数据格式库"}, {"生成JSON", "数据格式库"},
@@ -5698,6 +5718,7 @@ static string translateByTarget(const string& target, const vector<StmtPtr>& pro
     return "";
 }
 
+static vector<string> disassembleBytecode(const string& path, int line);
 Interpreter::Interpreter() {
     globals = std::make_shared<Scope>();
     rng.seed(std::random_device{}());
@@ -6258,6 +6279,26 @@ Interpreter::Interpreter() {
             ++pc;
         }
         return vNone();
+    });
+    registerBuiltin("反汇编", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto lines = disassembleBytecode(needStr(a[0], "反汇编", line), line);
+        auto l = std::make_shared<List>();
+        for (const auto& s : lines) l->items.push_back(vStr(s));
+        return vList(l);
+    });
+    registerBuiltin("反编译", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto lines = disassembleBytecode(needStr(a[0], "反编译", line), line);
+        string text;
+        for (const auto& s : lines) text += s + "\n";
+        if (a.size() == 1) return vStr(text);
+        string path = needStr(a[1], "反编译", line);
+        try {
+            ensureParentDirectory(path);
+            writeWholeFile(path, text, false);
+        } catch (IoError& e) {
+            throw WenError("文件错误", line, 0, e.what());
+        }
+        return vStr(path);
     });
     // ---------- 外派库 ----------
     registerBuiltin("外派支持", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
@@ -7908,6 +7949,22 @@ Interpreter::Interpreter() {
     });
 
     // ---------- 网络库 ----------
+    registerBuiltin("安全抓取", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string url = needStr(a[0], "安全抓取", line);
+        if (unsafeNetHost(url))
+            throw WenError("运行时错误", line, 0, "安全抓取拒绝内网/本机地址：" + url);
+        int timeout = a.size() == 2 ? (int)needIndex(a[1], "安全抓取", line) : 15000;
+        return vStr(httpGetText(url, timeout, line));
+    });
+    registerBuiltin("限速抓取", 2, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string url = needStr(a[0], "限速抓取", line);
+        long long ms = needIndex(a[1], "限速抓取", line);
+        if (ms < 0) ms = 0;
+        if (ms > 60000) ms = 60000;
+        std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        int timeout = a.size() == 3 ? (int)needIndex(a[2], "限速抓取", line) : 15000;
+        return vStr(httpGetText(url, timeout, line));
+    });
     registerBuiltin("抓取", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         string url = needStr(a[0], "抓取", line);
         int timeout = a.size() == 2 ? (int)needIndex(a[1], "抓取", line) : 15000;
@@ -10818,6 +10875,30 @@ static void printIncompleteError(const IncompleteError& e, const string& filenam
     printWenError(we, filename, lines);
 }
 
+static vector<string> disassembleBytecode(const string& path, int line) {
+    string text;
+    try {
+        text = readWholeFile(path);
+    } catch (IoError& e) {
+        throw WenError("文件错误", line, 0, e.what());
+    }
+    JsonReader reader(text, line);
+    auto root = needDict(reader.parse(), "字节码", line);
+    auto code = needList(root->items.at("code"), "字节码", line);
+    vector<string> out;
+    for (size_t i = 0; i < code->items.size(); ++i) {
+        auto ins = needDict(code->items[i], "字节码指令", line);
+        string op = needStr(ins->items.at("op"), "字节码 op", line);
+        std::ostringstream s;
+        s << std::setw(4) << std::setfill('0') << i << "  " << op;
+        if (ins->items.count("v")) s << " " << toText(ins->items["v"], true);
+        if (ins->items.count("name")) s << " " << needStr(ins->items["name"], "name", line);
+        if (ins->items.count("n")) s << " " << needNum(ins->items["n"], "n", line);
+        if (ins->items.count("to")) s << " -> " << needNum(ins->items["to"], "to", line);
+        out.push_back(s.str());
+    }
+    return out;
+}
 static string translateToCppSource(const vector<StmtPtr>& program, vector<string>& diags) {
     try {
         CppGenerator gen(program);
@@ -11321,6 +11402,33 @@ static int runMain(const vector<string>& args) {
     }
     if (cmd == "--后缀") {
         for (const auto& s : WEN_SUFFIXES) std::cout << s.use << "  " << s.ext << "\n";
+        return 0;
+    }
+    if (cmd == "--反编译" || cmd == "--反汇编") {
+        if (args.size() < 3) {
+            std::cerr << "用法：wen.exe --反编译 字节码.json [输出.txt]\n";
+            return 1;
+        }
+        vector<string> lines;
+        try {
+            lines = disassembleBytecode(args[2], 1);
+        } catch (WenError& e) {
+            std::cerr << "【" << e.kind << "】" << e.what() << "\n";
+            return 1;
+        }
+        string text;
+        for (const auto& s : lines) text += s + "\n";
+        if (args.size() >= 4) {
+            try {
+                ensureParentDirectory(args[3]);
+                writeWholeFile(args[3], text, false);
+            } catch (IoError& e) {
+                std::cerr << e.what() << "\n";
+                return 1;
+            }
+        } else {
+            std::cout << text;
+        }
         return 0;
     }
     if (cmd == "--签名") {
