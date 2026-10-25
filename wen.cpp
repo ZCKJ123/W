@@ -22,6 +22,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <unordered_map>
 #include <memory>
 #include <random>
 #include <regex>
@@ -49,6 +50,7 @@ __attribute__((used)) static const char WEN_EMBED_MARK[] =
 #endif
 
 using std::map;
+using std::unordered_map;
 using std::set;
 using std::shared_ptr;
 using std::string;
@@ -691,6 +693,23 @@ private:
 // 3. AST
 // ============================================================
 
+using SymId = uint32_t;
+static vector<string> gSymNames{""};
+static std::unordered_map<string, SymId> gSymIds;
+
+static SymId internSymbol(const string& name) {
+    auto it = gSymIds.find(name);
+    if (it != gSymIds.end()) return it->second;
+    SymId id = (SymId)gSymNames.size();
+    gSymNames.push_back(name);
+    gSymIds.emplace(name, id);
+    return id;
+}
+static const string& symbolName(SymId id) {
+    static const string empty;
+    return id < gSymNames.size() ? gSymNames[id] : empty;
+}
+
 struct Expr;
 using ExprPtr = shared_ptr<Expr>;
 
@@ -699,6 +718,7 @@ struct Expr {
     K k = K::None;
     double num = 0;
     string text;
+    SymId sym = 0;
     bool b = false;
     bool commandCall = false;
     string op;
@@ -717,7 +737,9 @@ struct Stmt {
     };
     K k = K::ExprStmt;
     string name;
+    SymId nameSym = 0;
     string name2;   // 「对于 键, 值 在 字典 中」的第二个变量
+    SymId name2Sym = 0;
     ExprPtr target;
     ExprPtr expr;
     vector<ExprPtr> args;
@@ -726,6 +748,7 @@ struct Stmt {
     vector<StmtPtr> finallyBody;
     vector<std::pair<ExprPtr, vector<StmtPtr>>> branches;
     vector<string> params;
+    vector<SymId> paramSyms;
     vector<string> imports;
     int line = 0;
 };
@@ -761,6 +784,7 @@ static ExprPtr mkVar(string name, int line) {
     auto e = std::make_shared<Expr>();
     e->k = Expr::K::Var;
     e->text = std::move(name);
+    e->sym = internSymbol(e->text);
     e->line = line;
     return e;
 }
@@ -1194,7 +1218,10 @@ private:
         auto s = std::make_shared<Stmt>();
         s->k = Stmt::K::For;
         s->name = nm.text;
+        s->nameSym = internSymbol(s->name);
+        s->nameSym = internSymbol(s->name);
         s->name2 = name2;
+        s->name2Sym = name2.empty() ? 0 : internSymbol(name2);
         s->expr = iter;
         s->body = body;
         s->line = line;
@@ -1220,6 +1247,7 @@ private:
         s->k = Stmt::K::Try;
         s->body = body;
         s->name = catchName;
+        s->nameSym = catchName.empty() ? 0 : internSymbol(catchName);
         s->elseBody = catchBody;
         s->finallyBody = finallyBody;
         s->line = line;
@@ -1256,6 +1284,7 @@ private:
         s->k = Stmt::K::Func;
         s->name = nm.text;
         s->params = std::move(params);
+        for (const auto& p : s->params) s->paramSyms.push_back(internSymbol(p));
         s->body = body;
         s->line = line;
         return s;
@@ -1667,6 +1696,7 @@ struct Dict { map<string, Value> items; };
 
 struct Scope {
     map<string, Value> vars;
+    unordered_map<SymId, Value> idVars;
     shared_ptr<Scope> parent;
 
     Scope() = default;
@@ -1677,6 +1707,23 @@ struct Scope {
         if (it != vars.end()) { out = it->second; return true; }
         if (parent) return parent->lookup(name, out);
         return false;
+    }
+    bool lookup(SymId id, Value& out) const {
+        auto it = idVars.find(id);
+        if (it != idVars.end()) { out = it->second; return true; }
+        auto jt = vars.find(symbolName(id));
+        if (jt != vars.end()) { out = jt->second; return true; }
+        if (parent) return parent->lookup(id, out);
+        return false;
+    }
+    void set(SymId id, Value v) {
+        idVars[id] = v;
+        vars[symbolName(id)] = std::move(v);
+    }
+    void set(const string& name, Value v) { set(internSymbol(name), std::move(v)); }
+    void eraseName(const string& name) {
+        idVars.erase(internSymbol(name));
+        vars.erase(name);
     }
 };
 
@@ -1693,6 +1740,7 @@ struct Callable {
 
 struct Function : Callable {
     vector<string> params;
+    vector<SymId> paramSyms;
     vector<StmtPtr> body;
     shared_ptr<Scope> closure;
     int line = 0;
@@ -3234,7 +3282,7 @@ void Interpreter::registerBuiltin(
     b->minArgs = minArgs;
     b->maxArgs = maxArgs;
     b->fn = std::move(fn);
-    globals->vars[name] = vFunc(b);
+    globals->set(name, vFunc(b));
 }
 
 vector<StmtPtr> Interpreter::parseSource(const string& src) {
@@ -3452,7 +3500,7 @@ void Interpreter::加载模块(const string& rawName, int line) {
             throw WenError("库冲突", line, 0,
                            "函数「" + kv.first + "」已被「" + owner->second +
                                "」占用；依赖「" + name + "」会覆盖它，请改名或去掉其中一个库");
-        globals->vars[kv.first] = kv.second;
+        globals->set(kv.first, kv.second);
         symbolOwner[kv.first] = name;
         if (auto b = std::dynamic_pointer_cast<Builtin>(kv.second.callable)) {
             b->module = name;
@@ -3464,19 +3512,19 @@ void Interpreter::加载模块(const string& rawName, int line) {
     }
     if (name == "数学库") {
         const double pi = std::acos(-1.0);
-        globals->vars["圆周率"] = vNum(pi);
-        globals->vars["π"] = vNum(pi);
-        globals->vars["自然常数"] = vNum(std::exp(1.0));
+        globals->set("圆周率", vNum(pi));
+        globals->set("π", vNum(pi));
+        globals->set("自然常数", vNum(std::exp(1.0)));
     } else if (name == "物理库") {
-        globals->vars["重力加速度"] = vNum(9.80665);
-        globals->vars["光速"] = vNum(299792458.0);
-        globals->vars["万有引力常数"] = vNum(6.67430e-11);
-        globals->vars["声速"] = vNum(343.0);
-        globals->vars["普朗克常数"] = vNum(6.62607015e-34);
-        globals->vars["电子电荷"] = vNum(1.602176634e-19);
-        globals->vars["阿伏伽德罗常数"] = vNum(6.02214076e23);
-        globals->vars["理想气体常数"] = vNum(8.314462618);
-        globals->vars["静电力常量"] = vNum(8.9875517923e9);
+        globals->set("重力加速度", vNum(9.80665));
+        globals->set("光速", vNum(299792458.0));
+        globals->set("万有引力常数", vNum(6.67430e-11));
+        globals->set("声速", vNum(343.0));
+        globals->set("普朗克常数", vNum(6.62607015e-34));
+        globals->set("电子电荷", vNum(1.602176634e-19));
+        globals->set("阿伏伽德罗常数", vNum(6.02214076e23));
+        globals->set("理想气体常数", vNum(8.314462618));
+        globals->set("静电力常量", vNum(8.9875517923e9));
     }
     loadedModules.insert(name);
 }
@@ -3548,7 +3596,7 @@ void Interpreter::加载外部库(const string& name, int line) {
                 throw WenError("库冲突", line, 0,
                                "名字「" + n + "」已被「" + owner->second +
                                    "」占用；库「" + name + "」不能再导出它");
-            globals->vars[n] = val;
+            globals->set(n, val);
             symbolOwner[n] = name;
         };
         if (moduleExports.empty()) {
@@ -3661,8 +3709,8 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
             Value iter = eval(s->expr, scope);
             bool two = !s->name2.empty();
             auto runOne = [&](const Value& k, const Value& v) -> bool {
-                scope->vars[s->name] = k;
-                if (two) scope->vars[s->name2] = v;
+                scope->set(s->nameSym ? s->nameSym : internSymbol(s->name), k);
+                if (two) scope->set(s->name2Sym ? s->name2Sym : internSymbol(s->name2), v);
                 try {
                     for (const auto& st : s->body) exec(st, scope);
                 } catch (ContinueSignal&) {
@@ -3722,7 +3770,7 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
                 auto stack = std::make_shared<List>();
                 for (const auto& f : e.frames) stack->items.push_back(vStr(f));
                 d->items["栈"] = vList(stack);
-                scope->vars[s->name] = vDict(d);
+                scope->set(s->nameSym ? s->nameSym : internSymbol(s->name), vDict(d));
                 try {
                     for (const auto& st : s->elseBody) exec(st, scope);
                 } catch (...) {
@@ -3742,6 +3790,7 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
             auto fn = std::make_shared<Function>();
             fn->name = s->name;
             fn->params = s->params;
+            fn->paramSyms = s->paramSyms;
             fn->body = s->body;
             fn->closure = scope;
             fn->line = s->line;
@@ -3753,7 +3802,7 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
                                        owner->second + "」占用；请改名");
                 symbolOwner[s->name] = "用户";
             }
-            scope->vars[s->name] = vFunc(fn);
+            scope->set(s->nameSym ? s->nameSym : internSymbol(s->name), vFunc(fn));
             break;
         }
         case Stmt::K::Return: {
@@ -3793,7 +3842,7 @@ Value Interpreter::eval(const ExprPtr& e, shared_ptr<Scope> scope) {
         case Expr::K::None: return vNone();
         case Expr::K::Var: {
             Value v;
-            if (!scope->lookup(e->text, v)) undefinedName(e->text, e->line);
+            if (!(e->sym && scope->lookup(e->sym, v)) && !scope->lookup(e->text, v)) undefinedName(e->text, e->line);
             // 零参数函数/内置：名字后面没写括号，也直接调用。
             // 要把它当值传给别人，请用有参数的函数（至少一个参数）。
             if (v.type == VT::Func && v.callable && v.callable->zeroArgCall()) {
@@ -4026,7 +4075,7 @@ Value Interpreter::callValue(const Value& callee, vector<Value>& args, int line)
 void Interpreter::assignTarget(const ExprPtr& target, const Value& val,
                                shared_ptr<Scope> scope) {
     if (target->k == Expr::K::Var) {
-        scope->vars[target->text] = val;
+        scope->set(target->sym ? target->sym : internSymbol(target->text), val);
         return;
     }
     if (target->k == Expr::K::Index) {
@@ -4106,7 +4155,11 @@ Value Function::call(Interpreter& vm, vector<Value>& args, int callLine) {
                        " 个参数，收到 " + std::to_string(args.size()) + " 个");
     }
     auto scope = std::make_shared<Scope>(closure);
-    for (size_t i = 0; i < params.size(); ++i) scope->vars[params[i]] = args[i];
+    for (size_t i = 0; i < params.size(); ++i) scope->set(i < paramSyms.size() ? paramSyms[i] : internSymbol(params[i]), args[i]);
+    for (size_t i = 0; i < params.size(); ++i) {
+        SymId id = i < paramSyms.size() ? paramSyms[i] : internSymbol(params[i]);
+        scope->set(id, args[i]);
+    }
     try {
         for (const auto& st : body) vm.exec(st, scope);
     } catch (ReturnSignal& r) {
@@ -7599,7 +7652,7 @@ Interpreter::Interpreter() {
         if (owner != symbolOwner.end())
             throw WenError("库冲突", line, 0,
                            "别名「" + newName + "」已被「" + owner->second + "」占用");
-        globals->vars[newName] = fn;
+        globals->set(newName, fn);
         auto oldOwner = symbolOwner.find(oldName);
         symbolOwner[newName] = oldOwner == symbolOwner.end() ? "别名" : oldOwner->second;
         return vBool(true);
@@ -7609,7 +7662,7 @@ Interpreter::Interpreter() {
         auto owner = symbolOwner.find(name);
         if (owner == symbolOwner.end() || owner->second == "用户")
             throw WenError("运行时错误", line, 0, "「" + name + "」不是别名");
-        globals->vars.erase(name);
+        globals->eraseName(name);
         symbolOwner.erase(owner);
         return vBool(true);
     });
@@ -10842,7 +10895,7 @@ Interpreter::Interpreter() {
     });
     registerBuiltin("注入变量", 2, 2, [](Interpreter& vm, vector<Value>& a, int line) -> Value {
         string name = needStr(a[0], "注入变量", line);
-        vm.globals->vars[name] = a[1];
+        vm.globals->set(name, a[1]);
         return a[1];
     });
     registerBuiltin("读取变量", 1, 1, [](Interpreter& vm, vector<Value>& a, int line) -> Value {
@@ -10863,7 +10916,9 @@ Interpreter::Interpreter() {
     });
     registerBuiltin("删除变量", 1, 1, [](Interpreter& vm, vector<Value>& a, int line) -> Value {
         string name = needStr(a[0], "删除变量", line);
-        return vBool(vm.globals->vars.erase(name) > 0);
+        bool had = vm.globals->vars.count(name) > 0;
+        vm.globals->eraseName(name);
+        return vBool(had);
     });
     registerBuiltin("执行文本", 1, 1, [](Interpreter& vm, vector<Value>& a, int line) -> Value {
         string src = needStr(a[0], "执行文本", line);
