@@ -2780,7 +2780,8 @@ static const std::map<string, string>& functionModules() {
         {"随机抽样", "概率库"}, {"洗牌", "概率库"},
 
         // 渲染库
-        {"新建面", "渲染库"}, {"面面积", "渲染库"}, {"移动面", "渲染库"},
+        {"新建面", "渲染库"}, {"添加场景", "渲染库"}, {"新建三维面", "渲染库"}, {"新建立方体", "渲染库"},
+        {"新建球", "渲染库"}, {"渲染三维", "渲染库"}, {"导出OBJ", "渲染库"}, {"面面积", "渲染库"}, {"移动面", "渲染库"},
         {"旋转面", "渲染库"}, {"缩放面", "渲染库"}, {"涂鸦", "渲染库"}, {"渐变", "渲染库"},
         {"体积光2D", "渲染库"}, {"体积光3D", "渲染库"},
         {"场景", "渲染库"}, {"清空场景", "渲染库"}, {"导出场景", "渲染库"},
@@ -4013,10 +4014,20 @@ static vector<RenderPoint> renderVerticesFromList(const Value& v, int line) {
     vector<RenderPoint> pts;
     for (const auto& item : l->items) {
         auto p = needList(item, "顶点", line);
-        if (p->items.size() != 2)
-            throw WenError("运行时错误", line, 0, "顶点必须是 [x, y]");
-        pts.push_back({needNum(p->items[0], "顶点 x", line),
-                       needNum(p->items[1], "顶点 y", line)});
+        if (p->items.size() == 2) {
+            pts.push_back({needNum(p->items[0], "顶点 x", line),
+                           needNum(p->items[1], "顶点 y", line)});
+        } else if (p->items.size() == 3) {
+            // 三维顶点在 2D 后端里做默认透视投影；深度排序请用「渲染三维」。
+            double x = needNum(p->items[0], "顶点 x", line);
+            double y = needNum(p->items[1], "顶点 y", line);
+            double z = needNum(p->items[2], "顶点 z", line);
+            double zz = z + 8.0;
+            if (zz <= 0.1) throw WenError("运行时错误", line, 0, "三维顶点在相机后面");
+            pts.push_back({400.0 + x * 520.0 / zz, 300.0 - y * 520.0 / zz});
+        } else {
+            throw WenError("运行时错误", line, 0, "顶点必须是 [x, y] 或 [x, y, z]");
+        }
     }
     if (pts.size() < 3)
         throw WenError("运行时错误", line, 0, "面至少需要 3 个顶点");
@@ -4105,6 +4116,93 @@ static Value renderPointsValue(const vector<RenderPoint>& pts) {
     return vList(vertices);
 }
 
+struct Render3Point {
+    double x = 0, y = 0, z = 0;
+};
+
+static vector<Render3Point> render3Vertices(const Value& v, int line) {
+    auto l = needList(v, "三维顶点", line);
+    vector<Render3Point> pts;
+    for (const auto& item : l->items) {
+        auto p = needList(item, "三维顶点", line);
+        if (p->items.size() != 3)
+            throw WenError("运行时错误", line, 0, "三维顶点必须是 [x, y, z]");
+        pts.push_back({needNum(p->items[0], "x", line),
+                       needNum(p->items[1], "y", line),
+                       needNum(p->items[2], "z", line)});
+    }
+    if (pts.size() < 3)
+        throw WenError("运行时错误", line, 0, "三维面至少需要 3 个顶点");
+    return pts;
+}
+
+static Value make3Face(const vector<Render3Point>& pts, const string& color) {
+    auto d = std::make_shared<Dict>();
+    d->items["类型"] = vStr("三维面");
+    auto vs = std::make_shared<List>();
+    for (const auto& p : pts) {
+        auto one = std::make_shared<List>();
+        one->items.push_back(vNum(p.x));
+        one->items.push_back(vNum(p.y));
+        one->items.push_back(vNum(p.z));
+        vs->items.push_back(vList(one));
+    }
+    d->items["顶点"] = vList(vs);
+    d->items["颜色"] = vStr(color);
+    return vDict(d);
+}
+
+static void collect3Faces(const Value& v, vector<Value>& out, int line) {
+    if (v.type == VT::Dict && v.dict) {
+        auto it = v.dict->items.find("类型");
+        if (it != v.dict->items.end() && toText(it->second) == "三维面") {
+            out.push_back(v);
+            return;
+        }
+        throw WenError("运行时错误", line, 0, "不是三维面");
+    }
+    if (v.type == VT::List && v.list) {
+        for (const auto& item : v.list->items) collect3Faces(item, out, line);
+        return;
+    }
+    throw WenError("运行时错误", line, 0, "需要三维面或三维面列表");
+}
+
+static Value make3Box(double cx, double cy, double cz, double s, const string& color) {
+    double h = s * 0.5;
+    auto list = std::make_shared<List>();
+    auto face = [&](std::initializer_list<Render3Point> pts) {
+        list->items.push_back(make3Face(vector<Render3Point>(pts), color));
+    };
+    face({{cx-h,cy-h,cz-h},{cx+h,cy-h,cz-h},{cx+h,cy+h,cz-h},{cx-h,cy+h,cz-h}});
+    face({{cx-h,cy-h,cz+h},{cx-h,cy+h,cz+h},{cx+h,cy+h,cz+h},{cx+h,cy-h,cz+h}});
+    face({{cx-h,cy-h,cz-h},{cx-h,cy+h,cz-h},{cx-h,cy+h,cz+h},{cx-h,cy-h,cz+h}});
+    face({{cx+h,cy-h,cz-h},{cx+h,cy-h,cz+h},{cx+h,cy+h,cz+h},{cx+h,cy+h,cz-h}});
+    face({{cx-h,cy-h,cz-h},{cx-h,cy-h,cz+h},{cx+h,cy-h,cz+h},{cx+h,cy-h,cz-h}});
+    face({{cx-h,cy+h,cz-h},{cx+h,cy+h,cz-h},{cx+h,cy+h,cz+h},{cx-h,cy+h,cz+h}});
+    return vList(list);
+}
+
+static Value make3Sphere(double cx, double cy, double cz, double r, int segs,
+                         const string& color) {
+    if (segs < 3) segs = 3;
+    if (segs > 64) segs = 64;
+    auto list = std::make_shared<List>();
+    const double pi = std::acos(-1.0);
+    auto at = [&](int i, int j) {
+        double th = pi * (double)i / segs;
+        double ph = 2.0 * pi * (double)j / segs;
+        return Render3Point{cx + r * std::sin(th) * std::cos(ph),
+                            cy + r * std::cos(th),
+                            cz + r * std::sin(th) * std::sin(ph)};
+    };
+    for (int i = 0; i < segs; ++i)
+        for (int j = 0; j < segs; ++j) {
+            auto a = at(i, j), b = at(i + 1, j), c = at(i + 1, j + 1), d = at(i, j + 1);
+            list->items.push_back(make3Face({a, b, c, d}, color));
+        }
+    return vList(list);
+}
 static bool renderPointInside(const vector<RenderPoint>& poly, double x, double y) {
     bool inside = false;
     for (size_t i = 0, j = poly.size() - 1; i < poly.size(); j = i++) {
@@ -8083,6 +8181,119 @@ Interpreter::Interpreter() {
         return vList(out);
     });
 
+    registerBuiltin("新建三维面", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string color = a.size() > 1 ? needStr(a[1], "新建三维面", line) : "#4aa3ff";
+        return make3Face(render3Vertices(a[0], line), color);
+    });
+    registerBuiltin("新建立方体", 4, 5, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        double x = needNum(a[0], "新建立方体", line);
+        double y = needNum(a[1], "新建立方体", line);
+        double z = needNum(a[2], "新建立方体", line);
+        double s = needNum(a[3], "新建立方体", line);
+        string color = a.size() > 4 ? needStr(a[4], "新建立方体", line) : "#4aa3ff";
+        return make3Box(x, y, z, s, color);
+    });
+    registerBuiltin("新建球", 4, 6, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        double x = needNum(a[0], "新建球", line);
+        double y = needNum(a[1], "新建球", line);
+        double z = needNum(a[2], "新建球", line);
+        double r = needNum(a[3], "新建球", line);
+        int segs = a.size() > 4 ? (int)needIndex(a[4], "新建球", line) : 12;
+        string color = a.size() > 5 ? needStr(a[5], "新建球", line) : "#f0a040";
+        return make3Sphere(x, y, z, r, segs, color);
+    });
+    registerBuiltin("渲染三维", 3, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        vector<Value> faces;
+        collect3Faces(a[0], faces, line);
+        double cam = needNum(a[1], "渲染三维", line);
+        if (cam <= 0.1) throw WenError("运行时错误", line, 0, "相机距离必须大于 0.1");
+        string path = needStr(a[2], "渲染三维", line);
+        struct Proj {
+            vector<std::pair<double, double>> pts;
+            double z = 0;
+            string color;
+        };
+        vector<Proj> out;
+        const double f = 520.0;
+        for (const auto& fv : faces) {
+            auto d = needDict(fv, "三维面", line);
+            auto pts = render3Vertices(d->items.at("顶点"), line);
+            string color = d->items.count("颜色") ? needStr(d->items["颜色"], "颜色", line)
+                                                  : "#4aa3ff";
+            Proj p;
+            p.color = color;
+            double zsum = 0;
+            bool ok = true;
+            for (const auto& v : pts) {
+                double zz = v.z + cam;
+                if (zz <= 0.1) { ok = false; break; }
+                p.pts.push_back({400.0 + v.x * f / zz, 300.0 - v.y * f / zz});
+                zsum += zz;
+            }
+            if (!ok) continue;
+            p.z = zsum / (double)pts.size();
+            out.push_back(p);
+        }
+        std::sort(out.begin(), out.end(), [](const Proj& x, const Proj& y) { return x.z > y.z; });
+        std::ostringstream svg;
+        svg << "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"800\" height=\"600\" "
+               "viewBox=\"0 0 800 600\">\n<rect width=\"800\" height=\"600\" fill=\"#0e1218\"/>\n";
+        for (const auto& p : out) {
+            auto rgb = renderHexRgb(p.color);
+            double lum = 0.55;
+            svg << "<polygon points=\"";
+            for (size_t i = 0; i < p.pts.size(); ++i) {
+                if (i) svg << " ";
+                svg << std::fixed << std::setprecision(2) << p.pts[i].first << ","
+                    << p.pts[i].second;
+            }
+            svg << "\" fill=\"rgb(" << (int)(rgb[0] * 255 * lum) << ","
+                << (int)(rgb[1] * 255 * lum) << "," << (int)(rgb[2] * 255 * lum)
+                << ")\" stroke=\"#000\" stroke-width=\"0.8\"/>\n";
+        }
+        svg << "<text x=\"16\" y=\"28\" fill=\"#9fb3c8\" font-size=\"14\">"
+               "文语言 · 3D 软件渲染</text>\n</svg>\n";
+        writeRenderSvg(path, svg.str(), line);
+        return vStr(path);
+    });
+    registerBuiltin("导出OBJ", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        vector<Value> faces;
+        collect3Faces(a[0], faces, line);
+        string path = needStr(a[1], "导出OBJ", line);
+        std::ostringstream obj;
+        size_t base = 1;
+        for (const auto& fv : faces) {
+            auto d = needDict(fv, "三维面", line);
+            auto pts = render3Vertices(d->items.at("顶点"), line);
+            for (const auto& v : pts)
+                obj << "v " << v.x << " " << v.y << " " << v.z << "\n";
+            obj << "f";
+            for (size_t i = 0; i < pts.size(); ++i) obj << " " << base + i;
+            obj << "\n";
+            base += pts.size();
+        }
+        try {
+            ensureParentDirectory(path);
+            writeWholeFile(path, obj.str(), false);
+        } catch (IoError& e) {
+            throw WenError("文件错误", line, 0, e.what());
+        }
+        return vStr(path);
+    });
+    registerBuiltin("添加场景", 1, 1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+        std::function<void(const Value&)> add;
+        add = [&](const Value& v) {
+            if (v.type == VT::Dict) {
+                renderScene.push_back(v);
+            } else if (v.type == VT::List && v.list) {
+                for (const auto& item : v.list->items) add(item);
+            } else {
+                throw WenError("运行时错误", line, 0, "添加场景需要面或面列表");
+            }
+        };
+        add(a[0]);
+        return vNum((double)renderScene.size());
+    });
     // ---------- 渲染库 ----------
     registerBuiltin("新建面", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
         return makeFaceValue(renderVerticesFromList(a[0], line));

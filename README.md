@@ -25,6 +25,7 @@
 - 文件/网络/网页/JSON/CSV
 - 时间、Base64/URL 编码、正则
 - SVG / OpenGL 4.6 / Vulkan 1.3 / WebGPU 导出
+- 3D 软件渲染：立方体/球/OBJ，OpenGL 后端自动投影 3D 面
 - 外派到 Python/JavaScript/JSON/Java
 - 翻译到字节码/C++/汇编；字节码可执行
 - 二进制缓冲、CPU 并行归约
