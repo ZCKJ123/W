@@ -11,21 +11,23 @@ DSH（DeepSeek Harness）插件：把「文」语言的编译诊断接成 `wen_c
 
 ## 安装（三选一）
 
-**1）包名（发到 npm 后）**
+**1）Git 分支地址（推荐）**
 
 ```
-dsh-wen-check
+git+https://gitee.com/zhuchen_1/wen.git#plugin-wen-check
 ```
 
-**2）Git 仓库地址**
+**2）压缩包地址**
 
 ```
-git+https://gitee.com/zhuchen_1/wen-check.git
+https://gitee.com/zhuchen_1/wen/raw/plugin-wen-check/wen-check-0.3.1.tgz
 ```
+
+下载后解压，在 DSH 的「添加插件」里粘贴目录绝对路径。
 
 **3）本地目录**
 
-把本仓库下载/克隆到任意目录，在 DSH 的「添加插件」里粘贴那个目录的绝对路径。
+把 `插件/wen-check` 复制到任意目录，在 DSH 的「添加插件」里粘贴那个目录的绝对路径。
 
 装好后工具名是 `wen_check`。
 
