@@ -1,6 +1,6 @@
 # 文语言（wen）
 
-用中文关键字写程序的小语言：解释运行、编译成原生 exe、带 25 个内置库。
+用中文关键字写程序的小语言：解释运行、编译成原生 exe、带 28 个内置库。
 
 - 版本：`0.1.0-snapshot`
 - 许可证：MIT
@@ -23,7 +23,7 @@
 - 中文关键字、少括号、块用 `则 … 结束`
 - 数学/概率/物理/图形/函数库
 - 文件/网络/网页/JSON/CSV
-- 时间、Base64/URL 编码、正则
+- 时间、路径、日志、哈希、Base64/URL 编码、正则
 - SVG / OpenGL 4.6 / Vulkan 1.3 / WebGPU 导出
 - 3D 渲染：立方体/球/OBJ；OpenGL 3D 走深度缓冲，Vulkan/WebGPU 暂投影
 - 外派到 Python/JavaScript/JSON/Java

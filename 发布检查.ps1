@@ -26,9 +26,9 @@ foreach ($exe in @('wen_full.exe', 'wen_lite.exe')) {
 
 Write-Host "5/5 库检查"
 $libs = (.\wen_full.exe --库) -join "`n"
-foreach ($name in @('时间库', '编码库', '正则库', 'CPU库')) {
+foreach ($name in @('时间库', '编码库', '正则库', 'CPU库', '路径库', '日志库', '哈希库')) {
     if ($libs -notmatch $name) { 失败 "缺少 $name" }
 }
 if ($libs -match 'GPU库') { 失败 "V0.1 不应带 GPU 库" }
 
-Write-Host "发货检查通过：67/67，版本、签名、标记、库都正常。" -ForegroundColor Green
+Write-Host "发货检查通过：68/68，版本、签名、标记、库都正常。" -ForegroundColor Green

@@ -1939,7 +1939,7 @@ static vector<string> splitLines(const string& s) {
 }
 
 static const char* WEN_SOURCE_SUFFIXES[] = {
-    ".wen", ".w", ".文", ".言", ".语", ".中文", ".文言", ".wenx", ".wx"};
+    ".wen", ".w", ".文", ".言", ".语", ".中文", ".文言"};
 static string resolveWenPath(const string& path) {
     if (fs::exists(fs::u8path(path))) return path;
     for (const char* suf : WEN_SOURCE_SUFFIXES) {
@@ -2742,6 +2742,12 @@ static Value applyBinary(const string& op, const Value& a, const Value& b, int l
 // 每个函数属于哪个库；没写「依赖」就用，会报错提醒。
 static const std::map<string, string>& functionModules() {
     static const std::map<string, string> m = {
+        // 路径 / 日志 / 哈希
+        {"路径拼接", "路径库"}, {"路径目录", "路径库"}, {"路径文件名", "路径库"},
+        {"路径扩展名", "路径库"}, {"路径绝对", "路径库"}, {"日志时间", "日志库"},
+        {"日志", "日志库"}, {"写日志", "日志库"}, {"清空日志", "日志库"},
+        {"哈希", "哈希库"}, {"文件哈希", "哈希库"}, {"校验和", "哈希库"},
+
         // 时间 / 编码 / 正则
         {"现在", "时间库"}, {"时间戳", "时间库"}, {"毫秒时间", "时间库"},
         {"格式化时间", "时间库"}, {"解析时间", "时间库"}, {"休眠", "时间库"},
@@ -3273,7 +3279,7 @@ bool Interpreter::是内置库(const string& rawName) const {
 void Interpreter::加载外部库(const string& name, int line) {
     if (loadedModules.count(name)) return;
 
-    static const char* suffixes[] = {".wen", ".w", ".文", ".言", ".语", ".中文", ".文言", ".wenx", ".wx", ".库", ".wenlib"};
+    static const char* suffixes[] = {".wen", ".w", ".文", ".言", ".语", ".中文", ".文言", ".库", ".wenlib"};
     vector<fs::path> dirs;
     std::error_code ec;
     if (!filename.empty() && filename[0] != '<') {
@@ -3303,7 +3309,7 @@ void Interpreter::加载外部库(const string& name, int line) {
         throw WenError("运行时错误", line, 0,
                        "找不到库「" + name +
                        "」：不是内置库，也没找到 库/" + name +
-                       ".wen（或 .w/.文/.言/.语/.中文/.文言/.wenx/.wx/.库/.wenlib，或目录 " + name + "/主.wen）");
+                       ".wen（或 .w/.文/.言/.语/.中文/.文言/.库/.wenlib，或目录 " + name + "/主.wen）");
     }
 
     loadedModules.insert(name);
@@ -7242,6 +7248,97 @@ Interpreter::Interpreter() {
         } catch (std::regex_error& e) {
             throw WenError("运行时错误", line, 0, string("正则表达式错误：") + e.what());
         }
+    });
+    // ---------- 路径 / 日志 / 哈希 ----------
+    registerBuiltin("路径拼接", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        return vStr((fs::u8path(needStr(a[0], "路径拼接", line)) /
+                     fs::u8path(needStr(a[1], "路径拼接", line))).string());
+    });
+    registerBuiltin("路径目录", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        return vStr(fs::u8path(needStr(a[0], "路径目录", line)).parent_path().string());
+    });
+    registerBuiltin("路径文件名", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        return vStr(fs::u8path(needStr(a[0], "路径文件名", line)).filename().string());
+    });
+    registerBuiltin("路径扩展名", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        return vStr(fs::u8path(needStr(a[0], "路径扩展名", line)).extension().string());
+    });
+    registerBuiltin("路径绝对", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        std::error_code ec;
+        auto p = fs::absolute(fs::u8path(needStr(a[0], "路径绝对", line)), ec);
+        if (ec) throw WenError("运行时错误", line, 0, "路径绝对失败：" + ec.message());
+        return vStr(p.string());
+    });
+    auto logStamp = []() {
+        std::time_t t = std::time(nullptr);
+        std::tm lt = *std::localtime(&t);
+        char buf[32];
+        std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &lt);
+        return string(buf);
+    };
+    registerBuiltin("日志时间", 0, 0, [logStamp](Interpreter&, vector<Value>&, int) -> Value {
+        return vStr(logStamp());
+    });
+    registerBuiltin("日志", 1, 1, [logStamp](Interpreter&, vector<Value>& a, int line) -> Value {
+        std::cout << "[" << logStamp() << "] " << needStr(a[0], "日志", line) << "\n";
+        return vNone();
+    });
+    registerBuiltin("写日志", 2, 2, [logStamp](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path = needStr(a[0], "写日志", line);
+        string text = "[" + logStamp() + "] " + needStr(a[1], "写日志", line) + "\n";
+        try {
+            ensureParentDirectory(path);
+            writeWholeFile(path, text, true);
+        } catch (IoError& e) {
+            throw WenError("文件错误", line, 0, e.what());
+        }
+        return vBool(true);
+    });
+    registerBuiltin("清空日志", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path = needStr(a[0], "清空日志", line);
+        try {
+            ensureParentDirectory(path);
+            writeWholeFile(path, "", false);
+        } catch (IoError& e) {
+            throw WenError("文件错误", line, 0, e.what());
+        }
+        return vBool(true);
+    });
+    auto fnv1a = [](const string& s) {
+        unsigned long long h = 1469598103934665603ULL;
+        for (unsigned char c : s) {
+            h ^= c;
+            h *= 1099511628211ULL;
+        }
+        return h;
+    };
+    registerBuiltin("哈希", 1, 1, [fnv1a](Interpreter&, vector<Value>& a, int line) -> Value {
+        unsigned long long h = fnv1a(needStr(a[0], "哈希", line));
+        std::ostringstream s;
+        s << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << h;
+        return vStr(s.str());
+    });
+    registerBuiltin("文件哈希", 1, 1, [fnv1a](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path = needStr(a[0], "文件哈希", line);
+        string raw;
+        try {
+            raw = readWholeFile(path);
+        } catch (IoError& e) {
+            throw WenError("文件错误", line, 0, e.what());
+        }
+        unsigned long long h = fnv1a(raw);
+        std::ostringstream s;
+        s << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << h;
+        return vStr(s.str());
+    });
+    registerBuiltin("校验和", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string s = needStr(a[0], "校验和", line);
+        unsigned int crc = 0xFFFFFFFFu;
+        for (unsigned char c : s) {
+            crc ^= c;
+            for (int i = 0; i < 8; ++i) crc = (crc >> 1) ^ (0xEDB88320u & -(crc & 1u));
+        }
+        return vNum((double)(crc ^ 0xFFFFFFFFu));
     });
     // ---------- 数学 ----------
     auto m1 = [this](const string& name, double (*f)(double)) {
