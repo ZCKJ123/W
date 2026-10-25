@@ -4,11 +4,13 @@ import { createHash } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
 import { mkdir, rename, stat, unlink } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { isAbsolute, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const runFile = promisify(execFile);
 
 const LEGACY_EXE = 'C:\\Users\\Acer\\Desktop\\zhongwen_lang\\wen.exe';
+const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url));
 const MAX_LIMIT = 200;
 
 function cachePath(config) {
@@ -20,6 +22,7 @@ function exeCandidates(config, cached) {
   const list = [
     config && typeof config.exePath === 'string' ? config.exePath : '',
     process.env.WEN_EXE || '',
+    join(PLUGIN_DIR, 'wen.exe'),
     cached || '',
     'wen',
     'wen.exe',
