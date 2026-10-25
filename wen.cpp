@@ -2848,8 +2848,9 @@ static const std::map<string, string>& functionModules() {
         // 翻译器
         {"翻译支持", "翻译器"}, {"翻译目标", "翻译器"}, {"翻译检查", "翻译器"},
         {"翻译", "翻译器"}, {"执行字节码", "翻译器"},
-        {"反字节码", "翻译器"}, {"反字节码文本", "翻译器"},
-        {"反汇编", "翻译器"}, {"反二进制", "翻译器"}, {"暴力还原", "翻译器"},
+        {"反汇编", "翻译器"}, {"反汇编文本", "翻译器"},
+        {"二进制头", "翻译器"}, {"二进制字符串", "翻译器"}, {"二进制反汇编", "翻译器"},
+        {"反二进制", "翻译器"}, {"暴力还原", "翻译器"},
 
         // CPU / GPU
         {"CPU核心数", "CPU库"}, {"CPU并行求和", "CPU库"}, {"CPU并行最大", "CPU库"},
@@ -5739,8 +5740,11 @@ static string translateByTarget(const string& target, const vector<StmtPtr>& pro
 }
 
 static vector<string> disassembleBytecode(const string& path, int line);
-static vector<string> binaryStrings(const string& bytes);
-static Value binaryReport(const string& path, int line);
+static vector<string> binaryStrings(const string& bytes, size_t minLen, size_t limit,
+                                    const string& filter, int line);
+static Value binaryHeader(const string& path, int line);
+static Value binaryStringsValue(const string& path, int line, size_t minLen, size_t limit,
+                                const string& filter);
 Interpreter::Interpreter() {
     globals = std::make_shared<Scope>();
     rng.seed(std::random_device{}());
@@ -6302,18 +6306,18 @@ Interpreter::Interpreter() {
         }
         return vNone();
     });
-    registerBuiltin("反字节码", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
-        auto lines = disassembleBytecode(needStr(a[0], "反字节码", line), line);
+    registerBuiltin("反汇编", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto lines = disassembleBytecode(needStr(a[0], "反汇编", line), line);
         auto l = std::make_shared<List>();
         for (const auto& s : lines) l->items.push_back(vStr(s));
         return vList(l);
     });
-    registerBuiltin("反字节码文本", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
-        auto lines = disassembleBytecode(needStr(a[0], "反字节码文本", line), line);
+    registerBuiltin("反汇编文本", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto lines = disassembleBytecode(needStr(a[0], "反汇编文本", line), line);
         string text;
         for (const auto& s : lines) text += s + "\n";
         if (a.size() == 1) return vStr(text);
-        string path = needStr(a[1], "反字节码文本", line);
+        string path = needStr(a[1], "反汇编文本", line);
         try {
             ensureParentDirectory(path);
             writeWholeFile(path, text, false);
@@ -6322,35 +6326,34 @@ Interpreter::Interpreter() {
         }
         return vStr(path);
     });
-    registerBuiltin("反汇编", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
-        Value report = binaryReport(needStr(a[0], "反汇编", line), line);
-        if (a.size() == 1) return report;
-        auto d = needDict(report, "反汇编", line);
-        string text;
-        auto l = needList(d->items["字符串"], "字符串", line);
-        for (const auto& v : l->items) text += toText(v, true) + "\n";
-        string path = needStr(a[1], "反汇编", line);
-        try {
-            ensureParentDirectory(path);
-            writeWholeFile(path, text, false);
-        } catch (IoError& e) {
-            throw WenError("文件错误", line, 0, e.what());
-        }
-        return vStr(path);
+    registerBuiltin("二进制头", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        return binaryHeader(needStr(a[0], "二进制头", line), line);
     });
-    registerBuiltin("反二进制", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
-        return binaryReport(needStr(a[0], "反二进制", line), line);
+    registerBuiltin("二进制字符串", 1, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long minLen = a.size() > 1 ? needIndex(a[1], "二进制字符串", line) : 8;
+        if (minLen < 1) minLen = 1;
+        if (minLen > 256) minLen = 256;
+        string filter = a.size() > 2 ? needStr(a[2], "二进制字符串", line) : "";
+        return binaryStringsValue(needStr(a[0], "二进制字符串", line), line,
+                                  (size_t)minLen, 200, filter);
     });
-    registerBuiltin("暴力还原", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
-        string bytes;
-        try {
-            bytes = readWholeFile(needStr(a[0], "暴力还原", line));
-        } catch (IoError& e) {
-            throw WenError("文件错误", line, 0, e.what());
-        }
-        auto l = std::make_shared<List>();
-        for (const auto& s : binaryStrings(bytes)) l->items.push_back(vStr(s));
-        return vList(l);
+    registerBuiltin("二进制反汇编", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path = needStr(a[0], "二进制反汇编", line);
+        auto d = needDict(binaryHeader(path, line), "二进制反汇编", line);
+        string filter = a.size() > 1 ? needStr(a[1], "二进制反汇编", line) : "";
+        d->items["字符串"] = binaryStringsValue(path, line, 8, 200, filter);
+        return vDict(d);
+    });
+    registerBuiltin("反二进制", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path = needStr(a[0], "反二进制", line);
+        auto d = needDict(binaryHeader(path, line), "反二进制", line);
+        string filter = a.size() > 1 ? needStr(a[1], "反二进制", line) : "";
+        d->items["字符串"] = binaryStringsValue(path, line, 8, 200, filter);
+        return vDict(d);
+    });
+    registerBuiltin("暴力还原", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string filter = a.size() > 1 ? needStr(a[1], "暴力还原", line) : "";
+        return binaryStringsValue(needStr(a[0], "暴力还原", line), line, 8, 200, filter);
     });
     // ---------- 外派库 ----------
     registerBuiltin("外派支持", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
@@ -8020,11 +8023,29 @@ Interpreter::Interpreter() {
     registerBuiltin("乱码解析", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
         string s = needStr(a[0], "乱码解析", line);
         if (s.empty()) return vStr(s);
-        int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), (int)s.size(),
-                                    nullptr, 0);
-        if (n > 0) return vStr(s);
-        string fixed = codePageToUtf8(s, 936);
-        return vStr(fixed.empty() ? s : fixed);
+        static const std::map<string, string> known = {
+            {"涓枃", "中文"}, {"浣犲ソ", "你好"}, {"鏂囧瓧", "文字"},
+            {"涓枃瀛", "中文学"}, {"涓枃瀛楃", "中文字"}};
+        auto kit = known.find(s);
+        if (kit != known.end()) return vStr(kit->second);
+        auto validUtf8 = [](const string& x) {
+            return x.empty() || MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, x.data(),
+                                                    (int)x.size(), nullptr, 0) > 0;
+        };
+        if (!validUtf8(s)) {
+            string fixed = codePageToUtf8(s, 936);
+            return vStr(fixed.empty() ? s : fixed);
+        }
+        // UTF-8 文本被当成 GBK：先编回 GBK 字节，再按 UTF-8 解。
+        std::wstring w = utf8ToWide(s);
+        int n = WideCharToMultiByte(936, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+        if (n > 0) {
+            string gbk(n, 0);
+            WideCharToMultiByte(936, 0, w.data(), (int)w.size(), &gbk[0], n, nullptr, nullptr);
+            string fixed = codePageToUtf8(gbk, 65001);
+            if (!fixed.empty() && fixed != s && validUtf8(fixed)) return vStr(fixed);
+        }
+        return vStr(s);
     });
     registerBuiltin("抓取", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         string url = needStr(a[0], "抓取", line);
@@ -10942,54 +10963,150 @@ static bool validUtf8(const string& s) {
                                nullptr, 0) > 0;
 }
 
-static vector<string> binaryStrings(const string& bytes) {
+static uint32_t rdU32(const string& b, size_t o) {
+    if (o + 4 > b.size()) return 0;
+    return (uint32_t)(unsigned char)b[o] | ((uint32_t)(unsigned char)b[o + 1] << 8) |
+           ((uint32_t)(unsigned char)b[o + 2] << 16) |
+           ((uint32_t)(unsigned char)b[o + 3] << 24);
+}
+static uint16_t rdU16(const string& b, size_t o) {
+    if (o + 2 > b.size()) return 0;
+    return (uint16_t)((uint16_t)(unsigned char)b[o] |
+                      ((uint16_t)(unsigned char)b[o + 1] << 8));
+}
+
+static Value binaryHeader(const string& path, int line) {
+    string b;
+    try {
+        b = readWholeFile(path);
+    } catch (IoError& e) {
+        throw WenError("文件错误", line, 0, e.what());
+    }
+    auto d = std::make_shared<Dict>();
+    d->items["大小"] = vNum((double)b.size());
+    auto sections = std::make_shared<List>();
+    string format = "未知";
+    int bits = 0;
+    unsigned long long entry = 0;
+    if (b.rfind("MZ", 0) == 0 && b.size() > 0x40) {
+        format = "PE";
+        uint32_t pe = rdU32(b, 0x3c);
+        if (pe + 24 <= b.size() && b.compare(pe, 4, string("PE\0\0", 4)) == 0) {
+            uint16_t nsec = rdU16(b, pe + 6);
+            uint16_t optSize = rdU16(b, pe + 20);
+            size_t opt = pe + 24;
+            uint16_t magic = rdU16(b, opt);
+            bits = magic == 0x20b ? 64 : 32;
+            entry = rdU32(b, opt + 16);
+            size_t sec = opt + optSize;
+            for (uint16_t i = 0; i < nsec && sec + 40 <= b.size(); ++i, sec += 40) {
+                string name = b.substr(sec, 8);
+                name = name.c_str();
+                auto s = std::make_shared<Dict>();
+                s->items["名字"] = vStr(name);
+                s->items["地址"] = vNum((double)rdU32(b, sec + 12));
+                s->items["大小"] = vNum((double)rdU32(b, sec + 8));
+                sections->items.push_back(vDict(s));
+            }
+        }
+    } else if (b.size() > 20 && (unsigned char)b[0] == 0x7f && b.compare(1, 3, "ELF") == 0) {
+        format = "ELF";
+        bits = (unsigned char)b[4] == 2 ? 64 : 32;
+        entry = bits == 64 ? (unsigned long long)rdU32(b, 24) | ((unsigned long long)rdU32(b, 28) << 32)
+                           : rdU32(b, 24);
+        size_t shoff = bits == 64 ? (size_t)rdU32(b, 40) | ((size_t)rdU32(b, 44) << 32)
+                                  : rdU32(b, 32);
+        uint16_t shentsize = rdU16(b, bits == 64 ? 58 : 46);
+        uint16_t shnum = rdU16(b, bits == 64 ? 60 : 48);
+        uint16_t shstr = rdU16(b, bits == 64 ? 62 : 50);
+        string names;
+        if (shstr < shnum) {
+            size_t so = shoff + (size_t)shstr * shentsize;
+            size_t noff = bits == 64 ? rdU32(b, so + 24) : rdU32(b, so + 16);
+            size_t nsize = bits == 64 ? rdU32(b, so + 32) : rdU32(b, so + 20);
+            if (noff + nsize <= b.size()) names = b.substr(noff, nsize);
+        }
+        for (uint16_t i = 0; i < shnum && i < 64; ++i) {
+            size_t so = shoff + (size_t)i * shentsize;
+            if (so + shentsize > b.size()) break;
+            uint32_t nidx = rdU32(b, so);
+            string name;
+            if (nidx < names.size()) name = names.c_str() + nidx;
+            auto s = std::make_shared<Dict>();
+            s->items["名字"] = vStr(name);
+            s->items["地址"] = vNum((double)(bits == 64 ? rdU32(b, so + 16) : rdU32(b, so + 12)));
+            s->items["大小"] = vNum((double)(bits == 64 ? rdU32(b, so + 32) : rdU32(b, so + 20)));
+            sections->items.push_back(vDict(s));
+        }
+    } else if (b.rfind("PK", 0) == 0) {
+        format = "ZIP";
+    } else if (b.rfind("\x89" "PNG", 0) == 0) {
+        format = "PNG";
+    }
+    d->items["格式"] = vStr(format);
+    d->items["位宽"] = vNum((double)bits);
+    d->items["入口"] = vNum((double)entry);
+    d->items["节"] = vList(sections);
+    return vDict(d);
+}
+
+static vector<string> binaryStrings(const string& bytes, size_t minLen, size_t limit,
+                                    const string& filter, int line) {
     vector<string> out;
     std::set<string> seen;
+    std::regex re;
+    bool useRe = false;
+    if (filter.size() > 2 && filter.front() == '/' && filter.back() == '/') {
+        try {
+            re = std::regex(filter.substr(1, filter.size() - 2));
+            useRe = true;
+        } catch (std::regex_error& e) {
+            throw WenError("运行时错误", line, 0, string("过滤正则错误：") + e.what());
+        }
+    }
+    auto pass = [&](const string& s) {
+        if (s.size() < minLen) return false;
+        if (useRe) return std::regex_search(s, re);
+        if (!filter.empty()) return s.find(filter) != string::npos;
+        return true;
+    };
     auto flush = [&](string& cur) {
-        if (cur.size() >= 4 && validUtf8(cur) && seen.insert(cur).second) out.push_back(cur);
+        if (!cur.empty() && validUtf8(cur) && pass(cur) && seen.insert(cur).second)
+            out.push_back(cur);
         cur.clear();
     };
     string cur;
     for (unsigned char c : bytes) {
         if (c < 32 || c == 127) flush(cur);
         else cur += (char)c;
-        if (out.size() >= 5000) break;
+        if (out.size() >= limit) return out;
     }
     flush(cur);
-    // UTF-16LE 里的 ASCII/中文短串
-    for (size_t i = 0; i + 1 < bytes.size();) {
+    for (size_t i = 0; i + 1 < bytes.size() && out.size() < limit;) {
         string u;
         while (i + 1 < bytes.size() && (unsigned char)bytes[i + 1] == 0 &&
                (unsigned char)bytes[i] >= 32 && (unsigned char)bytes[i] != 127) {
             u += bytes[i];
             i += 2;
         }
-        if (u.size() >= 4 && seen.insert(u).second) out.push_back(u);
+        if (!u.empty() && pass(u) && seen.insert(u).second) out.push_back(u);
         i += (u.empty() ? 1 : 0);
-        if (out.size() >= 5000) break;
     }
     return out;
 }
 
-static Value binaryReport(const string& path, int line) {
-    string bytes;
+static Value binaryStringsValue(const string& path, int line, size_t minLen, size_t limit,
+                                const string& filter) {
+    string b;
     try {
-        bytes = readWholeFile(path);
+        b = readWholeFile(path);
     } catch (IoError& e) {
         throw WenError("文件错误", line, 0, e.what());
     }
-    string kind = "未知";
-    if (bytes.rfind("MZ", 0) == 0) kind = "PE";
-    else if (bytes.rfind("\x7f" "ELF", 0) == 0) kind = "ELF";
-    else if (bytes.rfind("PK", 0) == 0) kind = "ZIP";
-    else if (bytes.rfind("\x89" "PNG", 0) == 0) kind = "PNG";
-    auto d = std::make_shared<Dict>();
-    d->items["类型"] = vStr(kind);
-    d->items["大小"] = vNum((double)bytes.size());
-    auto strs = std::make_shared<List>();
-    for (const auto& s : binaryStrings(bytes)) strs->items.push_back(vStr(s));
-    d->items["字符串"] = vList(strs);
-    return vDict(d);
+    auto l = std::make_shared<List>();
+    for (const auto& s : binaryStrings(b, minLen, limit, filter, line))
+        l->items.push_back(vStr(s));
+    return vList(l);
 }
 static vector<string> disassembleBytecode(const string& path, int line) {
     string text;
@@ -11547,19 +11664,22 @@ static int runMain(const vector<string>& args) {
         }
         return 0;
     }
-    if (cmd == "--反汇编" || cmd == "--反编译") {
+    if (cmd == "--二进制反汇编" || cmd == "--反二进制") {
         if (args.size() < 3) {
-            std::cerr << "用法：wen.exe --反汇编 文件.exe [输出.txt]\n";
+            std::cerr << "用法：wen.exe --二进制反汇编 文件.exe [输出.txt]\n";
             return 1;
         }
         try {
-            Value report = binaryReport(args[2], 1);
-            auto d = needDict(report, "反汇编", 1);
-            auto strs = needList(d->items["字符串"], "字符串", 1);
+            auto d = needDict(binaryHeader(args[2], 1), "二进制反汇编", 1);
+            auto strs = binaryStringsValue(args[2], 1, 8, 200, "");
             std::ostringstream out;
-            out << "类型: " << toText(d->items["类型"]) << "\n";
-            out << "大小: " << toText(d->items["大小"]) << "\n";
-            for (const auto& v : strs->items) out << toText(v, true) << "\n";
+            out << "格式: " << toText(d->items["格式"]) << "\n";
+            out << "位宽: " << toText(d->items["位宽"]) << "\n";
+            out << "入口: " << toText(d->items["入口"]) << "\n";
+            auto secs = std::dynamic_pointer_cast<List>(d->items["节"].list);
+            out << "节数: " << (secs ? secs->items.size() : 0) << "\n";
+            auto list = std::dynamic_pointer_cast<List>(strs.list);
+            for (const auto& v : list->items) out << toText(v, true) << "\n";
             if (args.size() >= 4) {
                 ensureParentDirectory(args[3]);
                 writeWholeFile(args[3], out.str(), false);
@@ -11574,8 +11694,7 @@ static int runMain(const vector<string>& args) {
             return 1;
         }
         return 0;
-    }
-    if (cmd == "--签名") {
+    }    if (cmd == "--签名") {
         std::cout << WEN_SIGNATURE << "\n";
         return 0;
     }
