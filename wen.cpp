@@ -1688,6 +1688,7 @@ struct Callable {
     // 零参数函数：名字后面不写括号也直接调用（少括号写法）。
     virtual bool zeroArgCall() const { return false; }
     virtual bool cacheable() const { return false; }
+    virtual string memoKey() const { return ""; }
 };
 
 struct Function : Callable {
@@ -1699,6 +1700,7 @@ struct Function : Callable {
     Value call(Interpreter& vm, vector<Value>& args, int line) override;
     string display() const override { return "<函数 " + name + ">"; }
     bool zeroArgCall() const override { return params.empty(); }
+    string memoKey() const override { return name; }
 };
 
 struct Builtin : Callable {
@@ -1706,6 +1708,8 @@ struct Builtin : Callable {
     int maxArgs = -1;
     string module;
     bool moduleKnown = false;
+    bool moduleLoaded = false;
+    bool core = true;
     bool cacheableFn = false;
     std::function<Value(Interpreter&, vector<Value>&, int)> fn;
 
@@ -3454,6 +3458,8 @@ void Interpreter::加载模块(const string& rawName, int line) {
             b->module = name;
             b->moduleKnown = true;
             b->cacheableFn = cacheableBuiltin(kv.first);
+            b->moduleLoaded = true;
+            b->core = false;
         }
     }
     if (name == "数学库") {
@@ -3961,16 +3967,16 @@ Value Interpreter::callValue(const Value& callee, vector<Value>& args, int line)
         return out;
     }
     if (leapAuto) {
-        auto lfn = std::dynamic_pointer_cast<Function>(callee.callable);
-        if (lfn && !lfn->name.empty()) {
-            string key = "leap|" + lfn->name + accelKey("", args);
+        string memo = callee.callable->memoKey();
+        if (!memo.empty()) {
+            string key = "leap|" + memo + accelKey("", args);
             auto it = leapCache.find(key);
             if (it != leapCache.end()) {
                 ++leapHits;
                 return it->second;
             }
             ++leapMisses;
-            Value out = lfn->call(*this, args, line);
+            Value out = callee.callable->call(*this, args, line);
             if (out.type == VT::Num || out.type == VT::Str || out.type == VT::Bool ||
                 out.type == VT::None) {
                 if (leapCache.size() >= leapLimit) leapCache.clear();
@@ -3980,9 +3986,9 @@ Value Interpreter::callValue(const Value& callee, vector<Value>& args, int line)
         }
     }
     if (memoryAuto && callee.type == VT::Func) {
-        auto fn = std::dynamic_pointer_cast<Function>(callee.callable);
-        if (fn && !fn->name.empty()) {
-            string key = "auto|" + fn->name + accelKey("", args);
+        string memo = callee.callable->memoKey();
+        if (!memo.empty()) {
+            string key = "auto|" + memo + accelKey("", args);
             auto it = memoryStore.find(key);
             if (it != memoryStore.end()) {
                 ++memoryHits;
@@ -4120,17 +4126,16 @@ Value Function::call(Interpreter& vm, vector<Value>& args, int callLine) {
 
 Value Builtin::call(Interpreter& vm, vector<Value>& args, int line) {
     if (vm.callStats && !name.empty()) ++vm.callCounts[name];
-    string lib;
-    if (moduleKnown) {
-        lib = module;
-    } else {
-        auto mit = functionModules().find(name);
-        if (mit != functionModules().end()) lib = mit->second;
-    }
-    if (!lib.empty() && !vm.loadedModules.count(lib)) {
-        throw WenError("运行时错误", line, 0,
-                       "「" + name + "」属于「" + lib +
-                       "」，请先在文件开头写「依赖 " + lib + "」");
+    if (!core && !moduleLoaded) {
+        string lib = module;
+        if (!moduleKnown) {
+            auto mit = functionModules().find(name);
+            if (mit != functionModules().end()) lib = mit->second;
+        }
+        if (!lib.empty() && !vm.loadedModules.count(lib))
+            throw WenError("运行时错误", line, 0,
+                           "「" + name + "」属于「" + lib +
+                           "」，请先在文件开头写「依赖 " + lib + "」");
     }
     if ((int)args.size() < minArgs ||
         (maxArgs >= 0 && (int)args.size() > maxArgs)) {
