@@ -417,6 +417,35 @@ private:
     void scanNumber() {
         int ln = line_, cl = col_;
         size_t start = pos_;
+        if (pos_ + 2 < src_.size() && src_[pos_] == '0' &&
+            (src_[pos_ + 1] == 'x' || src_[pos_ + 1] == 'X')) {
+            pos_ += 2; col_ += 2;
+            size_t ds = pos_;
+            while (pos_ < src_.size() && std::isxdigit((unsigned char)src_[pos_])) {
+                ++pos_; ++col_;
+            }
+            if (pos_ == ds) throw WenError("词法错误", ln, cl, "十六进制数字缺少数字");
+            string text = src_.substr(start, pos_ - start);
+            unsigned long long v = 0;
+            try { v = std::stoull(text, nullptr, 16); }
+            catch (...) { throw WenError("词法错误", ln, cl, "十六进制数字太大：" + text); }
+            add(TT::Number, text, ln, cl, (double)v);
+            return;
+        }
+        if (pos_ + 2 < src_.size() && src_[pos_] == '0' &&
+            (src_[pos_ + 1] == 'b' || src_[pos_ + 1] == 'B')) {
+            pos_ += 2; col_ += 2;
+            size_t ds = pos_;
+            while (pos_ < src_.size() && (src_[pos_] == '0' || src_[pos_] == '1')) {
+                ++pos_; ++col_;
+            }
+            if (pos_ == ds) throw WenError("词法错误", ln, cl, "二进制数字缺少数字");
+            string text = src_.substr(start, pos_ - start);
+            unsigned long long v = 0;
+            for (size_t i = 2; i < text.size(); ++i) v = (v << 1) | (text[i] == '1');
+            add(TT::Number, text, ln, cl, (double)v);
+            return;
+        }
         while (pos_ < src_.size() && std::isdigit((unsigned char)src_[pos_])) {
             ++pos_; ++col_;
         }
@@ -1611,7 +1640,7 @@ private:
 // 5. 运行时值
 // ============================================================
 
-enum class VT { None, Bool, Num, Str, List, Dict, Func, Set, Bytes, Range };
+enum class VT { None, Bool, Num, Str, List, Dict, Func, Set, Bytes, Range, Int };
 
 struct List;
 struct Dict;
@@ -1622,6 +1651,9 @@ struct Value {
     VT type = VT::None;
     bool b = false;
     double num = 0;
+    uint64_t i = 0;
+    int width = 32;
+    bool isSigned = false;
     string str;
     shared_ptr<List> list;
     shared_ptr<Dict> dict;
@@ -1697,6 +1729,42 @@ static Value vSet() { Value v; v.type = VT::Set; v.list = std::make_shared<List>
 static Value vSet(shared_ptr<List> l) { Value v; v.type = VT::Set; v.list = std::move(l); return v; }
 static Value vBytes(shared_ptr<vector<unsigned char>> b) { Value v; v.type = VT::Bytes; v.bytes = std::move(b); return v; }
 static Value vRange(double a, double b, double c) { Value v; v.type = VT::Range; v.rstart = a; v.rstop = b; v.rstep = c; return v; }
+static uint64_t intMask(int w) { return w >= 64 ? ~0ULL : ((1ULL << w) - 1); }
+static Value vInt(uint64_t bits, int w, bool s) { Value v; v.type = VT::Int; v.width = w; v.isSigned = s; v.i = bits & intMask(w); return v; }
+static int64_t intSigned(const Value& v) {
+    uint64_t b = v.i & intMask(v.width);
+    if (!v.isSigned) return (int64_t)b;
+    if (v.width >= 64) return (int64_t)b;
+    uint64_t sign = 1ULL << (v.width - 1);
+    if (b & sign) b |= ~intMask(v.width);
+    return (int64_t)b;
+}
+static uint64_t intFromValue(const Value& v, int width, bool sign, int line) {
+    if (v.type == VT::Int) return v.i & intMask(width);
+    if (v.type == VT::Num) {
+        double d = v.num;
+        if (sign) return (uint64_t)(int64_t)d;
+        return (uint64_t)d;
+    }
+    if (v.type == VT::Bool) return v.b ? 1 : 0;
+    if (v.type == VT::Str) {
+        try {
+            if (sign) return (uint64_t)std::stoll(v.str, nullptr, 0);
+            return std::stoull(v.str, nullptr, 0);
+        } catch (...) {
+            throw WenError("运行时错误", line, 0, "不是有效整数：" + v.str);
+        }
+    }
+    throw WenError("运行时错误", line, 0, "不能转成整数：值类型不匹配");
+}
+static Value asInt(const Value& v, int line) {
+    if (v.type == VT::Int) return v;
+    return vInt(intFromValue(v, 64, true, line), 64, true);
+}
+static string intText(const Value& v) {
+    if (v.isSigned) return std::to_string(intSigned(v));
+    return std::to_string(v.i & intMask(v.width));
+}
 
 // ============================================================
 // 6. 值工具
@@ -1714,6 +1782,7 @@ static string typeName(const Value& v) {
         case VT::Set: return "集合";
         case VT::Bytes: return "缓冲";
         case VT::Range: return "范围";
+        case VT::Int: return (v.isSigned ? "i" : "u") + std::to_string(v.width);
     }
     return "未知";
 }
@@ -1730,6 +1799,7 @@ static bool truthy(const Value& v) {
         case VT::Set: return v.list && !v.list->items.empty();
         case VT::Bytes: return v.bytes && !v.bytes->empty();
         case VT::Range: return (v.rstep > 0 ? v.rstart < v.rstop : v.rstart > v.rstop);
+        case VT::Int: return (v.i & intMask(v.width)) != 0;
     }
     return false;
 }
@@ -1775,6 +1845,7 @@ static string toText(const Value& v, bool quoteStrings = false, int depth = 0) {
         case VT::None: return "空";
         case VT::Bool: return v.b ? "真" : "假";
         case VT::Num: return numberToString(v.num);
+        case VT::Int: return intText(v);
         case VT::Str: return quoteStrings ? quoteText(v.str) : v.str;
         case VT::List: {
             if (!v.list) return "[]";
@@ -1869,6 +1940,8 @@ static bool valueEquals(const Value& a, const Value& b, int depth = 0) {
 }
 
 static double needNum(const Value& v, const string& where, int line) {
+    if (v.type == VT::Int) return (double)intSigned(v);
+    if (v.type == VT::Int) return (double)intSigned(v);
     if (v.type != VT::Num)
         throw WenError("运行时错误", line, 0,
                        "「" + where + "」需要数字，收到" + typeName(v));
@@ -2700,6 +2773,40 @@ static string htmlTitleText(const string& html) {
 // ---------- 运算 ----------
 
 static Value applyBinary(const string& op, const Value& a, const Value& b, int line) {
+    if ((a.type == VT::Int) != (b.type == VT::Int) &&
+        (a.type == VT::Int || b.type == VT::Int)) {
+        return applyBinary(op, vNum(needNum(a, "运算", line)), vNum(needNum(b, "运算", line)), line);
+    }
+    if (a.type == VT::Int && b.type == VT::Int) {
+        int w = std::max(a.width, b.width);
+        bool s = a.isSigned && b.isSigned;
+        uint64_t ua = a.i & intMask(a.width), ub = b.i & intMask(b.width);
+        int64_t sa = intSigned(a), sb = intSigned(b);
+        auto mk = [&](__int128 v) { return vInt((uint64_t)v, w, s); };
+        if (op == "+") return mk((__int128)(s ? sa : ua) + (s ? sb : ub));
+        if (op == "-") return mk((__int128)(s ? sa : ua) - (s ? sb : ub));
+        if (op == "*") return mk((__int128)(s ? sa : ua) * (s ? sb : ub));
+        if (op == "/" || op == "//") {
+            if ((s ? sb : ub) == 0) throw WenError("运行时错误", line, 0, "除数不能为 0");
+            return mk(s ? (__int128)(sa / sb) : (__int128)(ua / ub));
+        }
+        if (op == "%") {
+            if ((s ? sb : ub) == 0) throw WenError("运行时错误", line, 0, "除数不能为 0");
+            return mk(s ? (__int128)(sa % sb) : (__int128)(ua % ub));
+        }
+        if (op == "&") return vInt(ua & ub, w, s);
+        if (op == "|") return vInt(ua | ub, w, s);
+        if (op == "^") return vInt(ua ^ ub, w, s);
+        if (op == "<<") return vInt(ua << (ub & 63), w, s);
+        if (op == ">>") return vInt(ua >> (ub & 63), w, s);
+        if (op == "==" || op == "=") return vBool(ua == ub);
+        if (op == "!=") return vBool(ua != ub);
+        int cmp = s ? (sa < sb ? -1 : (sa > sb ? 1 : 0)) : (ua < ub ? -1 : (ua > ub ? 1 : 0));
+        if (op == "<") return vBool(cmp < 0);
+        if (op == "<=") return vBool(cmp <= 0);
+        if (op == ">") return vBool(cmp > 0);
+        if (op == ">=") return vBool(cmp >= 0);
+    }
     if (op == "+") {
         if (a.type == VT::Num && b.type == VT::Num) return vNum(a.num + b.num);
         if (a.type == VT::Str && b.type == VT::Str) return vStr(a.str + b.str);
@@ -3652,7 +3759,10 @@ Value Interpreter::eval(const ExprPtr& e, shared_ptr<Scope> scope) {
         }
         case Expr::K::Unary: {
             Value a = eval(e->args[0], scope);
-            if (e->op == "-") return vNum(-needNum(a, "负号", e->line));
+            if (e->op == "-") {
+            if (a.type == VT::Int) return vInt((uint64_t)(-(__int128)intSigned(a)), a.width, a.isSigned);
+            return vNum(-needNum(a, "负号", e->line));
+        }
             if (e->op == "+") return vNum(needNum(a, "正号", e->line));
             if (e->op == "非") return vBool(!truthy(a));
             rtError(e->line, "未知一元运算：" + e->op);
@@ -4222,6 +4332,69 @@ static vector<Render3Point> render3Vertices(const Value& v, int line) {
     return pts;
 }
 
+static uint64_t readFixed(const vector<unsigned char>& b, size_t off, int width, bool big) {
+    if (off + (size_t)width > b.size()) throw std::out_of_range("buffer");
+    uint64_t v = 0;
+    for (int i = 0; i < width; ++i) {
+        int idx = big ? (width - 1 - i) : i;
+        v |= (uint64_t)b[off + (size_t)idx] << (8 * i);
+    }
+    return v;
+}
+static void writeFixed(vector<unsigned char>& b, size_t off, int width, uint64_t v, bool big) {
+    if (off + (size_t)width > b.size()) throw std::out_of_range("buffer");
+    for (int i = 0; i < width; ++i) {
+        int idx = big ? (width - 1 - i) : i;
+        b[off + (size_t)idx] = (unsigned char)((v >> (8 * i)) & 255);
+    }
+}
+static Value makeLayout(const string& spec, int line) {
+    auto d = std::make_shared<Dict>();
+    auto fields = std::make_shared<List>();
+    size_t offset = 0;
+    int maxAlign = 1;
+    std::istringstream ss(spec);
+    string item;
+    while (std::getline(ss, item, ',')) {
+        size_t b = item.find_first_not_of(" \t");
+        if (b == string::npos) continue;
+        item = item.substr(b);
+        size_t sp = item.find_last_of(" \t");
+        if (sp == string::npos)
+            throw WenError("运行时错误", line, 0, "布局字段要写成「类型 名字」：" + item);
+        string type = lowerAscii(item.substr(0, sp));
+        string name = item.substr(sp + 1);
+        int width = 0;
+        bool sign = false, isFloat = false;
+        if (type == "u8") width = 1;
+        else if (type == "i8") { width = 1; sign = true; }
+        else if (type == "u16") width = 2;
+        else if (type == "i16") { width = 2; sign = true; }
+        else if (type == "u32") width = 4;
+        else if (type == "i32") { width = 4; sign = true; }
+        else if (type == "u64") width = 8;
+        else if (type == "i64") { width = 8; sign = true; }
+        else if (type == "f32") { width = 4; isFloat = true; }
+        else if (type == "f64") { width = 8; isFloat = true; }
+        else throw WenError("运行时错误", line, 0, "布局不认识的类型：" + type);
+        maxAlign = std::max(maxAlign, width);
+        offset = (offset + (size_t)width - 1) / (size_t)width * (size_t)width;
+        auto f = std::make_shared<Dict>();
+        f->items["名字"] = vStr(name);
+        f->items["类型"] = vStr(type);
+        f->items["偏移"] = vNum((double)offset);
+        f->items["大小"] = vNum(width);
+        f->items["有符号"] = vBool(sign);
+        f->items["浮点"] = vBool(isFloat);
+        fields->items.push_back(vDict(f));
+        offset += width;
+    }
+    offset = (offset + (size_t)maxAlign - 1) / (size_t)maxAlign * (size_t)maxAlign;
+    d->items["大小"] = vNum((double)offset);
+    d->items["对齐"] = vNum(maxAlign);
+    d->items["字段"] = vList(fields);
+    return vDict(d);
+}
 static Value make3Face(const vector<Render3Point>& pts, const string& color) {
     auto d = std::make_shared<Dict>();
     d->items["类型"] = vStr("三维面");
@@ -6012,6 +6185,37 @@ Interpreter::Interpreter() {
         return vBool(truthy(a[0]));
     });
 
+    auto mkFixed = [this](const string& name, int width, bool sign) {
+        registerBuiltin(name, 1, 1, [name, width, sign](Interpreter&, vector<Value>& a, int line) -> Value {
+            return vInt(intFromValue(a[0], width, sign, line), width, sign);
+        });
+    };
+    mkFixed("u8", 8, false); mkFixed("i8", 8, true);
+    mkFixed("u16", 16, false); mkFixed("i16", 16, true);
+    mkFixed("u32", 32, false); mkFixed("i32", 32, true);
+    mkFixed("u64", 64, false); mkFixed("i64", 64, true);
+    registerBuiltin("f32", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        return vNum((double)(float)needNum(a[0], "f32", line));
+    });
+    registerBuiltin("按位与", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        return applyBinary("&", asInt(a[0], line), asInt(a[1], line), line);
+    });
+    registerBuiltin("按位或", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        return applyBinary("|", asInt(a[0], line), asInt(a[1], line), line);
+    });
+    registerBuiltin("按位异或", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        return applyBinary("^", asInt(a[0], line), asInt(a[1], line), line);
+    });
+    registerBuiltin("取反", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        Value v = asInt(a[0], line);
+        return vInt(~v.i, v.width, v.isSigned);
+    });
+    registerBuiltin("左移", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        return applyBinary("<<", asInt(a[0], line), asInt(a[1], line), line);
+    });
+    registerBuiltin("右移", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        return applyBinary(">>", asInt(a[0], line), asInt(a[1], line), line);
+    });
     registerBuiltin("范围", 1, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double start = 0, stop = 0, step = 1;
         if (a.size() == 1) {
@@ -7536,6 +7740,102 @@ Interpreter::Interpreter() {
             throw WenError("运行时错误", line, 0, "缓冲字节必须在 0..255");
         (*b)[(size_t)i] = (unsigned char)v;
         return vBool(true);
+    });
+    registerBuiltin("缓冲读整数", 3, 5, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto b = needBytes(a[0], "缓冲读整数", line);
+        long long off = needIndex(a[1], "缓冲读整数", line);
+        int width = (int)needIndex(a[2], "缓冲读整数", line);
+        if (width != 1 && width != 2 && width != 4 && width != 8)
+            throw WenError("运行时错误", line, 0, "宽度只能是 1/2/4/8");
+        string endian = a.size() > 3 ? needStr(a[3], "缓冲读整数", line) : "小端";
+        bool sign = a.size() > 4 ? truthy(a[4]) : false;
+        try {
+            uint64_t v = readFixed(*b, (size_t)off, width, endian == "大端");
+            return vInt(v, width * 8, sign);
+        } catch (...) {
+            throw WenError("运行时错误", line, 0, "缓冲越界");
+        }
+    });
+    registerBuiltin("缓冲写整数", 3, 5, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto b = needBytes(a[0], "缓冲写整数", line);
+        long long off = needIndex(a[1], "缓冲写整数", line);
+        int width = a.size() > 3 ? (int)needIndex(a[3], "缓冲写整数", line) : 4;
+        if (width != 1 && width != 2 && width != 4 && width != 8)
+            throw WenError("运行时错误", line, 0, "宽度只能是 1/2/4/8");
+        string endian = a.size() > 4 ? needStr(a[4], "缓冲写整数", line) : "小端";
+        uint64_t v = intFromValue(a[2], width * 8, true, line);
+        try {
+            writeFixed(*b, (size_t)off, width, v, endian == "大端");
+        } catch (...) {
+            throw WenError("运行时错误", line, 0, "缓冲越界");
+        }
+        return vBool(true);
+    });
+    registerBuiltin("缓冲读浮点", 2, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto b = needBytes(a[0], "缓冲读浮点", line);
+        long long off = needIndex(a[1], "缓冲读浮点", line);
+        int width = a.size() > 2 ? (int)needIndex(a[2], "缓冲读浮点", line) : 4;
+        if (width != 4 && width != 8) throw WenError("运行时错误", line, 0, "浮点宽度只能是 4/8");
+        uint64_t bits = readFixed(*b, (size_t)off, width, false);
+        if (width == 4) { float f; uint32_t u=(uint32_t)bits; std::memcpy(&f,&u,4); return vNum(f); }
+        double d; std::memcpy(&d,&bits,8); return vNum(d);
+    });
+    registerBuiltin("缓冲写浮点", 3, 4, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto b = needBytes(a[0], "缓冲写浮点", line);
+        long long off = needIndex(a[1], "缓冲写浮点", line);
+        double d = needNum(a[2], "缓冲写浮点", line);
+        int width = a.size() > 3 ? (int)needIndex(a[3], "缓冲写浮点", line) : 4;
+        if (width == 4) { float f=(float)d; uint32_t u; std::memcpy(&u,&f,4); writeFixed(*b,(size_t)off,4,u,false); }
+        else if (width == 8) { uint64_t u; std::memcpy(&u,&d,8); writeFixed(*b,(size_t)off,8,u,false); }
+        else throw WenError("运行时错误", line, 0, "浮点宽度只能是 4/8");
+        return vBool(true);
+    });
+    registerBuiltin("新建布局", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        return makeLayout(needStr(a[0], "新建布局", line), line);
+    });
+    registerBuiltin("布局大小", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto d = needDict(a[0], "布局大小", line);
+        return d->items.at("大小");
+    });
+    registerBuiltin("布局读", 3, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto layout = needDict(a[0], "布局读", line);
+        string name = needStr(a[2], "布局读", line);
+        auto fields = needList(layout->items.at("字段"), "字段", line);
+        for (const auto& fv : fields->items) {
+            auto f = needDict(fv, "字段", line);
+            if (needStr(f->items.at("名字"), "名字", line) != name) continue;
+            long long off = (long long)needNum(f->items.at("偏移"), "偏移", line);
+            int width = (int)needNum(f->items.at("大小"), "大小", line);
+            auto b = needBytes(a[1], "布局读", line);
+            uint64_t bits = readFixed(*b, (size_t)off, width, false);
+            if (truthy(f->items.at("浮点"))) {
+                if (width == 4) { float x; uint32_t u=(uint32_t)bits; std::memcpy(&x,&u,4); return vNum(x); }
+                double x; std::memcpy(&x,&bits,8); return vNum(x);
+            }
+            return vInt(bits, width * 8, truthy(f->items.at("有符号")));
+        }
+        throw WenError("运行时错误", line, 0, "布局里没有字段「" + name + "」");
+    });
+    registerBuiltin("布局写", 4, 4, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto layout = needDict(a[0], "布局写", line);
+        auto b = needBytes(a[1], "布局写", line);
+        string name = needStr(a[2], "布局写", line);
+        auto fields = needList(layout->items.at("字段"), "字段", line);
+        for (const auto& fv : fields->items) {
+            auto f = needDict(fv, "字段", line);
+            if (needStr(f->items.at("名字"), "名字", line) != name) continue;
+            long long off = (long long)needNum(f->items.at("偏移"), "偏移", line);
+            int width = (int)needNum(f->items.at("大小"), "大小", line);
+            if (truthy(f->items.at("浮点"))) {
+                double x = needNum(a[3], "布局写", line);
+                if (width == 4) { float y=(float)x; uint32_t u; std::memcpy(&u,&y,4); writeFixed(*b,(size_t)off,4,u,false); }
+                else { uint64_t u; std::memcpy(&u,&x,8); writeFixed(*b,(size_t)off,8,u,false); }
+            } else {
+                writeFixed(*b, (size_t)off, width, intFromValue(a[3], width * 8, true, line), false);
+            }
+            return vBool(true);
+        }
+        throw WenError("运行时错误", line, 0, "布局里没有字段「" + name + "」");
     });
     registerBuiltin("缓冲转文本", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
         auto b = needBytes(a[0], "缓冲转文本", line);
