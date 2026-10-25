@@ -4392,7 +4392,7 @@ static void writeFixed(vector<unsigned char>& b, size_t off, int width, uint64_t
         b[off + (size_t)idx] = (unsigned char)((v >> (8 * i)) & 255);
     }
 }
-static Value makeLayout(const string& spec, int line) {
+static Value makeLayout(const string& spec, int line, bool packed = false) {
     auto d = std::make_shared<Dict>();
     auto fields = std::make_shared<List>();
     size_t offset = 0;
@@ -4422,7 +4422,7 @@ static Value makeLayout(const string& spec, int line) {
         else if (type == "f64") { width = 8; isFloat = true; }
         else throw WenError("运行时错误", line, 0, "布局不认识的类型：" + type);
         maxAlign = std::max(maxAlign, width);
-        offset = (offset + (size_t)width - 1) / (size_t)width * (size_t)width;
+        if (!packed) offset = (offset + (size_t)width - 1) / (size_t)width * (size_t)width;
         auto f = std::make_shared<Dict>();
         f->items["名字"] = vStr(name);
         f->items["类型"] = vStr(type);
@@ -4433,9 +4433,10 @@ static Value makeLayout(const string& spec, int line) {
         fields->items.push_back(vDict(f));
         offset += width;
     }
-    offset = (offset + (size_t)maxAlign - 1) / (size_t)maxAlign * (size_t)maxAlign;
+    if (!packed) offset = (offset + (size_t)maxAlign - 1) / (size_t)maxAlign * (size_t)maxAlign;
     d->items["大小"] = vNum((double)offset);
-    d->items["对齐"] = vNum(maxAlign);
+    d->items["对齐"] = vNum(packed ? 1 : maxAlign);
+    d->items["紧凑"] = vBool(packed);
     d->items["字段"] = vList(fields);
     return vDict(d);
 }
@@ -7839,7 +7840,12 @@ Interpreter::Interpreter() {
         else throw WenError("运行时错误", line, 0, "浮点宽度只能是 4/8");
         return vBool(true);
     });
-    registerBuiltin("新建布局", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+    registerBuiltin("新建布局", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        bool packed = false;
+        if (a.size() > 1) {
+            string mode = needStr(a[1], "新建布局", line);
+            packed = mode == "紧凑" || mode == "packed" || mode == "无填充";
+        }
         if (a[0].type == VT::List && a[0].list) {
             string spec;
             for (const auto& item : a[0].list->items) {
@@ -7850,9 +7856,9 @@ Interpreter::Interpreter() {
                 string type = needStr(pair->items[1], "字段类型", line);
                 spec += type + " " + name + ",";
             }
-            return makeLayout(spec, line);
+            return makeLayout(spec, line, packed);
         }
-        return makeLayout(needStr(a[0], "新建布局", line), line);
+        return makeLayout(needStr(a[0], "新建布局", line), line, packed);
     });
     registerBuiltin("布局大小", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
         auto d = needDict(a[0], "布局大小", line);
