@@ -2921,6 +2921,8 @@ public:
     Value lastValue;
     std::set<string> loadedModules;
     std::map<string, string> symbolOwner;  // 名字 -> 库/用户，防止静默覆盖
+    bool callStats = false;                // 调用统计：只在开启时计数
+    std::map<string, long long> callCounts;
     std::map<string, std::map<string, Value>> libraryFunctions;  // 库名 -> 函数表
     std::vector<Value> renderScene;  // 渲染场景：面/涂鸦/渐变/体积光，供各后端使用
     bool accelEnabled = false;       // 加速库：纯函数结果缓存开关
@@ -3861,6 +3863,7 @@ void Interpreter::setIndex(Value& obj, const Value& idx, const Value& val, int l
 
 // 函数调用：返回信号、循环外中断、错误调用栈
 Value Function::call(Interpreter& vm, vector<Value>& args, int callLine) {
+    if (vm.callStats && !name.empty()) ++vm.callCounts[name];
     if (args.size() != params.size()) {
         throw WenError("运行时错误", callLine, 0,
                        "函数「" + name + "」需要 " + std::to_string(params.size()) +
@@ -3886,6 +3889,7 @@ Value Function::call(Interpreter& vm, vector<Value>& args, int callLine) {
 }
 
 Value Builtin::call(Interpreter& vm, vector<Value>& args, int line) {
+    if (vm.callStats && !name.empty()) ++vm.callCounts[name];
     auto mit = functionModules().find(name);
     if (mit != functionModules().end() && !vm.loadedModules.count(mit->second)) {
         throw WenError("运行时错误", line, 0,
@@ -6730,6 +6734,52 @@ Interpreter::Interpreter() {
         return vStr(s);
     });
 
+    registerBuiltin("开启调用统计", 0, 0, [this](Interpreter&, vector<Value>&, int) -> Value {
+        callStats = true;
+        return vBool(true);
+    });
+    registerBuiltin("关闭调用统计", 0, 0, [this](Interpreter&, vector<Value>&, int) -> Value {
+        callStats = false;
+        return vBool(false);
+    });
+    registerBuiltin("调用次数", 1, 1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+        string name = needStr(a[0], "调用次数", line);
+        auto it = callCounts.find(name);
+        return vNum(it == callCounts.end() ? 0 : (double)it->second);
+    });
+    registerBuiltin("调用统计", 0, 0, [this](Interpreter&, vector<Value>&, int) -> Value {
+        auto d = std::make_shared<Dict>();
+        for (const auto& kv : callCounts) d->items[kv.first] = vNum((double)kv.second);
+        return vDict(d);
+    });
+    registerBuiltin("清空调用统计", 0, 0, [this](Interpreter&, vector<Value>&, int) -> Value {
+        callCounts.clear();
+        return vNone();
+    });
+    registerBuiltin("别名", 2, 2, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+        string oldName = needStr(a[0], "别名", line);
+        string newName = needStr(a[1], "别名", line);
+        Value fn;
+        if (!globals->lookup(oldName, fn))
+            throw WenError("运行时错误", line, 0, "没有名字「" + oldName + "」");
+        auto owner = symbolOwner.find(newName);
+        if (owner != symbolOwner.end())
+            throw WenError("库冲突", line, 0,
+                           "别名「" + newName + "」已被「" + owner->second + "」占用");
+        globals->vars[newName] = fn;
+        auto oldOwner = symbolOwner.find(oldName);
+        symbolOwner[newName] = oldOwner == symbolOwner.end() ? "别名" : oldOwner->second;
+        return vBool(true);
+    });
+    registerBuiltin("取消别名", 1, 1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+        string name = needStr(a[0], "取消别名", line);
+        auto owner = symbolOwner.find(name);
+        if (owner == symbolOwner.end() || owner->second == "用户")
+            throw WenError("运行时错误", line, 0, "「" + name + "」不是别名");
+        globals->vars.erase(name);
+        symbolOwner.erase(owner);
+        return vBool(true);
+    });
     registerBuiltin("签名", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
         return vStr(WEN_SIGNATURE);
     });
