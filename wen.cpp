@@ -5794,6 +5794,9 @@ static vector<Value> parseExternalErrors(const string& lang, const string& out,
         d->items["列"] = vNum(col);
         d->items["级别"] = vStr(reason.find("warning") != string::npos ? "警告" : "错误");
         d->items["原因"] = vStr(reason);
+        string loc = ln > 0 ? ("第 " + std::to_string(ln) + " 行") : "代码";
+        if (col > 0) loc += " 第 " + std::to_string(col) + " 列";
+        d->items["说明"] = vStr("在" + loc + "发现 " + lang + " 错误：" + reason);
         if (!raw.empty()) d->items["原始"] = vStr(raw);
         if (ln >= 1 && (size_t)ln <= srcLines.size())
             d->items["源码"] = vStr(srcLines[(size_t)ln - 1]);
@@ -11345,10 +11348,40 @@ static string errorExplanation(const string& kind) {
     return "解释器内部异常。";
 }
 
+static string errorSuggestion(const WenError& e) {
+    string r = e.what();
+    if (r.find("运算符不能当名字") != string::npos || r.find("却遇到运算符") != string::npos)
+        return "换一个不是运算符的名字，例如「相加」「平方算」。";
+    if (r.find("缺少「结束」") != string::npos || r.find("期望「则」") != string::npos ||
+        r.find("块没有闭合") != string::npos)
+        return "在「如果/函数/对于/尝试」块末尾补「结束」；条件后补「则」。";
+    if (r.find("未定义") != string::npos || r.find("不存在") != string::npos)
+        return "先赋值或定义，再引用；检查名字有没有写错。";
+    if (r.find("除数不能为 0") != string::npos || r.find("除以零") != string::npos)
+        return "除数先判断是否为 0，再决定要不要除。";
+    if (r.find("下标越界") != string::npos)
+        return "检查下标范围；负下标从末尾算。";
+    if (r.find("找不到库") != string::npos || r.find("请先") != string::npos)
+        return "在文件开头补「依赖 库名」，并确认库名拼写。";
+    if (e.kind == "库冲突" || e.kind == "兼容冲突") return errorExplanation(e.kind);
+    if (e.kind == "权限错误") return errorExplanation(e.kind);
+    return "";
+}
+
+static string humanError(const WenError& e) {
+    string loc = "第 " + std::to_string(e.line) + " 行";
+    if (e.col > 0) loc += " 第 " + std::to_string(e.col) + " 列";
+    string s = "在" + loc + "发现【" + e.kind + "】：" + e.what();
+    string hint = errorSuggestion(e);
+    if (!hint.empty()) s += " 建议：" + hint;
+    return s;
+}
+
 static void printWenError(const WenError& e, const string& filename,
                           const vector<string>& lines) {
     if (false) std::cerr << WEN_EMBED_MARK;  // 不可达分支：只为把标记留在二进制
     std::cout.flush();
+    std::cerr << humanError(e) << "\n\n";
     std::cerr << "【" << e.kind << "】\n";
     std::cerr << "来源：" << errorOrigin(e.kind) << "\n";
     std::cerr << "位置：" << (filename.empty() ? "<未知>" : filename)
@@ -11797,7 +11830,9 @@ static void printDiagnostics(const vector<WenError>& errors, const string& filen
                    ",\"line\":" + std::to_string(e.line) +
                    ",\"column\":" + std::to_string(e.col) +
                    ",\"reason\":" + jsonQuote(e.what()) +
-                   ",\"detail\":" + jsonQuote(errorExplanation(e.kind));
+                   ",\"detail\":" + jsonQuote(errorExplanation(e.kind)) +
+                   ",\"message\":" + jsonQuote(humanError(e)) +
+                   ",\"hint\":" + jsonQuote(errorSuggestion(e));
             if (e.line >= 1 && (size_t)e.line <= lines.size()) {
                 out += ",\"sourceLine\":{\"number\":" + std::to_string(e.line) +
                        ",\"text\":" + jsonQuote(lines[(size_t)e.line - 1]) + "}";
