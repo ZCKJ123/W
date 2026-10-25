@@ -2923,7 +2923,7 @@ static const std::map<string, string>& functionModules() {
 
         // 网络库
         {"抓取", "网络库"}, {"下载", "网络库"}, {"抓取JSON", "网络库"},
-        {"安全抓取", "网络库"}, {"限速抓取", "网络库"},
+        {"安全抓取", "网络库"}, {"限速抓取", "网络库"}, {"乱码解析", "网络库"},
 
         // JSON 库
         {"解析JSON", "数据格式库"}, {"生成JSON", "数据格式库"},
@@ -5719,6 +5719,8 @@ static string translateByTarget(const string& target, const vector<StmtPtr>& pro
 }
 
 static vector<string> disassembleBytecode(const string& path, int line);
+static vector<string> binaryStrings(const string& bytes);
+static Value binaryReport(const string& path, int line);
 Interpreter::Interpreter() {
     globals = std::make_shared<Scope>();
     rng.seed(std::random_device{}());
@@ -6280,18 +6282,18 @@ Interpreter::Interpreter() {
         }
         return vNone();
     });
-    registerBuiltin("反汇编", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
-        auto lines = disassembleBytecode(needStr(a[0], "反汇编", line), line);
+    registerBuiltin("反字节码", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto lines = disassembleBytecode(needStr(a[0], "反字节码", line), line);
         auto l = std::make_shared<List>();
         for (const auto& s : lines) l->items.push_back(vStr(s));
         return vList(l);
     });
-    registerBuiltin("反编译", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
-        auto lines = disassembleBytecode(needStr(a[0], "反编译", line), line);
+    registerBuiltin("反字节码文本", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto lines = disassembleBytecode(needStr(a[0], "反字节码文本", line), line);
         string text;
         for (const auto& s : lines) text += s + "\n";
         if (a.size() == 1) return vStr(text);
-        string path = needStr(a[1], "反编译", line);
+        string path = needStr(a[1], "反字节码文本", line);
         try {
             ensureParentDirectory(path);
             writeWholeFile(path, text, false);
@@ -6299,6 +6301,36 @@ Interpreter::Interpreter() {
             throw WenError("文件错误", line, 0, e.what());
         }
         return vStr(path);
+    });
+    registerBuiltin("反汇编", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        Value report = binaryReport(needStr(a[0], "反汇编", line), line);
+        if (a.size() == 1) return report;
+        auto d = needDict(report, "反汇编", line);
+        string text;
+        auto l = needList(d->items["字符串"], "字符串", line);
+        for (const auto& v : l->items) text += toText(v, true) + "\n";
+        string path = needStr(a[1], "反汇编", line);
+        try {
+            ensureParentDirectory(path);
+            writeWholeFile(path, text, false);
+        } catch (IoError& e) {
+            throw WenError("文件错误", line, 0, e.what());
+        }
+        return vStr(path);
+    });
+    registerBuiltin("反二进制", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        return binaryReport(needStr(a[0], "反二进制", line), line);
+    });
+    registerBuiltin("暴力还原", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string bytes;
+        try {
+            bytes = readWholeFile(needStr(a[0], "暴力还原", line));
+        } catch (IoError& e) {
+            throw WenError("文件错误", line, 0, e.what());
+        }
+        auto l = std::make_shared<List>();
+        for (const auto& s : binaryStrings(bytes)) l->items.push_back(vStr(s));
+        return vList(l);
     });
     // ---------- 外派库 ----------
     registerBuiltin("外派支持", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
@@ -7964,6 +7996,15 @@ Interpreter::Interpreter() {
         std::this_thread::sleep_for(std::chrono::milliseconds(ms));
         int timeout = a.size() == 3 ? (int)needIndex(a[2], "限速抓取", line) : 15000;
         return vStr(httpGetText(url, timeout, line));
+    });
+    registerBuiltin("乱码解析", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string s = needStr(a[0], "乱码解析", line);
+        if (s.empty()) return vStr(s);
+        int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), (int)s.size(),
+                                    nullptr, 0);
+        if (n > 0) return vStr(s);
+        string fixed = codePageToUtf8(s, 936);
+        return vStr(fixed.empty() ? s : fixed);
     });
     registerBuiltin("抓取", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         string url = needStr(a[0], "抓取", line);
@@ -10875,6 +10916,61 @@ static void printIncompleteError(const IncompleteError& e, const string& filenam
     printWenError(we, filename, lines);
 }
 
+static bool validUtf8(const string& s) {
+    if (s.empty()) return true;
+    return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), (int)s.size(),
+                               nullptr, 0) > 0;
+}
+
+static vector<string> binaryStrings(const string& bytes) {
+    vector<string> out;
+    std::set<string> seen;
+    auto flush = [&](string& cur) {
+        if (cur.size() >= 4 && validUtf8(cur) && seen.insert(cur).second) out.push_back(cur);
+        cur.clear();
+    };
+    string cur;
+    for (unsigned char c : bytes) {
+        if (c < 32 || c == 127) flush(cur);
+        else cur += (char)c;
+        if (out.size() >= 5000) break;
+    }
+    flush(cur);
+    // UTF-16LE 里的 ASCII/中文短串
+    for (size_t i = 0; i + 1 < bytes.size();) {
+        string u;
+        while (i + 1 < bytes.size() && (unsigned char)bytes[i + 1] == 0 &&
+               (unsigned char)bytes[i] >= 32 && (unsigned char)bytes[i] != 127) {
+            u += bytes[i];
+            i += 2;
+        }
+        if (u.size() >= 4 && seen.insert(u).second) out.push_back(u);
+        i += (u.empty() ? 1 : 0);
+        if (out.size() >= 5000) break;
+    }
+    return out;
+}
+
+static Value binaryReport(const string& path, int line) {
+    string bytes;
+    try {
+        bytes = readWholeFile(path);
+    } catch (IoError& e) {
+        throw WenError("文件错误", line, 0, e.what());
+    }
+    string kind = "未知";
+    if (bytes.rfind("MZ", 0) == 0) kind = "PE";
+    else if (bytes.rfind("\x7f" "ELF", 0) == 0) kind = "ELF";
+    else if (bytes.rfind("PK", 0) == 0) kind = "ZIP";
+    else if (bytes.rfind("\x89" "PNG", 0) == 0) kind = "PNG";
+    auto d = std::make_shared<Dict>();
+    d->items["类型"] = vStr(kind);
+    d->items["大小"] = vNum((double)bytes.size());
+    auto strs = std::make_shared<List>();
+    for (const auto& s : binaryStrings(bytes)) strs->items.push_back(vStr(s));
+    d->items["字符串"] = vList(strs);
+    return vDict(d);
+}
 static vector<string> disassembleBytecode(const string& path, int line) {
     string text;
     try {
@@ -11404,9 +11500,9 @@ static int runMain(const vector<string>& args) {
         for (const auto& s : WEN_SUFFIXES) std::cout << s.use << "  " << s.ext << "\n";
         return 0;
     }
-    if (cmd == "--反编译" || cmd == "--反汇编") {
+    if (cmd == "--反字节码") {
         if (args.size() < 3) {
-            std::cerr << "用法：wen.exe --反编译 字节码.json [输出.txt]\n";
+            std::cerr << "用法：wen.exe --反字节码 字节码.json [输出.txt]\n";
             return 1;
         }
         vector<string> lines;
@@ -11428,6 +11524,34 @@ static int runMain(const vector<string>& args) {
             }
         } else {
             std::cout << text;
+        }
+        return 0;
+    }
+    if (cmd == "--反汇编" || cmd == "--反编译") {
+        if (args.size() < 3) {
+            std::cerr << "用法：wen.exe --反汇编 文件.exe [输出.txt]\n";
+            return 1;
+        }
+        try {
+            Value report = binaryReport(args[2], 1);
+            auto d = needDict(report, "反汇编", 1);
+            auto strs = needList(d->items["字符串"], "字符串", 1);
+            std::ostringstream out;
+            out << "类型: " << toText(d->items["类型"]) << "\n";
+            out << "大小: " << toText(d->items["大小"]) << "\n";
+            for (const auto& v : strs->items) out << toText(v, true) << "\n";
+            if (args.size() >= 4) {
+                ensureParentDirectory(args[3]);
+                writeWholeFile(args[3], out.str(), false);
+            } else {
+                std::cout << out.str();
+            }
+        } catch (WenError& e) {
+            std::cerr << "【" << e.kind << "】" << e.what() << "\n";
+            return 1;
+        } catch (IoError& e) {
+            std::cerr << e.what() << "\n";
+            return 1;
         }
         return 0;
     }
