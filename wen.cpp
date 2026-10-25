@@ -670,6 +670,7 @@ struct Expr {
     double num = 0;
     string text;
     bool b = false;
+    bool commandCall = false;
     string op;
     vector<ExprPtr> args;
     vector<std::pair<ExprPtr, ExprPtr>> pairs;
@@ -755,6 +756,7 @@ static ExprPtr mkCall(ExprPtr callee, vector<ExprPtr> args, int line) {
     e->k = Expr::K::Call;
     e->args.push_back(std::move(callee));
     for (auto& a : args) e->args.push_back(std::move(a));
+    if (e->args[0]->k == Expr::K::Var && e->args[0]->text == "指挥") e->commandCall = true;
     e->line = line;
     return e;
 }
@@ -3591,7 +3593,7 @@ Value Interpreter::eval(const ExprPtr& e, shared_ptr<Scope> scope) {
         }
         case Expr::K::Call: {
             // 指挥("名字", 参数…) 直接派发，省掉“内置指挥 + 目标函数”两层调用。
-            if (e->args[0]->k == Expr::K::Var && e->args[0]->text == "指挥") {
+            if (e->commandCall) {
                 Value cmd;
                 if (scope->lookup("指挥", cmd) && cmd.type == VT::Func &&
                     std::dynamic_pointer_cast<Builtin>(cmd.callable)) {
@@ -3709,6 +3711,8 @@ static string accelKey(const string& name, const vector<Value>& args) {
 Value Interpreter::callValue(const Value& callee, vector<Value>& args, int line) {
     if (callee.type != VT::Func || !callee.callable)
         rtError(line, "这个值不能调用：" + typeName(callee));
+    if (!accelEnabled && !leapAuto && !memoryAuto)
+        return callee.callable->call(*this, args, line);
     if (accelEnabled && cacheableBuiltin(callee.callable->name)) {
         string key = accelKey(callee.callable->name, args);
         auto it = accelCache.find(key);
