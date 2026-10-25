@@ -3542,6 +3542,24 @@ Value Interpreter::eval(const ExprPtr& e, shared_ptr<Scope> scope) {
             return applyBinary(e->op, a, b, e->line);
         }
         case Expr::K::Call: {
+            // 指挥("名字", 参数…) 直接派发，省掉“内置指挥 + 目标函数”两层调用。
+            if (e->args[0]->k == Expr::K::Var && e->args[0]->text == "指挥") {
+                Value cmd;
+                if (scope->lookup("指挥", cmd) && cmd.type == VT::Func &&
+                    std::dynamic_pointer_cast<Builtin>(cmd.callable)) {
+                    if (e->args.size() < 2)
+                        rtError(e->line, "「指挥」至少需要一个命令名");
+                    string name = needStr(eval(e->args[1], scope), "指挥", e->line);
+                    Value target;
+                    if (!globals->lookup(name, target))
+                        rtError(e->line, "指挥层不认识命令「" + name + "」");
+                    vector<Value> cargs;
+                    cargs.reserve(e->args.size() - 2);
+                    for (size_t i = 2; i < e->args.size(); ++i)
+                        cargs.push_back(eval(e->args[i], scope));
+                    return callValue(target, cargs, e->line);
+                }
+            }
             // 被调用者要取“原始函数值”，不能再触发零参数自动调用，
             // 否则 零() 会先执行一次再被当成数字调用。
             Value callee;
