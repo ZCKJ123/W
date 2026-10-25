@@ -1938,14 +1938,25 @@ static vector<string> splitLines(const string& s) {
     return lines;
 }
 
-static const char* WEN_SOURCE_SUFFIXES[] = {
-    ".wen", ".w", ".文", ".言", ".语", ".中文", ".文言"};
+struct WenSuffixInfo {
+    const char* use;
+    const char* ext;
+};
+static const WenSuffixInfo WEN_SUFFIXES[] = {
+    {"脚本", ".脚本"}, {"程序", ".程序"}, {"库", ".库"}, {"用例", ".用例"},
+    {"场景", ".场景"}, {"模型", ".模型"}, {"矢量图", ".矢量图"},
+    {"数据", ".数据"}, {"表格", ".表格"}, {"日志", ".日志"},
+    {"配置", ".配置"}, {"缓冲", ".缓冲"}, {"网页", ".网页"},
+    {"着色器", ".着色器"}};
+static const char* WEN_SOURCE_SUFFIXES[] = {".脚本", ".程序", ".wen"};
 static string resolveWenPath(const string& path) {
     if (fs::exists(fs::u8path(path))) return path;
-    for (const char* suf : WEN_SOURCE_SUFFIXES) {
-        string p = path + suf;
+    for (const auto& s : WEN_SUFFIXES) {
+        string p = path + s.ext;
         if (fs::exists(fs::u8path(p))) return p;
     }
+    string p = path + ".wen";
+    if (fs::exists(fs::u8path(p))) return p;
     return path;
 }
 
@@ -3279,7 +3290,7 @@ bool Interpreter::是内置库(const string& rawName) const {
 void Interpreter::加载外部库(const string& name, int line) {
     if (loadedModules.count(name)) return;
 
-    static const char* suffixes[] = {".wen", ".w", ".文", ".言", ".语", ".中文", ".文言", ".库", ".wenlib"};
+    static const char* suffixes[] = {".库", ".wenlib", ".wen"};
     vector<fs::path> dirs;
     std::error_code ec;
     if (!filename.empty() && filename[0] != '<') {
@@ -3309,7 +3320,7 @@ void Interpreter::加载外部库(const string& name, int line) {
         throw WenError("运行时错误", line, 0,
                        "找不到库「" + name +
                        "」：不是内置库，也没找到 库/" + name +
-                       ".wen（或 .w/.文/.言/.语/.中文/.文言/.库/.wenlib，或目录 " + name + "/主.wen）");
+                       ".脚本/.程序/.wen（库还认 .库/.wenlib，或目录 " + name + "/主.wen）");
     }
 
     loadedModules.insert(name);
@@ -6894,6 +6905,12 @@ Interpreter::Interpreter() {
         globals->vars.erase(name);
         symbolOwner.erase(owner);
         return vBool(true);
+    });
+    registerBuiltin("文件后缀", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string use = needStr(a[0], "文件后缀", line);
+        for (const auto& s : WEN_SUFFIXES)
+            if (use == s.use) return vStr(s.ext);
+        throw WenError("运行时错误", line, 0, "没有用途「" + use + "」的后缀");
     });
     registerBuiltin("源文件后缀", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
         auto l = std::make_shared<List>();
@@ -11220,7 +11237,7 @@ static int runMain(const vector<string>& args) {
         return 0;
     }
     if (cmd == "--后缀") {
-        for (const char* suf : WEN_SOURCE_SUFFIXES) std::cout << suf << "\n";
+        for (const auto& s : WEN_SUFFIXES) std::cout << s.use << "  " << s.ext << "\n";
         return 0;
     }
     if (cmd == "--签名") {

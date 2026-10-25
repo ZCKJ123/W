@@ -21,5 +21,8 @@ desktop.ini
 __pycache__/
 *.pyc
 
+# 生成物
+审计报告.md
+
 # 本地临时测试
 _*.wen
