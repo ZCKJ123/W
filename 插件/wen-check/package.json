@@ -1,6 +1,6 @@
 {
   "name": "dsh-wen-check",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "private": false,
   "type": "module",
   "description": "DSH plugin: expose the wen language compiler as a structured-diagnostic tool (wen_check)."
@@ -19,6 +19,11 @@
     "locale/*.json",
     "icon.svg"
   ],
+  "wen": {
+    "official": true,
+    "signature": "WEN-LANG-0.1",
+    "version": "0.1.0-snapshot"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

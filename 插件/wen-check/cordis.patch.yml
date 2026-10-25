@@ -4,7 +4,7 @@
       config:
         # 首次使用时自动下载 wen.exe（指向 Gitee Release 直链）
         downloadUrl: https://gitee.com/zhuchen_1/wen/raw/p/wen.exe
-        sha256: 1f804702e682e131d4b59b02a00703575e18b01be49026114fcb56e9b6a096d9
+        sha256: f744783cac1714696c5744774ff3c7beff695851587d95e73ebe7c21452c43bd
         # 也可以改成你自己的缓存目录；默认 %USERPROFILE%\.dsh-wen-check
         # cacheDir: D:\wen-cache
         #

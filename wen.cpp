@@ -39,6 +39,7 @@
 #include <io.h>
 
 // 源码自带标签：任何二进制都能用 --签名 打印出来。
+static const char* WEN_VERSION = "0.1.0-snapshot";
 static const char* WEN_SIGNATURE =
     "文语言（wen） · 内置签名 WEN-LANG-0.1 · 2026 · 作者 Akm / 筑宸科技";
 
@@ -5760,6 +5761,8 @@ static string translateByTarget(const string& target, const vector<StmtPtr>& pro
 }
 
 static vector<string> disassembleBytecode(const string& path, int line);
+static Value verifyBinary(const string& path, int line);
+static Value verifyPlugin(const string& path, int line);
 static vector<string> binaryStrings(const string& bytes, size_t minLen, size_t limit,
                                     const string& filter, int line);
 static Value binaryHeader(const string& path, int line);
@@ -7331,6 +7334,12 @@ Interpreter::Interpreter() {
         auto out = std::make_shared<List>();
         out->items = std::move(results);
         return vList(out);
+    });
+    registerBuiltin("验证程序", 0, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        return verifyBinary(a.empty() ? "" : needStr(a[0], "验证程序", line), line);
+    });
+    registerBuiltin("验证插件", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        return verifyPlugin(needStr(a[0], "验证插件", line), line);
     });
     registerBuiltin("签名", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
         return vStr(WEN_SIGNATURE);
@@ -11265,6 +11274,71 @@ static void printIncompleteError(const IncompleteError& e, const string& filenam
     printWenError(we, filename, lines);
 }
 
+static string selfExePath() {
+    wchar_t buf[MAX_PATH] = {0};
+    DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    if (!n) return "";
+    return wideToUtf8(std::wstring(buf, n));
+}
+
+static Value verifyBinary(const string& path0, int line) {
+    string path = path0.empty() ? selfExePath() : path0;
+    string b;
+    try {
+        b = readWholeFile(path);
+    } catch (IoError& e) {
+        throw WenError("文件错误", line, 0, e.what());
+    }
+    bool sig = b.find(WEN_SIGNATURE) != string::npos;
+    bool mark = b.find("WEN-EMBEDDED-MARK") != string::npos;
+    bool lang = b.find("WEN-LANG-0.1") != string::npos;
+    bool exact = b.find(WEN_VERSION) != string::npos;
+    bool major = b.find("0.1") != string::npos;
+    bool official = sig && mark && lang;
+    auto d = std::make_shared<Dict>();
+    d->items["文件"] = vStr(path);
+    d->items["官方"] = vBool(official);
+    d->items["版本"] = vStr(WEN_VERSION);
+    d->items["版本匹配"] = vBool(exact);
+    d->items["主版本匹配"] = vBool(major);
+    d->items["签名"] = vBool(sig);
+    d->items["标记"] = vBool(mark);
+    d->items["可运行"] = vBool(official && (exact || major));
+    return vDict(d);
+}
+static Value verifyPlugin(const string& path0, int line) {
+    string path = path0;
+    if (fs::is_directory(fs::u8path(path)))
+        path = (fs::u8path(path) / fs::u8path("package.json")).u8string();
+    string text;
+    try {
+        text = readWholeFile(path);
+    } catch (IoError& e) {
+        throw WenError("文件错误", line, 0, e.what());
+    }
+    JsonReader reader(text, line);
+    auto root = needDict(reader.parse(), "插件", line);
+    auto d = std::make_shared<Dict>();
+    d->items["文件"] = vStr(path);
+    bool official = false, sig = false, exact = false;
+    string ver;
+    auto it = root->items.find("wen");
+    if (it != root->items.end() && it->second.type == VT::Dict && it->second.dict) {
+        auto& w = it->second.dict->items;
+        official = w.count("official") && truthy(w["official"]);
+        sig = w.count("signature") && w["signature"].type == VT::Str &&
+              w["signature"].str == "WEN-LANG-0.1";
+        if (w.count("version") && w["version"].type == VT::Str) ver = w["version"].str;
+        exact = ver == WEN_VERSION;
+    }
+    d->items["官方"] = vBool(official && sig);
+    d->items["版本"] = vStr(ver.empty() ? WEN_VERSION : ver);
+    d->items["版本匹配"] = vBool(exact);
+    d->items["主版本匹配"] = vBool(ver.rfind("0.1", 0) == 0);
+    d->items["签名"] = vBool(sig);
+    d->items["可运行"] = vBool(official && sig);
+    return vDict(d);
+}
 static bool validUtf8(const string& s) {
     if (s.empty()) return true;
     return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), (int)s.size(),
@@ -12002,7 +12076,43 @@ static int runMain(const vector<string>& args) {
             return 1;
         }
         return 0;
-    }    if (cmd == "--签名") {
+    }    if (cmd == "--验证") {
+        try {
+            Value d = verifyBinary(args.size() >= 3 ? args[2] : "", 1);
+            auto dict = needDict(d, "验证", 1);
+            for (const auto& k : {"文件", "官方", "版本", "版本匹配", "主版本匹配",
+                                  "签名", "标记", "可运行"}) {
+                auto it = dict->items.find(k);
+                if (it != dict->items.end())
+                    std::cout << k << ": " << toText(it->second, true) << "\n";
+            }
+            auto run = dict->items.find("可运行");
+            return run != dict->items.end() && truthy(run->second) ? 0 : 2;
+        } catch (WenError& e) {
+            std::cerr << "【" << e.kind << "】" << e.what() << "\n";
+            return 2;
+        }
+    }
+    if (cmd == "--验证插件") {
+        if (args.size() < 3) {
+            std::cerr << "用法：wen.exe --验证插件 插件目录\n";
+            return 2;
+        }
+        try {
+            auto d = needDict(verifyPlugin(args[2], 1), "验证插件", 1);
+            for (const auto& k : {"文件", "官方", "版本", "版本匹配", "主版本匹配",
+                                  "签名", "可运行"}) {
+                auto it = d->items.find(k);
+                if (it != d->items.end()) std::cout << k << ": " << toText(it->second, true) << "\n";
+            }
+            auto run = d->items.find("可运行");
+            return run != d->items.end() && truthy(run->second) ? 0 : 2;
+        } catch (WenError& e) {
+            std::cerr << "【" << e.kind << "】" << e.what() << "\n";
+            return 2;
+        }
+    }
+    if (cmd == "--签名") {
         std::cout << WEN_SIGNATURE << "\n";
         return 0;
     }

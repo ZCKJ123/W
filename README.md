@@ -14,6 +14,7 @@
 .\轻量构建.bat   # 轻量版：wen_lite.exe
 .\wen.exe 例子\你好.wen
 .\wen.exe --签名
+.\wen.exe --验证
 .\wen.exe --库
 .\发布检查.ps1   # 发货前检查
 ```
