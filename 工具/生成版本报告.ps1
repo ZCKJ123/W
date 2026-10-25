@@ -1,4 +1,5 @@
-﻿$ErrorActionPreference = 'Stop'
+﻿param([string]$Tests = '未运行')
+$ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot\..
 $exe = Join-Path (Get-Location) 'wen.exe'
 $verify = & $exe --验证
@@ -6,7 +7,7 @@ $plugin = & $exe --验证插件 '插件\wen-check'
 $version = & $exe --版本
 $hash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLower()
 $size = (Get-Item $exe).Length
-$test = powershell -NoProfile -ExecutionPolicy Bypass -File '测试\运行.ps1' 2>&1 | Select-Object -Last 1
+$test = $Tests
 $lines = @(
     '# 版本验证报告',
     '',

@@ -2853,7 +2853,7 @@ static const std::map<string, string>& functionModules() {
         // 翻译器
         {"翻译支持", "兼容库"}, {"翻译目标", "兼容库"}, {"翻译检查", "兼容库"},
         {"兼容支持", "兼容库"}, {"兼容翻译", "兼容库"}, {"兼容运行", "兼容库"},
-        {"兼容语言", "兼容库"}, {"兼容解析", "兼容库"},
+        {"兼容语言", "兼容库"}, {"兼容解析", "兼容库"}, {"兼容诊断", "兼容库"},
         {"翻译", "兼容库"}, {"执行字节码", "兼容库"},
         {"反汇编", "兼容库"}, {"反汇编文本", "兼容库"},
         {"二进制头", "兼容库"}, {"二进制字符串", "兼容库"}, {"二进制反汇编", "兼容库"},
@@ -5778,6 +5778,48 @@ static std::pair<int, string> runCapture(const string& cmd) {
     return {rc, out};
 }
 
+static vector<Value> parseExternalErrors(const string& lang, const string& out,
+                                         const string& code, int line) {
+    vector<Value> result;
+    auto srcLines = splitLines(code);
+    auto add = [&](int ln, int col, const string& reason) {
+        if ((int)result.size() >= 20) return;
+        auto d = std::make_shared<Dict>();
+        d->items["行"] = vNum(ln);
+        d->items["列"] = vNum(col);
+        d->items["级别"] = vStr(reason.find("warning") != string::npos ? "警告" : "错误");
+        d->items["原因"] = vStr(reason);
+        if (ln >= 1 && (size_t)ln <= srcLines.size())
+            d->items["源码"] = vStr(srcLines[(size_t)ln - 1]);
+        result.push_back(vDict(d));
+    };
+    std::regex colon(R"(([^:\r\n]+):(\d+):(?:(\d+):)?\s*(.*))");
+    for (const auto& raw : splitLines(out)) {
+        std::smatch m;
+        if (std::regex_search(raw, m, colon)) {
+            int ln = std::atoi(m[2].str().c_str());
+            int col = m[3].matched ? std::atoi(m[3].str().c_str()) : 0;
+            string reason = m[4].str();
+            if (reason.rfind("error:", 0) == 0) reason = reason.substr(6);
+            else if (reason.rfind("warning:", 0) == 0) reason = reason.substr(8);
+            add(ln, col, reason);
+        }
+    }
+    if (result.empty()) {
+        std::regex py(R"(File ".*?", line (\d+))");
+        std::regex pyErr(R"((\w*Error):\s*(.*))");
+        int ln = 0;
+        string reason;
+        for (const auto& raw : splitLines(out)) {
+            std::smatch m;
+            if (ln == 0 && std::regex_search(raw, m, py)) ln = std::atoi(m[1].str().c_str());
+            if (reason.empty() && std::regex_search(raw, m, pyErr))
+                reason = m[1].str() + ": " + m[2].str();
+        }
+        if (ln > 0 || !reason.empty()) add(ln, 0, reason.empty() ? "语法错误" : reason);
+    }
+    return result;
+}
 static Value compatParse(const string& lang0, const string& code, int line) {
     string lang = lowerAscii(lang0);
     if (lang == "json") {
@@ -5831,6 +5873,10 @@ static Value compatParse(const string& lang0, const string& code, int line) {
         d->items["ok"] = vBool(rc == 0);
         d->items["退出码"] = vNum((double)rc);
         d->items["输出"] = vStr(out);
+        auto diagList = std::make_shared<List>();
+        for (const auto& dv : parseExternalErrors(lang, out, code, line))
+            diagList->items.push_back(dv);
+        d->items["诊断"] = vList(diagList);
         std::error_code ec;
         fs::remove(tmp, ec);
         return vDict(d);
@@ -6305,6 +6351,13 @@ Interpreter::Interpreter() {
                               "c", "cpp", "lua", "ruby", "php", "bash", "rust", "go"})
             l->items.push_back(vStr(s));
         return vList(l);
+    });
+    registerBuiltin("兼容诊断", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        Value d = compatParse(needStr(a[0], "兼容诊断", line),
+                              needStr(a[1], "兼容诊断", line), line);
+        auto dict = needDict(d, "兼容诊断", line);
+        auto it = dict->items.find("诊断");
+        return it == dict->items.end() ? vList() : it->second;
     });
     registerBuiltin("兼容解析", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         return compatParse(needStr(a[0], "兼容解析", line),
