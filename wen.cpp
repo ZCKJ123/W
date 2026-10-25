@@ -1219,7 +1219,6 @@ private:
         s->k = Stmt::K::For;
         s->name = nm.text;
         s->nameSym = internSymbol(s->name);
-        s->nameSym = internSymbol(s->name);
         s->name2 = name2;
         s->name2Sym = name2.empty() ? 0 : internSymbol(name2);
         s->expr = iter;
@@ -1283,6 +1282,7 @@ private:
         auto s = std::make_shared<Stmt>();
         s->k = Stmt::K::Func;
         s->name = nm.text;
+        s->nameSym = internSymbol(s->name);
         s->params = std::move(params);
         for (const auto& p : s->params) s->paramSyms.push_back(internSymbol(p));
         s->body = body;
@@ -3709,8 +3709,8 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
             Value iter = eval(s->expr, scope);
             bool two = !s->name2.empty();
             auto runOne = [&](const Value& k, const Value& v) -> bool {
-                scope->set(s->nameSym ? s->nameSym : internSymbol(s->name), k);
-                if (two) scope->set(s->name2Sym ? s->name2Sym : internSymbol(s->name2), v);
+                scope->set(s->nameSym, k);
+                if (two) scope->set(s->name2Sym, v);
                 try {
                     for (const auto& st : s->body) exec(st, scope);
                 } catch (ContinueSignal&) {
@@ -3770,7 +3770,7 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
                 auto stack = std::make_shared<List>();
                 for (const auto& f : e.frames) stack->items.push_back(vStr(f));
                 d->items["栈"] = vList(stack);
-                scope->set(s->nameSym ? s->nameSym : internSymbol(s->name), vDict(d));
+                scope->set(s->nameSym, vDict(d));
                 try {
                     for (const auto& st : s->elseBody) exec(st, scope);
                 } catch (...) {
@@ -3802,7 +3802,7 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
                                        owner->second + "」占用；请改名");
                 symbolOwner[s->name] = "用户";
             }
-            scope->set(s->nameSym ? s->nameSym : internSymbol(s->name), vFunc(fn));
+            scope->set(s->nameSym, vFunc(fn));
             break;
         }
         case Stmt::K::Return: {
@@ -3842,7 +3842,7 @@ Value Interpreter::eval(const ExprPtr& e, shared_ptr<Scope> scope) {
         case Expr::K::None: return vNone();
         case Expr::K::Var: {
             Value v;
-            if (!(e->sym && scope->lookup(e->sym, v)) && !scope->lookup(e->text, v)) undefinedName(e->text, e->line);
+            if (!e->sym || !scope->lookup(e->sym, v)) undefinedName(e->text, e->line);
             // 零参数函数/内置：名字后面没写括号，也直接调用。
             // 要把它当值传给别人，请用有参数的函数（至少一个参数）。
             if (v.type == VT::Func && v.callable && v.callable->zeroArgCall()) {
@@ -4075,7 +4075,8 @@ Value Interpreter::callValue(const Value& callee, vector<Value>& args, int line)
 void Interpreter::assignTarget(const ExprPtr& target, const Value& val,
                                shared_ptr<Scope> scope) {
     if (target->k == Expr::K::Var) {
-        scope->set(target->sym ? target->sym : internSymbol(target->text), val);
+        if (!target->sym) rtError(target->line, "内部符号缺失：" + target->text);
+        scope->set(target->sym, val);
         return;
     }
     if (target->k == Expr::K::Index) {
@@ -4155,9 +4156,8 @@ Value Function::call(Interpreter& vm, vector<Value>& args, int callLine) {
                        " 个参数，收到 " + std::to_string(args.size()) + " 个");
     }
     auto scope = std::make_shared<Scope>(closure);
-    for (size_t i = 0; i < params.size(); ++i) scope->set(i < paramSyms.size() ? paramSyms[i] : internSymbol(params[i]), args[i]);
     for (size_t i = 0; i < params.size(); ++i) {
-        SymId id = i < paramSyms.size() ? paramSyms[i] : internSymbol(params[i]);
+        SymId id = paramSyms[i];
         scope->set(id, args[i]);
     }
     try {
