@@ -2854,6 +2854,7 @@ static const std::map<string, string>& functionModules() {
         {"翻译支持", "兼容库"}, {"翻译目标", "兼容库"}, {"翻译检查", "兼容库"},
         {"兼容支持", "兼容库"}, {"兼容翻译", "兼容库"}, {"兼容运行", "兼容库"},
         {"兼容语言", "兼容库"}, {"兼容解析", "兼容库"}, {"兼容诊断", "兼容库"},
+        {"兼容冲突", "兼容库"},
         {"翻译", "兼容库"}, {"执行字节码", "兼容库"},
         {"反汇编", "兼容库"}, {"反汇编文本", "兼容库"},
         {"二进制头", "兼容库"}, {"二进制字符串", "兼容库"}, {"二进制反汇编", "兼容库"},
@@ -5779,46 +5780,79 @@ static std::pair<int, string> runCapture(const string& cmd) {
 }
 
 static vector<Value> parseExternalErrors(const string& lang, const string& out,
-                                         const string& code, int line) {
+                                         const string& code, int line, int exitCode) {
     vector<Value> result;
     auto srcLines = splitLines(code);
-    auto add = [&](int ln, int col, const string& reason) {
-        if ((int)result.size() >= 20) return;
+    std::set<string> seen;
+    auto add = [&](int ln, int col, const string& reason, const string& raw) {
+        if ((int)result.size() >= 40) return;
+        string key = std::to_string(ln) + ":" + std::to_string(col) + ":" + reason;
+        if (!seen.insert(key).second) return;
         auto d = std::make_shared<Dict>();
+        d->items["文件"] = vStr("<代码>");
         d->items["行"] = vNum(ln);
         d->items["列"] = vNum(col);
         d->items["级别"] = vStr(reason.find("warning") != string::npos ? "警告" : "错误");
         d->items["原因"] = vStr(reason);
+        if (!raw.empty()) d->items["原始"] = vStr(raw);
         if (ln >= 1 && (size_t)ln <= srcLines.size())
             d->items["源码"] = vStr(srcLines[(size_t)ln - 1]);
         result.push_back(vDict(d));
     };
-    std::regex colon(R"(([^:\r\n]+):(\d+):(?:(\d+):)?\s*(.*))");
-    for (const auto& raw : splitLines(out)) {
+    auto lines = splitLines(out);
+    std::regex generic(R"(((?:[A-Za-z]:)?[^:\r\n]+):(\d+):(?:(\d+):)?\s*(?:error|warning|fatal error|note)?:?\s*(.+))");
+    for (size_t i = 0; i < lines.size(); ++i) {
         std::smatch m;
-        if (std::regex_search(raw, m, colon)) {
+        if (std::regex_search(lines[i], m, generic)) {
             int ln = std::atoi(m[2].str().c_str());
             int col = m[3].matched ? std::atoi(m[3].str().c_str()) : 0;
             string reason = m[4].str();
             if (reason.rfind("error:", 0) == 0) reason = reason.substr(6);
             else if (reason.rfind("warning:", 0) == 0) reason = reason.substr(8);
-            add(ln, col, reason);
+            add(ln, col, reason, lines[i]);
         }
     }
     if (result.empty()) {
         std::regex py(R"(File ".*?", line (\d+))");
         std::regex pyErr(R"((\w*Error):\s*(.*))");
-        int ln = 0;
+        int ln = 0, col = 0;
         string reason;
-        for (const auto& raw : splitLines(out)) {
+        for (size_t i = 0; i < lines.size(); ++i) {
             std::smatch m;
-            if (ln == 0 && std::regex_search(raw, m, py)) ln = std::atoi(m[1].str().c_str());
-            if (reason.empty() && std::regex_search(raw, m, pyErr))
+            if (ln == 0 && std::regex_search(lines[i], m, py)) ln = std::atoi(m[1].str().c_str());
+            if (reason.empty() && std::regex_search(lines[i], m, pyErr))
                 reason = m[1].str() + ": " + m[2].str();
+            if (ln > 0 && i > 0 && !lines[i - 1].empty()) {
+                auto caret = lines[i].find('^');
+                if (caret != string::npos) col = (int)caret + 1;
+            }
         }
-        if (ln > 0 || !reason.empty()) add(ln, 0, reason.empty() ? "语法错误" : reason);
+        if (ln > 0 || !reason.empty()) add(ln, col, reason.empty() ? "语法错误" : reason, "");
+    }
+    if (result.empty() && exitCode != 0) {
+        string first;
+        for (const auto& s : lines) {
+            if (!s.empty()) { first = s; break; }
+        }
+        bool missing = first.find("not recognized") != string::npos ||
+                       first.find("不是内部或外部命令") != string::npos ||
+                       first.find("command not found") != string::npos;
+        add(0, 0, missing ? "解析器不可用：" + first : (first.empty() ? "解析失败" : first), first);
     }
     return result;
+}
+static vector<std::pair<int, string>> compatTargetLines(const string& src) {
+    vector<std::pair<int, string>> out;
+    int n = 0;
+    for (const auto& raw : splitLines(src)) {
+        ++n;
+        size_t b = raw.find_first_not_of(" \t");
+        if (b == string::npos) continue;
+        string s = raw.substr(b);
+        if (s.rfind("# 翻译:", 0) == 0) out.push_back({n, "翻译:" + s.substr(6)});
+        else if (s.rfind("# 外派:", 0) == 0) out.push_back({n, "外派:" + s.substr(6)});
+    }
+    return out;
 }
 static Value compatParse(const string& lang0, const string& code, int line) {
     string lang = lowerAscii(lang0);
@@ -5874,7 +5908,7 @@ static Value compatParse(const string& lang0, const string& code, int line) {
         d->items["退出码"] = vNum((double)rc);
         d->items["输出"] = vStr(out);
         auto diagList = std::make_shared<List>();
-        for (const auto& dv : parseExternalErrors(lang, out, code, line))
+        for (const auto& dv : parseExternalErrors(lang, out, code, line, rc))
             diagList->items.push_back(dv);
         d->items["诊断"] = vList(diagList);
         std::error_code ec;
@@ -6362,6 +6396,21 @@ Interpreter::Interpreter() {
     registerBuiltin("兼容解析", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         return compatParse(needStr(a[0], "兼容解析", line),
                            needStr(a[1], "兼容解析", line), line);
+    });
+    registerBuiltin("兼容冲突", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string src = needStr(a[0], "兼容冲突", line);
+        auto targets = compatTargetLines(src);
+        auto d = std::make_shared<Dict>();
+        d->items["冲突"] = vBool(targets.size() > 1);
+        auto names = std::make_shared<List>();
+        auto lines = std::make_shared<List>();
+        for (const auto& t : targets) {
+            names->items.push_back(vStr(t.second));
+            lines->items.push_back(vNum(t.first));
+        }
+        d->items["目标"] = vList(names);
+        d->items["行"] = vList(lines);
+        return vDict(d);
     });
     registerBuiltin("兼容支持", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
         auto l = std::make_shared<List>();
@@ -11289,6 +11338,8 @@ static string errorExplanation(const string& kind) {
         return "文件路径不存在、没有读写权限，或目录创建失败。";
     if (kind == "库冲突")
         return "两个库或用户代码定义了同名函数；改名，或去掉其中一个依赖。";
+    if (kind == "兼容冲突")
+        return "源文件里写了多个翻译目标；一个文件只能保留一个目标行。";
     if (kind == "权限错误")
         return "需要管理员权限或危险模式；先设置 WEN_ADMIN_TOKEN 并申请管理员。";
     return "解释器内部异常。";
