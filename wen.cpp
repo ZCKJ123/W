@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <ctime>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -23,6 +24,7 @@
 #include <map>
 #include <memory>
 #include <random>
+#include <regex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -2727,6 +2729,14 @@ static Value applyBinary(const string& op, const Value& a, const Value& b, int l
 // 每个函数属于哪个库；没写「依赖」就用，会报错提醒。
 static const std::map<string, string>& functionModules() {
     static const std::map<string, string> m = {
+        // 时间 / 编码 / 正则
+        {"现在", "时间库"}, {"时间戳", "时间库"}, {"毫秒时间", "时间库"},
+        {"格式化时间", "时间库"}, {"解析时间", "时间库"}, {"休眠", "时间库"},
+        {"Base64编码", "编码库"}, {"Base64解码", "编码库"},
+        {"URL编码", "编码库"}, {"URL解码", "编码库"},
+        {"正则匹配", "正则库"}, {"正则查找", "正则库"},
+        {"正则替换", "正则库"}, {"正则分割", "正则库"},
+
         // 数学库
         {"平方根", "数学库"}, {"绝对值", "数学库"}, {"取整", "数学库"},
         {"向下取整", "数学库"}, {"向上取整", "数学库"}, {"指数", "数学库"},
@@ -2908,6 +2918,7 @@ public:
     bool lastWasExpr = false;
     Value lastValue;
     std::set<string> loadedModules;
+    std::map<string, string> symbolOwner;  // 名字 -> 库/用户，防止静默覆盖
     std::map<string, std::map<string, Value>> libraryFunctions;  // 库名 -> 函数表
     std::vector<Value> renderScene;  // 渲染场景：面/涂鸦/渐变/体积光，供各后端使用
     bool accelEnabled = false;       // 加速库：纯函数结果缓存开关
@@ -3208,7 +3219,15 @@ void Interpreter::加载模块(const string& rawName, int line) {
                        "未知库「" + name + "」；目前支持：" + list);
     }
     // 核心只负责安装：库自己声明了哪些函数，这里就装哪些。
-    for (const auto& kv : lib->second) globals->vars[kv.first] = kv.second;
+    for (const auto& kv : lib->second) {
+        auto owner = symbolOwner.find(kv.first);
+        if (owner != symbolOwner.end() && owner->second != name)
+            throw WenError("库冲突", line, 0,
+                           "函数「" + kv.first + "」已被「" + owner->second +
+                               "」占用；依赖「" + name + "」会覆盖它，请改名或去掉其中一个库");
+        globals->vars[kv.first] = kv.second;
+        symbolOwner[kv.first] = name;
+    }
     if (name == "数学库") {
         const double pi = std::acos(-1.0);
         globals->vars["圆周率"] = vNum(pi);
@@ -3286,11 +3305,17 @@ void Interpreter::加载外部库(const string& name, int line) {
         auto moduleScope = std::make_shared<Scope>(globals);
         execProgram(program, moduleScope);
 
+        auto installExport = [&](const string& n, const Value& val) {
+            auto owner = symbolOwner.find(n);
+            if (owner != symbolOwner.end() && owner->second != name)
+                throw WenError("库冲突", line, 0,
+                               "名字「" + n + "」已被「" + owner->second +
+                                   "」占用；库「" + name + "」不能再导出它");
+            globals->vars[n] = val;
+            symbolOwner[n] = name;
+        };
         if (moduleExports.empty()) {
-            // 没写「导出」：保持旧行为，导出库里的全部变量/函数
-            for (const auto& kv : moduleScope->vars) {
-                globals->vars[kv.first] = kv.second;
-            }
+            for (const auto& kv : moduleScope->vars) installExport(kv.first, kv.second);
         } else {
             for (const auto& n : moduleExports) {
                 auto it = moduleScope->vars.find(n);
@@ -3299,7 +3324,7 @@ void Interpreter::加载外部库(const string& name, int line) {
                                    "库「" + name + "」导出的名字「" + n +
                                    "」没有定义");
                 }
-                globals->vars[n] = it->second;
+                installExport(n, it->second);
             }
         }
         filename = oldFile;
@@ -3483,6 +3508,14 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
             fn->body = s->body;
             fn->closure = scope;
             fn->line = s->line;
+            if (scope == globals || (scope->parent && scope->parent == globals)) {
+                auto owner = symbolOwner.find(s->name);
+                if (owner != symbolOwner.end() && owner->second != "用户")
+                    throw WenError("库冲突", s->line, 0,
+                                   "名字「" + s->name + "」已被库「" +
+                                       owner->second + "」占用；请改名");
+                symbolOwner[s->name] = "用户";
+            }
             scope->vars[s->name] = vFunc(fn);
             break;
         }
@@ -6902,7 +6935,147 @@ Interpreter::Interpreter() {
         for (const auto& v : l->items) xs.push_back(needNum(v, "CPU并行最小", line));
         if (xs.empty()) throw WenError("运行时错误", line, 0, "列表不能为空");
         return vNum(parallelReduceNums(xs, 2));
-    });    // ---------- 数学 ----------
+    });    // ---------- 时间 / 编码 / 正则 ----------
+    registerBuiltin("现在", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+        std::time_t t = std::time(nullptr);
+        std::tm lt = *std::localtime(&t);
+        char buf[32];
+        std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &lt);
+        return vStr(buf);
+    });
+    registerBuiltin("时间戳", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+        return vNum((double)std::time(nullptr));
+    });
+    registerBuiltin("毫秒时间", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+        using namespace std::chrono;
+        return vNum((double)duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count());
+    });
+    registerBuiltin("格式化时间", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        std::time_t t = (std::time_t)needNum(a[0], "格式化时间", line);
+        std::tm lt = *std::localtime(&t);
+        char buf[32];
+        std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &lt);
+        return vStr(buf);
+    });
+    registerBuiltin("解析时间", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string s = needStr(a[0], "解析时间", line);
+        std::tm tm{};
+        std::istringstream ss(s);
+        ss >> std::get_time(&tm, "%Y-%m-%d %H:%M:%S");
+        if (ss.fail()) throw WenError("运行时错误", line, 0, "时间格式应为 YYYY-MM-DD HH:MM:SS");
+        return vNum((double)std::mktime(&tm));
+    });
+    registerBuiltin("休眠", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long ms = needIndex(a[0], "休眠", line);
+        if (ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        return vNone();
+    });
+    registerBuiltin("Base64编码", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        static const char* T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        string s = needStr(a[0], "Base64编码", line), out;
+        int val = 0, bits = -6;
+        for (unsigned char c : s) {
+            val = (val << 8) + c;
+            bits += 8;
+            while (bits >= 0) {
+                out += T[(val >> bits) & 63];
+                bits -= 6;
+            }
+        }
+        if (bits > -6) out += T[((val << 8) >> (bits + 8)) & 63];
+        while (out.size() % 4) out += '=';
+        return vStr(out);
+    });
+    registerBuiltin("Base64解码", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        static const string T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        string s = needStr(a[0], "Base64解码", line), out;
+        int val = 0, bits = -8;
+        for (unsigned char c : s) {
+            if (c == '=') break;
+            auto p = T.find((char)c);
+            if (p == string::npos) throw WenError("运行时错误", line, 0, "Base64 含非法字符");
+            val = (val << 6) + (int)p;
+            bits += 6;
+            if (bits >= 0) {
+                out += (char)((val >> bits) & 255);
+                bits -= 8;
+            }
+        }
+        return vStr(out);
+    });
+    registerBuiltin("URL编码", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        static const char* H = "0123456789ABCDEF";
+        string s = needStr(a[0], "URL编码", line), out;
+        for (unsigned char c : s) {
+            if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') out += (char)c;
+            else {
+                out += '%';
+                out += H[c >> 4];
+                out += H[c & 15];
+            }
+        }
+        return vStr(out);
+    });
+    registerBuiltin("URL解码", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string s = needStr(a[0], "URL解码", line), out;
+        auto hex = [&](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            throw WenError("运行时错误", line, 0, "URL 编码含非法字符");
+        };
+        for (size_t i = 0; i < s.size(); ++i) {
+            if (s[i] == '%') {
+                if (i + 2 >= s.size()) throw WenError("运行时错误", line, 0, "URL 编码不完整");
+                out += (char)((hex(s[i + 1]) << 4) | hex(s[i + 2]));
+                i += 2;
+            } else if (s[i] == '+') out += ' ';
+            else out += s[i];
+        }
+        return vStr(out);
+    });
+    registerBuiltin("正则匹配", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        try {
+            std::regex re(needStr(a[1], "正则匹配", line));
+            return vBool(std::regex_search(needStr(a[0], "正则匹配", line), re));
+        } catch (std::regex_error& e) {
+            throw WenError("运行时错误", line, 0, string("正则表达式错误：") + e.what());
+        }
+    });
+    registerBuiltin("正则查找", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        try {
+            std::regex re(needStr(a[1], "正则查找", line));
+            string s = needStr(a[0], "正则查找", line);
+            auto out = std::make_shared<List>();
+            for (std::sregex_iterator it(s.begin(), s.end(), re), end; it != end; ++it)
+                out->items.push_back(vStr(it->str()));
+            return vList(out);
+        } catch (std::regex_error& e) {
+            throw WenError("运行时错误", line, 0, string("正则表达式错误：") + e.what());
+        }
+    });
+    registerBuiltin("正则替换", 3, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        try {
+            std::regex re(needStr(a[1], "正则替换", line));
+            return vStr(std::regex_replace(needStr(a[0], "正则替换", line), re,
+                                           needStr(a[2], "正则替换", line)));
+        } catch (std::regex_error& e) {
+            throw WenError("运行时错误", line, 0, string("正则表达式错误：") + e.what());
+        }
+    });
+    registerBuiltin("正则分割", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        try {
+            std::regex re(needStr(a[1], "正则分割", line));
+            string s = needStr(a[0], "正则分割", line);
+            auto out = std::make_shared<List>();
+            std::sregex_token_iterator it(s.begin(), s.end(), re, -1), end;
+            for (; it != end; ++it) out->items.push_back(vStr(*it));
+            return vList(out);
+        } catch (std::regex_error& e) {
+            throw WenError("运行时错误", line, 0, string("正则表达式错误：") + e.what());
+        }
+    });
+    // ---------- 数学 ----------
     auto m1 = [this](const string& name, double (*f)(double)) {
         registerBuiltin(name, 1, 1,
                         [name, f](Interpreter&, vector<Value>& a, int line) -> Value {
@@ -10105,6 +10278,8 @@ static string errorExplanation(const string& kind) {
         return "这段脚本含有编译模式暂不支持的写法。";
     if (kind == "文件错误")
         return "文件路径不存在、没有读写权限，或目录创建失败。";
+    if (kind == "库冲突")
+        return "两个库或用户代码定义了同名函数；改名，或去掉其中一个依赖。";
     return "解释器内部异常。";
 }
 
