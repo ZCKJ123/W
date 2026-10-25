@@ -2816,8 +2816,8 @@ static const std::map<string, string>& functionModules() {
         {"导出OpenGL", "渲染库"}, {"导出WebGPU", "渲染库"}, {"导出Vulkan", "渲染库"},
 
         // 加速库
-        {"开启加速", "加速库"}, {"关闭加速", "加速库"}, {"清空缓存", "加速库"},
-        {"缓存大小", "加速库"}, {"加速命中", "加速库"},
+        {"开启加速", "跃迁库"}, {"关闭加速", "跃迁库"}, {"清空缓存", "跃迁库"},
+        {"缓存大小", "跃迁库"}, {"加速命中", "跃迁库"},
 
         // 翻译器
         {"翻译支持", "翻译器"}, {"翻译目标", "翻译器"}, {"翻译检查", "翻译器"},
@@ -2839,11 +2839,11 @@ static const std::map<string, string>& functionModules() {
         {"牵引", "内存库"}, {"牵引范围", "内存库"}, {"牵引名单", "内存库"},
         {"牵引清空", "内存库"}, {"压缩牵引", "内存库"},
         {"内存压缩率", "内存库"}, {"内存字典", "内存库"}, {"内存对半切", "内存库"},
-        {"内存清场", "内存库"}, {"内存压缩阈值", "内存库"},
+        {"内存清场", "内存库"}, {"内存压缩阈值", "内存库"}, {"压缩", "内存库"}, {"压缩率", "内存库"}, {"清空", "内存库"},
 
         // 外派库
-        {"外派支持", "外派库"}, {"外派目标", "外派库"}, {"外派检查", "外派库"},
-        {"外派翻译", "外派库"},
+        {"外派支持", "翻译器"}, {"外派目标", "翻译器"}, {"外派检查", "翻译器"},
+        {"外派翻译", "翻译器"},
 
         // 跃迁库
         {"跃迁查", "跃迁库"}, {"跃迁记", "跃迁库"}, {"跃迁清空", "跃迁库"},
@@ -3240,6 +3240,8 @@ void Interpreter::加载模块(const string& rawName, int line) {
     string name = rawName;
     if (name == "JSON库") name = "数据格式库";
     else if (name == "HTML库") name = "网页库";
+    else if (name == "加速库") name = "跃迁库";
+    else if (name == "外派库") name = "翻译器";
     if (loadedModules.count(name)) return;
     auto lib = libraryFunctions.find(name);
     if (lib == libraryFunctions.end()) {
@@ -3284,6 +3286,8 @@ bool Interpreter::是内置库(const string& rawName) const {
     string name = rawName;
     if (name == "JSON库") name = "数据格式库";
     else if (name == "HTML库") name = "网页库";
+    else if (name == "加速库") name = "跃迁库";
+    else if (name == "外派库") name = "翻译器";
     return libraryFunctions.count(name) > 0;
 }
 
@@ -6668,6 +6672,54 @@ Interpreter::Interpreter() {
         memoryTemp.clear();
         return vNum((double)n);
     });
+    registerBuiltin("压缩", 1, 2, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+        string what = needStr(a[0], "压缩", line);
+        auto callOld = [&](const string& name, vector<Value> args) -> Value {
+            Value fn;
+            if (!globals->lookup(name, fn))
+                throw WenError("运行时错误", line, 0, "内部缺少「" + name + "」");
+            return callValue(fn, args, line);
+        };
+        if (what == "全部") return callOld("压缩全部内存", {});
+        if (what == "牵引") return callOld("压缩牵引", {});
+        if (what == "键") {
+            if (a.size() < 2) throw WenError("运行时错误", line, 0, "压缩(\"键\", 键) 缺键");
+            return callOld("压缩内存", {a[1]});
+        }
+        return callOld("压缩内存", {a[0]});
+    });
+    registerBuiltin("压缩率", 0, 0, [this](Interpreter&, vector<Value>&, int line) -> Value {
+        Value fn;
+        if (!globals->lookup("内存压缩率", fn))
+            throw WenError("运行时错误", line, 0, "内存压缩率不存在");
+        vector<Value> no;
+        return callValue(fn, no, line);
+    });
+    registerBuiltin("清空", 1, 2, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+        string what = needStr(a[0], "清空", line);
+        auto callOld = [&](const string& name, vector<Value> args) -> Value {
+            Value fn;
+            if (!globals->lookup(name, fn))
+                throw WenError("运行时错误", line, 0, "内部缺少「" + name + "」");
+            return callValue(fn, args, line);
+        };
+        if (what == "全部") return callOld("内存清空", {});
+        if (what == "常驻") return callOld("内存清场", {});
+        if (what == "临时") return callOld("内存清临时", {});
+        if (what == "压缩") {
+            size_t n = memoryCompressed.size();
+            memoryCompressed.clear();
+            memoryOrigSize.clear();
+            memoryDict.clear();
+            memoryDictIndex.clear();
+            return vNum((double)n);
+        }
+        if (what == "键") {
+            if (a.size() < 2) throw WenError("运行时错误", line, 0, "清空(\"键\", 键) 缺键");
+            return callOld("内存删", {a[1]});
+        }
+        return callOld("内存删", {a[0]});
+    });
     registerBuiltin("内存缓存", 2, -1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
         string key = "cache|" + accelKey("", vector<Value>(a.begin() + 1, a.end()));
         auto it = memoryStore.find(key);
@@ -6927,11 +6979,9 @@ Interpreter::Interpreter() {
             {"物理库", "力学、热学、电学、光学、天体"},
             {"图形库", "面积、体积、表面积、距离"},
             {"渲染库", "面、涂鸦、渐变、体积光、导出后端"},
-            {"加速库", "纯函数结果缓存"},
-            {"外派库", "翻译到 Python/JS/JSON/Java"},
-            {"跃迁库", "同键跳过重复计算"},
+            {"跃迁库", "自动/纯函数缓存、统计、快照"},
             {"内存库", "常驻/临时内存、函数缓存、压缩、牵引"},
-            {"翻译器", "翻译到字节码/C++/汇编"},
+            {"翻译器", "翻译到 Python/JS/JSON/Java/字节码/C++/汇编"},
             {"函数库", "映射、过滤、折叠、排序、积分"},
             {"文件库", "读写、复制、重命名、目录"},
             {"输入库", "读整数/小数/按键、清屏"},
