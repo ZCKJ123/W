@@ -7117,6 +7117,49 @@ Interpreter::Interpreter() {
         }
         return vBool(dangerousMode);
     });
+    registerBuiltin("并行", 2, -1, [](Interpreter& vm, vector<Value>& a, int line) -> Value {
+        if (a[0].type != VT::Func || !a[0].callable)
+            throw WenError("运行时错误", line, 0, "并行需要函数");
+        auto b = std::dynamic_pointer_cast<Builtin>(a[0].callable);
+        if (!b || !b->cacheable())
+            throw WenError("运行时错误", line, 0,
+                           "并行只支持同一库的纯函数（数学/物理/概率等）");
+        vector<vector<Value>> calls;
+        for (size_t i = 1; i < a.size(); ++i) {
+            if (b->maxArgs != 1 && a[i].type == VT::List && a[i].list) {
+                calls.push_back(a[i].list->items);
+            } else {
+                calls.push_back({a[i]});
+            }
+        }
+        if (calls.size() > 64)
+            throw WenError("运行时错误", line, 0, "并行最多 64 组");
+        vector<Value> results(calls.size());
+        vector<string> errors(calls.size());
+        unsigned hw = std::thread::hardware_concurrency();
+        size_t threads = std::max(1u, std::min<unsigned>(hw ? hw : 1, (unsigned)calls.size()));
+        threads = std::min<size_t>(threads, 8);
+        vector<std::thread> pool;
+        for (size_t t = 0; t < threads; ++t) {
+            pool.emplace_back([&, t]() {
+                for (size_t i = t; i < calls.size(); i += threads) {
+                    try {
+                        results[i] = b->fn(vm, calls[i], line);
+                    } catch (WenError& e) {
+                        errors[i] = e.what();
+                    } catch (std::exception& e) {
+                        errors[i] = e.what();
+                    }
+                }
+            });
+        }
+        for (auto& th : pool) th.join();
+        for (const auto& e : errors)
+            if (!e.empty()) throw WenError("运行时错误", line, 0, "并行调用失败：" + e);
+        auto out = std::make_shared<List>();
+        out->items = std::move(results);
+        return vList(out);
+    });
     registerBuiltin("签名", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
         return vStr(WEN_SIGNATURE);
     });
