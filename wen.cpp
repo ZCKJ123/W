@@ -8519,6 +8519,63 @@ Interpreter::Interpreter() {
         string path = needStr(a[0], "导出OpenGL", line);
         if (renderScene.empty())
             throw WenError("运行时错误", line, 0, "场景是空的；先调用涂鸦/渐变/体积光");
+        bool has3D = false;
+        for (const auto& node : renderScene) {
+            auto d = needDict(node, "场景", line);
+            auto t = d->items.find("类型");
+            if (t != d->items.end() && toText(t->second) == "三维面") has3D = true;
+        }
+        if (has3D) {
+            string tpl3;
+            try {
+                tpl3 = readWholeFile("渲染后端/opengl3d模板.cpp");
+            } catch (IoError& e) {
+                throw WenError("文件错误", line, 0,
+                               "打不开 3D 模板（渲染后端/opengl3d模板.cpp）：" + string(e.what()));
+            }
+            std::ostringstream code;
+            auto f3 = [](double v) {
+                std::ostringstream s;
+                s << std::setprecision(8) << v;
+                string t = s.str();
+                if (t.find('.') == string::npos && t.find('e') == string::npos &&
+                    t.find('E') == string::npos) t += ".0";
+                return t + "f";
+            };
+            double maxr = 1.0;
+            for (const auto& node : renderScene) {
+                auto d = needDict(node, "场景", line);
+                auto t = d->items.find("类型");
+                if (t == d->items.end() || toText(t->second) != "三维面") continue;
+                auto pts = render3Vertices(d->items.at("顶点"), line);
+                string color = d->items.count("颜色") ? needStr(d->items["颜色"], "颜色", line) : "#4aa3ff";
+                auto rgb = renderHexRgb(color);
+                code << "    {{";
+                for (size_t i = 0; i < pts.size(); ++i) {
+                    if (i) code << ", ";
+                    code << "{" << f3(pts[i].x) << "," << f3(pts[i].y) << "," << f3(pts[i].z) << "}";
+                    maxr = std::max(maxr, std::sqrt(pts[i].x * pts[i].x + pts[i].y * pts[i].y + pts[i].z * pts[i].z));
+                }
+                code << "}, " << f3(rgb[0]) << ", " << f3(rgb[1]) << ", " << f3(rgb[2]) << "},\n";
+            }
+            size_t p3 = tpl3.find("// __SCENE3D__");
+            if (p3 == string::npos) throw WenError("引擎错误", line, 0, "3D 模板缺少 __SCENE3D__");
+            tpl3.replace(p3, string("// __SCENE3D__").size(), code.str());
+            auto repl = [&](const string& key, const string& val) {
+                size_t q = tpl3.find(key);
+                if (q != string::npos) tpl3.replace(q, key.size(), val);
+            };
+            repl("@W@", "900");
+            repl("@H@", "650");
+            repl("@CAM@", std::to_string(std::max(3.0, maxr * 2.8)));
+            try {
+                ensureParentDirectory(path);
+                writeWholeFile(path, tpl3, false);
+            } catch (IoError& e) {
+                throw WenError("文件错误", line, 0, e.what());
+            }
+            return vStr(path);
+        }
         string tpl;
         try {
             tpl = readWholeFile("渲染后端/opengl模板.cpp");

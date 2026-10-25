@@ -1,11 +1,13 @@
 # 构建产物
 wen.exe
 *.exe
+*.dll
 *.o
 *.obj
 
 # 例子生成的临时文件
 例子/*.exe
+*.dll
 例子/*.svg
 例子/笔记.txt
 
