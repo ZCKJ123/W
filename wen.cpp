@@ -2806,7 +2806,10 @@ static const std::map<string, string>& functionModules() {
 
         // 跃迁库
         {"跃迁查", "跃迁库"}, {"跃迁记", "跃迁库"}, {"跃迁清空", "跃迁库"},
-        {"跃迁调用", "跃迁库"},
+        {"跃迁调用", "跃迁库"}, {"开启跃迁", "跃迁库"}, {"关闭跃迁", "跃迁库"},
+        {"跃迁大小", "跃迁库"}, {"跃迁命中", "跃迁库"}, {"跃迁未命中", "跃迁库"},
+        {"跃迁复用率", "跃迁库"}, {"跃迁容量", "跃迁库"}, {"跃迁快照", "跃迁库"},
+        {"跃迁恢复", "跃迁库"}, {"跃迁导出", "跃迁库"}, {"跃迁导入", "跃迁库"},
 
         // 物理库
         {"速度", "物理库"}, {"加速度", "物理库"}, {"力", "物理库"},
@@ -2911,6 +2914,10 @@ public:
     std::map<string, Value> accelCache;
     long long accelHits = 0;
     std::map<string, Value> leapCache;  // 跃迁库：同键直接跳过计算
+    bool leapAuto = false;               // 跃迁库：自动缓存用户函数
+    long long leapHits = 0;
+    long long leapMisses = 0;
+    size_t leapLimit = 200000;
     std::map<string, Value> memoryStore;  // 内存库：常驻
     std::map<string, Value> memoryTemp;   // 内存库：临时
     std::map<string, string> memoryCompressed;  // 内存库：压缩区
@@ -2941,6 +2948,7 @@ public:
     vector<StmtPtr> parseSource(const string& src);
     void scanPull(const string& src);
     bool isPulled(const string& key) const;
+    string leapKey(const Value& key, int line);
     void buildMemoryDict(const string& extra = "");
     string compressMemoryText(const string& text);
     string decompressMemoryText(const string& text, int line);
@@ -3140,6 +3148,13 @@ string Interpreter::compressMemoryText(const string& text) {
     if (saving < memoryMinSavings) return text;
     if (decompressMemoryText(out, 0) != text) return text;
     return out;
+}
+
+static string accelKey(const string& name, const vector<Value>& args);
+string Interpreter::leapKey(const Value& key, int line) {
+    if (key.type == VT::Str) return key.str;
+    vector<Value> one{key};
+    return "key|" + accelKey("", one);
 }
 
 string Interpreter::decompressMemoryText(const string& text, int line) {
@@ -3675,6 +3690,25 @@ Value Interpreter::callValue(const Value& callee, vector<Value>& args, int line)
             accelCache[key] = out;
         }
         return out;
+    }
+    if (leapAuto) {
+        auto lfn = std::dynamic_pointer_cast<Function>(callee.callable);
+        if (lfn && !lfn->name.empty()) {
+            string key = "leap|" + lfn->name + accelKey("", args);
+            auto it = leapCache.find(key);
+            if (it != leapCache.end()) {
+                ++leapHits;
+                return it->second;
+            }
+            ++leapMisses;
+            Value out = lfn->call(*this, args, line);
+            if (out.type == VT::Num || out.type == VT::Str || out.type == VT::Bool ||
+                out.type == VT::None) {
+                if (leapCache.size() >= leapLimit) leapCache.clear();
+                leapCache[key] = out;
+            }
+            return out;
+        }
     }
     if (memoryAuto && callee.type == VT::Func) {
         auto fn = std::dynamic_pointer_cast<Function>(callee.callable);
@@ -6502,29 +6536,114 @@ Interpreter::Interpreter() {
     });
 
     // ---------- 跃迁库 ----------
+    registerBuiltin("开启跃迁", 0, 0, [this](Interpreter&, vector<Value>&, int) -> Value {
+        leapAuto = true;
+        return vBool(true);
+    });
+    registerBuiltin("关闭跃迁", 0, 0, [this](Interpreter&, vector<Value>&, int) -> Value {
+        leapAuto = false;
+        return vBool(true);
+    });
     registerBuiltin("跃迁查", 1, 1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
-        string key = needStr(a[0], "跃迁查", line);
+        string key = leapKey(a[0], line);
         return vBool(leapCache.count(key) > 0);
     });
     registerBuiltin("跃迁记", 2, 2, [this](Interpreter&, vector<Value>& a, int line) -> Value {
-        string key = needStr(a[0], "跃迁记", line);
+        string key = leapKey(a[0], line);
         leapCache[key] = a[1];
         return a[1];
     });
     registerBuiltin("跃迁清空", 0, 0, [this](Interpreter&, vector<Value>&, int) -> Value {
         leapCache.clear();
+        leapHits = 0;
+        leapMisses = 0;
         return vNone();
     });
     registerBuiltin("跃迁调用", 2, -1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
-        string key = needStr(a[0], "跃迁调用", line);
+        string key = leapKey(a[0], line);
         auto it = leapCache.find(key);
-        if (it != leapCache.end()) return it->second;
+        if (it != leapCache.end()) {
+            ++leapHits;
+            return it->second;
+        }
+        ++leapMisses;
         vector<Value> args(a.begin() + 2, a.end());
         Value out = callValue(a[1], args, line);
-        leapCache[key] = out;
+        if (out.type == VT::Num || out.type == VT::Str || out.type == VT::Bool ||
+            out.type == VT::None) {
+            if (leapCache.size() >= leapLimit) leapCache.clear();
+            leapCache[key] = out;
+        }
         return out;
     });
-
+    registerBuiltin("跃迁大小", 0, 0, [this](Interpreter&, vector<Value>&, int) -> Value {
+        return vNum((double)leapCache.size());
+    });
+    registerBuiltin("跃迁命中", 0, 0, [this](Interpreter&, vector<Value>&, int) -> Value {
+        return vNum((double)leapHits);
+    });
+    registerBuiltin("跃迁未命中", 0, 0, [this](Interpreter&, vector<Value>&, int) -> Value {
+        return vNum((double)leapMisses);
+    });
+    registerBuiltin("跃迁复用率", 0, 0, [this](Interpreter&, vector<Value>&, int) -> Value {
+        long long total = leapHits + leapMisses;
+        return vNum(total == 0 ? 0.0 : (double)leapHits / (double)total);
+    });
+    registerBuiltin("跃迁容量", 0, 1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (!a.empty()) {
+            long long n = needIndex(a[0], "跃迁容量", line);
+            if (n < 1) throw WenError("运行时错误", line, 0, "容量必须大于 0");
+            leapLimit = (size_t)n;
+            if (leapCache.size() > leapLimit) leapCache.clear();
+        }
+        return vNum((double)leapLimit);
+    });
+    registerBuiltin("跃迁快照", 0, 0, [this](Interpreter&, vector<Value>&, int) -> Value {
+        auto d = std::make_shared<Dict>();
+        for (const auto& kv : leapCache) {
+            if (kv.second.type != VT::Func) d->items[kv.first] = kv.second;
+        }
+        return vDict(d);
+    });
+    registerBuiltin("跃迁恢复", 1, 1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto d = needDict(a[0], "跃迁恢复", line);
+        leapCache.clear();
+        for (const auto& kv : d->items) {
+            if (kv.second.type != VT::Func) leapCache[kv.first] = kv.second;
+        }
+        return vNum((double)leapCache.size());
+    });
+    registerBuiltin("跃迁导出", 1, 1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path = needStr(a[0], "跃迁导出", line);
+        auto d = std::make_shared<Dict>();
+        for (const auto& kv : leapCache) {
+            if (kv.second.type != VT::Func) d->items[kv.first] = kv.second;
+        }
+        string text = jsonDump(vDict(d), line);
+        try {
+            ensureParentDirectory(path);
+            writeWholeFile(path, text, false);
+        } catch (IoError& e) {
+            throw WenError("文件错误", line, 0, e.what());
+        }
+        return vNum((double)d->items.size());
+    });
+    registerBuiltin("跃迁导入", 1, 1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path = needStr(a[0], "跃迁导入", line);
+        string text;
+        try {
+            text = readWholeFile(path);
+        } catch (IoError& e) {
+            throw WenError("文件错误", line, 0, e.what());
+        }
+        JsonReader reader(text, line);
+        auto d = needDict(reader.parse(), "跃迁导入", line);
+        leapCache.clear();
+        for (const auto& kv : d->items) {
+            if (kv.second.type != VT::Func) leapCache[kv.first] = kv.second;
+        }
+        return vNum((double)leapCache.size());
+    });
     // ---------- 加速库 ----------
     registerBuiltin("开启加速", 0, 0, [this](Interpreter&, vector<Value>&, int) -> Value {
         accelEnabled = true;
