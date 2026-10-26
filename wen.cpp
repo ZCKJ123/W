@@ -3326,7 +3326,7 @@ static const std::map<string, string>& functionModules() {
         {"新建神经层", "神经网络库"}, {"神经链", "神经网络库"}, {"前向", "神经网络库"},
         {"颜色", "视口库"}, {"新建视口", "视口库"}, {"视口清空", "视口库"}, {"视口画点", "视口库"},
         {"视口画线", "视口库"}, {"视口画三角形", "视口库"}, {"视口尺寸", "视口库"}, {"视口保存", "视口库"},
-        {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"},
+        {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"}, {"视口显示", "视口库"},
         {"大整数幂", "大整数库"}, {"大整数乘", "大整数库"}, {"大整数加", "大整数库"}, {"大整数阶乘", "大整数库"},
         {"阶乘位数", "大整数库"}, {"阶乘末尾零", "大整数库"}, {"阶乘概览", "大整数库"},
         {"大整数规模", "大整数库"}, {"阶乘规模", "大整数库"},
@@ -4925,6 +4925,30 @@ static void writeFixed(vector<unsigned char>& b, size_t off, int width, uint64_t
         b[off + (size_t)idx] = (unsigned char)((v >> (8 * i)) & 255);
     }
 }
+#ifdef _WIN32
+struct VpWindowData { int w; int h; std::vector<unsigned char> bgr; };
+static VpWindowData* gVpWin = nullptr;
+static LRESULT CALLBACK vpWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_PAINT && gVpWin) {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        BITMAPINFO bi;
+        ZeroMemory(&bi, sizeof(bi));
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = gVpWin->w;
+        bi.bmiHeader.biHeight = -gVpWin->h;
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 24;
+        bi.bmiHeader.biCompression = BI_RGB;
+        SetDIBitsToDevice(dc, 0, 0, gVpWin->w, gVpWin->h, 0, 0, 0, gVpWin->h,
+                          gVpWin->bgr.data(), &bi, DIB_RGB_COLORS);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    if (msg == WM_DESTROY) { PostQuitMessage(0); return 0; }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+#endif
 static int vpColor(const Value& v, int line) {
     long long c = (long long)needNum(v, "视口颜色", line);
     if (c < 0) c = 0;
@@ -9475,6 +9499,48 @@ Interpreter::Interpreter() {
             vpPut(d,x,y,(r<<16)|(g<<8)|b);
         }
         return a[0];
+    });
+    registerBuiltin("视口显示", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+#ifdef _WIN32
+        auto d = vpDict(a[0], line);
+        int w = (int)needNum(d->items.at("宽"), "视口", line);
+        int h = (int)needNum(d->items.at("高"), "视口", line);
+        string title = a.size() > 1 ? needStr(a[1], "视口显示", line) : "文语言视口";
+        auto& p = vpPixels(d);
+        VpWindowData data;
+        data.w = w; data.h = h; data.bgr.resize((size_t)w * h * 3);
+        for (int i = 0; i < w * h; ++i) {
+            data.bgr[(size_t)i * 3] = p[(size_t)i * 3 + 2];
+            data.bgr[(size_t)i * 3 + 1] = p[(size_t)i * 3 + 1];
+            data.bgr[(size_t)i * 3 + 2] = p[(size_t)i * 3];
+        }
+        gVpWin = &data;
+        WNDCLASSW wc;
+        ZeroMemory(&wc, sizeof(wc));
+        wc.lpfnWndProc = vpWndProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.lpszClassName = L"WenViewportWindow";
+        RegisterClassW(&wc);
+        std::wstring wt = utf8ToWide(title);
+        RECT rc{0, 0, w, h};
+        AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
+        HWND hwnd = CreateWindowExW(0, L"WenViewportWindow", wt.c_str(), WS_OVERLAPPEDWINDOW,
+                                    CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top,
+                                    nullptr, nullptr, wc.hInstance, nullptr);
+        if (!hwnd) { gVpWin = nullptr; throw WenError("运行时错误", line, 0, "窗口创建失败"); }
+        ShowWindow(hwnd, SW_SHOW);
+        UpdateWindow(hwnd);
+        MSG msg;
+        while (GetMessageW(&msg, nullptr, 0, 0)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        gVpWin = nullptr;
+        return vBool(true);
+#else
+        throw WenError("运行时错误", line, 0, "当前平台不支持窗口");
+#endif
     });
     registerBuiltin("视口尺寸", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
         auto d = vpDict(a[0], line);
