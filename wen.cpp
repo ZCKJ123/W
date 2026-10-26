@@ -2225,6 +2225,10 @@ static const WenSuffixInfo WEN_SUFFIXES[] = {
 static const char* WEN_SOURCE_SUFFIXES[] = {".脚本", ".程序", ".wen"};
 static bool gNoFast = false;
 static size_t gBigMaxDigits = 50000000;
+static std::set<string> gAdminPerms;
+static long long gExecuted = 0;
+static long long gTotal = 0;
+static int gLastLine = 0;
 static std::map<string, Value> gPoints;
 static const size_t kMaxPoints = 10000;
 struct SecEntry {
@@ -3322,6 +3326,7 @@ static const std::map<string, string>& functionModules() {
         {"新建神经层", "神经网络库"}, {"神经链", "神经网络库"}, {"前向", "神经网络库"},
         {"颜色", "视口库"}, {"新建视口", "视口库"}, {"视口清空", "视口库"}, {"视口画点", "视口库"},
         {"视口画线", "视口库"}, {"视口画三角形", "视口库"}, {"视口尺寸", "视口库"}, {"视口保存", "视口库"},
+        {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"},
         {"大整数幂", "大整数库"}, {"大整数乘", "大整数库"}, {"大整数加", "大整数库"}, {"大整数阶乘", "大整数库"},
         {"阶乘位数", "大整数库"}, {"阶乘末尾零", "大整数库"}, {"阶乘概览", "大整数库"},
         {"大整数规模", "大整数库"}, {"阶乘规模", "大整数库"},
@@ -3932,6 +3937,7 @@ void Interpreter::execProgram(const vector<StmtPtr>& program) {
 }
 
 void Interpreter::execProgram(const vector<StmtPtr>& program, shared_ptr<Scope> scope) {
+    gTotal = std::max<long long>(gTotal, (long long)program.size());
     try {
         for (const auto& s : program) exec(s, scope);
     } catch (ReturnSignal& r) {
@@ -4114,6 +4120,8 @@ static bool fastNumericWhile(Interpreter& vm, const StmtPtr& s,
 }
 
 void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
+    ++gExecuted;
+    gLastLine = s->line;
     if (s->k != Stmt::K::ExprStmt) lastWasExpr = false;
 
     switch (s->k) {
@@ -4940,6 +4948,16 @@ static void vpPut(const shared_ptr<Dict>& d, int x, int y, int c) {
     p[i] = (unsigned char)((c >> 16) & 255);
     p[i + 1] = (unsigned char)((c >> 8) & 255);
     p[i + 2] = (unsigned char)(c & 255);
+}
+static void vpPutZ(const shared_ptr<Dict>& d, int x, int y, double z, int c) {
+    int w = (int)needNum(d->items.at("宽"), "视口", 0);
+    int h = (int)needNum(d->items.at("高"), "视口", 0);
+    if (x < 0 || y < 0 || x >= w || y >= h) return;
+    auto dp = needList(d->items.at("深度"), "视口", 0);
+    size_t i = (size_t)y * (size_t)w + (size_t)x;
+    if (z >= needNum(dp->items[i], "视口", 0)) return;
+    dp->items[i] = vNum(z);
+    vpPut(d, x, y, c);
 }
 static Value makeLayout(const string& spec, int line, bool packed = false) {
     auto d = std::make_shared<Dict>();
@@ -8590,10 +8608,33 @@ Interpreter::Interpreter() {
         }
         return vBool(dangerousMode);
     });
+    registerBuiltin("管理员授权", 1, 1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (!adminGranted) throw WenError("权限错误", line, 0, "需要管理员");
+        gAdminPerms.insert(needStr(a[0], "管理员授权", line));
+        return vNum((double)gAdminPerms.size());
+    });
+    registerBuiltin("管理员可", 1, 1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+        string cmd = needStr(a[0], "管理员可", line);
+        if (!adminGranted) return vBool(false);
+        return vBool(gAdminPerms.empty() || gAdminPerms.count(cmd));
+    });
+    registerBuiltin("管理员能力", 0, 0, [this](Interpreter&, vector<Value>&, int) -> Value {
+        auto l = std::make_shared<List>();
+        if (gAdminPerms.empty()) {
+            for (const char* s : {"二进制破坏", "二进制恢复", "危险模式", "沙盒"})
+                l->items.push_back(vStr(s));
+        } else {
+            for (const auto& s : gAdminPerms) l->items.push_back(vStr(s));
+        }
+        return vList(l);
+    });
     registerBuiltin("管理员状态", 0, 0, [this](Interpreter&, vector<Value>&, int) -> Value {
         auto d = std::make_shared<Dict>();
         d->items["管理员"] = vBool(adminGranted);
         d->items["危险模式"] = vBool(dangerousMode);
+        auto perms = std::make_shared<List>();
+        for (const auto& s : gAdminPerms) perms->items.push_back(vStr(s));
+        d->items["授权"] = vList(perms);
         const char* cn = std::getenv("文_管理员口令");
         const char* en = std::getenv("WEN_ADMIN_TOKEN");
         d->items["口令来源"] = vStr(cn && *cn ? "文_管理员口令" : (en && *en ? "WEN_ADMIN_TOKEN" : "未配置"));
@@ -9309,6 +9350,9 @@ Interpreter::Interpreter() {
         d->items["宽"] = vNum(w);
         d->items["高"] = vNum(h);
         d->items["像素"] = vBytes(buf);
+        auto depth = std::make_shared<List>();
+        for (int k = 0; k < w * h; ++k) depth->items.push_back(vNum(1e30));
+        d->items["深度"] = vList(depth);
         return vDict(d);
     });
     registerBuiltin("视口清空", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
@@ -9367,6 +9411,69 @@ Interpreter::Interpreter() {
                 if ((w1 >= 0 && w2 >= 0 && w3 >= 0) || (w1 <= 0 && w2 <= 0 && w3 <= 0))
                     vpPut(d, x, y, c);
             }
+        return a[0];
+    });
+    registerBuiltin("视口画三角形Z", 11, 11, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto d = vpDict(a[0], line);
+        double x1=needNum(a[1],"视口画三角形Z",line), y1=needNum(a[2],"视口画三角形Z",line), z1=needNum(a[3],"视口画三角形Z",line);
+        double x2=needNum(a[4],"视口画三角形Z",line), y2=needNum(a[5],"视口画三角形Z",line), z2=needNum(a[6],"视口画三角形Z",line);
+        double x3=needNum(a[7],"视口画三角形Z",line), y3=needNum(a[8],"视口画三角形Z",line), z3=needNum(a[9],"视口画三角形Z",line);
+        int c = vpColor(a[10], line);
+        auto edge=[](double ax,double ay,double bx,double by,double px,double py){return (px-ax)*(by-ay)-(py-ay)*(bx-ax);};
+        double area=edge(x1,y1,x2,y2,x3,y3);
+        if (std::fabs(area)<1e-12) return a[0];
+        int minx=(int)std::floor(std::min({x1,x2,x3})), maxx=(int)std::ceil(std::max({x1,x2,x3}));
+        int miny=(int)std::floor(std::min({y1,y2,y3})), maxy=(int)std::ceil(std::max({y1,y2,y3}));
+        for(int y=miny;y<=maxy;++y) for(int x=minx;x<=maxx;++x){
+            double w1=edge(x2,y2,x3,y3,x,y)/area, w2=edge(x3,y3,x1,y1,x,y)/area, w3=edge(x1,y1,x2,y2,x,y)/area;
+            if(w1<0||w2<0||w3<0) continue;
+            vpPutZ(d,x,y,w1*z1+w2*z2+w3*z3,c);
+        }
+        return a[0];
+    });
+    registerBuiltin("视口画三维三角形", 11, 11, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto d = vpDict(a[0], line);
+        int w=(int)needNum(d->items.at("宽"),"视口",line), h=(int)needNum(d->items.at("高"),"视口",line);
+        auto proj=[&](double x,double y,double z,double& sx,double& sy,double& sz){
+            double f=(double)h/2; double zz=z+4; if(std::fabs(zz)<0.1) zz=0.1;
+            sx=w/2.0+x*f/zz; sy=h/2.0-y*f/zz; sz=zz;
+        };
+        double sx1,sy1,sz1,sx2,sy2,sz2,sx3,sy3,sz3;
+        proj(needNum(a[1],"视口画三维三角形",line),needNum(a[2],"视口画三维三角形",line),needNum(a[3],"视口画三维三角形",line),sx1,sy1,sz1);
+        proj(needNum(a[4],"视口画三维三角形",line),needNum(a[5],"视口画三维三角形",line),needNum(a[6],"视口画三维三角形",line),sx2,sy2,sz2);
+        proj(needNum(a[7],"视口画三维三角形",line),needNum(a[8],"视口画三维三角形",line),needNum(a[9],"视口画三维三角形",line),sx3,sy3,sz3);
+        int c=vpColor(a[10],line);
+        auto edge=[](double ax,double ay,double bx,double by,double px,double py){return (px-ax)*(by-ay)-(py-ay)*(bx-ax);};
+        double area=edge(sx1,sy1,sx2,sy2,sx3,sy3);
+        if(std::fabs(area)<1e-12) return a[0];
+        int minx=(int)std::floor(std::min({sx1,sx2,sx3})), maxx=(int)std::ceil(std::max({sx1,sx2,sx3}));
+        int miny=(int)std::floor(std::min({sy1,sy2,sy3})), maxy=(int)std::ceil(std::max({sy1,sy2,sy3}));
+        for(int y=miny;y<=maxy;++y) for(int x=minx;x<=maxx;++x){
+            double w1=edge(sx2,sy2,sx3,sy3,x,y)/area, w2=edge(sx3,sy3,sx1,sy1,x,y)/area, w3=edge(sx1,sy1,sx2,sy2,x,y)/area;
+            if(w1<0||w2<0||w3<0) continue;
+            vpPutZ(d,x,y,w1*sz1+w2*sz2+w3*sz3,c);
+        }
+        return a[0];
+    });
+    registerBuiltin("视口画三角形渐变", 10, 10, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto d = vpDict(a[0], line);
+        double x1=needNum(a[1],"视口画三角形渐变",line), y1=needNum(a[2],"视口画三角形渐变",line); int c1=vpColor(a[3],line);
+        double x2=needNum(a[4],"视口画三角形渐变",line), y2=needNum(a[5],"视口画三角形渐变",line); int c2=vpColor(a[6],line);
+        double x3=needNum(a[7],"视口画三角形渐变",line), y3=needNum(a[8],"视口画三角形渐变",line); int c3=vpColor(a[9],line);
+        auto edge=[](double ax,double ay,double bx,double by,double px,double py){return (px-ax)*(by-ay)-(py-ay)*(bx-ax);};
+        double area=edge(x1,y1,x2,y2,x3,y3);
+        if(std::fabs(area)<1e-12) return a[0];
+        auto r1=(c1>>16)&255,g1=(c1>>8)&255,b1=c1&255;
+        auto r2=(c2>>16)&255,g2=(c2>>8)&255,b2=c2&255;
+        auto r3=(c3>>16)&255,g3=(c3>>8)&255,b3=c3&255;
+        int minx=(int)std::floor(std::min({x1,x2,x3})), maxx=(int)std::ceil(std::max({x1,x2,x3}));
+        int miny=(int)std::floor(std::min({y1,y2,y3})), maxy=(int)std::ceil(std::max({y1,y2,y3}));
+        for(int y=miny;y<=maxy;++y) for(int x=minx;x<=maxx;++x){
+            double w1=edge(x2,y2,x3,y3,x,y)/area, w2=edge(x3,y3,x1,y1,x,y)/area, w3=edge(x1,y1,x2,y2,x,y)/area;
+            if(w1<0||w2<0||w3<0) continue;
+            int r=(int)(w1*r1+w2*r2+w3*r3), g=(int)(w1*g1+w2*g2+w3*g3), b=(int)(w1*b1+w2*b2+w3*b3);
+            vpPut(d,x,y,(r<<16)|(g<<8)|b);
+        }
         return a[0];
     });
     registerBuiltin("视口尺寸", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
@@ -13425,6 +13532,16 @@ static void printWenError(const WenError& e, const string& filename,
     if (false) std::cerr << WEN_EMBED_MARK;  // 不可达分支：只为把标记留在二进制
     std::cout.flush();
     std::cerr << humanError(e) << "\n\n";
+    if (gExecuted > 0) {
+        try {
+            std::ofstream log("截断报告.log", std::ios::trunc);
+            log << "任务执行过半后被截断\n";
+            log << "进度：" << gExecuted << "/" << gTotal << "\n";
+            log << "最后语句行：" << gLastLine << "\n";
+            log << "错误：" << e.kind << "：" << e.what() << "\n";
+            log << "位置：第 " << e.line << " 行 第 " << e.col << " 列\n";
+        } catch (...) {}
+    }
     std::cerr << "【" << e.kind << "】\n";
     std::cerr << "来源：" << errorOrigin(e.kind) << "\n";
     std::cerr << "位置：" << (filename.empty() ? "<未知>" : filename)
@@ -13960,6 +14077,14 @@ static int runFile(const string& path) {
         vm.execProgram(ast);
         return 0;
     } catch (WenError& e) {
+        if (gExecuted > 0) {
+            std::ofstream log("截断报告.log", std::ios::trunc);
+            log << "任务执行过半后被截断\n";
+            log << "进度：" << gExecuted << "/" << gTotal << "\n";
+            log << "最后语句行：" << gLastLine << "\n";
+            log << "错误：" << e.kind << "：" << e.what() << "\n";
+            log << "位置：第 " << e.line << " 行 第 " << e.col << " 列\n";
+        }
         printWenError(e, path, vm.sourceLines);
         return 1;
     } catch (IncompleteError& e) {
