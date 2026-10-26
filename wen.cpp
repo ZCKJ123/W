@@ -3308,9 +3308,9 @@ static const std::map<string, string>& functionModules() {
         // 翻译器
         {"翻译支持", "兼容库"}, {"翻译目标", "兼容库"}, {"翻译检查", "兼容库"},
         {"兼容支持", "兼容库"}, {"兼容翻译", "兼容库"}, {"兼容运行", "兼容库"},
-        {"安全检查", "安全库"}, {"自检", "安全库"}, {"官方标签", "安全库"}, {"安全白名单", "安全库"}, {"安全黑名单", "安全库"},
-        {"安全名单", "安全库"}, {"安全模式", "安全库"}, {"安全状态", "安全库"}, {"探针", "安全库"}, {"启动探针", "安全库"}, {"停止探针", "安全库"}, {"探针状态", "安全库"}, {"检测", "安全库"},
-        {"安全确认", "安全库"}, {"网络反流", "安全库"}, {"安全链路", "安全库"}, {"安全管理员", "安全库"}, {"是否安全管理员", "安全库"}, {"退出安全管理员", "安全库"},
+        {"安全检查", "网络库"}, {"自检", "网络库"}, {"官方标签", "网络库"}, {"安全白名单", "网络库"}, {"安全黑名单", "网络库"},
+        {"安全名单", "网络库"}, {"安全模式", "网络库"}, {"安全状态", "网络库"}, {"探针", "网络库"}, {"启动探针", "网络库"}, {"停止探针", "网络库"}, {"探针状态", "网络库"}, {"检测", "网络库"},
+        {"安全确认", "网络库"}, {"网络反流", "网络库"}, {"安全链路", "网络库"}, {"安全管理员", "网络库"}, {"是否安全管理员", "网络库"}, {"退出安全管理员", "网络库"},
         {"查看", "查看库"}, {"库清单", "查看库"}, {"函数清单", "查看库"},
         {"性能查看", "查看库"}, {"开启调用统计", "查看库"}, {"调用排行", "查看库"}, {"精英配置", "查看库"},
         {"兼容语言", "兼容库"}, {"兼容解析", "兼容库"}, {"兼容诊断", "兼容库"},
@@ -3755,6 +3755,7 @@ void Interpreter::加载模块(const string& rawName, int line) {
     else if (name == "HTML库") name = "网页库";
     else if (name == "加速库") name = "跃迁库";
     else if (name == "外派库") name = "兼容库";
+    else if (name == "安全库" || name == "检测库") name = "网络库";
     else if (name == "翻译器") name = "兼容库";
     if (loadedModules.count(name)) return;
     auto lib = libraryFunctions.find(name);
@@ -3809,6 +3810,7 @@ bool Interpreter::是内置库(const string& rawName) const {
     else if (name == "HTML库") name = "网页库";
     else if (name == "加速库") name = "跃迁库";
     else if (name == "外派库") name = "兼容库";
+    else if (name == "安全库" || name == "检测库") name = "网络库";
     else if (name == "翻译器") name = "兼容库";
     return libraryFunctions.count(name) > 0;
 }
@@ -6940,7 +6942,7 @@ static void bigAddShift(vector<uint32_t>& c, const vector<uint32_t>& a, size_t s
 }
 static vector<uint32_t> bigMul(const vector<uint32_t>& a, const vector<uint32_t>& b) {
     if (a.empty() || b.empty()) return {0};
-    if (std::min(a.size(), b.size()) <= 32) return bigMulSchool(a, b);
+    if (std::min(a.size(), b.size()) <= 128) return bigMulSchool(a, b);
     size_t n = std::max(a.size(), b.size()) / 2;
     vector<uint32_t> a0(a.begin(), a.begin() + std::min(n, a.size()));
     vector<uint32_t> a1(a.size() > n ? a.begin() + n : a.end(), a.end());
@@ -6957,6 +6959,26 @@ static vector<uint32_t> bigMul(const vector<uint32_t>& a, const vector<uint32_t>
     bigAddShift(out, z2, 2 * n);
     bigTrim(out);
     return out;
+}
+static vector<uint32_t> bigPow(vector<uint32_t> base, long long exp);
+static vector<uint32_t> bigFromU64(uint64_t v);
+static vector<uint32_t> bigProductList(const std::vector<vector<uint32_t>>& xs, size_t l, size_t r) {
+    if (l >= r) return {1};
+    if (r - l == 1) return xs[l];
+    size_t m = l + (r - l) / 2;
+    return bigMul(bigProductList(xs, l, m), bigProductList(xs, m, r));
+}
+static vector<uint32_t> bigFactorialPrime(uint32_t n) {
+    vector<char> comp(n + 1, 0);
+    std::vector<vector<uint32_t>> factors;
+    for (uint32_t p = 2; p <= n; ++p) {
+        if (comp[p]) continue;
+        for (uint64_t q = (uint64_t)p * p; q <= n; q += p) comp[(size_t)q] = 1;
+        long long e = 0;
+        for (uint64_t q = p; q <= n; q *= p) e += n / q;
+        factors.push_back(bigPow(bigFromU64(p), e));
+    }
+    return bigProductList(factors, 0, factors.size());
 }
 static vector<uint32_t> bigProductRange(uint32_t l, uint32_t r) {
     if (l > r) return {1};
