@@ -9802,6 +9802,60 @@ Interpreter::Interpreter() {
         d->items["可用GB"] = vNum((double)avail.QuadPart / (1024.0 * 1024.0 * 1024.0));
         return vDict(d);
     });
+    registerBuiltin("语言法", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+        auto l = std::make_shared<List>();
+        for (const char* s : {
+            "第一条 语言边界：关键字只有中文，英文不是关键字。",
+            "第二条 文件：UTF-8，推荐用途后缀。",
+            "第三条 语句边界：换行或分号，连续两个空行报错，块必须结束。",
+            "第四条 表达式：** 比一元紧，并置调用只吃一个一元表达式，比较不能连写。",
+            "第五条 变量与函数：参数和首次赋值是局部，递归上限 1000。",
+            "第六条 资源限制：大整数 5000 万位、内存值 64MB、范围 100 万。",
+            "第七条 文件与沙盒：只允许沙盒根、程序目录、当前目录、额外目录。",
+            "第八条 安全：危险操作需要管理员，安全策略只允许观察/询问/拒绝/允许。",
+            "第九条 网络：只允许 http/https，防火墙先匹配先生效。",
+            "第十条 错误：语法错误一次列多个，运行时错误报第一个，过半截断写日志。",
+            "第十一条 库：依赖后安装，不允许静默覆盖同名函数。",
+            "第十二条 禁止：英文关键字、比较连写、负并置参数、绕沙盒、绕管理员。",
+            "第十三条 违规：语法违规不运行，资源超限分配前拒绝。",
+            "第十四条 修改规范：文法、总表、解析器、测试必须同时改。"})
+            l->items.push_back(vStr(s));
+        return vList(l);
+    });
+    registerBuiltin("语言限制", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+        auto d = std::make_shared<Dict>();
+        d->items["递归"] = vNum(1000);
+        d->items["大整数位数"] = vNum((double)gBigMaxDigits);
+        d->items["内存值MB"] = vNum((double)gMemoryMaxBytes / (1024.0 * 1024.0));
+        d->items["范围元素"] = vNum(1000000);
+        d->items["缓冲字节"] = vNum(100000000);
+        d->items["网络超时秒"] = vNum(120);
+        return vDict(d);
+    });
+    registerBuiltin("合规检查", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path = resolveWenPath(needStr(a[0], "合规检查", line));
+        string src;
+        try { src = readWholeFile(path); }
+        catch (IoError& e) { throw WenError("文件错误", line, 0, e.what()); }
+        auto issues = std::make_shared<List>();
+        int ln = 0;
+        for (const auto& row : splitLines(src)) {
+            ++ln;
+            for (const char* kw : {"if", "while", "return", "print", "function"}) {
+                string pat = string("\\b") + kw + "\\b";
+                if (std::regex_search(row, std::regex(pat))) {
+                    auto d = std::make_shared<Dict>();
+                    d->items["行"] = vNum(ln);
+                    d->items["问题"] = vStr(string("英文关键字：") + kw);
+                    issues->items.push_back(vDict(d));
+                }
+            }
+        }
+        auto d = std::make_shared<Dict>();
+        d->items["合规"] = vBool(issues->items.empty());
+        d->items["问题"] = vList(issues);
+        return vDict(d);
+    });
     registerBuiltin("新建布局", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         bool packed = false;
         if (a.size() > 1) {
