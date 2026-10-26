@@ -2214,6 +2214,7 @@ static const WenSuffixInfo WEN_SUFFIXES[] = {
     {"配置", ".配置"}, {"缓冲", ".缓冲"}, {"网页", ".网页"},
     {"着色器", ".着色器"}};
 static const char* WEN_SOURCE_SUFFIXES[] = {".脚本", ".程序", ".wen"};
+static bool gNoFast = false;
 static bool gSandbox = false;
 static string gSandboxRoot;
 static vector<string> gSandboxAllow;
@@ -3814,6 +3815,7 @@ void Interpreter::execProgram(const vector<StmtPtr>& program, shared_ptr<Scope> 
 
 static bool fastLinearSumWhile(Interpreter& vm, const StmtPtr& s,
                                 const shared_ptr<Scope>& scope) {
+    if (gNoFast) return false;
     if (!scope || scope != vm.globals) return false;
     if (!s->expr || s->expr->k != Expr::K::Binary) return false;
     string op = s->expr->op;
@@ -3893,6 +3895,7 @@ static bool fastLinearSumWhile(Interpreter& vm, const StmtPtr& s,
 
 static bool fastNumericWhile(Interpreter& vm, const StmtPtr& s,
                              const shared_ptr<Scope>& scope) {
+    if (gNoFast) return false;
     if (!scope || scope != vm.globals) return false;
     if (!s->expr || s->expr->k != Expr::K::Binary) return false;
     string op = s->expr->op;
@@ -6776,6 +6779,10 @@ Interpreter::Interpreter() {
         auto list = needList(a[1], "调用", line);
         vector<Value> args = list->items;
         return vm.callValue(a[0], args, line);
+    });    registerBuiltin("数值文本", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        std::ostringstream ss;
+        ss << std::setprecision(17) << needNum(a[0], "数值文本", line);
+        return vStr(ss.str());
     });    registerBuiltin("长度", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
         const Value& v = a[0];
         if (v.type == VT::Str) return vNum((double)utf8Length(v.str));
@@ -13369,6 +13376,7 @@ static void startRuntimeLimit() {
 }
 
 static int runMain(vector<string> args) {
+    if (args.size() > 1 && args[1] == "--不快") { gNoFast = true; args.erase(args.begin() + 1); }
     if (args.size() >= 3 && args[1] == "--沙盒") {
         gSandboxRoot = fs::absolute(fs::u8path(args[2])).u8string();
         gSandbox = true;
