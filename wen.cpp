@@ -697,6 +697,19 @@ using SymId = uint32_t;
 static vector<string> gSymNames{""};
 static std::unordered_map<string, SymId> gSymIds;
 
+static unordered_map<SymId, int> gTopSlots;
+static int gTopNext = 0;
+static int topSlotFor(SymId id) {
+    auto it = gTopSlots.find(id);
+    if (it != gTopSlots.end()) return it->second;
+    int s = gTopNext++;
+    gTopSlots.emplace(id, s);
+    return s;
+}
+static int topSlotOf(SymId id) {
+    auto it = gTopSlots.find(id);
+    return it == gTopSlots.end() ? -1 : it->second;
+}
 static SymId internSymbol(const string& name) {
     auto it = gSymIds.find(name);
     if (it != gSymIds.end()) return it->second;
@@ -719,6 +732,7 @@ struct Expr {
     double num = 0;
     string text;
     SymId sym = 0;
+    int gslot = -1;
     bool b = false;
     bool commandCall = false;
     string op;
@@ -738,8 +752,10 @@ struct Stmt {
     K k = K::ExprStmt;
     string name;
     SymId nameSym = 0;
+    int nameSlot = -1;
     string name2;   // 「对于 键, 值 在 字典 中」的第二个变量
     SymId name2Sym = 0;
+    int name2Slot = -1;
     ExprPtr target;
     ExprPtr expr;
     vector<ExprPtr> args;
@@ -916,6 +932,20 @@ private:
     size_t idx_ = 0;
     bool recover_ = false;
     vector<WenError> errors_;
+    int funcDepth_ = 0;
+    int nextGlobalSlot_ = 0;
+    unordered_map<SymId, int> globalSlots_;
+    int slotFor(SymId id) {
+        auto it = globalSlots_.find(id);
+        if (it != globalSlots_.end()) return it->second;
+        int s = nextGlobalSlot_++;
+        globalSlots_.emplace(id, s);
+        return s;
+    }
+    int slotOf(SymId id) const {
+        auto it = globalSlots_.find(id);
+        return it == globalSlots_.end() ? -1 : it->second;
+    }
 
     const Token& peek(int k = 0) const {
         size_t i = idx_ + (size_t)k;
@@ -1088,6 +1118,7 @@ private:
         ++idx_;
         Token nm = expectName();
         ExprPtr target = mkVar(nm.text, nm.line);
+        if (funcDepth_ == 0) target->gslot = topSlotFor(target->sym);
         while (matchOp("[")) target = parseIndexPart(target, nm.line);
         static const std::set<string> compoundOps = {
             "+=", "-=", "*=", "/=", "//=", "%=", "**="};
@@ -1212,15 +1243,21 @@ private:
         ExprPtr iter = parseExpr();
         expectKw("中");
         expectKw("则");
+        SymId forSym = internSymbol(nm.text);
+        if (funcDepth_ == 0) topSlotFor(forSym);
+        SymId forSym2 = name2.empty() ? 0 : internSymbol(name2);
+        if (forSym2 && funcDepth_ == 0) topSlotFor(forSym2);
         auto body = parseBlock({"结束"});
         expectKw("结束");
         endStmt();
         auto s = std::make_shared<Stmt>();
         s->k = Stmt::K::For;
         s->name = nm.text;
-        s->nameSym = internSymbol(s->name);
+        s->nameSym = forSym;
+        if (funcDepth_ == 0) s->nameSlot = topSlotFor(s->nameSym);
         s->name2 = name2;
-        s->name2Sym = name2.empty() ? 0 : internSymbol(name2);
+        s->name2Sym = forSym2;
+        if (name2.size() && funcDepth_ == 0) s->name2Slot = topSlotFor(s->name2Sym);
         s->expr = iter;
         s->body = body;
         s->line = line;
@@ -1624,7 +1661,9 @@ private:
         }
         if (t.type == TT::Name) {
             ++idx_;
-            return mkVar(t.text, t.line);
+            auto v = mkVar(t.text, t.line);
+            if (funcDepth_ == 0) v->gslot = topSlotOf(v->sym);
+            return v;
         }
         if (matchOp("(")) {
             ExprPtr e = parseExpr();
@@ -1697,6 +1736,8 @@ struct Dict { map<string, Value> items; };
 struct Scope {
     map<string, Value> vars;
     unordered_map<SymId, Value> idVars;
+    vector<Value> fast;
+    vector<char> fastDefined;
     shared_ptr<Scope> parent;
 
     Scope() = default;
@@ -1719,6 +1760,17 @@ struct Scope {
     void set(SymId id, Value v) {
         idVars[id] = v;
         vars[symbolName(id)] = std::move(v);
+    }
+    bool fastGet(int i, Value& out) const {
+        if (i < 0 || (size_t)i >= fast.size() || !fastDefined[(size_t)i]) return false;
+        out = fast[(size_t)i];
+        return true;
+    }
+    void fastSet(int i, Value v) {
+        if (i < 0) return;
+        if ((size_t)i >= fast.size()) { fast.resize((size_t)i + 1); fastDefined.resize((size_t)i + 1, 0); }
+        fast[(size_t)i] = std::move(v);
+        fastDefined[(size_t)i] = 1;
     }
     void set(const string& name, Value v) { set(internSymbol(name), std::move(v)); }
     void eraseName(const string& name) {
@@ -3709,8 +3761,8 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
             Value iter = eval(s->expr, scope);
             bool two = !s->name2.empty();
             auto runOne = [&](const Value& k, const Value& v) -> bool {
-                scope->set(s->nameSym, k);
-                if (two) scope->set(s->name2Sym, v);
+                if (s->nameSlot >= 0) { globals->fastSet(s->nameSlot, k); if (k.type != VT::Num && k.type != VT::Int && k.type != VT::Bool) scope->set(s->nameSym, k); } else scope->set(s->nameSym, k);
+                if (two) { if (s->name2Slot >= 0) globals->fastSet(s->name2Slot, v); else scope->set(s->name2Sym, v); }
                 try {
                     for (const auto& st : s->body) exec(st, scope);
                 } catch (ContinueSignal&) {
@@ -3842,7 +3894,9 @@ Value Interpreter::eval(const ExprPtr& e, shared_ptr<Scope> scope) {
         case Expr::K::None: return vNone();
         case Expr::K::Var: {
             Value v;
-            if (!e->sym || !scope->lookup(e->sym, v)) undefinedName(e->text, e->line);
+            if (!(e->gslot >= 0 && globals->fastGet(e->gslot, v)) &&
+                (!e->sym || !scope->lookup(e->sym, v)))
+                undefinedName(e->text, e->line);
             // 零参数函数/内置：名字后面没写括号，也直接调用。
             // 要把它当值传给别人，请用有参数的函数（至少一个参数）。
             if (v.type == VT::Func && v.callable && v.callable->zeroArgCall()) {
@@ -4076,7 +4130,7 @@ void Interpreter::assignTarget(const ExprPtr& target, const Value& val,
                                shared_ptr<Scope> scope) {
     if (target->k == Expr::K::Var) {
         if (!target->sym) rtError(target->line, "内部符号缺失：" + target->text);
-        scope->set(target->sym, val);
+        if (target->gslot >= 0) { globals->fastSet(target->gslot, val); if (val.type != VT::Num && val.type != VT::Int && val.type != VT::Bool) scope->set(target->sym, val); } else scope->set(target->sym, val);
         return;
     }
     if (target->k == Expr::K::Index) {
