@@ -3813,6 +3813,7 @@ void Interpreter::execProgram(const vector<StmtPtr>& program, shared_ptr<Scope> 
 
 static bool fastNumericWhile(Interpreter& vm, const StmtPtr& s,
                              const shared_ptr<Scope>& scope) {
+    if (!scope || scope != vm.globals) return false;
     if (!s->expr || s->expr->k != Expr::K::Binary) return false;
     string op = s->expr->op;
     if (op != "<" && op != "<=" && op != ">" && op != ">=" && op != "==") return false;
@@ -3824,7 +3825,11 @@ static bool fastNumericWhile(Interpreter& vm, const StmtPtr& s,
     Value cv;
     if (!vm.globals->fastGet(condSlot, cv) || cv.type != VT::Num) return false;
 
-    struct Upd { int slot; bool add; bool operandSlot; double num; int oslot; };
+    struct Upd {
+        int slot = 0, oslot = 0, ti = -1, oi = -1;
+        bool add = true, operandSlot = false;
+        double num = 0;
+    };
     std::vector<Upd> ups;
     if (s->body.size() > 6) return false;
     for (const auto& st : s->body) {
@@ -3841,8 +3846,6 @@ static bool fastNumericWhile(Interpreter& vm, const StmtPtr& s,
         u.slot = st->target->gslot;
         u.add = bop == "+";
         u.operandSlot = b && b->k == Expr::K::Var && b->slotDepth == 0 && b->gslot >= 0;
-        u.num = 0;
-        u.oslot = 0;
         if (u.operandSlot) u.oslot = b->gslot;
         else if (b && b->k == Expr::K::Num) u.num = b->num;
         else return false;
@@ -3857,9 +3860,11 @@ static bool fastNumericWhile(Interpreter& vm, const StmtPtr& s,
         slots.push_back(slot);
         return (int)slots.size() - 1;
     };
-    std::vector<double> vals;
-    for (size_t i = 0; i < ups.size(); ++i) { idxOf(ups[i].slot); if (ups[i].operandSlot) idxOf(ups[i].oslot); }
-    vals.resize(slots.size());
+    for (auto& u : ups) {
+        u.ti = idxOf(u.slot);
+        if (u.operandSlot) u.oi = idxOf(u.oslot);
+    }
+    std::vector<double> vals(slots.size());
     for (size_t i = 0; i < slots.size(); ++i) {
         Value v;
         if (!vm.globals->fastGet(slots[i], v) || v.type != VT::Num) return false;
@@ -3867,23 +3872,19 @@ static bool fastNumericWhile(Interpreter& vm, const StmtPtr& s,
     }
     int ci = idxOf(condSlot);
     double lhs = vals[(size_t)ci];
-    auto cmp = [&]() -> bool {
-        if (op == "<") return lhs < rhs;
-        if (op == "<=") return lhs <= rhs;
-        if (op == ">") return lhs > rhs;
-        if (op == ">=") return lhs >= rhs;
-        return lhs == rhs;
-    };
-    long long guard = 0;
-    while (cmp()) {
-        for (const auto& u : ups) {
-            int ti = idxOf(u.slot);
-            double b = u.operandSlot ? vals[(size_t)idxOf(u.oslot)] : u.num;
-            vals[(size_t)ti] = u.add ? vals[(size_t)ti] + b : vals[(size_t)ti] - b;
-            if (u.slot == condSlot) lhs = vals[(size_t)ti];
+    auto step = [&]() {
+        for (auto& u : ups) {
+            double b = u.operandSlot ? vals[(size_t)u.oi] : u.num;
+            double& t = vals[(size_t)u.ti];
+            t = u.add ? t + b : t - b;
+            if (u.slot == condSlot) lhs = t;
         }
-        if (++guard > 1000000000LL) break;
-    }
+    };
+    if (op == "<") { while (lhs < rhs) step(); }
+    else if (op == "<=") { while (lhs <= rhs) step(); }
+    else if (op == ">") { while (lhs > rhs) step(); }
+    else if (op == ">=") { while (lhs >= rhs) step(); }
+    else { while (lhs == rhs) step(); }
     for (size_t i = 0; i < slots.size(); ++i)
         vm.globals->fastSet(slots[i], vNum(vals[i]));
     return true;
