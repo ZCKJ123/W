@@ -3197,6 +3197,7 @@ static const std::map<string, string>& functionModules() {
         {"兼容语言", "兼容库"}, {"兼容解析", "兼容库"}, {"兼容诊断", "兼容库"},
         {"兼容冲突", "兼容库"},
         {"新建神经层", "神经网络库"}, {"神经链", "神经网络库"}, {"前向", "神经网络库"},
+        {"大整数幂", "大整数库"}, {"大整数乘", "大整数库"}, {"大整数加", "大整数库"}, {"大整数阶乘", "大整数库"},
         {"训练", "神经网络库"}, {"保存网络", "神经网络库"}, {"读取网络", "神经网络库"},
         {"翻译", "兼容库"}, {"执行字节码", "兼容库"},
         {"反汇编", "兼容库"}, {"反汇编文本", "兼容库"},
@@ -6688,6 +6689,84 @@ static bool netAllowed(const std::vector<std::pair<string, bool>>& rules, const 
         if (netWildcard(r.first, host)) return r.second;
     return false;
 }
+static vector<uint32_t> bigParse(string s) {
+    size_t b = 0;
+    while (b < s.size() && std::isspace((unsigned char)s[b])) ++b;
+    while (s.size() > b && std::isspace((unsigned char)s.back())) s.pop_back();
+    if (b >= s.size()) return {0};
+    vector<uint32_t> out;
+    for (int i = (int)s.size(); i > (int)b; i -= 9) {
+        int st = std::max((int)b, i - 9);
+        uint32_t v = 0;
+        for (int j = st; j < i; ++j) {
+            if (!std::isdigit((unsigned char)s[j]))
+                throw WenError("运行时错误", 0, 0, "大整数只接受十进制数字");
+            v = v * 10 + (uint32_t)(s[j] - '0');
+        }
+        out.push_back(v);
+    }
+    return out;
+}
+static string bigStr(const vector<uint32_t>& a) {
+    if (a.empty()) return "0";
+    std::ostringstream ss;
+    ss << a.back();
+    for (int i = (int)a.size() - 2; i >= 0; --i)
+        ss << std::setw(9) << std::setfill('0') << a[(size_t)i];
+    return ss.str();
+}
+static void bigTrim(vector<uint32_t>& a) {
+    while (a.size() > 1 && a.back() == 0) a.pop_back();
+}
+static vector<uint32_t> bigMul(const vector<uint32_t>& a, const vector<uint32_t>& b) {
+    vector<uint32_t> c(a.size() + b.size(), 0);
+    for (size_t i = 0; i < a.size(); ++i) {
+        uint64_t carry = 0;
+        for (size_t j = 0; j < b.size(); ++j) {
+            uint64_t cur = (uint64_t)c[i + j] + (uint64_t)a[i] * b[j] + carry;
+            c[i + j] = (uint32_t)(cur % 1000000000ULL);
+            carry = cur / 1000000000ULL;
+        }
+        size_t k = i + b.size();
+        while (carry) {
+            uint64_t cur = (uint64_t)c[k] + carry;
+            c[k] = (uint32_t)(cur % 1000000000ULL);
+            carry = cur / 1000000000ULL;
+            ++k;
+        }
+    }
+    bigTrim(c);
+    return c;
+}
+static vector<uint32_t> bigAdd(const vector<uint32_t>& a, const vector<uint32_t>& b) {
+    vector<uint32_t> c(std::max(a.size(), b.size()) + 1, 0);
+    uint64_t carry = 0;
+    for (size_t i = 0; i < c.size(); ++i) {
+        uint64_t cur = carry;
+        if (i < a.size()) cur += a[i];
+        if (i < b.size()) cur += b[i];
+        c[i] = (uint32_t)(cur % 1000000000ULL);
+        carry = cur / 1000000000ULL;
+    }
+    bigTrim(c);
+    return c;
+}
+static vector<uint32_t> bigPow(vector<uint32_t> base, long long exp) {
+    vector<uint32_t> out{1};
+    while (exp > 0) {
+        if (exp & 1) out = bigMul(out, base);
+        exp >>= 1;
+        if (exp) base = bigMul(base, base);
+    }
+    return out;
+}
+static string bigArg(const Value& v, int line) {
+    if (v.type == VT::Str) return v.str;
+    if (v.type == VT::Int) return intText(v);
+    if (v.type == VT::Num) return std::to_string((long long)needNum(v, "大整数", line));
+    throw WenError("运行时错误", line, 0, "大整数参数需要数字或文本");
+}
+
 Interpreter::Interpreter() {
     globals = std::make_shared<Scope>();
     rng.seed(std::random_device{}());
@@ -8504,6 +8583,24 @@ Interpreter::Interpreter() {
     });
     registerBuiltin("是否沙盒", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
         return vBool(gSandbox);
+    });
+    registerBuiltin("大整数幂", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long e = (long long)needIndex(a[1], "大整数幂", line);
+        if (e < 0 || e > 1000000) throw WenError("运行时错误", line, 0, "指数必须在 0..1000000");
+        return vStr(bigStr(bigPow(bigParse(bigArg(a[0], line)), e)));
+    });
+    registerBuiltin("大整数乘", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        return vStr(bigStr(bigMul(bigParse(bigArg(a[0], line)), bigParse(bigArg(a[1], line)))));
+    });
+    registerBuiltin("大整数加", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        return vStr(bigStr(bigAdd(bigParse(bigArg(a[0], line)), bigParse(bigArg(a[1], line)))));
+    });
+    registerBuiltin("大整数阶乘", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long n = (long long)needIndex(a[0], "大整数阶乘", line);
+        if (n < 0 || n > 100000) throw WenError("运行时错误", line, 0, "阶乘参数必须在 0..100000");
+        vector<uint32_t> out{1};
+        for (long long i = 2; i <= n; ++i) out = bigMul(out, {(uint32_t)i});
+        return vStr(bigStr(out));
     });
     registerBuiltin("新建布局", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         bool packed = false;
