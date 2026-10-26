@@ -735,6 +735,7 @@ struct Expr {
     string text;
     SymId sym = 0;
     int gslot = -1;
+    mutable int localSlot = -1;
     bool b = false;
     bool commandCall = false;
     string op;
@@ -1744,12 +1745,16 @@ struct Scope {
     unordered_map<SymId, Value> idVars;
     vector<Value> fast;
     vector<char> fastDefined;
+    unordered_map<SymId, int> idSlot;
     shared_ptr<Scope> parent;
 
     Scope() = default;
     explicit Scope(shared_ptr<Scope> p) : parent(std::move(p)) {}
 
     bool lookup(const string& name, Value& out) const {
+        SymId sid = internSymbol(name);
+        auto sit = idSlot.find(sid);
+        if (sit != idSlot.end() && fastGet(sit->second, out)) return true;
         auto it = vars.find(name);
         if (it != vars.end()) { out = it->second; return true; }
         if (parent) return parent->lookup(name, out);
@@ -1767,6 +1772,19 @@ struct Scope {
         idVars[id] = v;
         vars[symbolName(id)] = std::move(v);
     }
+    int findSlot(SymId id) const {
+        auto it = idSlot.find(id);
+        return it == idSlot.end() ? -1 : it->second;
+    }
+    int slotFor(SymId id) {
+        auto it = idSlot.find(id);
+        if (it != idSlot.end()) return it->second;
+        int s = (int)fast.size();
+        idSlot.emplace(id, s);
+        fast.emplace_back();
+        fastDefined.push_back(0);
+        return s;
+    }
     bool fastGet(int i, Value& out) const {
         if (i < 0 || (size_t)i >= fast.size() || !fastDefined[(size_t)i]) return false;
         out = fast[(size_t)i];
@@ -1779,8 +1797,24 @@ struct Scope {
         fastDefined[(size_t)i] = 1;
     }
     void set(const string& name, Value v) { set(internSymbol(name), std::move(v)); }
+    vector<string> names() const {
+        vector<string> out;
+        for (const auto& kv : idSlot)
+            if ((size_t)kv.second < fastDefined.size() && fastDefined[(size_t)kv.second])
+                out.push_back(symbolName(kv.first));
+        for (const auto& kv : vars) out.push_back(kv.first);
+        std::sort(out.begin(), out.end());
+        out.erase(std::unique(out.begin(), out.end()), out.end());
+        return out;
+    }
     void eraseName(const string& name) {
-        idVars.erase(internSymbol(name));
+        SymId id = internSymbol(name);
+        idVars.erase(id);
+        auto it = idSlot.find(id);
+        if (it != idSlot.end()) {
+            if ((size_t)it->second < fastDefined.size()) fastDefined[(size_t)it->second] = 0;
+            idSlot.erase(it);
+        }
         vars.erase(name);
     }
 };
@@ -11368,12 +11402,12 @@ Interpreter::Interpreter() {
     });
     registerBuiltin("变量名单", 0, 0, [](Interpreter& vm, vector<Value>&, int) -> Value {
         auto l = std::make_shared<List>();
-        for (const auto& kv : vm.globals->vars) l->items.push_back(vStr(kv.first));
+        for (const auto& n : vm.globals->names()) l->items.push_back(vStr(n));
         return vList(l);
     });
     registerBuiltin("变量存在", 1, 1, [](Interpreter& vm, vector<Value>& a, int line) -> Value {
         string name = needStr(a[0], "变量存在", line);
-        return vBool(vm.globals->vars.count(name) > 0);
+        Value v; return vBool(vm.globals->lookup(name, v));
     });
     registerBuiltin("删除变量", 1, 1, [](Interpreter& vm, vector<Value>& a, int line) -> Value {
         string name = needStr(a[0], "删除变量", line);
