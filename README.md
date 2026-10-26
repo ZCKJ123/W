@@ -1,6 +1,6 @@
 # 文语言（wen）
 
-用中文关键字写程序的小语言：解释运行、编译成原生 exe、带 27 个内置库。
+用中文关键字写程序的小语言：解释运行、编译成原生 exe、带 33 个内置库。
 
 - 版本：`0.1.0-snapshot`
 - 许可证：MIT
@@ -11,7 +11,6 @@
 
 ```powershell
 .\完整构建.bat   # 完整版：wen_full.exe
-.\轻量构建.bat   # 轻量版：wen_lite.exe
 .\wen.exe 例子\你好.wen
 .\wen.exe --签名
 .\wen.exe --验证

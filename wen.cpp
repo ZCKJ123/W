@@ -3361,6 +3361,7 @@ static const std::map<string, string>& functionModules() {
         {"颜色", "视口库"}, {"新建视口", "视口库"}, {"视口清空", "视口库"}, {"视口画点", "视口库"},
         {"视口画线", "视口库"}, {"视口画三角形", "视口库"}, {"视口尺寸", "视口库"}, {"视口保存", "视口库"},
         {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"}, {"视口显示", "视口库"},
+        {"硬件信息", "硬件库"}, {"高精度计时", "硬件库"}, {"内存状态", "硬件库"}, {"屏幕尺寸", "硬件库"}, {"磁盘空间", "硬件库"},
         {"大整数幂", "大整数库"}, {"大整数乘", "大整数库"}, {"大整数加", "大整数库"}, {"大整数阶乘", "大整数库"},
         {"阶乘位数", "大整数库"}, {"阶乘末尾零", "大整数库"}, {"阶乘概览", "大整数库"},
         {"大整数规模", "大整数库"}, {"阶乘规模", "大整数库"},
@@ -9640,6 +9641,56 @@ Interpreter::Interpreter() {
         }
         try { writeWholeFile(path, bmp, false); } catch (IoError& e) { throw WenError("文件错误", line, 0, e.what()); }
         return vNum((double)bmp.size());
+    });
+    registerBuiltin("硬件信息", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+        SYSTEM_INFO si;
+        GetNativeSystemInfo(&si);
+        MEMORYSTATUSEX ms;
+        ms.dwLength = sizeof(ms);
+        GlobalMemoryStatusEx(&ms);
+        auto d = std::make_shared<Dict>();
+        d->items["处理器架构"] = vStr(
+            si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 ? "x64" :
+            si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_ARM64 ? "ARM64" : "x86");
+        d->items["逻辑核心"] = vNum((double)si.dwNumberOfProcessors);
+        d->items["总内存MB"] = vNum((double)ms.ullTotalPhys / (1024.0 * 1024.0));
+        d->items["可用内存MB"] = vNum((double)ms.ullAvailPhys / (1024.0 * 1024.0));
+        d->items["屏幕宽"] = vNum((double)GetSystemMetrics(SM_CXSCREEN));
+        d->items["屏幕高"] = vNum((double)GetSystemMetrics(SM_CYSCREEN));
+        return vDict(d);
+    });
+    registerBuiltin("高精度计时", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+        LARGE_INTEGER f, c;
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&c);
+        return vNum((double)c.QuadPart * 1000000000.0 / (double)f.QuadPart);
+    });
+    registerBuiltin("内存状态", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+        MEMORYSTATUSEX ms;
+        ms.dwLength = sizeof(ms);
+        GlobalMemoryStatusEx(&ms);
+        auto d = std::make_shared<Dict>();
+        d->items["总MB"] = vNum((double)ms.ullTotalPhys / (1024.0 * 1024.0));
+        d->items["可用MB"] = vNum((double)ms.ullAvailPhys / (1024.0 * 1024.0));
+        d->items["占用百分比"] = vNum((double)ms.dwMemoryLoad);
+        return vDict(d);
+    });
+    registerBuiltin("屏幕尺寸", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+        auto l = std::make_shared<List>();
+        l->items.push_back(vNum((double)GetSystemMetrics(SM_CXSCREEN)));
+        l->items.push_back(vNum((double)GetSystemMetrics(SM_CYSCREEN)));
+        return vList(l);
+    });
+    registerBuiltin("磁盘空间", 0, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path = a.empty() ? "." : needStr(a[0], "磁盘空间", line);
+        ULARGE_INTEGER avail, total, freeBytes;
+        std::wstring w = fs::absolute(fs::u8path(path)).wstring();
+        if (!GetDiskFreeSpaceExW(w.c_str(), &avail, &total, &freeBytes))
+            throw WenError("运行时错误", line, 0, "读不到磁盘空间：" + path);
+        auto d = std::make_shared<Dict>();
+        d->items["总GB"] = vNum((double)total.QuadPart / (1024.0 * 1024.0 * 1024.0));
+        d->items["可用GB"] = vNum((double)avail.QuadPart / (1024.0 * 1024.0 * 1024.0));
+        return vDict(d);
     });
     registerBuiltin("新建布局", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         bool packed = false;
