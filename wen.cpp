@@ -13534,7 +13534,7 @@ static void printWenError(const WenError& e, const string& filename,
     std::cerr << humanError(e) << "\n\n";
     if (gExecuted > 0) {
         try {
-            std::ofstream log("截断报告.log", std::ios::trunc);
+            std::ofstream log(fs::u8path("截断报告.log"), std::ios::trunc);
             log << "任务执行过半后被截断\n";
             log << "进度：" << gExecuted << "/" << gTotal << "\n";
             log << "最后语句行：" << gLastLine << "\n";
@@ -14078,7 +14078,7 @@ static int runFile(const string& path) {
         return 0;
     } catch (WenError& e) {
         if (gExecuted > 0) {
-            std::ofstream log("截断报告.log", std::ios::trunc);
+            std::ofstream log(fs::u8path("截断报告.log"), std::ios::trunc);
             log << "任务执行过半后被截断\n";
             log << "进度：" << gExecuted << "/" << gTotal << "\n";
             log << "最后语句行：" << gLastLine << "\n";
