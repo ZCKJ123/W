@@ -9313,7 +9313,7 @@ Interpreter::Interpreter() {
     });
     registerBuiltin("安全管理员", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
         const char* token = std::getenv("WEN_SECURITY_TOKEN");
-        if (!token || !*token) throw WenError("权限错误", line, 0, "未配置安全口令：先设置中文变量「文_安全口令」");
+        if (!token || !*token) throw WenError("安全权限", line, 0, "未配置安全口令：先设置中文变量「文_安全口令」");
         if (needStr(a[0], "安全管理员", line) != token)
             throw WenError("安全权限", line, 0, "安全管理员口令错误");
         gSecAdmin = true;
@@ -13581,9 +13581,9 @@ static string errorExplanation(const string& kind) {
     if (kind == "兼容冲突")
         return "源文件里写了多个翻译目标；一个文件只能保留一个目标行。";
     if (kind == "安全权限")
-        return "需要安全管理员；先设置 文_安全口令 或 WEN_SECURITY_TOKEN，再调用 安全管理员。";
+        return "需要安全管理员；先设置中文变量「文_安全口令」，再调用安全管理员。";
     if (kind == "权限错误")
-        return "需要管理员权限或危险模式；先设置 WEN_ADMIN_TOKEN 并申请管理员。";
+        return "需要管理员权限或危险模式；先设置中文变量「文_管理员口令」，再申请管理员。";
     return "解释器内部异常。";
 }
 
