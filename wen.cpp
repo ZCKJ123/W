@@ -3142,6 +3142,7 @@ static const std::map<string, string>& functionModules() {
         {"跃迁大小", "跃迁库"}, {"跃迁命中", "跃迁库"}, {"跃迁未命中", "跃迁库"},
         {"跃迁复用率", "跃迁库"}, {"跃迁容量", "跃迁库"}, {"跃迁快照", "跃迁库"},
         {"跃迁恢复", "跃迁库"}, {"跃迁导出", "跃迁库"}, {"跃迁导入", "跃迁库"},
+        {"跃迁统计", "跃迁库"}, {"跃迁键", "跃迁库"}, {"跃迁删除", "跃迁库"},
 
         // 物理库
         {"速度", "物理库"}, {"加速度", "物理库"}, {"力", "物理库"},
@@ -3253,9 +3254,9 @@ public:
     std::map<string, std::map<string, Value>> libraryFunctions;  // 库名 -> 函数表
     std::vector<Value> renderScene;  // 渲染场景：面/涂鸦/渐变/体积光，供各后端使用
     bool accelEnabled = false;       // 加速库：纯函数结果缓存开关
-    std::map<string, Value> accelCache;
+    std::unordered_map<string, Value> accelCache;
     long long accelHits = 0;
-    std::map<string, Value> leapCache;  // 跃迁库：同键直接跳过计算
+    std::unordered_map<string, Value> leapCache;  // 跃迁库：同键直接跳过计算
     bool leapAuto = false;               // 跃迁库：自动缓存用户函数
     long long leapHits = 0;
     long long leapMisses = 0;
@@ -3301,7 +3302,7 @@ public:
     void exec(const StmtPtr& s, shared_ptr<Scope> scope);
     Value eval(const ExprPtr& e, shared_ptr<Scope> scope);
     Value callValue(const Value& callee, vector<Value>& args, int line);
-    void assignTarget(const ExprPtr& target, const Value& val, shared_ptr<Scope> scope);
+    void assignTarget(const ExprPtr& target, Value val, shared_ptr<Scope> scope);
     Value getIndex(const Value& obj, const Value& idx, int line);
     void setIndex(Value& obj, const Value& idx, const Value& val, int line);
 
@@ -3727,7 +3728,7 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
     switch (s->k) {
         case Stmt::K::Assign: {
             Value v = eval(s->expr, scope);
-            assignTarget(s->target, v, scope);
+            assignTarget(s->target, std::move(v), scope);
             break;
         }
         case Stmt::K::Print: {
@@ -3863,6 +3864,7 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
                 symbolOwner[s->name] = "用户";
             }
             scope->set(s->nameSym, vFunc(fn));
+            { string pre = "leap|" + s->name + "|"; for (auto it = leapCache.begin(); it != leapCache.end(); ) it = it->first.rfind(pre, 0) == 0 ? leapCache.erase(it) : std::next(it); }
             break;
         }
         case Stmt::K::Return: {
@@ -4090,7 +4092,7 @@ Value Interpreter::callValue(const Value& callee, vector<Value>& args, int line)
             Value out = callee.callable->call(*this, args, line);
             if (out.type == VT::Num || out.type == VT::Str || out.type == VT::Bool ||
                 out.type == VT::None) {
-                if (leapCache.size() >= leapLimit) leapCache.clear();
+                if (leapLimit && leapCache.size() >= leapLimit) leapCache.clear();
                 leapCache[key] = out;
             }
             return out;
@@ -4134,11 +4136,15 @@ Value Interpreter::callValue(const Value& callee, vector<Value>& args, int line)
     return callee.callable->call(*this, args, line);
 }
 
-void Interpreter::assignTarget(const ExprPtr& target, const Value& val,
+void Interpreter::assignTarget(const ExprPtr& target, Value val,
                                shared_ptr<Scope> scope) {
     if (target->k == Expr::K::Var) {
         if (!target->sym) rtError(target->line, "内部符号缺失：" + target->text);
-        if (target->gslot >= 0) { globals->fastSet(target->gslot, val); if (val.type != VT::Num && val.type != VT::Int && val.type != VT::Bool) scope->set(target->sym, val); } else scope->set(target->sym, val);
+        if (target->gslot >= 0) {
+            if (val.type != VT::Num && val.type != VT::Int && val.type != VT::Bool)
+                scope->set(target->sym, val);
+            globals->fastSet(target->gslot, std::move(val));
+        } else scope->set(target->sym, std::move(val));
         return;
     }
     if (target->k == Expr::K::Index) {
@@ -7724,7 +7730,8 @@ Interpreter::Interpreter() {
         string label = leapKey(a[0], line);
         vector<Value> args(a.begin() + 2, a.end());
         // 用户键只作标签；真正的缓存身份是“标签 + 参数”，不会再拿旧参数的结果。
-        string key = label + accelKey("", args);
+        string fname = a[1].callable ? a[1].callable->name : "";
+        string key = label + "|" + fname + accelKey("", args);
         auto it = leapCache.find(key);
         if (it != leapCache.end()) {
             ++leapHits;
@@ -7734,7 +7741,7 @@ Interpreter::Interpreter() {
         Value out = callValue(a[1], args, line);
         if (out.type == VT::Num || out.type == VT::Str || out.type == VT::Bool ||
             out.type == VT::None) {
-            if (leapCache.size() >= leapLimit) leapCache.clear();
+            if (leapLimit && leapCache.size() >= leapLimit) leapCache.clear();
             leapCache[key] = out;
         }
         return out;
@@ -7760,6 +7767,30 @@ Interpreter::Interpreter() {
             if (leapCache.size() > leapLimit) leapCache.clear();
         }
         return vNum((double)leapLimit);
+    });
+    registerBuiltin("跃迁统计", 0, 0, [this](Interpreter&, vector<Value>&, int) -> Value {
+        auto d = std::make_shared<Dict>();
+        long long total = leapHits + leapMisses;
+        d->items["大小"] = vNum((double)leapCache.size());
+        d->items["命中"] = vNum((double)leapHits);
+        d->items["未命中"] = vNum((double)leapMisses);
+        d->items["复用率"] = vNum(total ? (double)leapHits / (double)total : 0.0);
+        d->items["容量"] = vNum((double)leapLimit);
+        d->items["自动"] = vBool(leapAuto);
+        return vDict(d);
+    });
+    registerBuiltin("跃迁键", 0, 0, [this](Interpreter&, vector<Value>&, int) -> Value {
+        auto l = std::make_shared<List>();
+        size_t n = 0;
+        for (const auto& kv : leapCache) {
+            if (n++ >= 200) break;
+            l->items.push_back(vStr(kv.first));
+        }
+        return vList(l);
+    });
+    registerBuiltin("跃迁删除", 1, 1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+        string key = leapKey(a[0], line);
+        return vBool(leapCache.erase(key) > 0);
     });
     registerBuiltin("跃迁快照", 0, 0, [this](Interpreter&, vector<Value>&, int) -> Value {
         auto d = std::make_shared<Dict>();
