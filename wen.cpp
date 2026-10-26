@@ -2228,6 +2228,7 @@ static bool gSandbox = false;
 static string gSandboxRoot;
 static vector<string> gSandboxAllow;
 static vector<string> gNetWhitelist;
+static size_t gNetChunk = 1024 * 1024;
 
 static string lowerPath(string p) {
     for (auto& c : p) c = (char)std::tolower((unsigned char)c);
@@ -3302,7 +3303,7 @@ static const std::map<string, string>& functionModules() {
         // 网络库
         {"抓取", "网络库"}, {"下载", "网络库"}, {"抓取JSON", "网络库"},
         {"安全抓取", "网络库"}, {"限速抓取", "网络库"}, {"乱码解析", "网络库"},
-        {"网络路径", "网络库"}, {"网络记录", "网络库"}, {"网络故事", "网络库"}, {"网络统计", "网络库"}, {"清空网络记录", "网络库"},
+        {"网络路径", "网络库"}, {"网络桥", "网络库"}, {"网络记录", "网络库"}, {"网络故事", "网络库"}, {"网络统计", "网络库"}, {"清空网络记录", "网络库"},
         {"二进制破坏", "网络库"}, {"二进制恢复", "网络库"},
 
         // JSON 库
@@ -8879,6 +8880,15 @@ Interpreter::Interpreter() {
         d->items["快路径"] = vBool(!gNoFast);
         return vDict(d);
     });
+    registerBuiltin("设置大整数上限", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long n = (long long)needIndex(a[0], "设置大整数上限", line);
+        if (n < 1) throw WenError("运行时错误", line, 0, "上限必须大于 0");
+        gBigMaxDigits = (size_t)n;
+        return vNum((double)gBigMaxDigits);
+    });
+    registerBuiltin("大整数上限", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+        return vNum((double)gBigMaxDigits);
+    });
     registerBuiltin("新建布局", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         bool packed = false;
         if (a.size() > 1) {
@@ -9955,6 +9965,19 @@ Interpreter::Interpreter() {
         size_t n = netHits.size();
         netHits.clear();
         return vNum((double)n);
+    });
+    registerBuiltin("网络桥", 0, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (!a.empty()) {
+            long long mb = (long long)needIndex(a[0], "网络桥", line);
+            if (mb < 1) mb = 1;
+            if (mb > 64) mb = 64;
+            gNetChunk = (size_t)mb * 1024 * 1024;
+        }
+        auto d = std::make_shared<Dict>();
+        d->items["块字节"] = vNum((double)gNetChunk);
+        d->items["块KB"] = vNum((double)gNetChunk / 1024.0);
+        d->items["块MB"] = vNum((double)gNetChunk / (1024.0 * 1024.0));
+        return vDict(d);
     });
     registerBuiltin("下载", 2, 3, [this](Interpreter&, vector<Value>& a, int line) -> Value {
         string url = needStr(a[0], "下载", line);
@@ -13682,6 +13705,10 @@ static void startRuntimeLimit() {
 
 static int runMain(vector<string> args) {
     if (args.size() > 1 && args[1] == "--不快") { gNoFast = true; args.erase(args.begin() + 1); }
+    if (args.size() >= 3 && args[1] == "--大整数上限") {
+        gBigMaxDigits = (size_t)std::stoull(args[2]);
+        args.erase(args.begin() + 1, args.begin() + 3);
+    }
     if (args.size() >= 3 && args[1] == "--沙盒") {
         gSandboxRoot = fs::absolute(fs::u8path(args[2])).u8string();
         gSandbox = true;
@@ -13713,6 +13740,10 @@ static int runMain(vector<string> args) {
     const string& cmd = args[1];
     for (const auto& a : args) {
         if (a == "--json" || a == "--诊断JSON") gJsonDiagnostics = true;
+    }
+    if (cmd == "--快照版本") {
+        std::cout << "文语言 0.1.0-snapshot\n";
+        return 0;
     }
     if (cmd == "--版本" || cmd == "-v") {
         std::cout << "文语言 v0.1 · 作者 Akm / 筑宸科技 · 2026-10-25 首次发布\n";
