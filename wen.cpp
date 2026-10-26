@@ -2233,6 +2233,9 @@ struct SecEntry {
 };
 static std::vector<SecEntry> gSecEntries;
 static string gSecurityPolicy = "观察";
+static bool gSecAdmin = false;
+static std::set<string> gSecWhite;
+static std::set<string> gSecBlack;
 
 static string secFingerprint(const string& path) {
     std::ifstream in(fs::u8path(path), std::ios::binary);
@@ -2256,6 +2259,37 @@ static bool secOfficialPath(const string& path) {
     string app = fs::current_path(ec).u8string();
     string full = fs::weakly_canonical(fs::u8path(path), ec).u8string();
     return !app.empty() && full.rfind(app, 0) == 0;
+}
+static std::vector<std::pair<int, std::string>> secScanSource(const string& src) {
+    static const std::vector<std::pair<std::string, std::string>> rules = {
+        {"二进制破坏", "危险操作"}, {"危险模式", "权限提升"},
+        {"申请管理员", "权限提升"}, {"调用外部", "外部执行"},
+        {"删除文件", "文件破坏"}, {"写二进制", "文件写入"},
+        {"下载", "网络写入"}, {"执行字节码", "动态执行"},
+        {"网络反流", "防火墙修改"}};
+    std::vector<std::pair<int, std::string>> out;
+    int n = 0;
+    for (const auto& raw : splitLines(src)) {
+        ++n;
+        for (const auto& r : rules)
+            if (raw.find(r.first) != std::string::npos)
+                out.push_back({n, r.second + "：" + r.first});
+    }
+    return out;
+}
+static std::string secDeclaredLabel(const string& src, string& label) {
+    for (const auto& raw : splitLines(src)) {
+        size_t b = raw.find_first_not_of(" \t");
+        if (b == string::npos) continue;
+        string s = raw.substr(b);
+        if (s.rfind("# 官方标签:", 0) != 0) continue;
+        std::istringstream ss(s.substr(7));
+        string name, hash;
+        ss >> name >> hash;
+        label = name;
+        return hash;
+    }
+    return "";
 }
 static SecEntry& secCheckFile(const string& path) {
     std::error_code ec;
@@ -3255,7 +3289,8 @@ static const std::map<string, string>& functionModules() {
         // 翻译器
         {"翻译支持", "兼容库"}, {"翻译目标", "兼容库"}, {"翻译检查", "兼容库"},
         {"兼容支持", "兼容库"}, {"兼容翻译", "兼容库"}, {"兼容运行", "兼容库"},
-        {"安全检查", "安全库"}, {"安全查息", "安全库"}, {"安全策略", "安全库"},
+        {"安全检查", "安全库"}, {"自检", "安全库"}, {"官方标签", "安全库"}, {"安全白名单", "安全库"}, {"安全黑名单", "安全库"},
+        {"安全名单", "安全库"}, {"安全管理员", "安全库"}, {"是否安全管理员", "安全库"}, {"退出安全管理员", "安全库"},
         {"安全确认", "安全库"}, {"网络反流", "安全库"}, {"安全链路", "安全库"},
         {"查看", "查看库"}, {"库清单", "查看库"}, {"函数清单", "查看库"},
         {"性能查看", "查看库"}, {"开启调用统计", "查看库"}, {"调用排行", "查看库"}, {"精英配置", "查看库"},
@@ -9036,6 +9071,81 @@ Interpreter::Interpreter() {
         }
         return vList(l);
     });
+    registerBuiltin("自检", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path = resolveWenPath(needStr(a[0], "自检", line));
+        string src;
+        try { src = readWholeFile(path); }
+        catch (IoError& e) { throw WenError("文件错误", line, 0, e.what()); }
+        auto issues = secScanSource(src);
+        string label, declared = secDeclaredLabel(src, label);
+        string actual = secFingerprint(path);
+        auto d = std::make_shared<Dict>();
+        d->items["文件"] = vStr(path);
+        d->items["声明标签"] = vStr(label);
+        d->items["声明指纹"] = vStr(declared);
+        d->items["实际指纹"] = vStr(actual);
+        d->items["对称"] = vBool(!declared.empty() && declared == actual);
+        auto l = std::make_shared<List>();
+        for (const auto& it : issues) {
+            auto one = std::make_shared<Dict>();
+            one->items["行"] = vNum(it.first);
+            one->items["问题"] = vStr(it.second);
+            l->items.push_back(vDict(one));
+        }
+        d->items["问题"] = vList(l);
+        d->items["可疑"] = vBool(!issues.empty());
+        return vDict(d);
+    });
+    registerBuiltin("官方标签", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path = resolveWenPath(needStr(a[0], "官方标签", line));
+        string src;
+        try { src = readWholeFile(path); }
+        catch (IoError& e) { throw WenError("文件错误", line, 0, e.what()); }
+        string label, declared = secDeclaredLabel(src, label);
+        string actual = secFingerprint(path);
+        bool symmetric = !declared.empty() && declared == actual;
+        bool official = symmetric && (label == "wen-official" || label == "WEN-VERIFIED");
+        auto d = std::make_shared<Dict>();
+        d->items["文件"] = vStr(path);
+        d->items["标签"] = vStr(label);
+        d->items["对称"] = vBool(symmetric);
+        d->items["官方"] = vBool(official);
+        return vDict(d);
+    });
+    registerBuiltin("安全白名单", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (!gSecAdmin) throw WenError("权限错误", line, 0, "需要安全管理员");
+        gSecWhite.insert(fs::absolute(fs::u8path(needStr(a[0], "安全白名单", line))).u8string());
+        return vNum((double)gSecWhite.size());
+    });
+    registerBuiltin("安全黑名单", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (!gSecAdmin) throw WenError("权限错误", line, 0, "需要安全管理员");
+        gSecBlack.insert(fs::absolute(fs::u8path(needStr(a[0], "安全黑名单", line))).u8string());
+        return vNum((double)gSecBlack.size());
+    });
+    registerBuiltin("安全名单", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+        auto d = std::make_shared<Dict>();
+        auto w = std::make_shared<List>(); auto b = std::make_shared<List>();
+        for (const auto& s : gSecWhite) w->items.push_back(vStr(s));
+        for (const auto& s : gSecBlack) b->items.push_back(vStr(s));
+        d->items["白名单"] = vList(w);
+        d->items["黑名单"] = vList(b);
+        return vDict(d);
+    });
+    registerBuiltin("安全管理员", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        const char* token = std::getenv("WEN_SECURITY_TOKEN");
+        if (!token || !*token) throw WenError("权限错误", line, 0, "未配置 WEN_SECURITY_TOKEN");
+        if (needStr(a[0], "安全管理员", line) != token)
+            throw WenError("权限错误", line, 0, "安全管理员口令错误");
+        gSecAdmin = true;
+        return vBool(true);
+    });
+    registerBuiltin("是否安全管理员", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+        return vBool(gSecAdmin);
+    });
+    registerBuiltin("退出安全管理员", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+        gSecAdmin = false;
+        return vBool(true);
+    });
     registerBuiltin("新建布局", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         bool packed = false;
         if (a.size() > 1) {
@@ -13544,6 +13654,22 @@ static int runFile(const string& path) {
     Interpreter vm;
     try {
         string src = readWholeFile(resolveWenPath(path));
+        string secAbs = fs::absolute(fs::u8path(path)).u8string();
+        if (gSecBlack.count(secAbs)) { std::cerr << "【安全拒绝】黑名单文件：" << path << "\n"; return 1; }
+        if (!gSecWhite.count(secAbs) && gSecurityPolicy != "观察") {
+            auto issues = secScanSource(src);
+            if (!issues.empty()) {
+                if (gSecurityPolicy == "拒绝") {
+                    std::cerr << "【安全拒绝】发现 " << issues.size() << " 处可疑代码：" << path << "\n";
+                    return 1;
+                }
+                if (gSecurityPolicy == "询问" && _isatty(_fileno(stdin))) {
+                    std::cerr << "【安全提醒】发现 " << issues.size() << " 处可疑代码：" << path << "\n允许运行？[y/N] ";
+                    string ans; std::getline(std::cin, ans);
+                    if (ans.empty() || (ans[0] != 'y' && ans[0] != 'Y')) { std::cerr << "已拒绝\n"; return 1; }
+                }
+            }
+        }
         vector<WenError> errors;
         string expanded;
         processSaveBlocks(src, false, expanded, errors);
