@@ -2574,7 +2574,7 @@ static string httpGetText(const string& url, int timeoutMs, int line) {
 #else
     (void)url;
     (void)timeoutMs;
-    throw WenError("运行时错误", line, 0, "网络库目前只支持 Windows（WinHTTP）");
+    throw WenError("运行时错误", line, 0, "网络库目前只支持 Windows 网络接口");
 #endif
 }
 
@@ -2611,7 +2611,7 @@ struct JsonReader {
 
     [[noreturn]] void fail(const string& msg) const {
         throw WenError("运行时错误", line, 0,
-                       "JSON 解析失败：" + msg + "（第 " + std::to_string(i + 1) + " 个字符）");
+                       "结构化文本解析失败：" + msg + "（第 " + std::to_string(i + 1) + " 个字符）");
     }
     void ws() {
         while (i < s.size() &&
@@ -2808,7 +2808,7 @@ static string jsonDump(const Value& v, int line) {
         case VT::Bool: return v.b ? "true" : "false";
         case VT::Num: {
             if (!std::isfinite(v.num))
-                throw WenError("运行时错误", line, 0, "JSON 不能表示无穷或 NaN");
+                throw WenError("运行时错误", line, 0, "结构化文本不能表示无穷或非数");
             std::ostringstream os;
             os << std::setprecision(15) << v.num;
             return os.str();
@@ -2847,7 +2847,7 @@ static string jsonDump(const Value& v, int line) {
             return out + "]";
         }
         default:
-            throw WenError("运行时错误", line, 0, "JSON 不支持函数类型");
+            throw WenError("运行时错误", line, 0, "结构化文本不支持函数类型");
     }
 }
 
@@ -7746,7 +7746,7 @@ Interpreter::Interpreter() {
         auto rootDict = needDict(root, "字节码", line);
         auto codeIt = rootDict->items.find("code");
         if (codeIt == rootDict->items.end())
-            throw WenError("运行时错误", line, 0, "字节码缺少 code");
+            throw WenError("运行时错误", line, 0, "字节码缺少代码段");
         auto code = needList(codeIt->second, "字节码", line);
         vector<Value> stack;
         std::map<string, Value> vars;
@@ -8633,7 +8633,7 @@ Interpreter::Interpreter() {
         string token = env ? env : "";
         if (token.empty())
             throw WenError("权限错误", line, 0,
-                           "未配置管理员口令：先设置环境变量 WEN_ADMIN_TOKEN");
+                           "未配置管理员口令：先设置中文变量「文_管理员口令」");
         if (needStr(a[0], "申请管理员", line) != token)
             throw WenError("权限错误", line, 0, "管理员口令不正确");
         adminGranted = true;
@@ -8684,7 +8684,7 @@ Interpreter::Interpreter() {
         d->items["授权"] = vList(perms);
         const char* cn = std::getenv("文_管理员口令");
         const char* en = std::getenv("WEN_ADMIN_TOKEN");
-        d->items["口令来源"] = vStr(cn && *cn ? "文_管理员口令" : (en && *en ? "WEN_ADMIN_TOKEN" : "未配置"));
+        d->items["口令来源"] = vStr(cn && *cn ? "文_管理员口令" : (en && *en ? "旧版英文变量" : "未配置"));
         return vDict(d);
     });
     registerBuiltin("沙盒状态", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
@@ -8758,7 +8758,7 @@ Interpreter::Interpreter() {
             {"跃迁库", "自动/纯函数缓存、统计、快照"},
             {"内存库", "常驻/临时内存、函数缓存、压缩、牵引"},
             {"神经网络库", "神经层/神经链/前向/训练"},
-            {"兼容库", "翻译到 Python/JS/JSON/Java/字节码/C++/汇编"},
+            {"兼容库", "翻译到外部语言：Python、JavaScript、结构化文本、Java、字节码、C++、汇编"},
             {"管理员库", "管理员权限、危险模式"},
             {"函数库", "映射、过滤、折叠、排序、积分"},
             {"文件库", "读写、复制、重命名、目录"},
@@ -8767,10 +8767,10 @@ Interpreter::Interpreter() {
             {"点阵库", "点集增删、平移、缩放"},
             {"频道库", "先进先出消息队列"},
             {"注入库", "调试注入变量/输入/代码"},
-            {"可视化库", "折线/柱状/散点/饼图 SVG"},
-            {"网络库", "抓取、下载、抓取 JSON、网络路径、防火墙"},
+            {"可视化库", "折线/柱状/散点/饼图矢量图"},
+            {"网络库", "抓取、下载、抓取结构化文本、网络路径、防火墙"},
             {"网页库", "去标签、取标签/属性/链接/标题"},
-            {"数据格式库", "JSON、CSV"}};
+            {"数据格式库", "结构化文本、表格文本"}};
         auto count = [&](const string& lib) {
             auto it = libraryFunctions.find(lib);
             return it == libraryFunctions.end() ? 0 : (int)it->second.size();
@@ -9313,7 +9313,7 @@ Interpreter::Interpreter() {
     });
     registerBuiltin("安全管理员", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
         const char* token = std::getenv("WEN_SECURITY_TOKEN");
-        if (!token || !*token) throw WenError("权限错误", line, 0, "未配置 WEN_SECURITY_TOKEN");
+        if (!token || !*token) throw WenError("权限错误", line, 0, "未配置安全口令：先设置中文变量「文_安全口令」");
         if (needStr(a[0], "安全管理员", line) != token)
             throw WenError("安全权限", line, 0, "安全管理员口令错误");
         gSecAdmin = true;
@@ -9812,7 +9812,7 @@ Interpreter::Interpreter() {
         std::tm tm{};
         std::istringstream ss(s);
         ss >> std::get_time(&tm, "%Y-%m-%d %H:%M:%S");
-        if (ss.fail()) throw WenError("运行时错误", line, 0, "时间格式应为 YYYY-MM-DD HH:MM:SS");
+        if (ss.fail()) throw WenError("运行时错误", line, 0, "时间格式应为「年-月-日 时:分:秒」");
         return vNum((double)std::mktime(&tm));
     });
     registerBuiltin("休眠", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
@@ -9843,7 +9843,7 @@ Interpreter::Interpreter() {
         for (unsigned char c : s) {
             if (c == '=') break;
             auto p = T.find((char)c);
-            if (p == string::npos) throw WenError("运行时错误", line, 0, "Base64 含非法字符");
+            if (p == string::npos) throw WenError("运行时错误", line, 0, "六四编码含非法字符");
             val = (val << 6) + (int)p;
             bits += 6;
             if (bits >= 0) {
@@ -9872,11 +9872,11 @@ Interpreter::Interpreter() {
             if (c >= '0' && c <= '9') return c - '0';
             if (c >= 'a' && c <= 'f') return c - 'a' + 10;
             if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-            throw WenError("运行时错误", line, 0, "URL 编码含非法字符");
+            throw WenError("运行时错误", line, 0, "网址编码含非法字符");
         };
         for (size_t i = 0; i < s.size(); ++i) {
             if (s[i] == '%') {
-                if (i + 2 >= s.size()) throw WenError("运行时错误", line, 0, "URL 编码不完整");
+                if (i + 2 >= s.size()) throw WenError("运行时错误", line, 0, "网址编码不完整");
                 out += (char)((hex(s[i + 1]) << 4) | hex(s[i + 2]));
                 i += 2;
             } else if (s[i] == '+') out += ' ';
@@ -11533,7 +11533,7 @@ Interpreter::Interpreter() {
                 code << "}, " << f3(rgb[0]) << ", " << f3(rgb[1]) << ", " << f3(rgb[2]) << "},\n";
             }
             size_t p3 = tpl3.find("// __SCENE3D__");
-            if (p3 == string::npos) throw WenError("引擎错误", line, 0, "3D 模板缺少 __SCENE3D__");
+            if (p3 == string::npos) throw WenError("引擎错误", line, 0, "三维模板缺少场景标记 __SCENE3D__");
             tpl3.replace(p3, string("// __SCENE3D__").size(), code.str());
             auto repl = [&](const string& key, const string& val) {
                 size_t q = tpl3.find(key);
@@ -11630,7 +11630,7 @@ Interpreter::Interpreter() {
         }
         size_t pos = tpl.find("// __SCENE__");
         if (pos == string::npos)
-            throw WenError("引擎错误", line, 0, "OpenGL 模板缺少 __SCENE__ 标记");
+            throw WenError("引擎错误", line, 0, "图形接口模板缺少场景标记 __SCENE__");
         tpl.replace(pos, string("// __SCENE__").size(), code.str());
         size_t wpos = tpl.find("@W@");
         if (wpos != string::npos) tpl.replace(wpos, 3, std::to_string(W));
@@ -11777,7 +11777,7 @@ Interpreter::Interpreter() {
         }
         size_t dpos = tpl.find("@DATA@");
         if (dpos == string::npos)
-            throw WenError("引擎错误", line, 0, "WebGPU 模板缺少 @DATA@ 标记");
+            throw WenError("引擎错误", line, 0, "网页图形接口模板缺少数据标记 @DATA@");
         tpl.replace(dpos, 6, data.str());
         tpl.replace(tpl.find("@W@"), 3, std::to_string(W));
         tpl.replace(tpl.find("@H@"), 3, std::to_string(H));
@@ -11922,7 +11922,7 @@ Interpreter::Interpreter() {
         }
         size_t dpos = tpl.find("@DATA@");
         if (dpos == string::npos)
-            throw WenError("引擎错误", line, 0, "Vulkan 模板缺少 @DATA@ 标记");
+            throw WenError("引擎错误", line, 0, "图形接口模板缺少数据标记 @DATA@");
         tpl.replace(dpos, 6, data.str());
         tpl.replace(tpl.find("@W@"), 3, std::to_string(W));
         tpl.replace(tpl.find("@H@"), 3, std::to_string(H));
