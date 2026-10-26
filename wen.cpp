@@ -1551,14 +1551,18 @@ private:
                 }
             }
             if (matchOp("(")) {
+                skipNewlines();
                 vector<ExprPtr> args;
                 if (!atOp(")")) {
                     args.push_back(parseExpr());
                     while (matchOp(",")) {
+                        skipNewlines();
                         if (atOp(")")) break;
                         args.push_back(parseExpr());
+                        skipNewlines();
                     }
                 }
+                skipNewlines();
                 expectOp(")");
                 e = mkCall(e, std::move(args), e->line);
                 continue;
@@ -6436,7 +6440,11 @@ Interpreter::Interpreter() {
     rng.seed(std::random_device{}());
 
     // ---------- 核心（不需要依赖）---------
-    registerBuiltin("长度", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+    registerBuiltin("调用", 2, 2, [](Interpreter& vm, vector<Value>& a, int line) -> Value {
+        auto list = needList(a[1], "调用", line);
+        vector<Value> args = list->items;
+        return vm.callValue(a[0], args, line);
+    });    registerBuiltin("长度", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
         const Value& v = a[0];
         if (v.type == VT::Str) return vNum((double)utf8Length(v.str));
         if (v.type == VT::List && v.list) return vNum((double)v.list->items.size());
