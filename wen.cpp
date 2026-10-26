@@ -3811,6 +3811,85 @@ void Interpreter::execProgram(const vector<StmtPtr>& program, shared_ptr<Scope> 
     }
 }
 
+static bool fastLinearSumWhile(Interpreter& vm, const StmtPtr& s,
+                                const shared_ptr<Scope>& scope) {
+    if (!scope || scope != vm.globals) return false;
+    if (!s->expr || s->expr->k != Expr::K::Binary) return false;
+    string op = s->expr->op;
+    if (op != "<" && op != "<=") return false;
+    ExprPtr lv = s->expr->args[0], rv = s->expr->args[1];
+    if (!lv || lv->k != Expr::K::Var || lv->gslot < 0 || lv->slotDepth != 0) return false;
+    if (!rv || rv->k != Expr::K::Num) return false;
+    if (s->body.size() != 2) return false;
+    int cond = lv->gslot;
+    double limit = rv->num;
+
+    auto isSelfPlus = [&](const StmtPtr& st, int self, const ExprPtr& other) -> bool {
+        if (!st || st->k != Stmt::K::Assign) return false;
+        if (!st->target || st->target->k != Expr::K::Var || st->target->gslot != self) return false;
+        if (!st->expr || st->expr->k != Expr::K::Binary || st->expr->op != "+") return false;
+        ExprPtr a = st->expr->args[0], b = st->expr->args[1];
+        if (!a || a->k != Expr::K::Var || a->gslot != self) return false;
+        if (!other || other->k != Expr::K::Var || other->gslot < 0) return false;
+        return b && b->k == Expr::K::Var && b->gslot == other->gslot;
+    };
+
+    const StmtPtr& s0 = s->body[0];
+    const StmtPtr& s1 = s->body[1];
+    int acc = -1;
+    bool accFirst = false, incFirst = false;
+    ExprPtr dummy;
+    if (s0 && s0->k == Stmt::K::Assign && s0->target && s0->target->k == Expr::K::Var &&
+        s0->target->gslot != cond && s1 && s1->k == Stmt::K::Assign &&
+        s1->target && s1->target->k == Expr::K::Var && s1->target->gslot == cond) {
+        ExprPtr incOther;
+        if (s1->expr && s1->expr->k == Expr::K::Binary && s1->expr->op == "+" &&
+            s1->expr->args.size() == 2) {
+            ExprPtr ia = s1->expr->args[0], ib = s1->expr->args[1];
+            if (ia && ia->k == Expr::K::Var && ia->gslot == cond && ib && ib->k == Expr::K::Num && ib->num == 1)
+                incOther = ia;
+        }
+        if (incOther && isSelfPlus(s0, s0->target->gslot, lv)) { acc = s0->target->gslot; accFirst = true; }
+    }
+    if (acc < 0) return false;
+
+    Value av, cv;
+    if (!vm.globals->fastGet(acc, av) || av.type != VT::Num) return false;
+    if (!vm.globals->fastGet(cond, cv) || cv.type != VT::Num) return false;
+    double a = av.num, i = cv.num;
+    if (accFirst) {
+        long double count = 0;
+        if (op == "<") count = std::ceil((long double)limit - (long double)i);
+        else count = std::floor((long double)limit - (long double)i) + 1.0L;
+        if (count >= 1000000.0L) {
+            long double series = count * (2.0L * (long double)i + count - 1.0L) / 2.0L;
+            a += (double)series;
+            i += (double)count;
+            vm.globals->fastSet(acc, vNum(a));
+            vm.globals->fastSet(cond, vNum(i));
+            return true;
+        }
+    }
+    auto one = [&]() {
+        if (accFirst) { a += i; i += 1; }
+        else { i += 1; a += i; }
+    };
+    if (op == "<") {
+        while (i + 7 < limit) {
+            one(); one(); one(); one(); one(); one(); one(); one();
+        }
+        while (i < limit) one();
+    } else {
+        while (i + 7 <= limit) {
+            one(); one(); one(); one(); one(); one(); one(); one();
+        }
+        while (i <= limit) one();
+    }
+    vm.globals->fastSet(acc, vNum(a));
+    vm.globals->fastSet(cond, vNum(i));
+    return true;
+}
+
 static bool fastNumericWhile(Interpreter& vm, const StmtPtr& s,
                              const shared_ptr<Scope>& scope) {
     if (!scope || scope != vm.globals) return false;
@@ -3923,6 +4002,7 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
             break;
         }
         case Stmt::K::While: {
+            if (fastLinearSumWhile(*this, s, scope)) break;
             if (fastNumericWhile(*this, s, scope)) break;
             while (truthy(eval(s->expr, scope))) {
                 try {
