@@ -3204,6 +3204,8 @@ static const std::map<string, string>& functionModules() {
         // 翻译器
         {"翻译支持", "兼容库"}, {"翻译目标", "兼容库"}, {"翻译检查", "兼容库"},
         {"兼容支持", "兼容库"}, {"兼容翻译", "兼容库"}, {"兼容运行", "兼容库"},
+        {"查看", "查看库"}, {"库清单", "查看库"}, {"函数清单", "查看库"},
+        {"性能查看", "查看库"}, {"开启调用统计", "查看库"}, {"调用排行", "查看库"}, {"精英配置", "查看库"},
         {"兼容语言", "兼容库"}, {"兼容解析", "兼容库"}, {"兼容诊断", "兼容库"},
         {"兼容冲突", "兼容库"},
         {"新建神经层", "神经网络库"}, {"神经链", "神经网络库"}, {"前向", "神经网络库"},
@@ -3300,7 +3302,7 @@ static const std::map<string, string>& functionModules() {
         // 网络库
         {"抓取", "网络库"}, {"下载", "网络库"}, {"抓取JSON", "网络库"},
         {"安全抓取", "网络库"}, {"限速抓取", "网络库"}, {"乱码解析", "网络库"},
-        {"网络路径", "网络库"}, {"防火墙", "网络库"}, {"防火墙检查", "网络库"},
+        {"网络路径", "网络库"}, {"网络记录", "网络库"}, {"网络故事", "网络库"}, {"网络统计", "网络库"}, {"清空网络记录", "网络库"},
         {"二进制破坏", "网络库"}, {"二进制恢复", "网络库"},
 
         // JSON 库
@@ -3382,6 +3384,7 @@ public:
     std::deque<string> inputBuffer;
     bool inLibrary_ = false;
     std::set<string> moduleExports;
+    std::vector<std::tuple<string, int, long long>> netHits;
     std::vector<std::pair<string, bool>> firewallRules;
 
     Interpreter();
@@ -8807,6 +8810,75 @@ Interpreter::Interpreter() {
         EmptyWorkingSet(GetCurrentProcess());
         return vNone();
     });
+    registerBuiltin("查看", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        const Value& v = a[0];
+        auto d = std::make_shared<Dict>();
+        d->items["类型"] = vStr(typeName(v));
+        string text = toText(v, true);
+        if (text.size() > 500) text = text.substr(0, 500) + "…";
+        d->items["文本"] = vStr(text);
+        long long len = 0;
+        if (v.type == VT::Str) len = (long long)utf8Length(v.str);
+        else if (v.type == VT::List && v.list) len = (long long)v.list->items.size();
+        else if (v.type == VT::Set && v.list) len = (long long)v.list->items.size();
+        else if (v.type == VT::Dict && v.dict) len = (long long)v.dict->items.size();
+        else if (v.type == VT::Bytes && v.bytes) len = (long long)v.bytes->size();
+        d->items["长度"] = vNum((double)len);
+        if (v.type == VT::Dict && v.dict) {
+            auto keys = std::make_shared<List>();
+            for (const auto& kv : v.dict->items) keys->items.push_back(vStr(kv.first));
+            d->items["键"] = vList(keys);
+        }
+        return vDict(d);
+    });
+    registerBuiltin("库清单", 0, 0, [this](Interpreter&, vector<Value>&, int) -> Value {
+        auto l = std::make_shared<List>();
+        for (const auto& kv : libraryFunctions) l->items.push_back(vStr(kv.first));
+        return vList(l);
+    });
+    registerBuiltin("函数清单", 0, 1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto l = std::make_shared<List>();
+        string only = a.empty() ? "" : needStr(a[0], "函数清单", line);
+        for (const auto& kv : libraryFunctions) {
+            if (!only.empty() && kv.first != only) continue;
+            for (const auto& fn : kv.second) l->items.push_back(vStr(fn.first));
+        }
+        return vList(l);
+    });
+    registerBuiltin("性能查看", 0, 0, [this](Interpreter&, vector<Value>&, int) -> Value {
+        auto d = std::make_shared<Dict>();
+        d->items["加速缓存"] = vBool(accelEnabled);
+        d->items["跃迁自动"] = vBool(leapAuto);
+        d->items["内存自动"] = vBool(memoryAuto);
+        d->items["调用统计"] = vBool(callStats);
+        d->items["加速命中"] = vNum((double)accelHits);
+        d->items["跃迁命中"] = vNum((double)leapHits);
+        d->items["内存命中"] = vNum((double)memoryHits);
+        return vDict(d);
+    });
+    registerBuiltin("调用排行", 0, 1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+        int n = a.empty() ? 20 : (int)needIndex(a[0], "调用排行", line);
+        vector<std::pair<long long, string>> rows;
+        for (const auto& kv : callCounts) rows.push_back({kv.second, kv.first});
+        std::sort(rows.begin(), rows.end(), [](auto& x, auto& y) { return x.first > y.first; });
+        auto l = std::make_shared<List>();
+        for (int i = 0; i < (int)rows.size() && i < n; ++i) {
+            auto d = std::make_shared<Dict>();
+            d->items["名字"] = vStr(rows[(size_t)i].second);
+            d->items["次数"] = vNum((double)rows[(size_t)i].first);
+            l->items.push_back(vDict(d));
+        }
+        return vList(l);
+    });
+    registerBuiltin("精英配置", 0, 1, [this](Interpreter&, vector<Value>& a, int) -> Value {
+        bool on = a.empty() ? true : truthy(a[0]);
+        accelEnabled = on;
+        if (on) callStats = false;
+        auto d = std::make_shared<Dict>();
+        d->items["加速"] = vBool(accelEnabled);
+        d->items["快路径"] = vBool(!gNoFast);
+        return vDict(d);
+    });
     registerBuiltin("新建布局", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         bool packed = false;
         if (a.size() > 1) {
@@ -9848,6 +9920,41 @@ Interpreter::Interpreter() {
         if (!netWhitelisted(url) || !netAllowed(firewallRules, url)) throw WenError("运行时错误", line, 0, "网络防火墙拒绝：" + netHostOf(url));
         int timeout = a.size() == 2 ? (int)needIndex(a[1], "抓取", line) : 15000;
         return vStr(httpGetText(url, timeout, line));
+    });
+    registerBuiltin("网络记录", 0, 0, [this](Interpreter&, vector<Value>&, int) -> Value {
+        auto l = std::make_shared<List>();
+        for (const auto& h : netHits) {
+            auto d = std::make_shared<Dict>();
+            d->items["网址"] = vStr(std::get<0>(h));
+            d->items["状态"] = vNum(std::get<1>(h));
+            d->items["毫秒"] = vNum((double)std::get<2>(h));
+            l->items.push_back(vDict(d));
+        }
+        return vList(l);
+    });
+    registerBuiltin("网络故事", 0, 0, [this](Interpreter&, vector<Value>&, int) -> Value {
+        auto l = std::make_shared<List>();
+        for (const auto& h : netHits) {
+            auto d = std::make_shared<Dict>();
+            d->items["网址"] = vStr(std::get<0>(h));
+            d->items["状态"] = vNum(std::get<1>(h));
+            d->items["毫秒"] = vNum((double)std::get<2>(h));
+            l->items.push_back(vDict(d));
+        }
+        return vList(l);
+    });
+    registerBuiltin("网络统计", 0, 0, [this](Interpreter&, vector<Value>&, int) -> Value {
+        auto d = std::make_shared<Dict>();
+        d->items["次数"] = vNum((double)netHits.size());
+        long long ms = 0;
+        for (const auto& h : netHits) ms += std::get<2>(h);
+        d->items["总毫秒"] = vNum((double)ms);
+        return vDict(d);
+    });
+    registerBuiltin("清空网络记录", 0, 0, [this](Interpreter&, vector<Value>&, int) -> Value {
+        size_t n = netHits.size();
+        netHits.clear();
+        return vNum((double)n);
     });
     registerBuiltin("下载", 2, 3, [this](Interpreter&, vector<Value>& a, int line) -> Value {
         string url = needStr(a[0], "下载", line);
