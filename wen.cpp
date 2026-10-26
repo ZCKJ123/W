@@ -3796,7 +3796,30 @@ void Interpreter::加载模块(const string& rawName, int line) {
             b->core = false;
         }
     }
-    if (name == "数学库") {
+    auto aliasFn = [&](const string& cn, const string& old) {
+        auto it = lib->second.find(old);
+        if (it == lib->second.end()) return;
+        globals->set(cn, it->second);
+        symbolOwner[cn] = name;
+    };
+    if (name == "数据格式库") {
+        aliasFn("解析结构化文本", "解析JSON");
+        aliasFn("生成结构化文本", "生成JSON");
+        aliasFn("解析表格文本", "解析CSV");
+        aliasFn("生成表格文本", "生成CSV");
+    } else if (name == "编码库") {
+        aliasFn("六四编码", "Base64编码");
+        aliasFn("六四解码", "Base64解码");
+        aliasFn("网址编码", "URL编码");
+        aliasFn("网址解码", "URL解码");
+    } else if (name == "处理器库") {
+        aliasFn("处理器核心数", "CPU核心数");
+        aliasFn("处理器并行求和", "CPU并行求和");
+        aliasFn("处理器并行最大", "CPU并行最大");
+        aliasFn("处理器并行最小", "CPU并行最小");
+    } else if (name == "网络库") {
+        aliasFn("抓取结构化文本", "抓取JSON");
+    }    if (name == "数学库") {
         const double pi = std::acos(-1.0);
         globals->set("圆周率", vNum(pi));
         globals->set("π", vNum(pi));
