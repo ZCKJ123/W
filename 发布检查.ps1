@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 function 失败($msg) { Write-Host "发货检查失败：$msg" -ForegroundColor Red; exit 1 }
 
@@ -31,4 +31,4 @@ foreach ($name in @('时间库', '编码库', '正则库', 'CPU库', '路径库'
 }
 if ($libs -match 'GPU库') { 失败 "V0.1 不应带 GPU 库" }
 
-Write-Host "发货检查通过：83/83，版本、签名、标记、库都正常。" -ForegroundColor Green
+Write-Host "发货检查通过：85/85，版本、签名、标记、库都正常。" -ForegroundColor Green

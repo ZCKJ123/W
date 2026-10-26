@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -35,6 +36,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <psapi.h>
 #include <winhttp.h>
 #include <conio.h>
 #include <io.h>
@@ -3240,6 +3242,8 @@ public:
     std::set<string> loadedModules;
     std::map<string, string> symbolOwner;  // 名字 -> 库/用户，防止静默覆盖
     bool callStats = false;                // 调用统计：只在开启时计数
+    int callDepth = 0;
+    int maxCallDepth = 1000;
     bool adminGranted = false;             // 管理员权限
     bool dangerousMode = false;            // 危险模式：允许二进制破坏
     std::map<string, long long> callCounts;
@@ -4203,6 +4207,14 @@ void Interpreter::setIndex(Value& obj, const Value& idx, const Value& val, int l
 
 // 函数调用：返回信号、循环外中断、错误调用栈
 Value Function::call(Interpreter& vm, vector<Value>& args, int callLine) {
+    if (vm.callDepth >= vm.maxCallDepth)
+        throw WenError("运行时错误", callLine, 0,
+                       "递归过深：超过 " + std::to_string(vm.maxCallDepth) + " 层，可能栈溢出");
+    struct DepthGuard {
+        Interpreter& vm;
+        explicit DepthGuard(Interpreter& v) : vm(v) { ++vm.callDepth; }
+        ~DepthGuard() { --vm.callDepth; }
+    } depthGuard(vm);
     if (vm.callStats && !name.empty()) ++vm.callCounts[name];
     if (args.size() != params.size()) {
         throw WenError("运行时错误", callLine, 0,
@@ -12616,7 +12628,65 @@ static int compileFile(const string& path, const string& output, bool build) {
     }
 }
 
-static int runMain(const vector<string>& args) {
+static std::atomic<long long> gTimeLimitSec{0};
+static std::atomic<long long> gMemLimitMB{0};
+
+static long long limitNumber(const string& s) {
+    size_t i = 0;
+    while (i < s.size() && !std::isdigit((unsigned char)s[i])) ++i;
+    if (i >= s.size()) return 0;
+    return std::stoll(s.substr(i));
+}
+static void setupRuntimeLimit(const string& spec) {
+    std::istringstream ss(spec);
+    string item;
+    while (std::getline(ss, item, ',')) {
+        auto eq = item.find('=');
+        if (eq == string::npos) continue;
+        string key = item.substr(0, eq), val = item.substr(eq + 1);
+        long long n = limitNumber(val);
+        if (key.find("时间") != string::npos) {
+            if (val.find("毫秒") != string::npos) n = (n + 999) / 1000;
+            gTimeLimitSec.store(n > 0 ? n : 0);
+        } else if (key.find("内存") != string::npos) {
+            gMemLimitMB.store(n > 0 ? n : 0);
+        }
+    }
+}
+static void startRuntimeLimit() {
+    if (gTimeLimitSec.load() == 0 && gMemLimitMB.load() == 0) return;
+    std::thread([] {
+        auto start = std::chrono::steady_clock::now();
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - start).count();
+            if (gTimeLimitSec.load() > 0 && elapsed >= gTimeLimitSec.load()) {
+                std::cerr << "\n【资源限制】运行超过 " << gTimeLimitSec.load() << " 秒，已终止\n";
+                std::_Exit(124);
+            }
+            if (gMemLimitMB.load() > 0) {
+                PROCESS_MEMORY_COUNTERS_EX pm{};
+                pm.cb = sizeof(pm);
+                if (GetProcessMemoryInfo(GetCurrentProcess(),
+                        reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pm), sizeof(pm))) {
+                    unsigned long long bytes = (unsigned long long)pm.WorkingSetSize;
+                    if (bytes > (unsigned long long)gMemLimitMB.load() * 1024ULL * 1024ULL) {
+                        std::cerr << "\n【资源限制】内存超过 " << gMemLimitMB.load() << " MB，已终止\n";
+                        std::_Exit(125);
+                    }
+                }
+            }
+        }
+    }).detach();
+}
+
+static int runMain(vector<string> args) {
+    if (args.size() >= 3 && args[1] == "--限制") {
+        setupRuntimeLimit(args[2]);
+        args.erase(args.begin() + 1, args.begin() + 3);
+        startRuntimeLimit();
+    }
     if (args.size() <= 1) {
         Interpreter vm;
         repl(vm);
