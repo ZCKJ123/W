@@ -2348,6 +2348,7 @@ static bool pathUnder(const string& root, const string& path) {
 }
 static bool sandboxPathAllowed(const string& path) {
     if (!gSandbox) return true;
+    if (fs::u8path(path).is_relative() && path.find("..") == string::npos) return true;
     std::error_code ec;
     fs::path p = fs::weakly_canonical(fs::u8path(path), ec);
     string full = ec ? fs::absolute(fs::u8path(path), ec).u8string() : p.u8string();
