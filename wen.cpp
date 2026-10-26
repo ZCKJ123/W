@@ -8653,19 +8653,17 @@ Interpreter::Interpreter() {
         auto n1 = bigSub(count, {1});
         auto term = bigAdd(bigMul(bigFromU64(2), first), bigMul(n1, stepv));
         auto total = bigDivSmall(bigMul(count, term), 2);
-        unsigned long long n = 0;
-        try { n = std::stoull(bigStr(count)); } catch (...) { return vStr(bigStr(total)); }
+        auto base = bigDivSmall(count, {64});
+        auto rem = bigSub(count, bigMul(base, {64}));
         auto current = first;
         auto seg = std::vector<uint32_t>{0};
-        unsigned long long base = n / 64, rem = n % 64;
         for (int k = 0; k < 64; ++k) {
-            unsigned long long len = base + (k == 63 ? rem : 0);
-            if (!len) continue;
-            auto lenBig = bigFromU64(len);
-            auto last = bigAdd(current, bigMul(bigFromU64(len - 1), stepv));
-            auto sum = bigDivSmall(bigMul(lenBig, bigAdd(current, last)), 2);
+            auto len = (k == 63) ? bigAdd(base, rem) : base;
+            if (bigStr(len) == "0") continue;
+            auto last = bigAdd(current, bigMul(bigSub(len, {1}), stepv));
+            auto sum = bigDivSmall(bigMul(len, bigAdd(current, last)), 2);
             seg = bigAdd(seg, sum);
-            current = bigAdd(current, bigMul(lenBig, stepv));
+            current = bigAdd(current, bigMul(len, stepv));
         }
         if (bigStr(seg) != bigStr(total))
             throw WenError("运行时错误", line, 0, "四段级数对账失败");
