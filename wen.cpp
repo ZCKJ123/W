@@ -13093,6 +13093,8 @@ static int runMain(vector<string> args) {
         while (std::getline(ss, h, ',')) if (!h.empty()) gNetWhitelist.push_back(h);
         args.erase(args.begin() + 1, args.begin() + 3);
     }
+    if (gSandbox && args.size() > 1 && fs::exists(fs::u8path(args[1])))
+        gSandboxAllow.push_back(fs::absolute(fs::u8path(args[1])).u8string());
     if (args.size() >= 3 && args[1] == "--限制") {
         setupRuntimeLimit(args[2]);
         args.erase(args.begin() + 1, args.begin() + 3);
