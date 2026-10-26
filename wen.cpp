@@ -1317,7 +1317,17 @@ private:
             }
         }
         expectKw("则");
-        auto body = parseBlock({"结束"});
+        // 函数体里不能再把变量绑成全局快槽：否则函数里的每个变量都会变成全局变量。
+        // 用 try 兜住解析错误，避免多错误模式（--检查）下 funcDepth_ 回不去。
+        ++funcDepth_;
+        vector<StmtPtr> body;
+        try {
+            body = parseBlock({"结束"});
+        } catch (...) {
+            --funcDepth_;
+            throw;
+        }
+        --funcDepth_;
         expectKw("结束");
         endStmt();
         auto s = std::make_shared<Stmt>();
@@ -1765,6 +1775,9 @@ struct Scope {
     bool lookup(SymId id, Value& out) const {
         auto it = idVars.find(id);
         if (it != idVars.end()) { out = it->second; return true; }
+        // 全局数字只存在快槽里，函数体内按名字读全局时也必须看得到。
+        auto sit = idSlot.find(id);
+        if (sit != idSlot.end() && fastGet(sit->second, out)) return true;
         auto jt = vars.find(symbolName(id));
         if (jt != vars.end()) { out = jt->second; return true; }
         if (parent) return parent->lookup(id, out);
@@ -1773,6 +1786,27 @@ struct Scope {
     void set(SymId id, Value v) {
         idVars[id] = v;
         vars[symbolName(id)] = std::move(v);
+    }
+    // 记下「名字 → 快槽」，让函数体、变量名单、外部库都能按名字找到全局数字。
+    void fastBind(SymId id, int slot) {
+        if (slot < 0) return;
+        if (idSlot.find(id) == idSlot.end()) idSlot.emplace(id, slot);
+    }
+    // 赋值语义：先找已经有这个绑定的那一层写入；都没找到返回 false，
+    // 由调用方在当前层新建（这样函数体里的新变量才是真正的局部变量）。
+    bool assign(SymId id, Value v) {
+        auto sit = idSlot.find(id);
+        if (sit != idSlot.end()) {
+            set(id, v);
+            fastSet(sit->second, v);
+            return true;
+        }
+        if (idVars.count(id) || vars.count(symbolName(id))) {
+            set(id, std::move(v));
+            return true;
+        }
+        if (parent) return parent->assign(id, std::move(v));
+        return false;
     }
     int findSlot(SymId id) const {
         auto it = idSlot.find(id);
@@ -4194,8 +4228,8 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
             Value iter = eval(s->expr, scope);
             bool two = !s->name2.empty();
             auto runOne = [&](const Value& k, const Value& v) -> bool {
-                if (s->nameSlot >= 0) { globals->fastSet(s->nameSlot, k); if (k.type != VT::Num && k.type != VT::Int && k.type != VT::Bool) scope->set(s->nameSym, k); } else scope->set(s->nameSym, k);
-                if (two) { if (s->name2Slot >= 0) globals->fastSet(s->name2Slot, v); else scope->set(s->name2Sym, v); }
+                if (s->nameSlot >= 0) { globals->fastBind(s->nameSym, s->nameSlot); globals->fastSet(s->nameSlot, k); if (k.type != VT::Num && k.type != VT::Int && k.type != VT::Bool) scope->set(s->nameSym, k); } else scope->set(s->nameSym, k);
+                if (two) { if (s->name2Slot >= 0) { globals->fastBind(s->name2Sym, s->name2Slot); globals->fastSet(s->name2Slot, v); } else scope->set(s->name2Sym, v); }
                 try {
                     for (const auto& st : s->body) exec(st, scope);
                 } catch (ContinueSignal&) {
@@ -4287,7 +4321,7 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
                                        owner->second + "」占用；请改名");
                 symbolOwner[s->name] = "用户";
             }
-            if (s->nameSlot >= 0 && !inLibrary_) globals->fastSet(s->nameSlot, vFunc(fn));
+            if (s->nameSlot >= 0 && !inLibrary_) { globals->fastBind(s->nameSym, s->nameSlot); globals->fastSet(s->nameSlot, vFunc(fn)); }
             scope->set(s->nameSym, vFunc(fn));
             { string pre = "leap|" + s->name + "|"; for (auto it = leapCache.begin(); it != leapCache.end(); ) it = it->first.rfind(pre, 0) == 0 ? leapCache.erase(it) : std::next(it); }
             break;
@@ -4566,10 +4600,13 @@ void Interpreter::assignTarget(const ExprPtr& target, Value val,
     if (target->k == Expr::K::Var) {
         if (!target->sym) rtError(target->line, "内部符号缺失：" + target->text);
         if (target->gslot >= 0) {
+            globals->fastBind(target->sym, target->gslot);
             if (val.type != VT::Num && val.type != VT::Int && val.type != VT::Bool)
                 scope->set(target->sym, val);
             globals->fastSet(target->gslot, std::move(val));
-        } else scope->set(target->sym, std::move(val));
+        } else if (!scope->assign(target->sym, val)) {
+            scope->set(target->sym, std::move(val));
+        }
         return;
     }
     if (target->k == Expr::K::Index) {
@@ -14115,7 +14152,7 @@ static int runFile(const string& path) {
             std::cerr << "【安全提醒】非官方/未知来源：" << se.file << "\n允许运行？[是/否] ";
             string ans;
             std::getline(std::cin, ans);
-            if (ans.empty() || (ans[0] != '是' && ans[0] != 'y' && ans[0] != 'Y')) { se.decision = "用户拒绝"; return 1; }
+            if (ans.empty() || (ans != "是" && ans[0] != 'y' && ans[0] != 'Y')) { se.decision = "用户拒绝"; return 1; }
             se.decision = "用户允许";
         } else {
             se.decision = "观察允许";
@@ -14136,7 +14173,7 @@ static int runFile(const string& path) {
                 if (gSecurityPolicy == "询问" && _isatty(_fileno(stdin))) {
                     std::cerr << "【安全提醒】发现 " << issues.size() << " 处可疑代码：" << path << "\n允许运行？[是/否] ";
                     string ans; std::getline(std::cin, ans);
-                    if (ans.empty() || (ans[0] != '是' && ans[0] != 'y' && ans[0] != 'Y')) { std::cerr << "已拒绝\n"; return 1; }
+                    if (ans.empty() || (ans != "是" && ans[0] != 'y' && ans[0] != 'Y')) { std::cerr << "已拒绝\n"; return 1; }
                 }
             }
         }

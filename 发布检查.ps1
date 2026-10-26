@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 function 失败($msg) { Write-Host "发货检查失败：$msg" -ForegroundColor Red; exit 1 }
 

@@ -4,7 +4,7 @@ setlocal
 set "PATH=C:\msys64\ucrt64\bin;%PATH%"
 set "GXX=C:\msys64\ucrt64\bin\g++.exe"
 if not exist "%GXX%" set "GXX=g++"
-"%GXX%" -std=c++17 -O2 -static -municode -o wen_full.exe wen.cpp -lwinhttp
+"%GXX%" -std=c++17 -O2 -static -municode -Wl,--stack,16777216 -o wen_full.exe wen.cpp -lwinhttp -lgdi32 -lpsapi
 if errorlevel 1 (
     echo 完整构建失败。
     exit /b 1
