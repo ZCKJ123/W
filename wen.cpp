@@ -3205,6 +3205,7 @@ static const std::map<string, string>& functionModules() {
         {"兼容冲突", "兼容库"},
         {"新建神经层", "神经网络库"}, {"神经链", "神经网络库"}, {"前向", "神经网络库"},
         {"大整数幂", "大整数库"}, {"大整数乘", "大整数库"}, {"大整数加", "大整数库"}, {"大整数阶乘", "大整数库"},
+        {"阶乘位数", "大整数库"}, {"阶乘末尾零", "大整数库"}, {"阶乘概览", "大整数库"},
         {"四段级数", "精度库"}, {"精确级数", "精度库"},
         {"训练", "神经网络库"}, {"保存网络", "神经网络库"}, {"读取网络", "神经网络库"},
         {"翻译", "兼容库"}, {"执行字节码", "兼容库"},
@@ -8690,6 +8691,38 @@ Interpreter::Interpreter() {
         vector<uint32_t> out{1};
         for (long long i = 2; i <= n; ++i) out = bigMul(out, {(uint32_t)i});
         return vStr(bigStr(out));
+    });
+    registerBuiltin("阶乘位数", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        long double n = (long double)needNum(a[0], "阶乘位数", line);
+        if (n < 0) throw WenError("运行时错误", line, 0, "阶乘参数不能为负");
+        long double lg = lgammal(n + 1.0L) / logl(10.0L);
+        return vStr(std::to_string((long long)std::floor(lg) + 1));
+    });
+    registerBuiltin("阶乘末尾零", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long n = (long long)needNum(a[0], "阶乘末尾零", line);
+        if (n < 0) throw WenError("运行时错误", line, 0, "阶乘参数不能为负");
+        long long z = 0;
+        while (n >= 5) { n /= 5; z += n; }
+        return vNum((double)z);
+    });
+    registerBuiltin("阶乘概览", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        long double n = (long double)needNum(a[0], "阶乘概览", line);
+        if (n < 0) throw WenError("运行时错误", line, 0, "阶乘参数不能为负");
+        int prec = a.size() > 1 ? (int)needIndex(a[1], "阶乘概览", line) : 8;
+        if (prec < 1 || prec > 17) throw WenError("运行时错误", line, 0, "前几位精度必须在 1..17");
+        long double lg = lgammal(n + 1.0L) / logl(10.0L);
+        long double fl = std::floor(lg);
+        long double frac = lg - fl;
+        long double lead = std::pow(10.0L, frac + prec - 1.0L);
+        long long prefix = (long long)lead;
+        long long z = 0;
+        for (long long x = (long long)n; x >= 5; x /= 5) z += x / 5;
+        auto d = std::make_shared<Dict>();
+        d->items["位数"] = vStr(std::to_string((long long)fl + 1));
+        d->items["末尾零"] = vNum((double)z);
+        d->items["前几位"] = vStr(std::to_string(prefix));
+        d->items["精度"] = vNum(prec);
+        return vDict(d);
     });
     registerBuiltin("新建布局", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         bool packed = false;
