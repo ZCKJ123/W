@@ -2271,6 +2271,8 @@ static std::vector<std::pair<int, std::string>> secScanSource(const string& src)
     int n = 0;
     for (const auto& raw : splitLines(src)) {
         ++n;
+        size_t cb = raw.find_first_not_of(" \t");
+        if (cb != string::npos && raw[cb] == '#') continue;
         for (const auto& r : rules)
             if (raw.find(r.first) != std::string::npos)
                 out.push_back({n, r.second + "：" + r.first});
@@ -3290,8 +3292,8 @@ static const std::map<string, string>& functionModules() {
         {"翻译支持", "兼容库"}, {"翻译目标", "兼容库"}, {"翻译检查", "兼容库"},
         {"兼容支持", "兼容库"}, {"兼容翻译", "兼容库"}, {"兼容运行", "兼容库"},
         {"安全检查", "安全库"}, {"自检", "安全库"}, {"官方标签", "安全库"}, {"安全白名单", "安全库"}, {"安全黑名单", "安全库"},
-        {"安全名单", "安全库"}, {"安全管理员", "安全库"}, {"是否安全管理员", "安全库"}, {"退出安全管理员", "安全库"},
-        {"安全确认", "安全库"}, {"网络反流", "安全库"}, {"安全链路", "安全库"},
+        {"安全名单", "安全库"}, {"安全模式", "安全库"}, {"安全状态", "安全库"},
+        {"安全确认", "安全库"}, {"网络反流", "安全库"}, {"安全链路", "安全库"}, {"安全管理员", "安全库"}, {"是否安全管理员", "安全库"}, {"退出安全管理员", "安全库"},
         {"查看", "查看库"}, {"库清单", "查看库"}, {"函数清单", "查看库"},
         {"性能查看", "查看库"}, {"开启调用统计", "查看库"}, {"调用排行", "查看库"}, {"精英配置", "查看库"},
         {"兼容语言", "兼容库"}, {"兼容解析", "兼容库"}, {"兼容诊断", "兼容库"},
@@ -9085,6 +9087,7 @@ Interpreter::Interpreter() {
         d->items["声明指纹"] = vStr(declared);
         d->items["实际指纹"] = vStr(actual);
         d->items["对称"] = vBool(!declared.empty() && declared == actual);
+        d->items["建议"] = vStr(issues.empty() ? "建议放行" : "建议拒绝");
         auto l = std::make_shared<List>();
         for (const auto& it : issues) {
             auto one = std::make_shared<Dict>();
@@ -9104,7 +9107,7 @@ Interpreter::Interpreter() {
         string label, declared = secDeclaredLabel(src, label);
         string actual = secFingerprint(path);
         bool symmetric = !declared.empty() && declared == actual;
-        bool official = symmetric && (label == "wen-official" || label == "WEN-VERIFIED");
+        bool official = symmetric && (label == "文-官方" || label == "文-认证" || label == "wen-official" || label == "WEN-VERIFIED");
         auto d = std::make_shared<Dict>();
         d->items["文件"] = vStr(path);
         d->items["标签"] = vStr(label);
@@ -9113,12 +9116,12 @@ Interpreter::Interpreter() {
         return vDict(d);
     });
     registerBuiltin("安全白名单", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
-        if (!gSecAdmin) throw WenError("权限错误", line, 0, "需要安全管理员");
+        if (!gSecAdmin) throw WenError("安全权限", line, 0, "需要安全管理员");
         gSecWhite.insert(fs::absolute(fs::u8path(needStr(a[0], "安全白名单", line))).u8string());
         return vNum((double)gSecWhite.size());
     });
     registerBuiltin("安全黑名单", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
-        if (!gSecAdmin) throw WenError("权限错误", line, 0, "需要安全管理员");
+        if (!gSecAdmin) throw WenError("安全权限", line, 0, "需要安全管理员");
         gSecBlack.insert(fs::absolute(fs::u8path(needStr(a[0], "安全黑名单", line))).u8string());
         return vNum((double)gSecBlack.size());
     });
@@ -9135,7 +9138,7 @@ Interpreter::Interpreter() {
         const char* token = std::getenv("WEN_SECURITY_TOKEN");
         if (!token || !*token) throw WenError("权限错误", line, 0, "未配置 WEN_SECURITY_TOKEN");
         if (needStr(a[0], "安全管理员", line) != token)
-            throw WenError("权限错误", line, 0, "安全管理员口令错误");
+            throw WenError("安全权限", line, 0, "安全管理员口令错误");
         gSecAdmin = true;
         return vBool(true);
     });
@@ -9145,6 +9148,19 @@ Interpreter::Interpreter() {
     registerBuiltin("退出安全管理员", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
         gSecAdmin = false;
         return vBool(true);
+    });
+    registerBuiltin("安全模式", 1, 1, [](Interpreter&, vector<Value>& a, int) -> Value {
+        gSecurityPolicy = truthy(a[0]) ? "询问" : "观察";
+        return vStr(gSecurityPolicy);
+    });
+    registerBuiltin("安全状态", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+        auto d = std::make_shared<Dict>();
+        d->items["策略"] = vStr(gSecurityPolicy);
+        d->items["管理员"] = vBool(gSecAdmin);
+        d->items["白名单"] = vNum((double)gSecWhite.size());
+        d->items["黑名单"] = vNum((double)gSecBlack.size());
+        d->items["查息"] = vNum((double)gSecEntries.size());
+        return vDict(d);
     });
     registerBuiltin("新建布局", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         bool packed = false;
@@ -13122,6 +13138,8 @@ static string errorExplanation(const string& kind) {
         return "两个库或用户代码定义了同名函数；改名，或去掉其中一个依赖。";
     if (kind == "兼容冲突")
         return "源文件里写了多个翻译目标；一个文件只能保留一个目标行。";
+    if (kind == "安全权限")
+        return "需要安全管理员；先设置 文_安全口令 或 WEN_SECURITY_TOKEN，再调用 安全管理员。";
     if (kind == "权限错误")
         return "需要管理员权限或危险模式；先设置 WEN_ADMIN_TOKEN 并申请管理员。";
     return "解释器内部异常。";
@@ -13642,10 +13660,10 @@ static int runFile(const string& path) {
             return 1;
         }
         if (gSecurityPolicy == "询问" && _isatty(_fileno(stdin))) {
-            std::cerr << "【安全提醒】非官方/未知来源：" << se.file << "\n允许运行？[y/N] ";
+            std::cerr << "【安全提醒】非官方/未知来源：" << se.file << "\n允许运行？[是/否] ";
             string ans;
             std::getline(std::cin, ans);
-            if (ans.empty() || (ans[0] != 'y' && ans[0] != 'Y')) { se.decision = "用户拒绝"; return 1; }
+            if (ans.empty() || (ans[0] != '是' && ans[0] != 'y' && ans[0] != 'Y')) { se.decision = "用户拒绝"; return 1; }
             se.decision = "用户允许";
         } else {
             se.decision = "观察允许";
@@ -13664,9 +13682,9 @@ static int runFile(const string& path) {
                     return 1;
                 }
                 if (gSecurityPolicy == "询问" && _isatty(_fileno(stdin))) {
-                    std::cerr << "【安全提醒】发现 " << issues.size() << " 处可疑代码：" << path << "\n允许运行？[y/N] ";
+                    std::cerr << "【安全提醒】发现 " << issues.size() << " 处可疑代码：" << path << "\n允许运行？[是/否] ";
                     string ans; std::getline(std::cin, ans);
-                    if (ans.empty() || (ans[0] != 'y' && ans[0] != 'Y')) { std::cerr << "已拒绝\n"; return 1; }
+                    if (ans.empty() || (ans[0] != '是' && ans[0] != 'y' && ans[0] != 'Y')) { std::cerr << "已拒绝\n"; return 1; }
                 }
             }
         }
