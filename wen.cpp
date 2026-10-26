@@ -3863,6 +3863,7 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
                                        owner->second + "」占用；请改名");
                 symbolOwner[s->name] = "用户";
             }
+            if (s->nameSlot >= 0 && !inLibrary_) globals->fastSet(s->nameSlot, vFunc(fn));
             scope->set(s->nameSym, vFunc(fn));
             { string pre = "leap|" + s->name + "|"; for (auto it = leapCache.begin(); it != leapCache.end(); ) it = it->first.rfind(pre, 0) == 0 ? leapCache.erase(it) : std::next(it); }
             break;
