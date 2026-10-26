@@ -3205,6 +3205,7 @@ static const std::map<string, string>& functionModules() {
         {"兼容冲突", "兼容库"},
         {"新建神经层", "神经网络库"}, {"神经链", "神经网络库"}, {"前向", "神经网络库"},
         {"大整数幂", "大整数库"}, {"大整数乘", "大整数库"}, {"大整数加", "大整数库"}, {"大整数阶乘", "大整数库"},
+        {"四段级数", "精度库"}, {"精确级数", "精度库"},
         {"训练", "神经网络库"}, {"保存网络", "神经网络库"}, {"读取网络", "神经网络库"},
         {"翻译", "兼容库"}, {"执行字节码", "兼容库"},
         {"反汇编", "兼容库"}, {"反汇编文本", "兼容库"},
@@ -6780,6 +6781,33 @@ static vector<uint32_t> bigAdd(const vector<uint32_t>& a, const vector<uint32_t>
     bigTrim(c);
     return c;
 }
+static vector<uint32_t> bigSub(const vector<uint32_t>& a, const vector<uint32_t>& b) {
+    vector<uint32_t> c = a;
+    int64_t borrow = 0;
+    for (size_t i = 0; i < c.size(); ++i) {
+        int64_t cur = (int64_t)c[i] - borrow - (i < b.size() ? b[i] : 0);
+        if (cur < 0) { cur += 1000000000LL; borrow = 1; } else borrow = 0;
+        c[i] = (uint32_t)cur;
+    }
+    bigTrim(c);
+    return c;
+}
+static vector<uint32_t> bigDivSmall(vector<uint32_t> a, uint32_t d) {
+    uint64_t rem = 0;
+    for (int i = (int)a.size() - 1; i >= 0; --i) {
+        uint64_t cur = rem * 1000000000ULL + a[(size_t)i];
+        a[(size_t)i] = (uint32_t)(cur / d);
+        rem = cur % d;
+    }
+    bigTrim(a);
+    return a;
+}
+static vector<uint32_t> bigFromU64(uint64_t v) {
+    vector<uint32_t> out;
+    if (!v) return {0};
+    while (v) { out.push_back((uint32_t)(v % 1000000000ULL)); v /= 1000000000ULL; }
+    return out;
+}
 static vector<uint32_t> bigPow(vector<uint32_t> base, long long exp) {
     vector<uint32_t> out{1};
     while (exp > 0) {
@@ -8616,6 +8644,36 @@ Interpreter::Interpreter() {
     });
     registerBuiltin("是否沙盒", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
         return vBool(gSandbox);
+    });
+    registerBuiltin("四段级数", 3, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto first = bigParse(bigArg(a[0], line));
+        auto count = bigParse(bigArg(a[1], line));
+        auto stepv = bigParse(bigArg(a[2], line));
+        if (bigStr(count) == "0") return vStr("0");
+        auto n1 = bigSub(count, {1});
+        auto term = bigAdd(bigMul(bigFromU64(2), first), bigMul(n1, stepv));
+        auto total = bigDivSmall(bigMul(count, term), 2);
+        unsigned long long n = 0;
+        try { n = std::stoull(bigStr(count)); } catch (...) { return vStr(bigStr(total)); }
+        auto current = first;
+        auto seg = std::vector<uint32_t>{0};
+        unsigned long long base = n / 64, rem = n % 64;
+        for (int k = 0; k < 64; ++k) {
+            unsigned long long len = base + (k == 63 ? rem : 0);
+            if (!len) continue;
+            auto lenBig = bigFromU64(len);
+            auto last = bigAdd(current, bigMul(bigFromU64(len - 1), stepv));
+            auto sum = bigDivSmall(bigMul(lenBig, bigAdd(current, last)), 2);
+            seg = bigAdd(seg, sum);
+            current = bigAdd(current, bigMul(lenBig, stepv));
+        }
+        if (bigStr(seg) != bigStr(total))
+            throw WenError("运行时错误", line, 0, "四段级数对账失败");
+        return vStr(bigStr(total));
+    });
+    registerBuiltin("精确级数", 3, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        Value fn;
+        return vStr("");
     });
     registerBuiltin("大整数幂", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         long long e = (long long)needIndex(a[1], "大整数幂", line);
