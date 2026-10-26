@@ -3107,6 +3107,8 @@ static const std::map<string, string>& functionModules() {
         {"兼容支持", "兼容库"}, {"兼容翻译", "兼容库"}, {"兼容运行", "兼容库"},
         {"兼容语言", "兼容库"}, {"兼容解析", "兼容库"}, {"兼容诊断", "兼容库"},
         {"兼容冲突", "兼容库"},
+        {"新建神经层", "神经网络库"}, {"神经链", "神经网络库"}, {"前向", "神经网络库"},
+        {"训练", "神经网络库"}, {"保存网络", "神经网络库"}, {"读取网络", "神经网络库"},
         {"翻译", "兼容库"}, {"执行字节码", "兼容库"},
         {"反汇编", "兼容库"}, {"反汇编文本", "兼容库"},
         {"二进制头", "兼容库"}, {"二进制字符串", "兼容库"}, {"二进制反汇编", "兼容库"},
@@ -3194,6 +3196,7 @@ static const std::map<string, string>& functionModules() {
         // 网络库
         {"抓取", "网络库"}, {"下载", "网络库"}, {"抓取JSON", "网络库"},
         {"安全抓取", "网络库"}, {"限速抓取", "网络库"}, {"乱码解析", "网络库"},
+        {"网络路径", "网络库"}, {"防火墙", "网络库"}, {"防火墙检查", "网络库"},
         {"二进制破坏", "网络库"}, {"二进制恢复", "网络库"},
 
         // JSON 库
@@ -3275,6 +3278,7 @@ public:
     std::deque<string> inputBuffer;
     bool inLibrary_ = false;
     std::set<string> moduleExports;
+    std::vector<std::pair<string, bool>> firewallRules;
 
     Interpreter();
 
@@ -6260,6 +6264,166 @@ static Value compatParse(const string& lang0, const string& code, int line) {
         throw;
     }
 }
+static double nnAct(double x, const string& act) {
+    if (act == "tanh") return std::tanh(x);
+    if (act == "relu") return x > 0 ? x : 0;
+    if (act == "linear") return x;
+    return 1.0 / (1.0 + std::exp(-x));
+}
+static double nnActDeriv(double z, double y, const string& act) {
+    if (act == "tanh") return 1 - y * y;
+    if (act == "relu") return z > 0 ? 1 : 0;
+    if (act == "linear") return 1;
+    return y * (1 - y);
+}
+static Value nnLayer(int in, int out, string act, int line) {
+    if (in <= 0 || out <= 0 || in > 4096 || out > 4096)
+        throw WenError("运行时错误", line, 0, "神经层尺寸必须在 1..4096");
+    if (act.empty()) act = "sigmoid";
+    std::mt19937 rng(std::random_device{}());
+    double limit = std::sqrt(6.0 / (in + out));
+    std::uniform_real_distribution<double> dist(-limit, limit);
+    auto weights = std::make_shared<List>();
+    for (int j = 0; j < out; ++j) {
+        auto row = std::make_shared<List>();
+        for (int i = 0; i < in; ++i) row->items.push_back(vNum(dist(rng)));
+        weights->items.push_back(vList(row));
+    }
+    auto bias = std::make_shared<List>();
+    for (int j = 0; j < out; ++j) bias->items.push_back(vNum(0));
+    auto d = std::make_shared<Dict>();
+    d->items["输入"] = vNum(in);
+    d->items["输出"] = vNum(out);
+    d->items["激活"] = vStr(act);
+    d->items["权重"] = vList(weights);
+    d->items["偏置"] = vList(bias);
+    return vDict(d);
+}
+static std::vector<double> nnInput(const Value& v, int line) {
+    auto l = needList(v, "神经网络输入", line);
+    std::vector<double> x;
+    for (const auto& e : l->items) x.push_back(needNum(e, "神经网络输入", line));
+    return x;
+}
+static std::vector<Value> nnLayers(const Value& net, int line) {
+    auto d = needDict(net, "神经网络", line);
+    auto it = d->items.find("层");
+    if (it == d->items.end()) throw WenError("运行时错误", line, 0, "不是神经链");
+    auto l = needList(it->second, "神经链", line);
+    return l->items;
+}
+static std::vector<double> nnForward(const Value& net, const std::vector<double>& input,
+                                     int line) {
+    auto layers = nnLayers(net, line);
+    std::vector<double> cur = input;
+    for (const auto& lv : layers) {
+        auto layer = needDict(lv, "神经层", line);
+        int in = (int)needNum(layer->items.at("输入"), "输入", line);
+        int out = (int)needNum(layer->items.at("输出"), "输出", line);
+        if ((int)cur.size() != in)
+            throw WenError("运行时错误", line, 0, "神经层输入尺寸不匹配");
+        auto weights = needList(layer->items.at("权重"), "权重", line);
+        auto bias = needList(layer->items.at("偏置"), "偏置", line);
+        string act = needStr(layer->items.at("激活"), "激活", line);
+        std::vector<double> next((size_t)out);
+        for (int j = 0; j < out; ++j) {
+            auto row = needList(weights->items[(size_t)j], "权重行", line);
+            double s = needNum(bias->items[(size_t)j], "偏置", line);
+            for (int i = 0; i < in; ++i)
+                s += needNum(row->items[(size_t)i], "权重", line) * cur[(size_t)i];
+            next[(size_t)j] = nnAct(s, act);
+        }
+        cur = std::move(next);
+    }
+    return cur;
+}
+static Value nnTrain(const Value& net, const std::vector<double>& input,
+                     const std::vector<double>& target, double lr, int line) {
+    auto layers = nnLayers(net, line);
+    std::vector<std::vector<double>> cur(1, input);
+    std::vector<std::vector<double>> zs;
+    for (const auto& lv : layers) {
+        auto layer = needDict(lv, "神经层", line);
+        int in = (int)needNum(layer->items.at("输入"), "输入", line);
+        int out = (int)needNum(layer->items.at("输出"), "输出", line);
+        auto weights = needList(layer->items.at("权重"), "权重", line);
+        auto bias = needList(layer->items.at("偏置"), "偏置", line);
+        string act = needStr(layer->items.at("激活"), "激活", line);
+        std::vector<double> z((size_t)out), y((size_t)out);
+        for (int j = 0; j < out; ++j) {
+            auto row = needList(weights->items[(size_t)j], "权重行", line);
+            double s = needNum(bias->items[(size_t)j], "偏置", line);
+            for (int i = 0; i < in; ++i)
+                s += needNum(row->items[(size_t)i], "权重", line) * cur.back()[(size_t)i];
+            z[(size_t)j] = s;
+            y[(size_t)j] = nnAct(s, act);
+        }
+        zs.push_back(z);
+        cur.push_back(y);
+    }
+    if ((int)cur.back().size() != (int)target.size())
+        throw WenError("运行时错误", line, 0, "训练目标尺寸不匹配");
+    std::vector<double> delta(target.size());
+    double loss = 0;
+    for (size_t j = 0; j < target.size(); ++j) {
+        double err = cur.back()[j] - target[j];
+        loss += err * err;
+        delta[j] = err * nnActDeriv(zs.back()[j], cur.back()[j],
+                                    needStr(needDict(layers.back(), "层", line)->items.at("激活"), "激活", line));
+    }
+    loss /= (double)target.size();
+    for (int li = (int)layers.size() - 1; li >= 0; --li) {
+        auto layer = needDict(layers[(size_t)li], "神经层", line);
+        int in = (int)needNum(layer->items.at("输入"), "输入", line);
+        auto weights = needList(layer->items.at("权重"), "权重", line);
+        auto bias = needList(layer->items.at("偏置"), "偏置", line);
+        std::vector<double> prev((size_t)in, 0);
+        for (int j = 0; j < (int)delta.size(); ++j) {
+            auto row = needList(weights->items[(size_t)j], "权重行", line);
+            for (int i = 0; i < in; ++i) {
+                double w = needNum(row->items[(size_t)i], "权重", line);
+                prev[(size_t)i] += w * delta[(size_t)j];
+                row->items[(size_t)i] = vNum(w - lr * delta[(size_t)j] * cur[(size_t)li][(size_t)i]);
+            }
+            bias->items[(size_t)j] = vNum(needNum(bias->items[(size_t)j], "偏置", line) - lr * delta[(size_t)j]);
+        }
+        if (li > 0) {
+            string act = needStr(needDict(layers[(size_t)(li - 1)], "层", line)->items.at("激活"), "激活", line);
+            for (int i = 0; i < in; ++i)
+                prev[(size_t)i] *= nnActDeriv(zs[(size_t)(li - 1)][(size_t)i],
+                                              cur[(size_t)li][(size_t)i], act);
+            delta = prev;
+        }
+    }
+    return vNum(loss);
+}
+
+static string netHostOf(const string& url) {
+    size_t p = url.find("://");
+    size_t b = p == string::npos ? 0 : p + 3;
+    size_t e = url.find_first_of("/:?#", b);
+    string host = url.substr(b, e == string::npos ? string::npos : e - b);
+    for (auto& c : host) c = (char)std::tolower((unsigned char)c);
+    return host;
+}
+static bool netWildcard(const string& pat, const string& text) {
+    size_t p = 0, t = 0, star = string::npos, mark = 0;
+    while (t < text.size()) {
+        if (p < pat.size() && (pat[p] == '?' || pat[p] == text[t])) { ++p; ++t; }
+        else if (p < pat.size() && pat[p] == '*') { star = p++; mark = t; }
+        else if (star != string::npos) { p = star + 1; t = ++mark; }
+        else return false;
+    }
+    while (p < pat.size() && pat[p] == '*') ++p;
+    return p == pat.size();
+}
+static bool netAllowed(const std::vector<std::pair<string, bool>>& rules, const string& url) {
+    if (rules.empty()) return true;
+    string host = netHostOf(url);
+    for (const auto& r : rules)
+        if (netWildcard(r.first, host)) return r.second;
+    return false;
+}
 Interpreter::Interpreter() {
     globals = std::make_shared<Scope>();
     rng.seed(std::random_device{}());
@@ -7831,6 +7995,7 @@ Interpreter::Interpreter() {
             {"渲染库", "面、涂鸦、渐变、体积光、导出后端"},
             {"跃迁库", "自动/纯函数缓存、统计、快照"},
             {"内存库", "常驻/临时内存、函数缓存、压缩、牵引"},
+            {"神经网络库", "神经层/神经链/前向/训练"},
             {"兼容库", "翻译到 Python/JS/JSON/Java/字节码/C++/汇编"},
             {"管理员库", "管理员权限、危险模式"},
             {"函数库", "映射、过滤、折叠、排序、积分"},
@@ -7841,7 +8006,7 @@ Interpreter::Interpreter() {
             {"频道库", "先进先出消息队列"},
             {"注入库", "调试注入变量/输入/代码"},
             {"可视化库", "折线/柱状/散点/饼图 SVG"},
-            {"网络库", "抓取、下载、抓取 JSON"},
+            {"网络库", "抓取、下载、抓取 JSON、网络路径、防火墙"},
             {"网页库", "去标签、取标签/属性/链接/标题"},
             {"数据格式库", "JSON、CSV"}};
         auto count = [&](const string& lib) {
@@ -7958,6 +8123,61 @@ Interpreter::Interpreter() {
         else if (width == 8) { uint64_t u; std::memcpy(&u,&d,8); writeFixed(*b,(size_t)off,8,u,false); }
         else throw WenError("运行时错误", line, 0, "浮点宽度只能是 4/8");
         return vBool(true);
+    });
+    registerBuiltin("新建神经层", 2, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        int in = (int)needIndex(a[0], "新建神经层", line);
+        int out = (int)needIndex(a[1], "新建神经层", line);
+        string act = a.size() > 2 ? needStr(a[2], "新建神经层", line) : "sigmoid";
+        return nnLayer(in, out, act, line);
+    });
+    registerBuiltin("神经链", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto layers = needList(a[0], "神经链", line);
+        if (layers->items.empty()) throw WenError("运行时错误", line, 0, "神经链至少需要一层");
+        int expect = -1;
+        for (const auto& lv : layers->items) {
+            auto layer = needDict(lv, "神经层", line);
+            int in = (int)needNum(layer->items.at("输入"), "输入", line);
+            if (expect >= 0 && in != expect)
+                throw WenError("运行时错误", line, 0, "神经链条尺寸不连续");
+            expect = (int)needNum(layer->items.at("输出"), "输出", line);
+        }
+        auto d = std::make_shared<Dict>();
+        d->items["类型"] = vStr("神经链");
+        d->items["层"] = a[0];
+        return vDict(d);
+    });
+    registerBuiltin("前向", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto x = nnInput(a[1], line);
+        auto y = nnForward(a[0], x, line);
+        auto l = std::make_shared<List>();
+        for (double v : y) l->items.push_back(vNum(v));
+        return vList(l);
+    });
+    registerBuiltin("训练", 3, 4, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto x = nnInput(a[1], line);
+        auto t = nnInput(a[2], line);
+        double lr = a.size() > 3 ? needNum(a[3], "训练", line) : 0.1;
+        return nnTrain(a[0], x, t, lr, line);
+    });
+    registerBuiltin("保存网络", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path = needStr(a[1], "保存网络", line);
+        try {
+            writeWholeFile(path, jsonDump(a[0], line), false);
+        } catch (IoError& e) {
+            throw WenError("文件错误", line, 0, e.what());
+        }
+        return vStr(path);
+    });
+    registerBuiltin("读取网络", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path = needStr(a[0], "读取网络", line);
+        string text;
+        try {
+            text = readWholeFile(path);
+        } catch (IoError& e) {
+            throw WenError("文件错误", line, 0, e.what());
+        }
+        JsonReader reader(text, line);
+        return reader.parse();
     });
     registerBuiltin("新建布局", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         bool packed = false;
@@ -8871,16 +9091,58 @@ Interpreter::Interpreter() {
         return vBool(ok || fs::exists(fs::u8path(path)));
     });
 
+    registerBuiltin("网络路径", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string url = needStr(a[0], "网络路径", line);
+        size_t p = url.find("://");
+        string scheme = p == string::npos ? "" : url.substr(0, p);
+        size_t b = p == string::npos ? 0 : p + 3;
+        size_t e = url.find_first_of("/?#", b);
+        string authority = url.substr(b, e == string::npos ? string::npos : e - b);
+        string path = e == string::npos ? "/" : url.substr(e);
+        size_t colon = authority.find(':');
+        string host = colon == string::npos ? authority : authority.substr(0, colon);
+        string port = colon == string::npos ? "" : authority.substr(colon + 1);
+        auto d = std::make_shared<Dict>();
+        d->items["协议"] = vStr(scheme);
+        d->items["主机"] = vStr(host);
+        d->items["端口"] = vStr(port);
+        d->items["路径"] = vStr(path);
+        return vDict(d);
+    });
+    registerBuiltin("防火墙", 1, 1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto rules = needList(a[0], "防火墙", line);
+        firewallRules.clear();
+        for (const auto& rv : rules->items) {
+            string r = needStr(rv, "防火墙规则", line);
+            size_t sp = r.find(' ');
+            if (sp == string::npos)
+                throw WenError("运行时错误", line, 0, "规则要写成「允许 主机」或「拒绝 主机」");
+            string kind = r.substr(0, sp);
+            string host = r.substr(sp + 1);
+            bool allow = kind == "允许" || kind == "allow";
+            firewallRules.push_back({host, allow});
+        }
+        return vNum((double)firewallRules.size());
+    });
+    registerBuiltin("防火墙检查", 1, 1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+        string url = needStr(a[0], "防火墙检查", line);
+        auto d = std::make_shared<Dict>();
+        d->items["主机"] = vStr(netHostOf(url));
+        d->items["允许"] = vBool(netAllowed(firewallRules, url));
+        return vDict(d);
+    });
     // ---------- 网络库 ----------
-    registerBuiltin("安全抓取", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+    registerBuiltin("安全抓取", 1, 2, [this](Interpreter&, vector<Value>& a, int line) -> Value {
         string url = needStr(a[0], "安全抓取", line);
+        if (!netAllowed(firewallRules, url)) throw WenError("运行时错误", line, 0, "网络防火墙拒绝：" + netHostOf(url));
         if (unsafeNetHost(url))
             throw WenError("运行时错误", line, 0, "安全抓取拒绝内网/本机地址：" + url);
         int timeout = a.size() == 2 ? (int)needIndex(a[1], "安全抓取", line) : 15000;
         return vStr(httpGetText(url, timeout, line));
     });
-    registerBuiltin("限速抓取", 2, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
+    registerBuiltin("限速抓取", 2, 3, [this](Interpreter&, vector<Value>& a, int line) -> Value {
         string url = needStr(a[0], "限速抓取", line);
+        if (!netAllowed(firewallRules, url)) throw WenError("运行时错误", line, 0, "网络防火墙拒绝：" + netHostOf(url));
         long long ms = needIndex(a[1], "限速抓取", line);
         if (ms < 0) ms = 0;
         if (ms > 60000) ms = 60000;
@@ -8953,13 +9215,15 @@ Interpreter::Interpreter() {
         }
         return vStr(out);
     });
-    registerBuiltin("抓取", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+    registerBuiltin("抓取", 1, 2, [this](Interpreter&, vector<Value>& a, int line) -> Value {
         string url = needStr(a[0], "抓取", line);
+        if (!netAllowed(firewallRules, url)) throw WenError("运行时错误", line, 0, "网络防火墙拒绝：" + netHostOf(url));
         int timeout = a.size() == 2 ? (int)needIndex(a[1], "抓取", line) : 15000;
         return vStr(httpGetText(url, timeout, line));
     });
-    registerBuiltin("下载", 2, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
+    registerBuiltin("下载", 2, 3, [this](Interpreter&, vector<Value>& a, int line) -> Value {
         string url = needStr(a[0], "下载", line);
+        if (!netAllowed(firewallRules, url)) throw WenError("运行时错误", line, 0, "网络防火墙拒绝：" + netHostOf(url));
         string path = needStr(a[1], "下载", line);
         int timeout = a.size() == 3 ? (int)needIndex(a[2], "下载", line) : 15000;
         string body = httpGetText(url, timeout, line);
