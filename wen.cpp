@@ -2221,6 +2221,8 @@ static const WenSuffixInfo WEN_SUFFIXES[] = {
     {"着色器", ".着色器"}};
 static const char* WEN_SOURCE_SUFFIXES[] = {".脚本", ".程序", ".wen"};
 static bool gNoFast = false;
+static std::map<string, Value> gPoints;
+static const size_t kMaxPoints = 10000;
 static bool gSandbox = false;
 static string gSandboxRoot;
 static vector<string> gSandboxAllow;
@@ -3206,7 +3208,7 @@ static const std::map<string, string>& functionModules() {
         {"新建神经层", "神经网络库"}, {"神经链", "神经网络库"}, {"前向", "神经网络库"},
         {"大整数幂", "大整数库"}, {"大整数乘", "大整数库"}, {"大整数加", "大整数库"}, {"大整数阶乘", "大整数库"},
         {"阶乘位数", "大整数库"}, {"阶乘末尾零", "大整数库"}, {"阶乘概览", "大整数库"},
-        {"四段级数", "精度库"}, {"精确级数", "精度库"},
+        {"四段级数", "精度库"}, {"复式解析", "精度库"}, {"精确级数", "精度库"},
         {"训练", "神经网络库"}, {"保存网络", "神经网络库"}, {"读取网络", "神经网络库"},
         {"翻译", "兼容库"}, {"执行字节码", "兼容库"},
         {"反汇编", "兼容库"}, {"反汇编文本", "兼容库"},
@@ -8670,9 +8672,15 @@ Interpreter::Interpreter() {
             throw WenError("运行时错误", line, 0, "四段级数对账失败");
         return vStr(bigStr(total));
     });
-    registerBuiltin("精确级数", 3, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
+    registerBuiltin("精确级数", 3, 3, [this](Interpreter&, vector<Value>& a, int line) -> Value {
         Value fn;
-        return vStr("");
+        if (!globals->lookup("四段级数", fn)) throw WenError("运行时错误", line, 0, "缺少四段级数");
+        return callValue(fn, a, line);
+    });
+    registerBuiltin("复式解析", 3, 3, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+        Value fn;
+        if (!globals->lookup("四段级数", fn)) throw WenError("运行时错误", line, 0, "缺少四段级数");
+        return callValue(fn, a, line);
     });
     registerBuiltin("大整数幂", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         long long e = (long long)needIndex(a[1], "大整数幂", line);
@@ -8723,6 +8731,43 @@ Interpreter::Interpreter() {
         d->items["前几位"] = vStr(std::to_string(prefix));
         d->items["精度"] = vNum(prec);
         return vDict(d);
+    });
+    registerBuiltin("存点", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string key = needStr(a[0], "存点", line);
+        if (gPoints.size() >= kMaxPoints && !gPoints.count(key))
+            throw WenError("运行时错误", line, 0, "检查点数量超过上限，请先清点");
+        gPoints[key] = a[1];
+        return vBool(true);
+    });
+    registerBuiltin("取点", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string key = needStr(a[0], "取点", line);
+        auto it = gPoints.find(key);
+        if (it == gPoints.end()) throw WenError("运行时错误", line, 0, "没有这个检查点：" + key);
+        return it->second;
+    });
+    registerBuiltin("清点", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+        size_t n = gPoints.size();
+        gPoints.clear();
+        return vNum((double)n);
+    });
+    registerBuiltin("点数量", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+        return vNum((double)gPoints.size());
+    });
+    registerBuiltin("清理内存", 0, 0, [this](Interpreter&, vector<Value>&, int) -> Value {
+        accelCache.clear();
+        leapCache.clear();
+        memoryStore.clear();
+        memoryTemp.clear();
+        memoryCompressed.clear();
+        memoryOrigSize.clear();
+        memoryDict.clear();
+        memoryDictIndex.clear();
+        renderScene.clear();
+        std::unordered_map<string, Value>().swap(accelCache);
+        std::map<string, Value>().swap(memoryStore);
+        std::unordered_map<string, Value>().swap(leapCache);
+        EmptyWorkingSet(GetCurrentProcess());
+        return vNone();
     });
     registerBuiltin("新建布局", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         bool packed = false;
