@@ -1716,7 +1716,7 @@ private:
 // 5. 运行时值
 // ============================================================
 
-enum class VT { None, Bool, Num, Str, List, Dict, Func, Set, Bytes, Range, Int };
+enum class VT { None, Bool, Num, Str, List, Dict, Func, Set, Bytes, Range, Int, Big };
 
 struct List;
 struct Dict;
@@ -1731,6 +1731,7 @@ struct Value {
     int width = 32;
     bool isSigned = false;
     string str;
+    string big;
     shared_ptr<List> list;
     shared_ptr<Dict> dict;
     shared_ptr<Callable> callable;
@@ -1875,6 +1876,7 @@ static Value vSet(shared_ptr<List> l) { Value v; v.type = VT::Set; v.list = std:
 static Value vBytes(shared_ptr<vector<unsigned char>> b) { Value v; v.type = VT::Bytes; v.bytes = std::move(b); return v; }
 static Value vRange(double a, double b, double c) { Value v; v.type = VT::Range; v.rstart = a; v.rstop = b; v.rstep = c; return v; }
 static uint64_t intMask(int w) { return w >= 64 ? ~0ULL : ((1ULL << w) - 1); }
+static Value vBig(string s) { Value v; v.type = VT::Big; v.big = std::move(s); return v; }
 static Value vInt(uint64_t bits, int w, bool s) { Value v; v.type = VT::Int; v.width = w; v.isSigned = s; v.i = bits & intMask(w); return v; }
 static int64_t intSigned(const Value& v) {
     uint64_t b = v.i & intMask(v.width);
@@ -1967,6 +1969,7 @@ static string typeName(const Value& v) {
         case VT::Bytes: return "缓冲";
         case VT::Range: return "范围";
         case VT::Int: return (v.isSigned ? "i" : "u") + std::to_string(v.width);
+        case VT::Big: return "大整数";
     }
     return "未知";
 }
@@ -1984,6 +1987,7 @@ static bool truthy(const Value& v) {
         case VT::Bytes: return v.bytes && !v.bytes->empty();
         case VT::Range: return (v.rstep > 0 ? v.rstart < v.rstop : v.rstart > v.rstop);
         case VT::Int: return (v.i & intMask(v.width)) != 0;
+        case VT::Big: return v.big != "0";
     }
     return false;
 }
@@ -2030,6 +2034,7 @@ static string toText(const Value& v, bool quoteStrings = false, int depth = 0) {
         case VT::Bool: return v.b ? "真" : "假";
         case VT::Num: return numberToString(v.num);
         case VT::Int: return intText(v);
+        case VT::Big: return v.big;
         case VT::Str: return quoteStrings ? quoteText(v.str) : v.str;
         case VT::List: {
             if (!v.list) return "[]";
@@ -2124,6 +2129,7 @@ static bool valueEquals(const Value& a, const Value& b, int depth = 0) {
 }
 
 static double needNum(const Value& v, const string& where, int line) {
+    if (v.type == VT::Big) { try { return std::stod(v.big); } catch (...) { throw WenError("运行时错误", line, 0, "大整数不能转成小数"); } }
     if (v.type == VT::Int) return (double)intSigned(v);
     if (v.type == VT::Int) return (double)intSigned(v);
     if (v.type != VT::Num)
@@ -3813,6 +3819,7 @@ void Interpreter::execProgram(const vector<StmtPtr>& program, shared_ptr<Scope> 
     }
 }
 
+static string int128ToString(__int128 x);
 static bool fastLinearSumWhile(Interpreter& vm, const StmtPtr& s,
                                 const shared_ptr<Scope>& scope) {
     if (gNoFast) return false;
@@ -3865,6 +3872,15 @@ static bool fastLinearSumWhile(Interpreter& vm, const StmtPtr& s,
         if (op == "<") count = std::ceil((long double)limit - (long double)i);
         else count = std::floor((long double)limit - (long double)i) + 1.0L;
         if (count >= 1000000.0L) {
+            auto isInt = [](double x) { return std::trunc(x) == x && std::fabs(x) < 9.0e15; };
+            if (isInt(a) && isInt(i) && isInt(limit) && count < 9.0e18L) {
+                __int128 c = (__int128)count;
+                __int128 series = c * (2 * (__int128)(long long)i + (c - 1)) / 2;
+                __int128 sum = (__int128)(long long)a + series;
+                vm.globals->fastSet(acc, vBig(int128ToString(sum)));
+                vm.globals->fastSet(cond, vNum(i + (double)c));
+                return true;
+            }
             long double series = count * (2.0L * (long double)i + count - 1.0L) / 2.0L;
             a += (double)series;
             i += (double)count;
@@ -6691,6 +6707,16 @@ static bool netAllowed(const std::vector<std::pair<string, bool>>& rules, const 
     for (const auto& r : rules)
         if (netWildcard(r.first, host)) return r.second;
     return false;
+}
+static string int128ToString(__int128 x) {
+    if (x == 0) return "0";
+    bool neg = x < 0;
+    unsigned __int128 u = neg ? (unsigned __int128)(-x) : (unsigned __int128)x;
+    string s;
+    while (u) { s.push_back(char('0' + (int)(u % 10))); u /= 10; }
+    if (neg) s.push_back('-');
+    std::reverse(s.begin(), s.end());
+    return s;
 }
 static vector<uint32_t> bigParse(string s) {
     size_t b = 0;
