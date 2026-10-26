@@ -735,6 +735,7 @@ struct Expr {
     string text;
     SymId sym = 0;
     int gslot = -1;
+    int slotDepth = 0;
     mutable int localSlot = -1;
     bool b = false;
     bool commandCall = false;
@@ -3810,6 +3811,84 @@ void Interpreter::execProgram(const vector<StmtPtr>& program, shared_ptr<Scope> 
     }
 }
 
+static bool fastNumericWhile(Interpreter& vm, const StmtPtr& s,
+                             const shared_ptr<Scope>& scope) {
+    if (!s->expr || s->expr->k != Expr::K::Binary) return false;
+    string op = s->expr->op;
+    if (op != "<" && op != "<=" && op != ">" && op != ">=" && op != "==") return false;
+    ExprPtr left = s->expr->args[0], right = s->expr->args[1];
+    if (!left || left->k != Expr::K::Var || left->slotDepth != 0 || left->gslot < 0) return false;
+    if (!right || right->k != Expr::K::Num) return false;
+    int condSlot = left->gslot;
+    double rhs = right->num;
+    Value cv;
+    if (!vm.globals->fastGet(condSlot, cv) || cv.type != VT::Num) return false;
+
+    struct Upd { int slot; bool add; bool operandSlot; double num; int oslot; };
+    std::vector<Upd> ups;
+    if (s->body.size() > 6) return false;
+    for (const auto& st : s->body) {
+        if (!st || st->k != Stmt::K::Assign) return false;
+        if (!st->target || st->target->k != Expr::K::Var ||
+            st->target->slotDepth != 0 || st->target->gslot < 0) return false;
+        if (!st->expr || st->expr->k != Expr::K::Binary) return false;
+        string bop = st->expr->op;
+        if (bop != "+" && bop != "-") return false;
+        ExprPtr a = st->expr->args[0], b = st->expr->args[1];
+        if (!a || a->k != Expr::K::Var || a->gslot != st->target->gslot ||
+            a->slotDepth != 0) return false;
+        Upd u;
+        u.slot = st->target->gslot;
+        u.add = bop == "+";
+        u.operandSlot = b && b->k == Expr::K::Var && b->slotDepth == 0 && b->gslot >= 0;
+        u.num = 0;
+        u.oslot = 0;
+        if (u.operandSlot) u.oslot = b->gslot;
+        else if (b && b->k == Expr::K::Num) u.num = b->num;
+        else return false;
+        ups.push_back(u);
+    }
+    if (ups.empty()) return false;
+
+    std::vector<int> slots{condSlot};
+    auto idxOf = [&](int slot) -> int {
+        for (size_t i = 0; i < slots.size(); ++i)
+            if (slots[i] == slot) return (int)i;
+        slots.push_back(slot);
+        return (int)slots.size() - 1;
+    };
+    std::vector<double> vals;
+    for (size_t i = 0; i < ups.size(); ++i) { idxOf(ups[i].slot); if (ups[i].operandSlot) idxOf(ups[i].oslot); }
+    vals.resize(slots.size());
+    for (size_t i = 0; i < slots.size(); ++i) {
+        Value v;
+        if (!vm.globals->fastGet(slots[i], v) || v.type != VT::Num) return false;
+        vals[i] = v.num;
+    }
+    int ci = idxOf(condSlot);
+    double lhs = vals[(size_t)ci];
+    auto cmp = [&]() -> bool {
+        if (op == "<") return lhs < rhs;
+        if (op == "<=") return lhs <= rhs;
+        if (op == ">") return lhs > rhs;
+        if (op == ">=") return lhs >= rhs;
+        return lhs == rhs;
+    };
+    long long guard = 0;
+    while (cmp()) {
+        for (const auto& u : ups) {
+            int ti = idxOf(u.slot);
+            double b = u.operandSlot ? vals[(size_t)idxOf(u.oslot)] : u.num;
+            vals[(size_t)ti] = u.add ? vals[(size_t)ti] + b : vals[(size_t)ti] - b;
+            if (u.slot == condSlot) lhs = vals[(size_t)ti];
+        }
+        if (++guard > 1000000000LL) break;
+    }
+    for (size_t i = 0; i < slots.size(); ++i)
+        vm.globals->fastSet(slots[i], vNum(vals[i]));
+    return true;
+}
+
 void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
     if (s->k != Stmt::K::ExprStmt) lastWasExpr = false;
 
@@ -3843,6 +3922,7 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
             break;
         }
         case Stmt::K::While: {
+            if (fastNumericWhile(*this, s, scope)) break;
             while (truthy(eval(s->expr, scope))) {
                 try {
                     for (const auto& st : s->body) exec(st, scope);
