@@ -3320,6 +3320,8 @@ static const std::map<string, string>& functionModules() {
         {"兼容语言", "兼容库"}, {"兼容解析", "兼容库"}, {"兼容诊断", "兼容库"},
         {"兼容冲突", "兼容库"},
         {"新建神经层", "神经网络库"}, {"神经链", "神经网络库"}, {"前向", "神经网络库"},
+        {"颜色", "视口库"}, {"新建视口", "视口库"}, {"视口清空", "视口库"}, {"视口画点", "视口库"},
+        {"视口画线", "视口库"}, {"视口画三角形", "视口库"}, {"视口尺寸", "视口库"}, {"视口保存", "视口库"},
         {"大整数幂", "大整数库"}, {"大整数乘", "大整数库"}, {"大整数加", "大整数库"}, {"大整数阶乘", "大整数库"},
         {"阶乘位数", "大整数库"}, {"阶乘末尾零", "大整数库"}, {"阶乘概览", "大整数库"},
         {"大整数规模", "大整数库"}, {"阶乘规模", "大整数库"},
@@ -4914,6 +4916,30 @@ static void writeFixed(vector<unsigned char>& b, size_t off, int width, uint64_t
         int idx = big ? (width - 1 - i) : i;
         b[off + (size_t)idx] = (unsigned char)((v >> (8 * i)) & 255);
     }
+}
+static int vpColor(const Value& v, int line) {
+    long long c = (long long)needNum(v, "视口颜色", line);
+    if (c < 0) c = 0;
+    if (c > 0xFFFFFF) c &= 0xFFFFFF;
+    return (int)c;
+}
+static shared_ptr<Dict> vpDict(const Value& v, int line) {
+    auto d = needDict(v, "视口", line);
+    if (!d->items.count("像素")) throw WenError("运行时错误", line, 0, "不是视口");
+    return d;
+}
+static vector<unsigned char>& vpPixels(const shared_ptr<Dict>& d) {
+    return *d->items.at("像素").bytes;
+}
+static void vpPut(const shared_ptr<Dict>& d, int x, int y, int c) {
+    int w = (int)needNum(d->items.at("宽"), "视口", 0);
+    int h = (int)needNum(d->items.at("高"), "视口", 0);
+    if (x < 0 || y < 0 || x >= w || y >= h) return;
+    auto& p = vpPixels(d);
+    size_t i = ((size_t)y * (size_t)w + (size_t)x) * 3;
+    p[i] = (unsigned char)((c >> 16) & 255);
+    p[i + 1] = (unsigned char)((c >> 8) & 255);
+    p[i + 2] = (unsigned char)(c & 255);
 }
 static Value makeLayout(const string& spec, int line, bool packed = false) {
     auto d = std::make_shared<Dict>();
@@ -8564,6 +8590,24 @@ Interpreter::Interpreter() {
         }
         return vBool(dangerousMode);
     });
+    registerBuiltin("管理员状态", 0, 0, [this](Interpreter&, vector<Value>&, int) -> Value {
+        auto d = std::make_shared<Dict>();
+        d->items["管理员"] = vBool(adminGranted);
+        d->items["危险模式"] = vBool(dangerousMode);
+        const char* cn = std::getenv("文_管理员口令");
+        const char* en = std::getenv("WEN_ADMIN_TOKEN");
+        d->items["口令来源"] = vStr(cn && *cn ? "文_管理员口令" : (en && *en ? "WEN_ADMIN_TOKEN" : "未配置"));
+        return vDict(d);
+    });
+    registerBuiltin("沙盒状态", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+        auto d = std::make_shared<Dict>();
+        d->items["启用"] = vBool(gSandbox);
+        d->items["根目录"] = vStr(gSandboxRoot);
+        auto l = std::make_shared<List>();
+        for (const auto& a : gSandboxAllow) l->items.push_back(vStr(a));
+        d->items["允许"] = vList(l);
+        return vDict(d);
+    });
     registerBuiltin("并行", 2, -1, [](Interpreter& vm, vector<Value>& a, int line) -> Value {
         if (a[0].type != VT::Func || !a[0].callable)
             throw WenError("运行时错误", line, 0, "并行需要函数");
@@ -9239,6 +9283,130 @@ Interpreter::Interpreter() {
         Value fn;
         if (!globals->lookup("自检", fn)) throw WenError("运行时错误", line, 0, "缺少自检");
         return callValue(fn, a, line);
+    });
+    registerBuiltin("颜色", 3, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        int r = (int)needIndex(a[0], "颜色", line);
+        int g = (int)needIndex(a[1], "颜色", line);
+        int b = (int)needIndex(a[2], "颜色", line);
+        r = std::max(0, std::min(255, r));
+        g = std::max(0, std::min(255, g));
+        b = std::max(0, std::min(255, b));
+        return vNum((double)((r << 16) | (g << 8) | b));
+    });
+    registerBuiltin("新建视口", 2, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        int w = (int)needIndex(a[0], "新建视口", line);
+        int h = (int)needIndex(a[1], "新建视口", line);
+        if (w < 1 || h < 1 || w > 4096 || h > 4096)
+            throw WenError("运行时错误", line, 0, "视口尺寸必须在 1..4096");
+        int bg = a.size() > 2 ? vpColor(a[2], line) : 0;
+        auto buf = std::make_shared<std::vector<unsigned char>>((size_t)w * h * 3);
+        for (int i = 0; i < w * h; ++i) {
+            (*buf)[(size_t)i * 3] = (unsigned char)((bg >> 16) & 255);
+            (*buf)[(size_t)i * 3 + 1] = (unsigned char)((bg >> 8) & 255);
+            (*buf)[(size_t)i * 3 + 2] = (unsigned char)(bg & 255);
+        }
+        auto d = std::make_shared<Dict>();
+        d->items["宽"] = vNum(w);
+        d->items["高"] = vNum(h);
+        d->items["像素"] = vBytes(buf);
+        return vDict(d);
+    });
+    registerBuiltin("视口清空", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto d = vpDict(a[0], line);
+        int c = a.size() > 1 ? vpColor(a[1], line) : 0;
+        int w = (int)needNum(d->items.at("宽"), "视口", line);
+        int h = (int)needNum(d->items.at("高"), "视口", line);
+        auto& p = vpPixels(d);
+        for (int i = 0; i < w * h; ++i) {
+            p[(size_t)i * 3] = (unsigned char)((c >> 16) & 255);
+            p[(size_t)i * 3 + 1] = (unsigned char)((c >> 8) & 255);
+            p[(size_t)i * 3 + 2] = (unsigned char)(c & 255);
+        }
+        return a[0];
+    });
+    registerBuiltin("视口画点", 4, 4, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto d = vpDict(a[0], line);
+        vpPut(d, (int)needIndex(a[1], "视口画点", line), (int)needIndex(a[2], "视口画点", line), vpColor(a[3], line));
+        return a[0];
+    });
+    registerBuiltin("视口画线", 6, 6, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto d = vpDict(a[0], line);
+        int x1 = (int)needIndex(a[1], "视口画线", line), y1 = (int)needIndex(a[2], "视口画线", line);
+        int x2 = (int)needIndex(a[3], "视口画线", line), y2 = (int)needIndex(a[4], "视口画线", line);
+        int c = vpColor(a[5], line);
+        int dx = std::abs(x2 - x1), sx = x1 < x2 ? 1 : -1;
+        int dy = -std::abs(y2 - y1), sy = y1 < y2 ? 1 : -1;
+        int err = dx + dy;
+        while (true) {
+            vpPut(d, x1, y1, c);
+            if (x1 == x2 && y1 == y2) break;
+            int e2 = 2 * err;
+            if (e2 >= dy) { err += dy; x1 += sx; }
+            if (e2 <= dx) { err += dx; y1 += sy; }
+        }
+        return a[0];
+    });
+    registerBuiltin("视口画三角形", 8, 8, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto d = vpDict(a[0], line);
+        int x1 = (int)needIndex(a[1], "视口画三角形", line), y1 = (int)needIndex(a[2], "视口画三角形", line);
+        int x2 = (int)needIndex(a[3], "视口画三角形", line), y2 = (int)needIndex(a[4], "视口画三角形", line);
+        int x3 = (int)needIndex(a[5], "视口画三角形", line), y3 = (int)needIndex(a[6], "视口画三角形", line);
+        int c = vpColor(a[7], line);
+        int minx = std::min({x1, x2, x3}), maxx = std::max({x1, x2, x3});
+        int miny = std::min({y1, y2, y3}), maxy = std::max({y1, y2, y3});
+        auto edge = [](int ax, int ay, int bx, int by, int px, int py) {
+            return (px - ax) * (by - ay) - (py - ay) * (bx - ax);
+        };
+        int area = edge(x1, y1, x2, y2, x3, y3);
+        if (!area) return a[0];
+        for (int y = miny; y <= maxy; ++y)
+            for (int x = minx; x <= maxx; ++x) {
+                int w1 = edge(x2, y2, x3, y3, x, y);
+                int w2 = edge(x3, y3, x1, y1, x, y);
+                int w3 = edge(x1, y1, x2, y2, x, y);
+                if ((w1 >= 0 && w2 >= 0 && w3 >= 0) || (w1 <= 0 && w2 <= 0 && w3 <= 0))
+                    vpPut(d, x, y, c);
+            }
+        return a[0];
+    });
+    registerBuiltin("视口尺寸", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto d = vpDict(a[0], line);
+        auto l = std::make_shared<List>();
+        l->items.push_back(d->items.at("宽"));
+        l->items.push_back(d->items.at("高"));
+        return vList(l);
+    });
+    registerBuiltin("视口保存", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto d = vpDict(a[0], line);
+        string path = needStr(a[1], "视口保存", line);
+        int w = (int)needNum(d->items.at("宽"), "视口", line);
+        int h = (int)needNum(d->items.at("高"), "视口", line);
+        int row = (w * 3 + 3) & ~3;
+        string bmp(54 + (size_t)row * h, '\0');
+        bmp[0] = 'B'; bmp[1] = 'M';
+        auto put32 = [&](size_t off, uint32_t v) {
+            bmp[off] = (char)(v & 255); bmp[off + 1] = (char)((v >> 8) & 255);
+            bmp[off + 2] = (char)((v >> 16) & 255); bmp[off + 3] = (char)((v >> 24) & 255);
+        };
+        put32(2, (uint32_t)bmp.size());
+        put32(10, 54);
+        put32(14, 40);
+        put32(18, (uint32_t)w);
+        put32(22, (uint32_t)h);
+        bmp[26] = 1; bmp[28] = 24;
+        put32(34, (uint32_t)row * h);
+        auto& p = vpPixels(d);
+        for (int y = 0; y < h; ++y) {
+            size_t dst = 54 + (size_t)(h - 1 - y) * row;
+            for (int x = 0; x < w; ++x) {
+                size_t src = ((size_t)y * w + x) * 3;
+                bmp[dst + x * 3] = (char)p[src + 2];
+                bmp[dst + x * 3 + 1] = (char)p[src + 1];
+                bmp[dst + x * 3 + 2] = (char)p[src];
+            }
+        }
+        try { writeWholeFile(path, bmp, false); } catch (IoError& e) { throw WenError("文件错误", line, 0, e.what()); }
+        return vNum((double)bmp.size());
     });
     registerBuiltin("新建布局", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         bool packed = false;
