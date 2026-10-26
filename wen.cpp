@@ -1477,7 +1477,12 @@ private:
                 int line = peek().line;
                 ++idx_;
                 ExprPtr right = parseAdd();
-                return mkBinary(op, left, right, line);
+                ExprPtr result = mkBinary(op, left, right, line);
+                if (peek().type == TT::Op &&
+                    (peek().text == "==" || peek().text == "=" || peek().text == "!=" ||
+                     peek().text == "<" || peek().text == "<=" || peek().text == ">" || peek().text == ">="))
+                    err(peek(), "比较不能连写；请用「且」分开，或用括号分组");
+                return result;
             }
         }
         if (matchKw("在")) {
@@ -3164,6 +3169,12 @@ static string htmlTitleText(const string& html) {
 // ---------- 运算 ----------
 
 static Value applyBinary(const string& op, const Value& a, const Value& b, int line) {
+    if ((a.type == VT::Func || b.type == VT::Func) &&
+        (op == "+" || op == "-" || op == "*" || op == "/" || op == "//" ||
+         op == "%" || op == "**" || op == "<" || op == "<=" || op == ">" || op == ">=")) {
+        throw WenError("运行时错误", line, 0,
+            "函数不能参与算术或比较；并置调用只吃一个一元表达式，负数参数请加括号");
+    }
     if ((a.type == VT::Int) != (b.type == VT::Int) &&
         (a.type == VT::Int || b.type == VT::Int)) {
         return applyBinary(op, vNum(needNum(a, "运算", line)), vNum(needNum(b, "运算", line)), line);
