@@ -2229,6 +2229,7 @@ static string gSandboxRoot;
 static vector<string> gSandboxAllow;
 static vector<string> gNetWhitelist;
 static size_t gNetChunk = 1024 * 1024;
+static string gNetProtocol;
 
 static string lowerPath(string p) {
     for (auto& c : p) c = (char)std::tolower((unsigned char)c);
@@ -3303,7 +3304,7 @@ static const std::map<string, string>& functionModules() {
         // 网络库
         {"抓取", "网络库"}, {"下载", "网络库"}, {"抓取JSON", "网络库"},
         {"安全抓取", "网络库"}, {"限速抓取", "网络库"}, {"乱码解析", "网络库"},
-        {"网络路径", "网络库"}, {"网络桥", "网络库"}, {"网络记录", "网络库"}, {"网络故事", "网络库"}, {"网络统计", "网络库"}, {"清空网络记录", "网络库"},
+        {"网络路径", "网络库"}, {"网络协议", "网络库"}, {"网络桥", "网络库"}, {"网络记录", "网络库"}, {"网络故事", "网络库"}, {"网络统计", "网络库"}, {"清空网络记录", "网络库"},
         {"二进制破坏", "网络库"}, {"二进制恢复", "网络库"},
 
         // JSON 库
@@ -6703,6 +6704,10 @@ static bool netWildcard(const string& pat, const string& text) {
     while (p < pat.size() && pat[p] == '*') ++p;
     return p == pat.size();
 }
+static bool netProtocolOk(const string& url) {
+    if (gNetProtocol.empty()) return true;
+    return url.rfind(gNetProtocol + "://", 0) == 0;
+}
 static bool netWhitelisted(const string& url) {
     if (!gSandbox && gNetWhitelist.empty()) return true;
     if (gNetWhitelist.empty()) return false;
@@ -6757,7 +6762,7 @@ static string bigStr(const vector<uint32_t>& a) {
 static void bigTrim(vector<uint32_t>& a) {
     while (a.size() > 1 && a.back() == 0) a.pop_back();
 }
-static vector<uint32_t> bigMul(const vector<uint32_t>& a, const vector<uint32_t>& b) {
+static vector<uint32_t> bigMulSchool(const vector<uint32_t>& a, const vector<uint32_t>& b) {
     vector<uint32_t> c(a.size() + b.size(), 0);
     for (size_t i = 0; i < a.size(); ++i) {
         uint64_t carry = 0;
@@ -6816,6 +6821,43 @@ static vector<uint32_t> bigFromU64(uint64_t v) {
     if (!v) return {0};
     while (v) { out.push_back((uint32_t)(v % 1000000000ULL)); v /= 1000000000ULL; }
     return out;
+}
+static void bigAddShift(vector<uint32_t>& c, const vector<uint32_t>& a, size_t shift) {
+    if (c.size() < shift + a.size() + 1) c.resize(shift + a.size() + 1, 0);
+    uint64_t carry = 0;
+    size_t i = 0;
+    for (; i < a.size() || carry; ++i) {
+        uint64_t cur = (uint64_t)c[shift + i] + (i < a.size() ? a[i] : 0) + carry;
+        c[shift + i] = (uint32_t)(cur % 1000000000ULL);
+        carry = cur / 1000000000ULL;
+    }
+    bigTrim(c);
+}
+static vector<uint32_t> bigMul(const vector<uint32_t>& a, const vector<uint32_t>& b) {
+    if (a.empty() || b.empty()) return {0};
+    if (std::min(a.size(), b.size()) <= 32) return bigMulSchool(a, b);
+    size_t n = std::max(a.size(), b.size()) / 2;
+    vector<uint32_t> a0(a.begin(), a.begin() + std::min(n, a.size()));
+    vector<uint32_t> a1(a.size() > n ? a.begin() + n : a.end(), a.end());
+    vector<uint32_t> b0(b.begin(), b.begin() + std::min(n, b.size()));
+    vector<uint32_t> b1(b.size() > n ? b.begin() + n : b.end(), b.end());
+    bigTrim(a0); bigTrim(a1); bigTrim(b0); bigTrim(b1);
+    auto z0 = bigMul(a0, b0);
+    auto z2 = bigMul(a1, b1);
+    auto z1 = bigMul(bigAdd(a0, a1), bigAdd(b0, b1));
+    z1 = bigSub(z1, z0);
+    z1 = bigSub(z1, z2);
+    auto out = z0;
+    bigAddShift(out, z1, n);
+    bigAddShift(out, z2, 2 * n);
+    bigTrim(out);
+    return out;
+}
+static vector<uint32_t> bigProductRange(uint32_t l, uint32_t r) {
+    if (l > r) return {1};
+    if (l == r) return bigFromU64(l);
+    uint32_t m = l + (r - l) / 2;
+    return bigMul(bigProductRange(l, m), bigProductRange(m + 1, r));
 }
 static vector<uint32_t> bigPow(vector<uint32_t> base, long long exp) {
     vector<uint32_t> out{1};
@@ -9801,6 +9843,11 @@ Interpreter::Interpreter() {
         return vBool(ok || fs::exists(fs::u8path(path)));
     });
 
+    registerBuiltin("网络协议", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string url = needStr(a[0], "网络协议", line);
+        size_t p = url.find("://");
+        return vStr(p == string::npos ? "" : lowerAscii(url.substr(0, p)));
+    });
     registerBuiltin("网络路径", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
         string url = needStr(a[0], "网络路径", line);
         size_t p = url.find("://");
@@ -9844,7 +9891,7 @@ Interpreter::Interpreter() {
     // ---------- 网络库 ----------
     registerBuiltin("安全抓取", 1, 2, [this](Interpreter&, vector<Value>& a, int line) -> Value {
         string url = needStr(a[0], "安全抓取", line);
-        if (!netWhitelisted(url) || !netAllowed(firewallRules, url)) throw WenError("运行时错误", line, 0, "网络防火墙拒绝：" + netHostOf(url));
+        if (!netProtocolOk(url) || !netWhitelisted(url) || !netAllowed(firewallRules, url)) throw WenError("运行时错误", line, 0, "网络防火墙拒绝：" + netHostOf(url));
         if (unsafeNetHost(url))
             throw WenError("运行时错误", line, 0, "安全抓取拒绝内网/本机地址：" + url);
         int timeout = a.size() == 2 ? (int)needIndex(a[1], "安全抓取", line) : 15000;
@@ -9852,7 +9899,7 @@ Interpreter::Interpreter() {
     });
     registerBuiltin("限速抓取", 2, 3, [this](Interpreter&, vector<Value>& a, int line) -> Value {
         string url = needStr(a[0], "限速抓取", line);
-        if (!netWhitelisted(url) || !netAllowed(firewallRules, url)) throw WenError("运行时错误", line, 0, "网络防火墙拒绝：" + netHostOf(url));
+        if (!netProtocolOk(url) || !netWhitelisted(url) || !netAllowed(firewallRules, url)) throw WenError("运行时错误", line, 0, "网络防火墙拒绝：" + netHostOf(url));
         long long ms = needIndex(a[1], "限速抓取", line);
         if (ms < 0) ms = 0;
         if (ms > 60000) ms = 60000;
@@ -9927,7 +9974,7 @@ Interpreter::Interpreter() {
     });
     registerBuiltin("抓取", 1, 2, [this](Interpreter&, vector<Value>& a, int line) -> Value {
         string url = needStr(a[0], "抓取", line);
-        if (!netWhitelisted(url) || !netAllowed(firewallRules, url)) throw WenError("运行时错误", line, 0, "网络防火墙拒绝：" + netHostOf(url));
+        if (!netProtocolOk(url) || !netWhitelisted(url) || !netAllowed(firewallRules, url)) throw WenError("运行时错误", line, 0, "网络防火墙拒绝：" + netHostOf(url));
         int timeout = a.size() == 2 ? (int)needIndex(a[1], "抓取", line) : 15000;
         return vStr(httpGetText(url, timeout, line));
     });
@@ -9966,22 +10013,29 @@ Interpreter::Interpreter() {
         netHits.clear();
         return vNum((double)n);
     });
-    registerBuiltin("网络桥", 0, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+    registerBuiltin("网络桥", 0, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         if (!a.empty()) {
             long long mb = (long long)needIndex(a[0], "网络桥", line);
             if (mb < 1) mb = 1;
             if (mb > 64) mb = 64;
             gNetChunk = (size_t)mb * 1024 * 1024;
         }
+        if (a.size() > 1) {
+            string p = lowerAscii(needStr(a[1], "网络桥", line));
+            if (p != "" && p != "http" && p != "https")
+                throw WenError("运行时错误", line, 0, "网络桥只支持 http/https");
+            gNetProtocol = p;
+        }
         auto d = std::make_shared<Dict>();
         d->items["块字节"] = vNum((double)gNetChunk);
         d->items["块KB"] = vNum((double)gNetChunk / 1024.0);
         d->items["块MB"] = vNum((double)gNetChunk / (1024.0 * 1024.0));
+        d->items["协议"] = vStr(gNetProtocol.empty() ? "任意" : gNetProtocol);
         return vDict(d);
     });
     registerBuiltin("下载", 2, 3, [this](Interpreter&, vector<Value>& a, int line) -> Value {
         string url = needStr(a[0], "下载", line);
-        if (!netWhitelisted(url) || !netAllowed(firewallRules, url)) throw WenError("运行时错误", line, 0, "网络防火墙拒绝：" + netHostOf(url));
+        if (!netProtocolOk(url) || !netWhitelisted(url) || !netAllowed(firewallRules, url)) throw WenError("运行时错误", line, 0, "网络防火墙拒绝：" + netHostOf(url));
         string path = needStr(a[1], "下载", line);
         int timeout = a.size() == 3 ? (int)needIndex(a[2], "下载", line) : 15000;
         string body = httpGetText(url, timeout, line);
