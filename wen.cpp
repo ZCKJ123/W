@@ -2224,6 +2224,55 @@ static bool gNoFast = false;
 static size_t gBigMaxDigits = 50000000;
 static std::map<string, Value> gPoints;
 static const size_t kMaxPoints = 10000;
+struct SecEntry {
+    string file;
+    string fingerprint;
+    string source;
+    string status;
+    string decision;
+};
+static std::vector<SecEntry> gSecEntries;
+static string gSecurityPolicy = "观察";
+
+static string secFingerprint(const string& path) {
+    std::ifstream in(fs::u8path(path), std::ios::binary);
+    if (!in) return "";
+    uint64_t h = 1469598103934665603ULL;
+    char buf[65536];
+    while (in) {
+        in.read(buf, sizeof(buf));
+        std::streamsize n = in.gcount();
+        for (std::streamsize i = 0; i < n; ++i) {
+            h ^= (unsigned char)buf[i];
+            h *= 1099511628211ULL;
+        }
+    }
+    std::ostringstream ss;
+    ss << std::hex << h;
+    return ss.str();
+}
+static bool secOfficialPath(const string& path) {
+    std::error_code ec;
+    string app = fs::current_path(ec).u8string();
+    string full = fs::weakly_canonical(fs::u8path(path), ec).u8string();
+    return !app.empty() && full.rfind(app, 0) == 0;
+}
+static SecEntry& secCheckFile(const string& path) {
+    std::error_code ec;
+    string full = fs::weakly_canonical(fs::u8path(path), ec).u8string();
+    if (full.empty()) full = path;
+    string fp = secFingerprint(full);
+    for (auto& e : gSecEntries)
+        if (e.file == full && e.fingerprint == fp) return e;
+    SecEntry e;
+    e.file = full;
+    e.fingerprint = fp;
+    e.source = secOfficialPath(full) ? "官方目录" : "外部";
+    e.status = e.source == "官方目录" ? "安全" : "密切";
+    e.decision = "待定";
+    gSecEntries.push_back(e);
+    return gSecEntries.back();
+}
 static bool gSandbox = false;
 static string gSandboxRoot;
 static vector<string> gSandboxAllow;
@@ -3206,6 +3255,8 @@ static const std::map<string, string>& functionModules() {
         // 翻译器
         {"翻译支持", "兼容库"}, {"翻译目标", "兼容库"}, {"翻译检查", "兼容库"},
         {"兼容支持", "兼容库"}, {"兼容翻译", "兼容库"}, {"兼容运行", "兼容库"},
+        {"安全检查", "安全库"}, {"安全查息", "安全库"}, {"安全策略", "安全库"},
+        {"安全确认", "安全库"}, {"网络反流", "安全库"}, {"安全链路", "安全库"},
         {"查看", "查看库"}, {"库清单", "查看库"}, {"函数清单", "查看库"},
         {"性能查看", "查看库"}, {"开启调用统计", "查看库"}, {"调用排行", "查看库"}, {"精英配置", "查看库"},
         {"兼容语言", "兼容库"}, {"兼容解析", "兼容库"}, {"兼容诊断", "兼容库"},
@@ -8931,6 +8982,60 @@ Interpreter::Interpreter() {
     registerBuiltin("大整数上限", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
         return vNum((double)gBigMaxDigits);
     });
+    registerBuiltin("安全检查", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto& e = secCheckFile(needStr(a[0], "安全检查", line));
+        auto d = std::make_shared<Dict>();
+        d->items["文件"] = vStr(e.file);
+        d->items["指纹"] = vStr(e.fingerprint);
+        d->items["来源"] = vStr(e.source);
+        d->items["状态"] = vStr(e.status);
+        d->items["决定"] = vStr(e.decision);
+        return vDict(d);
+    });
+    registerBuiltin("安全查息", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+        auto l = std::make_shared<List>();
+        for (const auto& e : gSecEntries) {
+            auto d = std::make_shared<Dict>();
+            d->items["文件"] = vStr(e.file);
+            d->items["指纹"] = vStr(e.fingerprint);
+            d->items["来源"] = vStr(e.source);
+            d->items["状态"] = vStr(e.status);
+            d->items["决定"] = vStr(e.decision);
+            l->items.push_back(vDict(d));
+        }
+        return vList(l);
+    });
+    registerBuiltin("安全策略", 0, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (!a.empty()) {
+            string p = needStr(a[0], "安全策略", line);
+            if (p != "观察" && p != "询问" && p != "拒绝" && p != "允许")
+                throw WenError("运行时错误", line, 0, "策略只能是 观察/询问/拒绝/允许");
+            gSecurityPolicy = p;
+        }
+        return vStr(gSecurityPolicy);
+    });
+    registerBuiltin("安全确认", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto& e = secCheckFile(needStr(a[0], "安全确认", line));
+        e.decision = truthy(a[1]) ? "用户允许" : "用户拒绝";
+        return vBool(truthy(a[1]));
+    });
+    registerBuiltin("网络反流", 1, 1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto l = needList(a[0], "网络反流", line);
+        for (const auto& v : l->items)
+            firewallRules.push_back({needStr(v, "网络反流", line), false});
+        return vNum((double)l->items.size());
+    });
+    registerBuiltin("安全链路", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+        auto l = std::make_shared<List>();
+        for (const auto& e : gSecEntries) {
+            auto d = std::make_shared<Dict>();
+            d->items["文件"] = vStr(e.file);
+            d->items["状态"] = vStr(e.status);
+            d->items["决定"] = vStr(e.decision);
+            l->items.push_back(vDict(d));
+        }
+        return vList(l);
+    });
     registerBuiltin("新建布局", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         bool packed = false;
         if (a.size() > 1) {
@@ -13419,6 +13524,23 @@ static void printDiagnostics(const vector<WenError>& errors, const string& filen
 }
 
 static int runFile(const string& path) {
+    SecEntry& se = secCheckFile(path);
+    if (se.status == "密切" && se.decision == "待定") {
+        if (gSecurityPolicy == "拒绝") {
+            se.decision = "策略拒绝";
+            std::cerr << "【安全拒绝】非官方/未知来源脚本：" << se.file << "\n";
+            return 1;
+        }
+        if (gSecurityPolicy == "询问" && _isatty(_fileno(stdin))) {
+            std::cerr << "【安全提醒】非官方/未知来源：" << se.file << "\n允许运行？[y/N] ";
+            string ans;
+            std::getline(std::cin, ans);
+            if (ans.empty() || (ans[0] != 'y' && ans[0] != 'Y')) { se.decision = "用户拒绝"; return 1; }
+            se.decision = "用户允许";
+        } else {
+            se.decision = "观察允许";
+        }
+    }
     Interpreter vm;
     try {
         string src = readWholeFile(resolveWenPath(path));
