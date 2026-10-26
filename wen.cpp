@@ -1835,6 +1835,9 @@ struct Callable {
 struct Function : Callable {
     vector<string> params;
     vector<SymId> paramSyms;
+    int simpleOp = 0;
+    double simpleConst = 0;
+    SymId simpleParam = 0;
     vector<StmtPtr> body;
     shared_ptr<Scope> closure;
     int line = 0;
@@ -4624,6 +4627,8 @@ Value Function::call(Interpreter& vm, vector<Value>& args, int callLine) {
         SymId id = paramSyms[i];
         scope->set(id, args[i]);
     }
+    if (body.size() == 1 && body[0] && body[0]->k == Stmt::K::Return)
+        return body[0]->expr ? vm.eval(body[0]->expr, scope) : vNone();
     try {
         for (const auto& st : body) vm.exec(st, scope);
     } catch (ReturnSignal& r) {
