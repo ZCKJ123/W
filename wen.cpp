@@ -2221,6 +2221,7 @@ static const WenSuffixInfo WEN_SUFFIXES[] = {
     {"着色器", ".着色器"}};
 static const char* WEN_SOURCE_SUFFIXES[] = {".脚本", ".程序", ".wen"};
 static bool gNoFast = false;
+static size_t gBigMaxDigits = 50000000;
 static std::map<string, Value> gPoints;
 static const size_t kMaxPoints = 10000;
 static bool gSandbox = false;
@@ -3208,6 +3209,7 @@ static const std::map<string, string>& functionModules() {
         {"新建神经层", "神经网络库"}, {"神经链", "神经网络库"}, {"前向", "神经网络库"},
         {"大整数幂", "大整数库"}, {"大整数乘", "大整数库"}, {"大整数加", "大整数库"}, {"大整数阶乘", "大整数库"},
         {"阶乘位数", "大整数库"}, {"阶乘末尾零", "大整数库"}, {"阶乘概览", "大整数库"},
+        {"大整数规模", "大整数库"}, {"阶乘规模", "大整数库"},
         {"四段级数", "精度库"}, {"复式解析", "精度库"}, {"精确级数", "精度库"},
         {"训练", "神经网络库"}, {"保存网络", "神经网络库"}, {"读取网络", "神经网络库"},
         {"翻译", "兼容库"}, {"执行字节码", "兼容库"},
@@ -6820,7 +6822,20 @@ static vector<uint32_t> bigPow(vector<uint32_t> base, long long exp) {
     }
     return out;
 }
-static string bigArg(const Value& v, int line) {
+static long double bigDigitEstimate(const vector<uint32_t>& base, long long exp) {
+    if (exp <= 0 || base.empty()) return 1;
+    long double d = 0;
+    for (size_t i = 0; i < base.size(); ++i)
+        d += (long double)base[i] * std::pow(1000000000.0L, (long double)i);
+    if (d <= 0) return 1;
+    return std::floor((long double)exp * std::log10(d)) + 1.0L;
+}
+static void bigGuard(long double digits, int line = 0) {
+    if (digits > (long double)gBigMaxDigits)
+        throw WenError("运行时错误", line, 0,
+            "大整数结果约 " + std::to_string((long long)digits) +
+            " 位，超过上限 " + std::to_string(gBigMaxDigits) + " 位；拒绝分配");
+}static string bigArg(const Value& v, int line) {
     if (v.type == VT::Str) return v.str;
     if (v.type == VT::Int) return intText(v);
     if (v.type == VT::Num) return std::to_string((long long)needNum(v, "大整数", line));
@@ -8685,7 +8700,9 @@ Interpreter::Interpreter() {
     registerBuiltin("大整数幂", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         long long e = (long long)needIndex(a[1], "大整数幂", line);
         if (e < 0 || e > 1000000) throw WenError("运行时错误", line, 0, "指数必须在 0..1000000");
-        return vStr(bigStr(bigPow(bigParse(bigArg(a[0], line)), e)));
+        auto bs = bigParse(bigArg(a[0], line));
+        bigGuard(bigDigitEstimate(bs, e), line);
+        return vStr(bigStr(bigPow(bs, e)));
     });
     registerBuiltin("大整数乘", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         return vStr(bigStr(bigMul(bigParse(bigArg(a[0], line)), bigParse(bigArg(a[1], line)))));
@@ -8693,10 +8710,31 @@ Interpreter::Interpreter() {
     registerBuiltin("大整数加", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         return vStr(bigStr(bigAdd(bigParse(bigArg(a[0], line)), bigParse(bigArg(a[1], line)))));
     });
+    registerBuiltin("大整数规模", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto base = bigParse(bigArg(a[0], line));
+        long long e = (long long)needIndex(a[1], "大整数规模", line);
+        long double d = bigDigitEstimate(base, e);
+        auto r = std::make_shared<Dict>();
+        r->items["位数"] = vStr(std::to_string((long long)d));
+        r->items["约MB"] = vNum((double)(d / 1000000.0L));
+        r->items["超上限"] = vBool(d > (long double)gBigMaxDigits);
+        return vDict(r);
+    });
+    registerBuiltin("阶乘规模", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        long double n = (long double)needNum(a[0], "阶乘规模", line);
+        if (n < 0) throw WenError("运行时错误", line, 0, "阶乘参数不能为负");
+        long double d = lgammal(n + 1.0L) / logl(10.0L) + 1.0L;
+        auto r = std::make_shared<Dict>();
+        r->items["位数"] = vStr(std::to_string((long long)d));
+        r->items["约GB"] = vNum((double)(d / 1000000000.0L));
+        r->items["超上限"] = vBool(d > (long double)gBigMaxDigits);
+        return vDict(r);
+    });
     registerBuiltin("大整数阶乘", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
         long long n = (long long)needIndex(a[0], "大整数阶乘", line);
         if (n < 0 || n > 100000) throw WenError("运行时错误", line, 0, "阶乘参数必须在 0..100000");
         vector<uint32_t> out{1};
+        bigGuard(lgammal((long double)n + 1.0L) / logl(10.0L) + 1.0L, line);
         for (long long i = 2; i <= n; ++i) out = bigMul(out, {(uint32_t)i});
         return vStr(bigStr(out));
     });
