@@ -2234,6 +2234,9 @@ struct SecEntry {
 static std::vector<SecEntry> gSecEntries;
 static string gSecurityPolicy = "观察";
 static bool gSecAdmin = false;
+static bool gProbeActive = false;
+static string gProbeTarget;
+static string gProbeStatus = "待命";
 static std::set<string> gSecWhite;
 static std::set<string> gSecBlack;
 
@@ -2292,6 +2295,20 @@ static std::string secDeclaredLabel(const string& src, string& label) {
         return hash;
     }
     return "";
+}
+static string readWholeFile(const string& path);
+static string resolveWenPath(const string& path);
+static void probeExternal(const string& path, int line) {
+    if (!gProbeActive) return;
+    gProbeTarget = fs::absolute(fs::u8path(path)).u8string();
+    gProbeStatus = "扫描中";
+    string src;
+    try { src = readWholeFile(resolveWenPath(path)); }
+    catch (...) { gProbeStatus = "无法读取"; return; }
+    auto issues = secScanSource(src);
+    gProbeStatus = issues.empty() ? "已放行" : "发现可疑";
+    if (!issues.empty() && gSecurityPolicy == "拒绝")
+        throw WenError("安全权限", line, 0, "探针拒绝启动：" + path);
 }
 static SecEntry& secCheckFile(const string& path) {
     std::error_code ec;
@@ -3292,7 +3309,7 @@ static const std::map<string, string>& functionModules() {
         {"翻译支持", "兼容库"}, {"翻译目标", "兼容库"}, {"翻译检查", "兼容库"},
         {"兼容支持", "兼容库"}, {"兼容翻译", "兼容库"}, {"兼容运行", "兼容库"},
         {"安全检查", "安全库"}, {"自检", "安全库"}, {"官方标签", "安全库"}, {"安全白名单", "安全库"}, {"安全黑名单", "安全库"},
-        {"安全名单", "安全库"}, {"安全模式", "安全库"}, {"安全状态", "安全库"},
+        {"安全名单", "安全库"}, {"安全模式", "安全库"}, {"安全状态", "安全库"}, {"探针", "安全库"}, {"启动探针", "安全库"}, {"停止探针", "安全库"}, {"探针状态", "安全库"}, {"检测", "安全库"},
         {"安全确认", "安全库"}, {"网络反流", "安全库"}, {"安全链路", "安全库"}, {"安全管理员", "安全库"}, {"是否安全管理员", "安全库"}, {"退出安全管理员", "安全库"},
         {"查看", "查看库"}, {"库清单", "查看库"}, {"函数清单", "查看库"},
         {"性能查看", "查看库"}, {"开启调用统计", "查看库"}, {"调用排行", "查看库"}, {"精英配置", "查看库"},
@@ -9161,6 +9178,39 @@ Interpreter::Interpreter() {
         d->items["黑名单"] = vNum((double)gSecBlack.size());
         d->items["查息"] = vNum((double)gSecEntries.size());
         return vDict(d);
+    });
+    registerBuiltin("探针", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path = resolveWenPath(needStr(a[0], "探针", line));
+        gProbeTarget = fs::absolute(fs::u8path(path)).u8string();
+        gProbeStatus = "待命（未启动）";
+        auto d = std::make_shared<Dict>();
+        d->items["目标"] = vStr(gProbeTarget);
+        d->items["存在"] = vBool(fs::exists(fs::u8path(path)));
+        d->items["指纹"] = vStr(secFingerprint(path));
+        d->items["状态"] = vStr(gProbeStatus);
+        return vDict(d);
+    });
+    registerBuiltin("启动探针", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+        gProbeActive = true;
+        gProbeStatus = "监控中";
+        return vBool(true);
+    });
+    registerBuiltin("停止探针", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+        gProbeActive = false;
+        gProbeStatus = "已停止";
+        return vBool(true);
+    });
+    registerBuiltin("探针状态", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+        auto d = std::make_shared<Dict>();
+        d->items["启用"] = vBool(gProbeActive);
+        d->items["目标"] = vStr(gProbeTarget);
+        d->items["状态"] = vStr(gProbeStatus);
+        return vDict(d);
+    });
+    registerBuiltin("检测", 1, 1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+        Value fn;
+        if (!globals->lookup("自检", fn)) throw WenError("运行时错误", line, 0, "缺少自检");
+        return callValue(fn, a, line);
     });
     registerBuiltin("新建布局", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         bool packed = false;
