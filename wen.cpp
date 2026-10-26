@@ -2179,6 +2179,37 @@ static const WenSuffixInfo WEN_SUFFIXES[] = {
     {"配置", ".配置"}, {"缓冲", ".缓冲"}, {"网页", ".网页"},
     {"着色器", ".着色器"}};
 static const char* WEN_SOURCE_SUFFIXES[] = {".脚本", ".程序", ".wen"};
+static bool gSandbox = false;
+static string gSandboxRoot;
+static vector<string> gSandboxAllow;
+static vector<string> gNetWhitelist;
+
+static string lowerPath(string p) {
+    for (auto& c : p) c = (char)std::tolower((unsigned char)c);
+    return p;
+}
+static bool pathUnder(const string& root, const string& path) {
+    string r = lowerPath(root), p = lowerPath(path);
+    if (r.empty()) return false;
+    if (r.back() != '\\' && r.back() != '/') r += '\\';
+    return p.rfind(r, 0) == 0 || lowerPath(path) == lowerPath(root);
+}
+static bool sandboxPathAllowed(const string& path) {
+    if (!gSandbox) return true;
+    std::error_code ec;
+    fs::path p = fs::weakly_canonical(fs::u8path(path), ec);
+    string full = ec ? fs::absolute(fs::u8path(path), ec).u8string() : p.u8string();
+    for (const auto& a : gSandboxAllow) {
+        std::error_code e2;
+        string ar = fs::weakly_canonical(fs::u8path(a), e2).u8string();
+        if (pathUnder(ar.empty() ? a : ar, full)) return true;
+    }
+    return false;
+}
+static void sandboxRequire(const string& path) {
+    if (!sandboxPathAllowed(path))
+        throw IoError("沙盒拒绝访问路径：" + path);
+}
 static string resolveWenPath(const string& path) {
     if (fs::exists(fs::u8path(path))) return path;
     for (const auto& s : WEN_SUFFIXES) {
@@ -2191,6 +2222,7 @@ static string resolveWenPath(const string& path) {
 }
 
 static string readWholeFile(const string& path) {
+    sandboxRequire(path);
     std::ifstream in(fs::u8path(path), std::ios::binary);
     if (!in) throw IoError("打不开文件：" + path);
     std::ostringstream ss;
@@ -2204,11 +2236,29 @@ static string readWholeFile(const string& path) {
 }
 
 static void writeWholeFile(const string& path, const string& text, bool append) {
-    std::ofstream out(fs::u8path(path),
-                      std::ios::binary | (append ? std::ios::app : std::ios::trunc));
-    if (!out) throw IoError("打不开文件：" + path);
-    out << text;
-    if (!out) throw IoError("写入失败：" + path);
+    sandboxRequire(path);
+    if (append) {
+        std::ofstream out(fs::u8path(path), std::ios::binary | std::ios::app);
+        if (!out) throw IoError("打不开文件：" + path);
+        out.write(text.data(), (std::streamsize)text.size());
+        if (!out) throw IoError("写入失败：" + path);
+        return;
+    }
+    auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    fs::path tmp = fs::u8path(path + ".tmp." + std::to_string((long long)stamp));
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) throw IoError("打不开临时文件：" + tmp.u8string());
+        out.write(text.data(), (std::streamsize)text.size());
+        out.flush();
+        if (!out) { std::error_code ec; fs::remove(tmp, ec); throw IoError("写入失败：" + path); }
+    }
+    if (!MoveFileExW(tmp.wstring().c_str(), fs::u8path(path).wstring().c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        std::error_code ec;
+        fs::remove(tmp, ec);
+        throw IoError("替换文件失败：" + path);
+    }
 }
 
 #ifdef _WIN32
@@ -6428,6 +6478,14 @@ static bool netWildcard(const string& pat, const string& text) {
     while (p < pat.size() && pat[p] == '*') ++p;
     return p == pat.size();
 }
+static bool netWhitelisted(const string& url) {
+    if (!gSandbox && gNetWhitelist.empty()) return true;
+    if (gNetWhitelist.empty()) return false;
+    string host = netHostOf(url);
+    for (const auto& w : gNetWhitelist)
+        if (netWildcard(w, host)) return true;
+    return false;
+}
 static bool netAllowed(const std::vector<std::pair<string, bool>>& rules, const string& url) {
     if (rules.empty()) return true;
     string host = netHostOf(url);
@@ -8219,6 +8277,39 @@ Interpreter::Interpreter() {
         JsonReader reader(text, line);
         return reader.parse();
     });
+    registerBuiltin("沙盒", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string root = needStr(a[0], "沙盒", line);
+        std::error_code ec;
+        fs::path rp = fs::absolute(fs::u8path(root), ec);
+        gSandboxRoot = rp.u8string();
+        gSandbox = true;
+        gSandboxAllow.clear();
+        gSandboxAllow.push_back(gSandboxRoot);
+        gSandboxAllow.push_back(fs::current_path().u8string());
+        if (a.size() > 1) {
+            auto extra = needList(a[1], "沙盒允许", line);
+            for (const auto& v : extra->items)
+                gSandboxAllow.push_back(needStr(v, "沙盒允许", line));
+        }
+        return vStr(gSandboxRoot);
+    });
+    registerBuiltin("白名单", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto l = needList(a[0], "白名单", line);
+        gNetWhitelist.clear();
+        for (const auto& v : l->items)
+            gNetWhitelist.push_back(needStr(v, "白名单", line));
+        return vNum((double)gNetWhitelist.size());
+    });
+    registerBuiltin("白名单检查", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string url = needStr(a[0], "白名单检查", line);
+        auto d = std::make_shared<Dict>();
+        d->items["主机"] = vStr(netHostOf(url));
+        d->items["允许"] = vBool(netWhitelisted(url));
+        return vDict(d);
+    });
+    registerBuiltin("是否沙盒", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+        return vBool(gSandbox);
+    });
     registerBuiltin("新建布局", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         bool packed = false;
         if (a.size() > 1) {
@@ -9174,7 +9265,7 @@ Interpreter::Interpreter() {
     // ---------- 网络库 ----------
     registerBuiltin("安全抓取", 1, 2, [this](Interpreter&, vector<Value>& a, int line) -> Value {
         string url = needStr(a[0], "安全抓取", line);
-        if (!netAllowed(firewallRules, url)) throw WenError("运行时错误", line, 0, "网络防火墙拒绝：" + netHostOf(url));
+        if (!netWhitelisted(url) || !netAllowed(firewallRules, url)) throw WenError("运行时错误", line, 0, "网络防火墙拒绝：" + netHostOf(url));
         if (unsafeNetHost(url))
             throw WenError("运行时错误", line, 0, "安全抓取拒绝内网/本机地址：" + url);
         int timeout = a.size() == 2 ? (int)needIndex(a[1], "安全抓取", line) : 15000;
@@ -9182,7 +9273,7 @@ Interpreter::Interpreter() {
     });
     registerBuiltin("限速抓取", 2, 3, [this](Interpreter&, vector<Value>& a, int line) -> Value {
         string url = needStr(a[0], "限速抓取", line);
-        if (!netAllowed(firewallRules, url)) throw WenError("运行时错误", line, 0, "网络防火墙拒绝：" + netHostOf(url));
+        if (!netWhitelisted(url) || !netAllowed(firewallRules, url)) throw WenError("运行时错误", line, 0, "网络防火墙拒绝：" + netHostOf(url));
         long long ms = needIndex(a[1], "限速抓取", line);
         if (ms < 0) ms = 0;
         if (ms > 60000) ms = 60000;
@@ -9257,13 +9348,13 @@ Interpreter::Interpreter() {
     });
     registerBuiltin("抓取", 1, 2, [this](Interpreter&, vector<Value>& a, int line) -> Value {
         string url = needStr(a[0], "抓取", line);
-        if (!netAllowed(firewallRules, url)) throw WenError("运行时错误", line, 0, "网络防火墙拒绝：" + netHostOf(url));
+        if (!netWhitelisted(url) || !netAllowed(firewallRules, url)) throw WenError("运行时错误", line, 0, "网络防火墙拒绝：" + netHostOf(url));
         int timeout = a.size() == 2 ? (int)needIndex(a[1], "抓取", line) : 15000;
         return vStr(httpGetText(url, timeout, line));
     });
     registerBuiltin("下载", 2, 3, [this](Interpreter&, vector<Value>& a, int line) -> Value {
         string url = needStr(a[0], "下载", line);
-        if (!netAllowed(firewallRules, url)) throw WenError("运行时错误", line, 0, "网络防火墙拒绝：" + netHostOf(url));
+        if (!netWhitelisted(url) || !netAllowed(firewallRules, url)) throw WenError("运行时错误", line, 0, "网络防火墙拒绝：" + netHostOf(url));
         string path = needStr(a[1], "下载", line);
         int timeout = a.size() == 3 ? (int)needIndex(a[2], "下载", line) : 15000;
         string body = httpGetText(url, timeout, line);
@@ -12986,6 +13077,22 @@ static void startRuntimeLimit() {
 }
 
 static int runMain(vector<string> args) {
+    if (args.size() >= 3 && args[1] == "--沙盒") {
+        gSandboxRoot = fs::absolute(fs::u8path(args[2])).u8string();
+        gSandbox = true;
+        gSandboxAllow.clear();
+        gSandboxAllow.push_back(gSandboxRoot);
+        gSandboxAllow.push_back(fs::current_path().u8string());
+        args.erase(args.begin() + 1, args.begin() + 3);
+        if (args.size() > 1 && fs::exists(fs::u8path(args[1]))) gSandboxAllow.push_back(fs::absolute(fs::u8path(args[1])).u8string());
+    }
+    if (args.size() >= 3 && args[1] == "--白名单") {
+        gNetWhitelist.clear();
+        std::istringstream ss(args[2]);
+        string h;
+        while (std::getline(ss, h, ',')) if (!h.empty()) gNetWhitelist.push_back(h);
+        args.erase(args.begin() + 1, args.begin() + 3);
+    }
     if (args.size() >= 3 && args[1] == "--限制") {
         setupRuntimeLimit(args[2]);
         args.erase(args.begin() + 1, args.begin() + 3);

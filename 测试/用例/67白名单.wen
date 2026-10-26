@@ -1,0 +1,4 @@
+依赖 网络库
+白名单(["example.com"])
+打印 白名单检查("https://example.com/x")["允许"]
+打印 白名单检查("https://bad.com/x")["允许"]
