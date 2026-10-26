@@ -2261,6 +2261,7 @@ static bool gNoFast = false;
 static size_t gBigMaxDigits = 50000000;
 static std::set<string> gAdminPerms;
 static long long gExecuted = 0;
+static size_t gMemoryMaxBytes = 64 * 1024 * 1024;
 static long long gTotal = 0;
 static int gLastLine = 0;
 static std::map<string, Value> gPoints;
@@ -3360,12 +3361,12 @@ static const std::map<string, string>& functionModules() {
         {"新建神经层", "神经网络库"}, {"神经链", "神经网络库"}, {"前向", "神经网络库"},
         {"颜色", "视口库"}, {"新建视口", "视口库"}, {"视口清空", "视口库"}, {"视口画点", "视口库"},
         {"视口画线", "视口库"}, {"视口画三角形", "视口库"}, {"视口尺寸", "视口库"}, {"视口保存", "视口库"},
-        {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"}, {"视口显示", "视口库"},
+        {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"}, {"视口显示", "视口库"}, {"视口加载模型", "视口库"},
         {"硬件信息", "硬件库"}, {"高精度计时", "硬件库"}, {"内存状态", "硬件库"}, {"屏幕尺寸", "硬件库"}, {"磁盘空间", "硬件库"},
         {"大整数幂", "大整数库"}, {"大整数乘", "大整数库"}, {"大整数加", "大整数库"}, {"大整数阶乘", "大整数库"},
         {"阶乘位数", "大整数库"}, {"阶乘末尾零", "大整数库"}, {"阶乘概览", "大整数库"},
         {"大整数规模", "大整数库"}, {"阶乘规模", "大整数库"},
-        {"四段级数", "精度库"}, {"复式解析", "精度库"}, {"精确级数", "精度库"},
+        {"四段级数", "精度库"}, {"快速求和", "精度库"}, {"复式解析", "精度库"}, {"精确级数", "精度库"},
         {"训练", "神经网络库"}, {"保存网络", "神经网络库"}, {"读取网络", "神经网络库"},
         {"翻译", "兼容库"}, {"执行字节码", "兼容库"},
         {"反汇编", "兼容库"}, {"反汇编文本", "兼容库"},
@@ -3377,7 +3378,7 @@ static const std::map<string, string>& functionModules() {
         {"CPU并行最小", "CPU库"},
 
         // 内存库
-        {"内存存", "内存库"}, {"内存取", "内存库"}, {"内存有", "内存库"},
+        {"内存存", "内存库"}, {"内存上限", "内存库"}, {"内存用量", "内存库"}, {"内存取", "内存库"}, {"内存有", "内存库"},
         {"内存删", "内存库"}, {"内存清空", "内存库"}, {"内存大小", "内存库"},
         {"内存键", "内存库"}, {"内存临时存", "内存库"}, {"内存临时取", "内存库"},
         {"内存清临时", "内存库"}, {"内存命中", "内存库"}, {"开启内存", "内存库"},
@@ -8091,6 +8092,24 @@ Interpreter::Interpreter() {
         }
         return a[1];
     });
+    registerBuiltin("内存上限", 0, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (!a.empty()) {
+            long long mb = (long long)needIndex(a[0], "内存上限", line);
+            if (mb < 1) throw WenError("运行时错误", line, 0, "上限至少 1MB");
+            gMemoryMaxBytes = (size_t)mb * 1024 * 1024;
+        }
+        return vNum((double)gMemoryMaxBytes / (1024.0 * 1024.0));
+    });
+    registerBuiltin("内存用量", 0, 0, [this](Interpreter&, vector<Value>&, int) -> Value {
+        size_t bytes = 0;
+        for (const auto& kv : memoryStore) bytes += toText(kv.second, true).size();
+        for (const auto& kv : memoryTemp) bytes += toText(kv.second, true).size();
+        auto d = std::make_shared<Dict>();
+        d->items["字节"] = vNum((double)bytes);
+        d->items["MB"] = vNum((double)bytes / (1024.0 * 1024.0));
+        d->items["上限MB"] = vNum((double)gMemoryMaxBytes / (1024.0 * 1024.0));
+        return vDict(d);
+    });
     registerBuiltin("内存取", 1, 2, [this](Interpreter&, vector<Value>& a, int line) -> Value {
         string key = needStr(a[0], "内存取", line);
         auto it = memoryStore.find(key);
@@ -9041,6 +9060,15 @@ Interpreter::Interpreter() {
         if (!globals->lookup("四段级数", fn)) throw WenError("运行时错误", line, 0, "缺少四段级数");
         return callValue(fn, a, line);
     });
+    registerBuiltin("快速求和", 1, 3, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+        Value fn;
+        if (!globals->lookup("四段级数", fn)) throw WenError("运行时错误", line, 0, "缺少四段级数");
+        vector<Value> args;
+        if (a.size() == 1) { args.push_back(vNum(1)); args.push_back(a[0]); args.push_back(vNum(1)); }
+        else if (a.size() == 2) { args.push_back(a[0]); args.push_back(a[1]); args.push_back(vNum(1)); }
+        else args = a;
+        return callValue(fn, args, line);
+    });
     registerBuiltin("复式解析", 3, 3, [this](Interpreter&, vector<Value>& a, int line) -> Value {
         Value fn;
         if (!globals->lookup("四段级数", fn)) throw WenError("运行时错误", line, 0, "缺少四段级数");
@@ -9602,6 +9630,77 @@ Interpreter::Interpreter() {
 #else
         throw WenError("运行时错误", line, 0, "当前平台不支持窗口");
 #endif
+    });
+    registerBuiltin("视口加载模型", 2, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto d = vpDict(a[0], line);
+        string path = needStr(a[1], "视口加载模型", line);
+        string text;
+        try { text = readWholeFile(path); }
+        catch (IoError& e) { throw WenError("文件错误", line, 0, e.what()); }
+        int w = (int)needNum(d->items.at("宽"), "视口", line);
+        int h = (int)needNum(d->items.at("高"), "视口", line);
+        int color = a.size() > 2 ? vpColor(a[2], line) : 0xFFFFFF;
+        struct V3 { double x, y, z; };
+        vector<V3> vs;
+        std::istringstream in(text);
+        string row;
+        while (std::getline(in, row)) {
+            if (row.rfind("v ", 0) == 0) {
+                std::istringstream ss(row.substr(2));
+                V3 p{};
+                if (ss >> p.x >> p.y >> p.z) vs.push_back(p);
+            }
+        }
+        if (vs.empty()) throw WenError("运行时错误", line, 0, "模型没有顶点");
+        V3 lo = vs[0], hi = vs[0];
+        for (const auto& p : vs) {
+            lo.x = std::min(lo.x, p.x); lo.y = std::min(lo.y, p.y); lo.z = std::min(lo.z, p.z);
+            hi.x = std::max(hi.x, p.x); hi.y = std::max(hi.y, p.y); hi.z = std::max(hi.z, p.z);
+        }
+        double cx = (lo.x + hi.x) / 2, cy = (lo.y + hi.y) / 2, cz = (lo.z + hi.z) / 2;
+        double ext = std::max({hi.x - lo.x, hi.y - lo.y, hi.z - lo.z, 1e-6});
+        double f = (double)h / 2 * 2.0 / ext;
+        auto proj = [&](const V3& p, double& sx, double& sy, double& sz) {
+            double x = p.x - cx, y = p.y - cy, z = p.z - cz;
+            double zz = z + 4.0;
+            if (std::fabs(zz) < 0.1) zz = 0.1;
+            sx = w / 2.0 + x * f / zz;
+            sy = h / 2.0 - y * f / zz;
+            sz = zz;
+        };
+        in.clear(); in.seekg(0);
+        int faces = 0;
+        while (std::getline(in, row)) {
+            if (row.rfind("f ", 0) != 0) continue;
+            std::istringstream ss(row.substr(2));
+            vector<int> idx;
+            string tok;
+            while (ss >> tok) {
+                size_t slash = tok.find('/');
+                int n = std::atoi((slash == string::npos ? tok : tok.substr(0, slash)).c_str());
+                if (n == 0) continue;
+                idx.push_back(n > 0 ? n - 1 : (int)vs.size() + n);
+            }
+            if (idx.size() < 3) continue;
+            for (size_t k = 1; k + 1 < idx.size(); ++k) {
+                int i0 = idx[0], i1 = idx[k], i2 = idx[k + 1];
+                if (i0 < 0 || i1 < 0 || i2 < 0 || i0 >= (int)vs.size() || i1 >= (int)vs.size() || i2 >= (int)vs.size()) continue;
+                double x1,y1,z1,x2,y2,z2,x3,y3,z3;
+                proj(vs[i0],x1,y1,z1); proj(vs[i1],x2,y2,z2); proj(vs[i2],x3,y3,z3);
+                double minx=std::min({x1,x2,x3}), maxx=std::max({x1,x2,x3});
+                double miny=std::min({y1,y2,y3}), maxy=std::max({y1,y2,y3});
+                auto edge=[](double ax,double ay,double bx,double by,double px,double py){return (px-ax)*(by-ay)-(py-ay)*(bx-ax);};
+                double area=edge(x1,y1,x2,y2,x3,y3);
+                if (std::fabs(area)<1e-12) continue;
+                for(int y=(int)miny;y<=(int)maxy;++y) for(int x=(int)minx;x<=(int)maxx;++x){
+                    double a1=edge(x2,y2,x3,y3,x,y)/area, a2=edge(x3,y3,x1,y1,x,y)/area, a3=edge(x1,y1,x2,y2,x,y)/area;
+                    if(a1<0||a2<0||a3<0) continue;
+                    vpPutZ(d,x,y,a1*z1+a2*z2+a3*z3,color);
+                }
+                ++faces;
+            }
+        }
+        return vNum((double)faces);
     });
     registerBuiltin("视口尺寸", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
         auto d = vpDict(a[0], line);
