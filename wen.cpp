@@ -599,9 +599,6 @@ private:
                 }
                 char e = src_[pos_ + 1];
                 switch (e) {
-                    case 'n': val += '\n'; break;
-                    case 't': val += '\t'; break;
-                    case 'r': val += '\r'; break;
                     case '\\': val += '\\'; break;
                     case '"': val += '"'; break;
                     case '\'': val += '\''; break;
@@ -658,9 +655,6 @@ private:
                     throw WenError("词法错误", line_, col_, "文本末尾的转义不完整");
                 char e = src_[pos_ + 1];
                 switch (e) {
-                    case 'n': val += '\n'; break;
-                    case 't': val += '\t'; break;
-                    case 'r': val += '\r'; break;
                     case '\\': val += '\\'; break;
                     case '"': val += '"'; break;
                     case '\'': val += '\''; break;
@@ -3587,7 +3581,7 @@ public:
             if (kv.second.count(name))
                 throw WenError("运行时错误", line, 0,
                                "「" + name + "」属于「" + kv.first +
-                                   "」，请先在文件开头写「依赖 " + kv.first + "」");
+                                   "」，请先在使用前写「依赖 " + kv.first + "」");
         }
         static const std::map<string, string> constLib = {
             {"圆周率", "数学库"}, {"π", "数学库"}, {"自然常数", "数学库"},
@@ -3597,7 +3591,7 @@ public:
         if (ci != constLib.end())
             throw WenError("运行时错误", line, 0,
                            "「" + name + "」属于「" + ci->second +
-                               "」，请先在文件开头写「依赖 " + ci->second + "」");
+                               "」，请先在使用前写「依赖 " + ci->second + "」");
         throw WenError("运行时错误", line, 0, "变量「" + name + "」还没有值");
     }
 };
@@ -4741,7 +4735,7 @@ Value Builtin::call(Interpreter& vm, vector<Value>& args, int line) {
         if (!lib.empty() && !vm.loadedModules.count(lib))
             throw WenError("运行时错误", line, 0,
                            "「" + name + "」属于「" + lib +
-                           "」，请先在文件开头写「依赖 " + lib + "」");
+                           "」，请先在使用前写「依赖 " + lib + "」");
     }
     if ((int)args.size() < minArgs ||
         (maxArgs >= 0 && (int)args.size() > maxArgs)) {
@@ -9856,6 +9850,9 @@ Interpreter::Interpreter() {
         d->items["问题"] = vList(issues);
         return vDict(d);
     });
+    registerBuiltin("换行符", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value { return vStr("\n"); });
+    registerBuiltin("制表符", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value { return vStr("\t"); });
+    registerBuiltin("回车符", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value { return vStr("\r"); });
     registerBuiltin("新建布局", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         bool packed = false;
         if (a.size() > 1) {
@@ -13471,7 +13468,7 @@ private:
         if (git != globals_.end()) return git->second;
         if (name == "圆周率" || name == "π" || name == "自然常数") {
             if (!imports_.count("数学库"))
-                err(line, "「" + name + "」属于数学库，请先在文件开头写「依赖 数学库」");
+                err(line, "「" + name + "」属于数学库，请先在使用前写「依赖 数学库」");
             if (name == "自然常数") return "2.71828182845904523536";
             return "3.14159265358979323846";
         }
@@ -13507,7 +13504,7 @@ private:
                 // 零参数内置「随机」可以省括号：编译模式里也按调用处理。
                 if (e->text == "随机") {
                     if (!imports_.count("数学库"))
-                        err(e->line, "「随机」属于数学库，请先在文件开头写「依赖 数学库」");
+                        err(e->line, "「随机」属于数学库，请先在使用前写「依赖 数学库」");
                     return "rand_real()";
                 }
                 return varRef(e->text, e->line);
@@ -13551,7 +13548,7 @@ private:
                 if (modIt != functionModules().end() && modIt->second == "数学库" &&
                     !imports_.count("数学库")) {
                     err(e->line, "「" + name +
-                                     "」属于数学库，请先在文件开头写「依赖 数学库」");
+                                     "」属于数学库，请先在使用前写「依赖 数学库」");
                 }
                 auto fit = funcs_.find(name);
                 if (fit != funcs_.end()) {
@@ -14255,7 +14252,8 @@ static int processSaveBlocks(const string& src, bool write, string& out,
     int blocks = 0;
     for (size_t i = 0; i < lines.size(); ++i) {
         string t = trim(lines[i]);
-        if (t.size() > kw.size() && t.compare(0, kw.size(), kw) == 0) {
+        if (t.compare(0, kw.size(), kw) == 0 &&
+            (t.size() == kw.size() || std::isspace((unsigned char)t[kw.size()]))) {
             string rest = trim(t.substr(kw.size()));
             if (rest.empty()) {
                 errors.push_back(WenError("语法错误", (int)i + 1, 0,
