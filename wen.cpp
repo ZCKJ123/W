@@ -7139,7 +7139,94 @@ static void bigAddShift(vector<uint32_t>& c, const vector<uint32_t>& a, size_t s
     }
     bigTrim(c);
 }
+#if defined(__SIZEOF_INT128__)
+static uint64_t nttPow(uint64_t a, uint64_t e, uint64_t mod) {
+    uint64_t r = 1;
+    while (e) { if (e & 1) r = r * a % mod; a = a * a % mod; e >>= 1; }
+    return r;
+}
+static void ntt(vector<int>& a, bool inv, int mod, int root) {
+    int n = (int)a.size();
+    for (int i = 1, j = 0; i < n; ++i) {
+        int bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) std::swap(a[i], a[j]);
+    }
+    for (int len = 2; len <= n; len <<= 1) {
+        uint64_t wlen = nttPow(root, (uint64_t)(mod - 1) / len, mod);
+        if (inv) wlen = nttPow(wlen, mod - 2, mod);
+        for (int i = 0; i < n; i += len) {
+            uint64_t w = 1;
+            int half = len >> 1;
+            for (int j = 0; j < half; ++j) {
+                int u = a[i + j];
+                int v = (int)((uint64_t)a[i + j + half] * w % mod);
+                int x = u + v; if (x >= mod) x -= mod;
+                int y = u - v; if (y < 0) y += mod;
+                a[i + j] = x;
+                a[i + j + half] = y;
+                w = w * wlen % mod;
+            }
+        }
+    }
+    if (inv) {
+        uint64_t invn = nttPow(n, mod - 2, mod);
+        for (int& x : a) x = (int)((uint64_t)x * invn % mod);
+    }
+}
+static vector<uint32_t> bigMulNTT(const vector<uint32_t>& a, const vector<uint32_t>& b) {
+    static const int MODS[3] = {998244353, 1004535809, 469762049};
+    static const int ROOT = 3;
+    size_t need = a.size() + b.size();
+    size_t n = 1;
+    while (n < need) n <<= 1;
+    vector<vector<int>> conv(3, vector<int>(n));
+    for (int k = 0; k < 3; ++k) {
+        vector<int> fa(n), fb(n);
+        for (size_t i = 0; i < a.size(); ++i) fa[i] = (int)(a[i] % MODS[k]);
+        for (size_t i = 0; i < b.size(); ++i) fb[i] = (int)(b[i] % MODS[k]);
+        ntt(fa, false, MODS[k], ROOT);
+        ntt(fb, false, MODS[k], ROOT);
+        for (size_t i = 0; i < n; ++i) fa[i] = (int)((uint64_t)fa[i] * fb[i] % MODS[k]);
+        ntt(fa, true, MODS[k], ROOT);
+        conv[k] = std::move(fa);
+    }
+    uint64_t inv12 = nttPow(MODS[0], MODS[1] - 2, MODS[1]);
+    uint64_t p12 = (uint64_t)MODS[0] * MODS[1];
+    uint64_t inv123 = nttPow(p12 % MODS[2], MODS[2] - 2, MODS[2]);
+    vector<unsigned __int128> coeff(need);
+    for (size_t i = 0; i < need; ++i) {
+        uint64_t r1 = (uint64_t)conv[0][i];
+        uint64_t r2 = (uint64_t)conv[1][i];
+        uint64_t r3 = (uint64_t)conv[2][i];
+        uint64_t t1 = (r2 + MODS[1] - r1 % MODS[1]) % MODS[1] * inv12 % MODS[1];
+        unsigned __int128 x12 = (unsigned __int128)r1 + (unsigned __int128)MODS[0] * t1;
+        uint64_t r3x = (uint64_t)(x12 % MODS[2]);
+        uint64_t t2 = (r3 + MODS[2] - r3x) % MODS[2] * inv123 % MODS[2];
+        coeff[i] = x12 + (unsigned __int128)p12 * t2;
+    }
+    vector<uint32_t> out(need + 1, 0);
+    unsigned __int128 carry = 0;
+    for (size_t i = 0; i < need; ++i) {
+        unsigned __int128 cur = coeff[i] + carry;
+        out[i] = (uint32_t)(cur % 1000000000ULL);
+        carry = cur / 1000000000ULL;
+    }
+    size_t k = need;
+    while (carry) {
+        out[k++] = (uint32_t)(carry % 1000000000ULL);
+        carry /= 1000000000ULL;
+    }
+    out.resize(k);
+    bigTrim(out);
+    return out;
+}
+#endif
 static vector<uint32_t> bigMul(const vector<uint32_t>& a, const vector<uint32_t>& b) {
+#if defined(__SIZEOF_INT128__)
+    if (std::min(a.size(), b.size()) >= 1024) return bigMulNTT(a, b);
+#endif
     if (a.empty() || b.empty()) return {0};
     if (std::min(a.size(), b.size()) <= 128) return bigMulSchool(a, b);
     size_t n = std::max(a.size(), b.size()) / 2;
@@ -9307,7 +9394,7 @@ Interpreter::Interpreter() {
         if (n < 0 || n > 100000) throw WenError("运行时错误", line, 0, "阶乘参数必须在 0..100000");
         vector<uint32_t> out{1};
         bigGuard(lgammal((long double)n + 1.0L) / logl(10.0L) + 1.0L, line);
-        for (long long i = 2; i <= n; ++i) out = bigMul(out, {(uint32_t)i});
+        out = n >= 2 ? bigProductRange(2, (uint32_t)n) : out;
         return vStr(bigStr(out));
     });
     registerBuiltin("阶乘位数", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
