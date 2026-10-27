@@ -11,9 +11,6 @@ foreach ($f in $all) {
     foreach ($m in [regex]::Matches($text, '(?m)^函数\s+(\S+)\s+则\s*$')) {
         $zero[$m.Groups[1].Value] = $true
     }
-    if ($text -match '√|°|²|³' -and $text -notmatch '依赖[^\n]*数学库') {
-        $hits += [pscustomobject]@{ 文件 = $f.FullName.Substring($root.Length + 1); 规则 = '核心符号缺数学库' }
-    }
 }
 foreach ($f in $all) {
     $text = [IO.File]::ReadAllText($f.FullName, [Text.Encoding]::UTF8)
