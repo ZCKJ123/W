@@ -34,9 +34,9 @@ if ($LASTEXITCODE -ne 0) { 失败 "32 位性能门禁不通过" }
 
 Write-Host "8/10 版本 / 签名"
 $version = (.\wen_full.exe --版本) -join "`n"
-if ($version -notmatch '文语言 v0\.1 · 作者 Akm / 筑宸科技 · 2026-10-25 首次发布') { 失败 "版本签名不对：$version" }
+if ($version -notmatch '文语言 v0\.2 · 作者 Akm / 筑宸科技 · 2026-10-25 首次发布') { 失败 "版本签名不对：$version" }
 $sign = .\wen_full.exe --签名
-if ($sign -notmatch 'WEN-LANG-0\.1') { 失败 "内置签名不对" }
+if ($sign -notmatch 'WEN-LANG-0\.2') { 失败 "内置签名不对" }
 
 Write-Host "9/10 二进制标记"
 foreach ($exe in @('wen_full.exe', 'wen32.exe')) {
@@ -49,6 +49,6 @@ $libs = (.\wen_full.exe --库) -join "`n"
 foreach ($name in @('时间库', '编码库', '正则库', 'CPU库', '路径库', '日志库', '哈希库', '硬件库', '视口库')) {
     if ($libs -notmatch $name) { 失败 "缺少 $name" }
 }
-if ($libs -match 'GPU库') { 失败 "V0.1 不应带 GPU 库" }
+if ($libs -match 'GPU库') { 失败 "V0.2 不应带 GPU 库" }
 
 Write-Host "发货检查通过：137/137，版本、签名、标记、库都正常。" -ForegroundColor Green

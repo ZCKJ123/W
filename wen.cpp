@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// 文语言（wen）· 内置签名 WEN-LANG-0.1 · 2026 · 作者与贡献者
+// 文语言（wen）· 内置签名 WEN-LANG-0.2 · 2026 · 作者与贡献者
 // wen.cpp —— 「文」语言 C++17 解释器
 // 目标：不经过 Python，直接编译成原生 wen.exe；中文关键字；内置数学库。
 // 构建：C:\msys64\ucrt64\bin\g++.exe -std=c++17 -O2 -static -municode -o wen.exe wen.cpp -lwinhttp
@@ -37,19 +37,21 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <shellapi.h>
 #include <psapi.h>
 #include <winhttp.h>
 #include <conio.h>
 #include <io.h>
 
 // 源码自带标签：任何二进制都能用 --签名 打印出来。
-static const char* WEN_VERSION = "0.1.0";
+static const char* WEN_VERSION = "0.2.0";
 static const char* WEN_SIGNATURE =
-    "文语言（wen） · 内置签名 WEN-LANG-0.1 · 2026 · 作者 Akm / 筑宸科技";
+    "文语言（wen） · 内置签名 WEN-LANG-0.2 · 2026 · 作者 Akm / 筑宸科技";
+static std::string openWenWorkbench(const std::string& title, const std::string& initial, int line);
 
 // 永不执行的标记字符串：强制留在二进制里，用来证明源码归属。
 __attribute__((used)) static const char WEN_EMBED_MARK[] =
-    "WEN-EMBEDDED-MARK · 文语言 v0.1 · 作者 Akm / 筑宸科技 · 2026-10-25 首次发布";
+    "WEN-EMBEDDED-MARK · 文语言 v0.2 · 作者 Akm / 筑宸科技 · 2026-10-25 首次发布";
 #endif
 
 using std::map;
@@ -5707,7 +5709,7 @@ struct PyEmitter {
     }
     string generate() {
         for (const auto& s : program) stmt(s);
-        string head = "# 由「文」外派库生成 · WEN-LANG-0.1\n";
+        string head = "# 由「文」外派库生成 · WEN-LANG-0.2\n";
         if (usedMath) head += "import math\n";
         if (usedRandom) head += "import random\n";
         return head + out.str();
@@ -5933,7 +5935,7 @@ struct JsEmitter {
             "if(typeof v==='boolean')return '布尔';if(Array.isArray(v))return '列表';"
             "if(typeof v==='object')return '字典';return '未知';}\n"
             "function wenRandInt(a,b){return Math.floor(Math.random()*(b-a+1))+a;}\n";
-        return "// 由「文」外派库生成 · WEN-LANG-0.1\n" + string(helpers) + "\n" + out.str();
+        return "// 由「文」外派库生成 · WEN-LANG-0.2\n" + string(helpers) + "\n" + out.str();
     }
 };
 
@@ -6323,7 +6325,7 @@ struct JavaEmitter {
     }
     string generate() {
         std::ostringstream head;
-        head << "// 由「文」外派库生成 · WEN-LANG-0.1\nimport java.util.*;\n\npublic class Main {\n";
+        head << "// 由「文」外派库生成 · WEN-LANG-0.2\nimport java.util.*;\n\npublic class Main {\n";
         head << R"JAVA(static class W {
     static void print(Object... a) {
         StringBuilder b = new StringBuilder();
@@ -7756,6 +7758,11 @@ Interpreter::Interpreter() {
     globals->set("π", vNum(piValue()));
     globals->set("自然常数", vNum(wenE()));
     rng.seed(std::random_device{}());
+    registerBuiltin("工作台", 0, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string title = a.size() >= 1 ? needStr(a[0], "工作台", line) : "文工作台";
+        string initial = a.size() >= 2 ? needStr(a[1], "工作台", line) : "";
+        return vStr(openWenWorkbench(title, initial, line));
+    });
 
     // ---------- 核心（不需要依赖）---------
     registerBuiltin("调用", 2, 2, [](Interpreter& vm, vector<Value>& a, int line) -> Value {
@@ -14032,7 +14039,7 @@ static string cppVarName(const string& n) {
 static string cppFuncName(const string& n) { return "函数_" + n; }
 
 static string cppPreamble() {
-    return R"CPP(// 文语言（wen）· WEN-LANG-0.1
+    return R"CPP(// 文语言（wen）· WEN-LANG-0.2
 #include <bits/stdc++.h>
 using namespace std;
 
@@ -14707,7 +14714,7 @@ static Value verifyBinary(const string& path0, int line) {
     }
     bool sig = b.find(WEN_SIGNATURE) != string::npos;
     bool mark = b.find("WEN-EMBEDDED-MARK") != string::npos;
-    bool lang = b.find("WEN-LANG-0.1") != string::npos;
+    bool lang = b.find("WEN-LANG-0.2") != string::npos;
     bool exact = b.find(WEN_VERSION) != string::npos;
     bool major = b.find("0.1") != string::npos;
     bool official = sig && mark && lang;
@@ -14743,14 +14750,14 @@ static Value verifyPlugin(const string& path0, int line) {
         auto& w = it->second.dict->items;
         official = w.count("official") && truthy(w["official"]);
         sig = w.count("signature") && w["signature"].type == VT::Str &&
-              w["signature"].str == "WEN-LANG-0.1";
+              w["signature"].str == "WEN-LANG-0.2";
         if (w.count("version") && w["version"].type == VT::Str) ver = w["version"].str;
         exact = ver == WEN_VERSION;
     }
     d->items["官方"] = vBool(official && sig);
     d->items["版本"] = vStr(ver.empty() ? WEN_VERSION : ver);
     d->items["版本匹配"] = vBool(exact);
-    d->items["主版本匹配"] = vBool(ver.rfind("0.1", 0) == 0);
+    d->items["主版本匹配"] = vBool(ver.rfind(string(WEN_VERSION).substr(0, 3), 0) == 0);
     d->items["签名"] = vBool(sig);
     d->items["可运行"] = vBool(official && sig);
     return vDict(d);
@@ -15573,6 +15580,114 @@ static void startRuntimeLimit() {
     }).detach();
 }
 
+#ifdef _WIN32
+struct WenWorkbench {
+    HWND edit = nullptr;
+    HWND status = nullptr;
+    std::wstring draft;
+};
+
+static void workbenchSave(WenWorkbench* st, bool run) {
+    int len = GetWindowTextLengthW(st->edit);
+    std::wstring text((size_t)len + 1, L'\0');
+    GetWindowTextW(st->edit, text.data(), len + 1);
+    text.resize((size_t)len);
+    string utf8 = wideToUtf8(text);
+    std::ofstream out(fs::u8path("工作台草稿.wen"), std::ios::binary);
+    out << utf8;
+    out.close();
+    SetWindowTextW(st->status, L"已保存：工作台草稿.wen");
+    if (!run) return;
+    wchar_t exe[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring params = L"\"" + st->draft + L"\"";
+    ShellExecuteW(nullptr, L"open", exe, params.c_str(), nullptr, SW_SHOWNORMAL);
+}
+
+static LRESULT CALLBACK workbenchProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    auto* st = (WenWorkbench*)GetWindowLongPtrW(h, GWLP_USERDATA);
+    switch (msg) {
+        case WM_CREATE: {
+            auto* cs = (CREATESTRUCTW*)lp;
+            st = (WenWorkbench*)cs->lpCreateParams;
+            SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)st);
+            st->edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE |
+                ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_WANTRETURN,
+                8, 40, 760, 500, h, (HMENU)1001, nullptr, nullptr);
+            CreateWindowExW(0, L"BUTTON", L"保存草稿",
+                WS_CHILD | WS_VISIBLE, 8, 8, 100, 26, h, (HMENU)1002, nullptr, nullptr);
+            CreateWindowExW(0, L"BUTTON", L"运行",
+                WS_CHILD | WS_VISIBLE, 116, 8, 80, 26, h, (HMENU)1003, nullptr, nullptr);
+            CreateWindowExW(0, L"BUTTON", L"关闭",
+                WS_CHILD | WS_VISIBLE, 204, 8, 80, 26, h, (HMENU)1004, nullptr, nullptr);
+            st->status = CreateWindowExW(0, L"STATIC", L"在这里写文代码；Ctrl+S 保存",
+                WS_CHILD | WS_VISIBLE, 300, 12, 480, 22, h, (HMENU)1005, nullptr, nullptr);
+            HFONT font = CreateFontW(-18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
+            SendMessageW(st->edit, WM_SETFONT, (WPARAM)font, TRUE);
+            return 0;
+        }
+        case WM_SIZE:
+            if (st && st->edit) {
+                MoveWindow(st->edit, 8, 40, LOWORD(lp) - 16, HIWORD(lp) - 78, TRUE);
+                MoveWindow(st->status, 300, 12, LOWORD(lp) - 316, 22, TRUE);
+            }
+            return 0;
+        case WM_COMMAND:
+            if (!st) break;
+            if (LOWORD(wp) == 1002) workbenchSave(st, false);
+            else if (LOWORD(wp) == 1003) workbenchSave(st, true);
+            else if (LOWORD(wp) == 1004) DestroyWindow(h);
+            return 0;
+        case WM_CLOSE:
+            DestroyWindow(h);
+            return 0;
+        case WM_DESTROY:
+            PostQuitMessage(0);
+            return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+static string openWenWorkbench(const string& title, const string& initial, int line) {
+    static bool registered = false;
+    HINSTANCE inst = GetModuleHandleW(nullptr);
+    if (!registered) {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = workbenchProc;
+        wc.hInstance = inst;
+        wc.hCursor = LoadCursorW(nullptr, IDC_IBEAM);
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        wc.lpszClassName = L"WenWorkbenchWindow";
+        if (!RegisterClassExW(&wc)) throw WenError("运行时错误", line, 0, "工作台窗口注册失败");
+        registered = true;
+    }
+    WenWorkbench st;
+    wchar_t cwd[MAX_PATH]{};
+    GetCurrentDirectoryW(MAX_PATH, cwd);
+    st.draft = std::wstring(cwd) + L"\\工作台草稿.wen";
+    std::wstring wtitle = utf8ToWide(title);
+    HWND h = CreateWindowExW(0, L"WenWorkbenchWindow", wtitle.c_str(),
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
+        900, 650, nullptr, nullptr, inst, &st);
+    if (!h) throw WenError("运行时错误", line, 0, "工作台窗口创建失败");
+    if (!initial.empty()) SetWindowTextW(st.edit, utf8ToWide(initial).c_str());
+    MSG msg{};
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    return "工作台草稿.wen";
+}
+#else
+static string openWenWorkbench(const string&, const string&, int line) {
+    throw WenError("运行时错误", line, 0, "工作台只支持 Windows");
+}
+#endif
+
 static int runMain(vector<string> args) {
     if (args.size() > 1 && args[1] == "--不快") { gNoFast = true; args.erase(args.begin() + 1); }
     if (args.size() >= 3 && args[1] == "--大整数上限") {
@@ -15612,12 +15727,12 @@ static int runMain(vector<string> args) {
         if (a == "--json" || a == "--诊断JSON") gJsonDiagnostics = true;
     }
     if (cmd == "--快照版本") {
-        std::cout << "文语言 0.1.0\n";
+        std::cout << "文语言 0.2.0\n";
         return 0;
     }
     if (cmd == "--帮助" || cmd == "-h" || cmd == "帮助") {
         std::cout <<
-            "文语言 0.1.0\n"
+            "文语言 0.2.0\n"
             "用法：\n"
             "  wen.exe 文件.wen                 运行\n"
             "  wen.exe --检查 文件.wen         只做词法/语法/静态检查\n"
@@ -15681,7 +15796,7 @@ static int runMain(vector<string> args) {
         return 0;
     }
     if (cmd == "--版本" || cmd == "-v") {
-        std::cout << "文语言 v0.1 · 作者 Akm / 筑宸科技 · 2026-10-25 首次发布\n";
+        std::cout << "文语言 v0.2 · 作者 Akm / 筑宸科技 · 2026-10-25 首次发布\n";
         std::cout << "版本: " << WEN_VERSION << "\n";
         return 0;
     }
