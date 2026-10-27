@@ -733,7 +733,6 @@ struct Expr {
     mutable int localSlot = -1;
     bool b = false;
     bool commandCall = false;
-    bool juxtaposed = false;
     string op;
     vector<ExprPtr> args;
     vector<std::pair<ExprPtr, ExprPtr>> pairs;
@@ -1463,11 +1462,6 @@ private:
         return parseComparison();
     }
 
-    void rejectJuxt(ExprPtr e) {
-        if (e && e->juxtaposed)
-            err(peek(), "并置调用不能直接和二元运算符混写；请用括号分组");
-    }
-
     ExprPtr parseComparison() {
         ExprPtr left = parseAdd();
         if (peek().type == TT::Op) {
@@ -1475,10 +1469,8 @@ private:
             if (op == "==" || op == "=" || op == "!=" || op == "<" ||
                 op == "<=" || op == ">" || op == ">=") {
                 int line = peek().line;
-                rejectJuxt(left);
                 ++idx_;
                 ExprPtr right = parseAdd();
-                rejectJuxt(right);
                 ExprPtr result = mkBinary(op, left, right, line);
                 if (peek().type == TT::Op &&
                     (peek().text == "==" || peek().text == "=" || peek().text == "!=" ||
@@ -1489,9 +1481,7 @@ private:
         }
         if (matchKw("在")) {
             int line = peek().line;
-            rejectJuxt(left);
             ExprPtr right = parseAdd();
-            rejectJuxt(right);
             expectKw("中");
             return mkBinary("在", left, right, line);
         }
@@ -1503,10 +1493,8 @@ private:
         while (atOp("+") || atOp("-")) {
             string op = peek().text;
             int line = peek().line;
-            rejectJuxt(left);
             ++idx_;
             ExprPtr right = parseMul();
-            rejectJuxt(right);
             left = mkBinary(op, left, right, line);
         }
         return left;
@@ -1517,10 +1505,8 @@ private:
         while (atOp("*") || atOp("/") || atOp("//") || atOp("%")) {
             string op = peek().text;
             int line = peek().line;
-            rejectJuxt(left);
             ++idx_;
             ExprPtr right = parseUnary();
-            rejectJuxt(right);
             left = mkBinary(op, left, right, line);
         }
         return left;
@@ -1530,18 +1516,14 @@ private:
         if (atOp("√")) {
             int line = peek().line;
             ++idx_;
-            ExprPtr arg = parseUnary();
-            ExprPtr u = mkUnary("√", arg, line);
-            u->juxtaposed = arg->juxtaposed;
-            return u;
+            ExprPtr v = parseUnary();
+            vector<ExprPtr> args{v};
+            return mkCall(mkVar("平方根", line), std::move(args), line);
         }
         if (atOp("-")) {
             int line = peek().line;
             ++idx_;
-            ExprPtr arg = parseUnary();
-            ExprPtr u = mkUnary("-", arg, line);
-            u->juxtaposed = arg->juxtaposed;
-            return u;
+            return mkUnary("-", parseUnary(), line);
         }
         if (atOp("+")) {
             ++idx_;
@@ -1554,9 +1536,7 @@ private:
         ExprPtr left = parsePostfix();
         if (matchOp("**")) {
             int line = peek().line;
-            rejectJuxt(left);
             ExprPtr right = parseUnary();
-            rejectJuxt(right);
             return mkBinary("**", left, right, line);
         }
         return left;
@@ -1576,7 +1556,8 @@ private:
                 if (atOp("°")) {
                     int line = peek().line;
                     ++idx_;
-                    e = mkUnary("°", e, line);
+                    vector<ExprPtr> args{e};
+                    e = mkCall(mkVar("角度转弧度", line), std::move(args), line);
                     continue;
                 }
             }
@@ -1607,7 +1588,6 @@ private:
                 ExprPtr arg = parseUnary();
                 vector<ExprPtr> args{arg};
                 e = mkCall(e, std::move(args), line);
-                e->juxtaposed = true;
                 continue;
             }
             break;
@@ -1705,7 +1685,6 @@ private:
         if (matchOp("(")) {
             ExprPtr e = parseExpr();
             expectOp(")");
-            e->juxtaposed = false;
             return e;
         }
         if (matchOp("[")) {
@@ -1898,7 +1877,7 @@ struct Function : Callable {
 
     Value call(Interpreter& vm, vector<Value>& args, int line) override;
     string display() const override { return "<函数 " + name + ">"; }
-    bool zeroArgCall() const override { return false; }
+    bool zeroArgCall() const override { return params.empty(); }
     string memoKey() const override { return name; }
 };
 
@@ -1914,7 +1893,7 @@ struct Builtin : Callable {
 
     Value call(Interpreter& vm, vector<Value>& args, int line) override;
     string display() const override { return "<内置函数 " + name + ">"; }
-    bool zeroArgCall() const override { return false; }
+    bool zeroArgCall() const override { return minArgs == 0; }
     bool cacheable() const override { return cacheableFn; }
 };
 
@@ -3327,10 +3306,11 @@ static const std::map<string, string>& functionModules() {
         {"对数", "数学库"}, {"对数10", "数学库"},
         {"反正弦", "数学库"}, {"反余弦", "数学库"}, {"反正切", "数学库"},
         {"反正切2", "数学库"}, {"符号", "数学库"}, {"随机", "数学库"},
-        {"随机整数", "数学库"},
-        {"解二次方程", "数学库"},
+        {"随机整数", "数学库"}, {"最大", "数学库"}, {"最小", "数学库"},
+        {"求和", "数学库"}, {"解二次方程", "数学库"},
         {"阶乘", "数学库"}, {"最大公约数", "数学库"}, {"最小公倍数", "数学库"},
         {"是否素数", "数学库"}, {"质因数分解", "数学库"},
+        {"平均数", "数学库"}, {"中位数", "数学库"},
         {"方差", "数学库"}, {"样本方差", "数学库"}, {"标准差", "数学库"}, {"样本标准差", "数学库"},
         {"组合数", "数学库"}, {"排列数", "数学库"}, {"矩阵乘", "数学库"},
         {"二次函数", "数学库"}, {"多项式求值", "数学库"},
@@ -3493,7 +3473,8 @@ static const std::map<string, string>& functionModules() {
         {"取属性", "网页库"}, {"取链接", "网页库"}, {"取标题", "网页库"},
 
         // 集合库
-        {"并集", "集合库"}, {"交集", "集合库"},
+        {"新建集合", "集合库"}, {"集合添加", "集合库"}, {"集合删除", "集合库"},
+        {"集合存在", "集合库"}, {"并集", "集合库"}, {"交集", "集合库"},
         {"差集", "集合库"}, {"子集", "集合库"}, {"对称差", "集合库"},
 
         // 点阵库
@@ -4392,7 +4373,8 @@ Value Interpreter::eval(const ExprPtr& e, shared_ptr<Scope> scope) {
             if (!(e->gslot >= 0 && globals->fastGet(e->gslot, v)) &&
                 (!e->sym || !scope->lookup(e->sym, v)))
                 undefinedName(e->text, e->line);
-            // 零参数函数/内置：暂时保留，等 0.2 迁移完成后再删。
+            // 零参数函数/内置：名字后面没写括号，也直接调用。
+            // 要把它当值传给别人，请用有参数的函数（至少一个参数）。
             if (v.type == VT::Func && v.callable && v.callable->zeroArgCall()) {
                 vector<Value> noArgs;
                 return callValue(v, noArgs, e->line);
@@ -4407,12 +4389,6 @@ Value Interpreter::eval(const ExprPtr& e, shared_ptr<Scope> scope) {
         }
             if (e->op == "+") return vNum(needNum(a, "正号", e->line));
             if (e->op == "非") return vBool(!truthy(a));
-            if (e->op == "√") {
-                double x = needNum(a, "根号", e->line);
-                if (x < 0) rtError(e->line, "根号不能对负数开平方");
-                return vNum(std::sqrt(x));
-            }
-            if (e->op == "°") return vNum(needNum(a, "角度", e->line) * std::acos(-1.0) / 180.0);
             rtError(e->line, "未知一元运算：" + e->op);
         }
         case Expr::K::Binary: {
@@ -6757,6 +6733,20 @@ static vector<std::pair<int, string>> compatTargetLines(const string& src) {
     }
     return out;
 }
+static vector<string> compatUserFuncCollisions(const string& src) {
+    vector<string> out;
+    for (const auto& raw : splitLines(src)) {
+        size_t b = raw.find_first_not_of(" \t");
+        if (b == string::npos) continue;
+        string s = raw.substr(b);
+        if (s.rfind("函数 ", 0) != 0) continue;
+        std::istringstream ss(s.substr(6));
+        string name;
+        if (!(ss >> name)) continue;
+        if (functionModules().count(name)) out.push_back(name);
+    }
+    return out;
+}
 static Value compatParse(const string& lang0, const string& code, int line) {
     string lang = lowerAscii(lang0);
     if (lang == "json") {
@@ -7182,9 +7172,6 @@ static void bigGuard(long double digits, int line = 0) {
 
 Interpreter::Interpreter() {
     globals = std::make_shared<Scope>();
-    globals->set("圆周率", vNum(std::acos(-1.0)));
-    globals->set("π", vNum(std::acos(-1.0)));
-    globals->set("自然常数", vNum(std::exp(1.0)));
     rng.seed(std::random_device{}());
 
     // ---------- 核心（不需要依赖）---------
@@ -7628,6 +7615,11 @@ Interpreter::Interpreter() {
         } catch (IoError& e) {
             throw WenError("文件错误", line, 0, e.what());
         }
+        auto collisions = compatUserFuncCollisions(src);
+        if (!collisions.empty())
+            throw WenError("翻译错误", line, 0,
+                "用户函数「" + collisions[0] +
+                "」与内置函数同名，无法区分；请给用户函数改名");
         vector<string> diags;
         auto ts = translationTargets(src);
         string target;
@@ -8045,6 +8037,11 @@ Interpreter::Interpreter() {
         } catch (IoError& e) {
             throw WenError("文件错误", line, 0, e.what());
         }
+        auto collisions = compatUserFuncCollisions(src);
+        if (!collisions.empty())
+            throw WenError("外派错误", line, 0,
+                "用户函数「" + collisions[0] +
+                "」与内置函数同名，无法区分；请给用户函数改名");
         vector<string> diags;
         string target = externalTarget(src);
         bool ok = target == "python" || target == "javascript" || target == "js" ||
@@ -13856,6 +13853,10 @@ static string errorExplanation(const string& kind) {
         return "两个库或用户代码定义了同名函数；改名，或去掉其中一个依赖。";
     if (kind == "兼容冲突")
         return "源文件里写了多个翻译目标；一个文件只能保留一个目标行。";
+    if (kind == "翻译错误")
+        return "翻译没有完成；这是源码或目标支持问题，不是解释器故障。请按报告修正后重试。";
+    if (kind == "外派错误")
+        return "外派没有完成；这是源码或目标支持问题，不是解释器故障。请按报告修正后重试。";
     if (kind == "安全权限")
         return "需要安全管理员；先设置中文变量「文_安全口令」，再调用安全管理员。";
     if (kind == "权限错误")
