@@ -20,6 +20,26 @@ foreach ($old in @('零参数函数名字一出现', '并置调用只吃', '并�
         Write-Host ("失败：语法.ebnf 仍含旧规则「{0}」" -f $old)
     }
 }
+$specDocs = @('语言规范.md', '使用规范.md', '语法总表.md')
+$bannedSpec = @(
+    '名字出现即调用',
+    '不是一等值',
+    '只接受一个一元表达式',
+    '`加一 2 * 3` 是 `(加一 2)',
+    '源码必须是 UTF-8',
+    '`.wen` 只作为兼容后缀'
+)
+foreach ($doc in $specDocs) {
+    $p = Join-Path $root $doc
+    if (-not (Test-Path $p)) { continue }
+    $body = [IO.File]::ReadAllText($p, [Text.Encoding]::UTF8)
+    foreach ($bad in $bannedSpec) {
+        if ($body.Contains($bad)) {
+            $fail++
+            Write-Host ("失败：{0} 仍含 0.1 旧规则「{1}」" -f $doc, $bad)
+        }
+    }
+}
 
 foreach ($doc in $docs) {
     $path = Join-Path $root $doc

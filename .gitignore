@@ -26,3 +26,5 @@ __pycache__/
 
 # 本地临时测试
 _*.wen
+_*.txt
+*.log
