@@ -3380,6 +3380,7 @@ static const std::map<string, string>& functionModules() {
 
         // 时间 / 编码 / 正则
         {"现在", "时间库"}, {"时间戳", "时间库"}, {"毫秒时间", "时间库"},
+        {"时间分量", "时间库"}, {"高精度时间", "时间库"}, {"帧同步", "时间库"},
         {"格式化时间", "时间库"}, {"解析时间", "时间库"}, {"休眠", "时间库"},
         {"Base64编码", "编码库"}, {"Base64解码", "编码库"},
         {"URL编码", "编码库"}, {"URL解码", "编码库"},
@@ -10805,7 +10806,38 @@ Interpreter::Interpreter() {
         if (xs.empty()) throw WenError("运行时错误", line, 0, "列表不能为空");
         return vNum(parallelReduceNums(xs, 2));
     });    // ---------- 时间 / 编码 / 正则 ----------
-    registerBuiltin("现在", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+    registerBuiltin("时间分量", 0, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        double ts = a.size() >= 1 ? needNum(a[0], "时间分量", line) : (double)std::time(nullptr);
+        std::time_t t = (std::time_t)ts;
+        std::tm lt = *std::localtime(&t);
+        auto d = std::make_shared<Dict>();
+        d->items["年"] = vNum(lt.tm_year + 1900);
+        d->items["月"] = vNum(lt.tm_mon + 1);
+        d->items["日"] = vNum(lt.tm_mday);
+        d->items["时"] = vNum(lt.tm_hour);
+        d->items["分"] = vNum(lt.tm_min);
+        d->items["秒"] = vNum(lt.tm_sec);
+        d->items["毫秒"] = vNum(a.size() >= 1 ? (int)((ts - std::floor(ts)) * 1000) : (int)((double)(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() % 1000)));
+        d->items["星期"] = vNum(lt.tm_wday);
+        d->items["年日"] = vNum(lt.tm_yday + 1);
+        return vDict(d);
+    });
+    registerBuiltin("高精度时间", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+        return vNum(std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    });
+    registerBuiltin("帧同步", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        static auto last = std::chrono::steady_clock::now();
+        int fps = (int)needNum(a[0], "帧同步", line);
+        if (fps <= 0) fps = 60;
+        auto target = std::chrono::duration<double>(1.0 / fps);
+        auto now = std::chrono::steady_clock::now();
+        auto used = now - last;
+        if (used < target) std::this_thread::sleep_for(target - used);
+        auto end = std::chrono::steady_clock::now();
+        double dt = std::chrono::duration<double>(end - last).count();
+        last = end;
+        return vNum(dt);
+    });    registerBuiltin("现在", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
         std::time_t t = std::time(nullptr);
         std::tm lt = *std::localtime(&t);
         char buf[32];

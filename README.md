@@ -22,6 +22,7 @@
 .\完整构建.bat   # 完整版：wen_full.exe
 .\wen.exe 例子\你好.wen
 .\wen.exe 工程\文工作台\工作台.wen   # 图形工作台
+.\wen.exe 工程\时钟\时钟.wen         # 时间/秒针演示
 .\wen.exe --签名
 .\wen.exe --验证
 .\wen.exe --库
