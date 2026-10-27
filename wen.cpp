@@ -1654,9 +1654,7 @@ private:
                 string inner = text.substr(i + 1, j - i - 1);
                 flush();
                 ExprPtr e = parseEmbedded(inner, line);
-                vector<ExprPtr> args{e};
-                acc = mkBinary("+", acc,
-                               mkCall(mkVar("文本", line), std::move(args), line), line);
+                acc = mkBinary("+", acc, mkUnary("插值", e, line), line);
                 i = j + 1;
                 continue;
             }
@@ -4428,6 +4426,7 @@ Value Interpreter::eval(const ExprPtr& e, shared_ptr<Scope> scope) {
         }
             if (e->op == "+") return vNum(needNum(a, "正号", e->line));
             if (e->op == "非") return vBool(!truthy(a));
+            if (e->op == "插值") return vStr(toText(a, false));
             if (e->op == "√") {
                 double x = needNum(a, "根号", e->line);
                 if (x < 0) rtError(e->line, "根号不能对负数开平方");
@@ -5477,6 +5476,7 @@ struct PyEmitter {
             case Expr::K::Unary: {
                 string a = expr(e->args[0]);
                 if (e->op == "非") return "(not " + a + ")";
+                if (e->op == "插值") return "str(" + a + ")";
                 return "(" + e->op + a + ")";
             }
             case Expr::K::Binary: {
@@ -5675,6 +5675,7 @@ struct JsEmitter {
             case Expr::K::Unary: {
                 string a = expr(e->args[0]);
                 if (e->op == "非") return "(!wenTruthy(" + a + "))";
+                if (e->op == "插值") return "String(" + a + ")";
                 return "(" + e->op + a + ")";
             }
             case Expr::K::Binary: {
@@ -6044,6 +6045,7 @@ struct JavaEmitter {
             }
             case Expr::K::Unary:
                 if (e->op == "非") return "(!W.truthy(" + expr(e->args[0]) + "))";
+                if (e->op == "插值") return "String(" + expr(e->args[0]) + ")";
                 return "(W.neg(" + expr(e->args[0]) + "))";
             case Expr::K::Binary: {
                 string a = expr(e->args[0]), b = expr(e->args[1]);
@@ -13951,6 +13953,7 @@ private:
                 if (e->op == "-") return "(-(" + a + "))";
                 if (e->op == "+") return a;
                 if (e->op == "非") return "(!(" + a + "))";
+                if (e->op == "插值") return "文本(" + a + ")";
                 err(e->line, "未知一元运算：" + e->op);
             }
             case Expr::K::Binary: {
