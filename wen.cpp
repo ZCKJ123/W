@@ -10260,13 +10260,17 @@ Interpreter::Interpreter() {
         d->items["深度"] = vList(depth);
         return vDict(d);
     });
-    registerBuiltin("光追渲染", 2, 5, [](Interpreter&, vector<Value>& a, int line) -> Value {
-        int w = (int)needIndex(a[0], "光追渲染", line);
-        int h = (int)needIndex(a[1], "光追渲染", line);
+    registerBuiltin("光追渲染", 2, 6, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        int outW = (int)needIndex(a[0], "光追渲染", line);
+        int outH = (int)needIndex(a[1], "光追渲染", line);
         int samples = a.size() >= 3 ? (int)needIndex(a[2], "光追渲染", line) : 4;
         double tm = a.size() >= 4 ? needNum(a[3], "光追渲染", line) : 0;
-        if (w < 1 || h < 1 || w > 2048 || h > 2048)
+        double scale = a.size() >= 5 ? needNum(a[4], "光追渲染", line) : 1.0;
+        if (outW < 1 || outH < 1 || outW > 2048 || outH > 2048)
             throw WenError("运行时错误", line, 0, "光追尺寸必须在 1..2048");
+        scale = std::max(0.1, std::min(1.0, scale));
+        int w = std::max(1, (int)(outW * scale));
+        int h = std::max(1, (int)(outH * scale));
         samples = std::max(1, std::min(samples, 32));
         auto buf = std::make_shared<std::vector<unsigned char>>((size_t)w * h * 3);
         auto rnd = []() {
@@ -10434,10 +10438,44 @@ Interpreter::Interpreter() {
         for (unsigned k = 0; k < nt; ++k)
             workers.emplace_back(renderRows, h*(int)k/(int)nt, h*(int)(k+1)/(int)nt);
         for (auto& th : workers) th.join();
+        auto finalBuf = std::make_shared<std::vector<unsigned char>>((size_t)outW * outH * 3);
+        if (scale <= 0.5) {
+            for (int oy = 0; oy < outH; ++oy) {
+                int sy = std::min(h - 1, oy * h / outH);
+                for (int ox = 0; ox < outW; ++ox) {
+                    int sx = std::min(w - 1, ox * w / outW);
+                    size_t si = ((size_t)sy * w + sx) * 3;
+                    size_t di = ((size_t)oy * outW + ox) * 3;
+                    (*finalBuf)[di] = (*buf)[si];
+                    (*finalBuf)[di + 1] = (*buf)[si + 1];
+                    (*finalBuf)[di + 2] = (*buf)[si + 2];
+                }
+            }
+        } else {
+            for (int oy = 0; oy < outH; ++oy) for (int ox = 0; ox < outW; ++ox) {
+                double sx = (ox + 0.5) * w / outW - 0.5;
+                double sy = (oy + 0.5) * h / outH - 0.5;
+                int x0 = std::max(0, std::min(w - 1, (int)std::floor(sx)));
+                int y0 = std::max(0, std::min(h - 1, (int)std::floor(sy)));
+                int x1 = std::max(0, std::min(w - 1, x0 + 1));
+                int y1 = std::max(0, std::min(h - 1, y0 + 1));
+                double fx = sx - x0, fy = sy - y0;
+                size_t oi = ((size_t)oy * outW + ox) * 3;
+                for (int ch = 0; ch < 3; ++ch) {
+                    double v00 = (*buf)[((size_t)y0 * w + x0) * 3 + ch];
+                    double v10 = (*buf)[((size_t)y0 * w + x1) * 3 + ch];
+                    double v01 = (*buf)[((size_t)y1 * w + x0) * 3 + ch];
+                    double v11 = (*buf)[((size_t)y1 * w + x1) * 3 + ch];
+                    double v = v00 * (1 - fx) * (1 - fy) + v10 * fx * (1 - fy) +
+                               v01 * (1 - fx) * fy + v11 * fx * fy;
+                    (*finalBuf)[oi + ch] = (unsigned char)std::max(0.0, std::min(255.0, v));
+                }
+            }
+        }
         auto d = std::make_shared<Dict>();
-        d->items["宽"] = vNum(w);
-        d->items["高"] = vNum(h);
-        d->items["像素"] = vBytes(buf);
+        d->items["宽"] = vNum(outW);
+        d->items["高"] = vNum(outH);
+        d->items["像素"] = vBytes(finalBuf);
         return vDict(d);
     });
     registerBuiltin("视口取色", 3, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
