@@ -44,23 +44,36 @@ $pi = @'
 依赖 数学库
 打印 长度 高精度圆周率(10000)
 '@
+$lib = @'
+依赖 数学库
+将 i 变成 0
+将 和 变成 0
+当 i 小于 1000000 则
+将 和 变成 和 + 平方根(i % 100 + 1) + 长度("abcdef")
+将 i 变成 i + 1
+结束
+打印 和
+'@
 
 $ta = Run-Script $arith
 $tf = Run-Script $fn
 $tp = Run-Script $pi
+$tl = Run-Script $lib
 $t1 = Run-Script $fac
 $t2 = Run-Script $fac
 $tbig = [Math]::Min($t1, $t2)
 
 $arithUs = $ta * 1000000.0 / 1000000.0
 $fnUs = $tf * 1000000.0 / 1000000.0
+$libUs = $tl * 1000000.0 / 1000000.0
 $bigOk = $tbig -lt 0.5
-$calcOk = ($arithUs -lt 35) -and ($fnUs -lt 35) -and ($tp -lt 0.5)
+$calcOk = ($arithUs -lt 35) -and ($fnUs -lt 35) -and ($libUs -lt 35) -and ($tp -lt 0.5)
 
 [pscustomobject]@{
     架构 = if ($32) { '32 位' } else { '64 位' }
     算术微秒 = [Math]::Round($arithUs, 3)
     函数微秒 = [Math]::Round($fnUs, 3)
+    库调用微秒 = [Math]::Round($libUs, 3)
     阶乘秒 = [Math]::Round($tbig, 3)
     圆周率秒 = [Math]::Round($tp, 3)
     单次达标 = $calcOk

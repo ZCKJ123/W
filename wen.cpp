@@ -6574,7 +6574,12 @@ struct StackEmitter {
                      "DICT " + std::to_string(e->pairs.size()));
                 break;
             case Expr::K::Slice:
-                diag(e->line, "字节码/汇编暂不支持切片");
+                expr(e->args[0]);
+                for (size_t i = 1; i < 4; ++i) {
+                    if (i < e->args.size() && e->args[i]) expr(e->args[i]);
+                    else emit("push", "\"v\":null", "PUSH null");
+                }
+                emit("slice", "", "SLICE");
                 break;
         }
     }
@@ -8270,6 +8275,41 @@ Interpreter::Interpreter() {
             } else if (op == "index") {
                 Value idx = pop(), obj = pop();
                 stack.push_back(getIndex(obj, idx, line));
+            } else if (op == "slice") {
+                Value stepV = pop(), stopV = pop(), startV = pop(), obj = pop();
+                long long step = stepV.type == VT::None ? 1 : (long long)needIndex(stepV, "切片步长", line);
+                if (step == 0) throw WenError("运行时错误", line, 0, "切片步长不能是 0");
+                vector<Value> items;
+                bool isText = false;
+                if ((obj.type == VT::List || obj.type == VT::Set) && obj.list) items = obj.list->items;
+                else if (obj.type == VT::Str) {
+                    for (const auto& ch : utf8Chars(obj.str)) items.push_back(vStr(ch));
+                    isText = true;
+                } else throw WenError("运行时错误", line, 0, "切片只能用在列表、集合或文本上，收到" + typeName(obj));
+                long long n = (long long)items.size();
+                bool hasStart = startV.type != VT::None;
+                bool hasStop = stopV.type != VT::None;
+                long long start = hasStart ? 0 : (step > 0 ? 0 : n - 1);
+                long long stop = hasStop ? 0 : (step > 0 ? n : -1);
+                if (hasStart) start = (long long)needIndex(startV, "切片起点", line);
+                if (hasStop) stop = (long long)needIndex(stopV, "切片终点", line);
+                if (hasStart && start < 0) start += n;
+                if (hasStop && stop < 0) stop += n;
+                if (step > 0) {
+                    start = std::max(0LL, std::min(start, n));
+                    stop = std::max(0LL, std::min(stop, n));
+                } else {
+                    start = std::max(-1LL, std::min(start, n - 1));
+                    stop = std::max(-1LL, std::min(stop, n - 1));
+                }
+                auto outList = std::make_shared<List>();
+                for (long long i = start; step > 0 ? i < stop : i > stop; i += step)
+                    outList->items.push_back(items[(size_t)i]);
+                if (isText) {
+                    string s;
+                    for (const auto& v : outList->items) s += v.str;
+                    stack.push_back(vStr(s));
+                } else stack.push_back(vList(outList));
             } else if (op == "call") {
                 string fname = needStr(arg("name"), "字节码 call", line);
                 int n = (int)needIndex(arg("n"), "字节码 call", line);
