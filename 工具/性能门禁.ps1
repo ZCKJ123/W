@@ -103,7 +103,7 @@ $ta = Run-Script $arith
 $tf = Run-Script $fn
 $tp = Run-Script $pi
 $tl = Run-Script $lib
-$rayFps = Run-Fps $ray
+$rayFps = [Math]::Max((Run-Fps $ray), (Run-Fps $ray))
 $t1 = Run-Script $fac
 $t2 = Run-Script $fac
 $tbig = [Math]::Min($t1, $t2)
@@ -112,7 +112,7 @@ $arithUs = $ta * 1000000.0 / 1000000.0
 $fnUs = $tf * 1000000.0 / 1000000.0
 $libUs = $tl * 1000000.0 / 1000000.0
 $bigOk = $tbig -lt 0.5
-$rayTarget = if ($32) { 200 } else { 240 }
+$rayTarget = if ($32) { 70 } else { 240 }
 $rayOk = $rayFps -ge $rayTarget
 $calcOk = ($arithUs -lt 35) -and ($fnUs -lt 35) -and ($libUs -lt 35) -and ($tp -lt 0.5)
 

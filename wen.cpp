@@ -10249,7 +10249,7 @@ Interpreter::Interpreter() {
         d->items["深度"] = vList(depth);
         return vDict(d);
     });
-    registerBuiltin("光追渲染", 2, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
+    registerBuiltin("光追渲染", 2, 4, [](Interpreter&, vector<Value>& a, int line) -> Value {
         int w = (int)needIndex(a[0], "光追渲染", line);
         int h = (int)needIndex(a[1], "光追渲染", line);
         if (w < 1 || h < 1 || w > 2048 || h > 2048)
@@ -10296,31 +10296,55 @@ Interpreter::Interpreter() {
             } else { nx = 0; ny = 1; nz = 0; }
             return true;
         };
-        auto color = [&](double ox, double oy, double oz, double dx, double dy, double dz) {
+        double tm = a.size() >= 4 ? needNum(a[3], "光追渲染", line) : 0;
+        std::function<std::array<double, 3>(double, double, double, double, double, double, int)> color;
+        color = [&](double ox, double oy, double oz, double dx, double dy, double dz, int depth) {
             double t, nx, ny, nz; int mat = 0;
             if (!nearest(ox, oy, oz, dx, dy, dz, t, nx, ny, nz, mat))
                 return std::array<double, 3>{0.35 + 0.25 * (dy + 0.5), 0.45, 0.7};
             double px = ox + dx * t, py = oy + dy * t, pz = oz + dz * t;
+            if (mat == 3) {
+                double w1 = 0.10 * std::sin(px * 7.0 + tm * 2.0);
+                double w2 = 0.06 * std::sin(pz * 11.0 + tm * 1.7);
+                nx = w1; nz = 0.08 * std::cos(pz * 9.0 + tm * 1.3); ny = 1.0;
+                double l = std::sqrt(nx * nx + ny * ny + nz * nz);
+                nx /= l; ny /= l; nz /= l;
+            }
             double lx = -1.6, ly = 3.2, lz = 2.4;
             double ll = std::sqrt(lx * lx + ly * ly + lz * lz);
             lx /= ll; ly /= ll; lz /= ll;
             double diff = std::max(0.0, nx * lx + ny * ly + nz * lz);
-            double sh = nearest(px + nx * 1e-3, py + ny * 1e-3, pz + nz * 1e-3, lx, ly, lz, t, nx, ny, nz, mat) ? 0.25 : 1.0;
+            double sh = nearest(px + nx * 1e-3, py + ny * 1e-3, pz + nz * 1e-3,
+                                lx, ly, lz, t, nx, ny, nz, mat) ? 0.25 : 1.0;
             std::array<double, 3> base{0.85, 0.22, 0.2};
-            if (mat == 1) base = {0.2, 0.75, 0.35};
-            else if (mat == 2) base = {0.25, 0.45, 0.95};
-            else if (mat == 3) base = (((int)std::floor(px * 2) + (int)std::floor(pz * 2)) & 1)
-                                      ? std::array<double, 3>{0.8, 0.8, 0.75}
-                                      : std::array<double, 3>{0.25, 0.28, 0.32};
+            double refl = 0.15;
+            if (mat == 1) { base = {0.2, 0.75, 0.35}; refl = 0.1; }
+            else if (mat == 2) { base = {0.25, 0.45, 0.95}; refl = 0.72; }
+            else if (mat == 3) {
+                int check = ((int)std::floor(px * 2) + (int)std::floor(pz * 2)) & 1;
+                base = check ? std::array<double, 3>{0.80, 0.82, 0.80}
+                             : std::array<double, 3>{0.20, 0.30, 0.35};
+                refl = 0.45;
+            }
             double k = 0.12 + 0.88 * diff;
-            return std::array<double, 3>{base[0] * k * sh, base[1] * k * sh, base[2] * k * sh};
+            std::array<double, 3> out{base[0] * k * sh, base[1] * k * sh, base[2] * k * sh};
+            if (depth > 0) {
+                double dot = dx * nx + dy * ny + dz * nz;
+                double rx = dx - 2 * dot * nx, ry = dy - 2 * dot * ny, rz = dz - 2 * dot * nz;
+                auto r = color(px + nx * 1e-3, py + ny * 1e-3, pz + nz * 1e-3,
+                               rx, ry, rz, depth - 1);
+                out[0] = out[0] * (1 - refl) + r[0] * refl;
+                out[1] = out[1] * (1 - refl) + r[1] * refl;
+                out[2] = out[2] * (1 - refl) + r[2] * refl;
+            }
+            return out;
         };
         auto renderRows = [&](int y0, int y1) {
             for (int y = y0; y < y1; ++y) for (int x = 0; x < w; ++x) {
                 double px = (2.0 * (x + 0.5) / w - 1.0) * (double)w / h * 0.7;
                 double py = (1.0 - 2.0 * (y + 0.5) / h) * 0.7;
                 double len = std::sqrt(px * px + py * py + 1.0);
-                auto c = color(0, 0, 2.4, px / len, py / len, -1.0 / len);
+                auto c = color(0, 0, 2.4, px / len, py / len, -1.0 / len, 1);
                 size_t i = ((size_t)y * w + x) * 3;
                 (*buf)[i] = (unsigned char)(255 * std::max(0.0, std::min(1.0, c[0])));
                 (*buf)[i + 1] = (unsigned char)(255 * std::max(0.0, std::min(1.0, c[1])));
