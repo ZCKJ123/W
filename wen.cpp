@@ -5505,8 +5505,20 @@ struct PyEmitter {
     int indent = 0;
     bool usedMath = false;
     bool usedRandom = false;
+    std::set<string> userFuncs;
 
-    explicit PyEmitter(const vector<StmtPtr>& p) : program(p) {}
+    explicit PyEmitter(const vector<StmtPtr>& p) : program(p) { collectFuncs(p); }
+
+    void collectFuncs(const vector<StmtPtr>& ps) {
+        for (const auto& s : ps) {
+            if (!s) continue;
+            if (s->k == Stmt::K::Func) userFuncs.insert(s->name);
+            collectFuncs(s->body);
+            collectFuncs(s->elseBody);
+            collectFuncs(s->finallyBody);
+            for (const auto& br : s->branches) collectFuncs(br.second);
+        }
+    }
 
     void diag(int line, const string& msg) {
         diags.push_back("第 " + std::to_string(line) + " 行：" + msg);
@@ -5536,6 +5548,7 @@ struct PyEmitter {
                 string a = expr(e->args[0]);
                 if (e->op == "非") return "(not " + a + ")";
                 if (e->op == "插值") return "str(" + a + ")";
+                if (e->op == "√") { usedMath = true; return "math.sqrt(" + a + ")"; }
                 return "(" + e->op + a + ")";
             }
             case Expr::K::Binary: {
@@ -5561,7 +5574,7 @@ struct PyEmitter {
                     {"指数", "exp"}, {"反余弦", "acos"}, {"反正弦", "asin"},
                     {"反正切", "atan"}, {"双曲正弦", "sinh"}, {"双曲余弦", "cosh"},
                     {"双曲正切", "tanh"}, {"向上取整", "ceil"}, {"向下取整", "floor"}};
-                auto mit = mathNames.find(name);
+                auto mit = userFuncs.count(name) ? mathNames.end() : mathNames.find(name);
                 if (mit != mathNames.end()) {
                     usedMath = true;
                     callee = "math." + mit->second;
@@ -5571,7 +5584,7 @@ struct PyEmitter {
                     else if (name == "随机") { usedRandom = true; callee = "random.random"; }
                     else if (name == "随机整数") { usedRandom = true; callee = "random.randint"; }
                     else if (!name.empty() && functionModules().count(name) &&
-                             !pyNames.count(name)) {
+                             !pyNames.count(name) && !userFuncs.count(name)) {
                         diag(e->line, "内置函数「" + name + "」没有 Python 映射");
                     }
                 }
@@ -5735,6 +5748,7 @@ struct JsEmitter {
                 string a = expr(e->args[0]);
                 if (e->op == "非") return "(!wenTruthy(" + a + "))";
                 if (e->op == "插值") return "String(" + a + ")";
+                if (e->op == "√") return "Math.sqrt(" + a + ")";
                 return "(" + e->op + a + ")";
             }
             case Expr::K::Binary: {
@@ -6105,6 +6119,7 @@ struct JavaEmitter {
             case Expr::K::Unary:
                 if (e->op == "非") return "(!W.truthy(" + expr(e->args[0]) + "))";
                 if (e->op == "插值") return "String(" + expr(e->args[0]) + ")";
+                if (e->op == "√") return "Math.sqrt(" + expr(e->args[0]) + ")";
                 return "(W.neg(" + expr(e->args[0]) + "))";
             case Expr::K::Binary: {
                 string a = expr(e->args[0]), b = expr(e->args[1]);
@@ -6544,11 +6559,18 @@ struct StackIns {
     int target = -1;
 };
 
+struct BcFunction {
+    vector<string> params;
+    vector<StackIns> code;
+};
+
 struct StackEmitter {
     const vector<StmtPtr>& program;
     vector<string> diags;
     vector<StackIns> code;
     int tempCounter = 0;
+    bool inFunction = false;
+    map<string, BcFunction> funcs;
     vector<vector<int>> breakJumps;
     vector<vector<int>> continueJumps;
 
@@ -6584,6 +6606,7 @@ struct StackEmitter {
                 expr(e->args[0]);
                 if (e->op == "非") emit("not", "", "NOT");
                 else if (e->op == "-") emit("neg", "", "NEG");
+                else if (e->op == "√") emit("sqrt", "", "SQRT");
                 else diag(e->line, "字节码/汇编不支持的运算符「" + e->op + "」");
                 break;
             case Expr::K::Binary: {
@@ -6697,9 +6720,15 @@ struct StackEmitter {
                 if (continueJumps.empty()) diag(s->line, "「继续」只能用在循环里");
                 else continueJumps.back().push_back(emit("jmp", "\"to\":0", "JMP 0"));
                 break;
-            case Stmt::K::Func:
-                diag(s->line, "字节码/汇编暂不支持函数定义");
+            case Stmt::K::Func: {
+                if (inFunction) { diag(s->line, "字节码/汇编暂不支持嵌套函数"); break; }
+                StackEmitter sub(s->body);
+                sub.inFunction = true;
+                for (const auto& bodyStmt : s->body) sub.stmt(bodyStmt);
+                for (const auto& d : sub.diags) diags.push_back(d);
+                funcs[s->name] = {s->params, sub.code};
                 break;
+            }
             case Stmt::K::For: {
                 if (!s->name2.empty()) {
                     string dictVar = "__for_dict_" + std::to_string(tempCounter);
@@ -6791,7 +6820,10 @@ struct StackEmitter {
             case Stmt::K::Export:
                 break;
             case Stmt::K::Return:
-                diag(s->line, "字节码/汇编暂不支持返回");
+                if (!inFunction) { diag(s->line, "「返回」只能写在函数里"); break; }
+                if (s->expr) expr(s->expr);
+                else emit("push", "\"v\":null", "PUSH null");
+                emit("ret", "", "RET");
                 break;
         }
     }
@@ -6807,7 +6839,28 @@ struct StackEmitter {
             if (code[i].target >= 0) o << ",\"to\":" << code[i].target;
             o << "}";
         }
-        o << "]}";
+        o << "],\"functions\":{";
+        bool firstFn = true;
+        for (const auto& kv : funcs) {
+            if (!firstFn) o << ",";
+            firstFn = false;
+            o << quoteText(kv.first) << ":{\"params\":[";
+            for (size_t j = 0; j < kv.second.params.size(); ++j) {
+                if (j) o << ",";
+                o << quoteText(kv.second.params[j]);
+            }
+            o << "],\"code\":[";
+            for (size_t j = 0; j < kv.second.code.size(); ++j) {
+                if (j) o << ",";
+                const auto& c = kv.second.code[j];
+                o << "{\"op\":" << quoteText(c.op);
+                if (!c.jsonArg.empty()) o << "," << c.jsonArg;
+                if (c.target >= 0) o << ",\"to\":" << c.target;
+                o << "}";
+            }
+            o << "]}";
+        }
+        o << "}}";
         return o.str();
     }
     string assembly() {
@@ -8020,10 +8073,14 @@ Interpreter::Interpreter() {
     registerBuiltin("读取", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
         string path = needStr(a[0], "读取", line);
         try {
-            return vStr(readWholeFile(path));
+            return vStr(normalizeWenSource(readWholeFile(path)));
         } catch (IoError& e) {
             throw WenError("文件错误", line, 0, e.what());
         }
+    });
+    registerBuiltin("文本解码", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string s = needStr(a[0], "文本解码", line);
+        return vStr(normalizeWenSource(s));
     });
     registerBuiltin("运行", 1, 1, [](Interpreter& vm, vector<Value>& a, int line) -> Value {
         string path = needStr(a[0], "运行", line);
@@ -8160,11 +8217,6 @@ Interpreter::Interpreter() {
         } catch (IoError& e) {
             throw WenError("文件错误", line, 0, e.what());
         }
-        auto collisions = compatUserFuncCollisions(src);
-        if (!collisions.empty())
-            throw WenError("翻译错误", line, 0,
-                "用户函数「" + collisions[0] +
-                "」与内置函数同名，无法区分；请给用户函数改名");
         vector<string> diags;
         auto ts = translationTargets(src);
         string target;
@@ -8356,6 +8408,34 @@ Interpreter::Interpreter() {
         if (codeIt == rootDict->items.end())
             throw WenError("运行时错误", line, 0, "字节码缺少代码段");
         auto code = needList(codeIt->second, "字节码", line);
+        struct BcFn { vector<string> params; shared_ptr<List> code; };
+        struct BcFrame {
+            shared_ptr<List> code;
+            std::map<string, Value> vars;
+            vector<Value> stack;
+            size_t pc = 0;
+        };
+        map<string, BcFn> fns;
+        auto fnsIt = rootDict->items.find("functions");
+        if (fnsIt != rootDict->items.end()) {
+            auto fd = needDict(fnsIt->second, "字节码函数表", line);
+            for (const auto& kv : fd->items) {
+                auto one = needDict(kv.second, "字节码函数", line);
+                BcFn fn;
+                auto pit = one->items.find("params");
+                if (pit != one->items.end()) {
+                    auto pl = needList(pit->second, "字节码参数", line);
+                    for (const auto& pv : pl->items)
+                        fn.params.push_back(needStr(pv, "字节码参数", line));
+                }
+                auto cit = one->items.find("code");
+                if (cit == one->items.end())
+                    throw WenError("运行时错误", line, 0, "字节码函数缺少代码段：" + kv.first);
+                fn.code = needList(cit->second, "字节码函数代码", line);
+                fns[kv.first] = fn;
+            }
+        }
+        vector<BcFrame> frames;
         vector<Value> stack;
         std::map<string, Value> vars;
         auto pop = [&]() -> Value {
@@ -8391,6 +8471,10 @@ Interpreter::Interpreter() {
                 vars[name] = pop();
             } else if (op == "neg") {
                 stack.push_back(vNum(-needNum(pop(), "字节码 neg", line)));
+            } else if (op == "sqrt") {
+                double x = needNum(pop(), "字节码 sqrt", line);
+                if (x < 0) throw WenError("运行时错误", line, 0, "根号不能对负数开平方");
+                stack.push_back(vNum(wenSqrt(x)));
             } else if (op == "not") {
                 stack.push_back(vBool(!truthy(pop())));
             } else if (op == "add" || op == "sub" || op == "mul" || op == "div" ||
@@ -8475,10 +8559,34 @@ Interpreter::Interpreter() {
                 int n = (int)needIndex(arg("n"), "字节码 call", line);
                 vector<Value> args((size_t)n);
                 for (int i = n - 1; i >= 0; --i) args[(size_t)i] = pop();
+                auto uit = fns.find(fname);
+                if (uit != fns.end()) {
+                    frames.push_back({code, std::move(vars), std::move(stack), pc});
+                    vars.clear();
+                    stack.clear();
+                    const auto& fn = uit->second;
+                    for (size_t i = 0; i < fn.params.size(); ++i)
+                        vars[fn.params[i]] = i < args.size() ? args[i] : vNone();
+                    code = fn.code;
+                    pc = 0;
+                    continue;
+                }
                 Value fn;
                 if (!globals->lookup(fname, fn))
                     throw WenError("运行时错误", line, 0, "字节码调用不存在的名字：" + fname);
                 stack.push_back(callValue(fn, args, line));
+            } else if (op == "ret") {
+                Value r = stack.empty() ? vNone() : pop();
+                if (frames.empty())
+                    throw WenError("运行时错误", line, 0, "字节码「返回」没有调用帧");
+                BcFrame f = std::move(frames.back());
+                frames.pop_back();
+                code = f.code;
+                vars = std::move(f.vars);
+                stack = std::move(f.stack);
+                pc = f.pc + 1;
+                stack.push_back(r);
+                continue;
             } else if (op == "print") {
                 int n = (int)needIndex(arg("n"), "字节码 print", line);
                 vector<Value> vals;
@@ -8634,11 +8742,6 @@ Interpreter::Interpreter() {
         } catch (IoError& e) {
             throw WenError("文件错误", line, 0, e.what());
         }
-        auto collisions = compatUserFuncCollisions(src);
-        if (!collisions.empty())
-            throw WenError("外派错误", line, 0,
-                "用户函数「" + collisions[0] +
-                "」与内置函数同名，无法区分；请给用户函数改名");
         vector<string> diags;
         string target = externalTarget(src);
         bool ok = target == "python" || target == "javascript" || target == "js" ||
@@ -14182,6 +14285,8 @@ private:
                 if (e->op == "-") return "(-(" + a + "))";
                 if (e->op == "+") return a;
                 if (e->op == "非") return "(!(" + a + "))";
+                if (e->op == "√") return "std::sqrt(" + a + ")";
+                if (e->op == "插值") return "文本(" + a + ")";
                 if (e->op == "插值") return "文本(" + a + ")";
                 err(e->line, "未知一元运算：" + e->op);
             }
@@ -14214,12 +14319,6 @@ private:
                 vector<string> args;
                 for (size_t i = 1; i < e->args.size(); ++i)
                     args.push_back(expr(e->args[i]));
-                auto modIt = functionModules().find(name);
-                if (modIt != functionModules().end() && modIt->second == "数学库" &&
-                    !imports_.count("数学库")) {
-                    err(e->line, "「" + name +
-                                     "」属于数学库，请先在使用前写「依赖 数学库」");
-                }
                 auto fit = funcs_.find(name);
                 if (fit != funcs_.end()) {
                     if (args.size() != fit->second->params.size())
@@ -14233,6 +14332,12 @@ private:
                     }
                     out += ")";
                     return out;
+                }
+                auto modIt = functionModules().find(name);
+                if (modIt != functionModules().end() && modIt->second == "数学库" &&
+                    !imports_.count("数学库")) {
+                    err(e->line, "「" + name +
+                                     "」属于数学库，请先在使用前写「依赖 数学库」");
                 }
                 auto need = [&](size_t n) {
                     if (args.size() != n)
