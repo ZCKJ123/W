@@ -5220,8 +5220,6 @@ static void playerForceFocus(HWND hwnd) {
     if (fg && fg != me) AttachThreadInput(me, fg, TRUE);
     BringWindowToTop(hwnd); SetActiveWindow(hwnd); SetForegroundWindow(hwnd); SetFocus(hwnd);
     SwitchToThisWindow(hwnd, TRUE);
-    SetWindowPos(hwnd, HWND_TOPMOST, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE);
-    SetWindowPos(hwnd, HWND_NOTOPMOST, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE);
     if (fg && fg != me) AttachThreadInput(me, fg, FALSE);
 }
 static LRESULT CALLBACK playerWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -5261,14 +5259,7 @@ static LRESULT CALLBACK playerWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         SetCursorPos(cx, cy);
         return 0;
     }
-    if (msg == WM_SIZE && gPlayer && wp != SIZE_MINIMIZED) {
-        std::lock_guard<std::mutex> lk(gPlayer->mtx);
-        gPlayer->w = std::max(1, (int)LOWORD(lp));
-        gPlayer->h = std::max(1, (int)HIWORD(lp));
-        gPlayer->bgr.assign((size_t)gPlayer->w * gPlayer->h * 3, 0);
-        gPlayer->back.assign((size_t)gPlayer->w * gPlayer->h * 3, 0);
-        return 0;
-    }
+    if (msg == WM_SIZE && gPlayer) return 0;  // 固定渲染面，避免与显示线程尺寸竞态
     if (msg == WM_KILLFOCUS && gPlayer && gPlayer->capture) {
         gPlayer->capture = false; ReleaseCapture(); ShowCursor(TRUE);
     }
@@ -10991,10 +10982,10 @@ Interpreter::Interpreter() {
             if (!RegisterClassW(&wc)) throw WenError("运行时错误", line, 0, "玩家窗口注册失败");
             reg = true;
         }
-        PlayerWin pw; pw.w = w; pw.h = h; pw.back.assign((size_t)w*h*3, 0); pw.back.assign((size_t)w*h*3, 0);
+        PlayerWin pw; pw.w = w; pw.h = h; pw.bgr.assign((size_t)w*h*3, 0); pw.back.assign((size_t)w*h*3, 0);
         gPlayer = &pw;
         RECT rc{0,0,w,h};
-        DWORD style = full ? (WS_POPUP | WS_VISIBLE) : (WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+        DWORD style = full ? (WS_POPUP | WS_VISIBLE) : ((WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX) | WS_VISIBLE);
         if (!full) AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
         else { rc.right = GetSystemMetrics(SM_CXSCREEN); rc.bottom = GetSystemMetrics(SM_CYSCREEN); }
         HWND hwnd = CreateWindowExW(full ? WS_EX_TOPMOST : 0, L"WenPlayerWindow", title.c_str(), style,
@@ -11006,27 +10997,6 @@ Interpreter::Interpreter() {
         ShowWindow(hwnd, SW_SHOW);
         playerForceFocus(hwnd);
         pw.capture = true; SetCapture(hwnd); ShowCursor(FALSE);
-        std::thread presenter([&]() {
-            HDC pdc = GetDC(hwnd);
-            HDC sdc = GetDC(nullptr);
-            int refresh = GetDeviceCaps(sdc, VREFRESH); ReleaseDC(nullptr, sdc);
-            if (refresh < 1) refresh = 60;
-            pw.refreshRate = refresh;
-            int period = std::max(1, 1000 / refresh);
-            vector<unsigned char> snap;
-            while (!pw.stop.load()) {
-                { std::lock_guard<std::mutex> lk(pw.mtx); snap = pw.bgr; }
-                if (!snap.empty()) {
-                    BITMAPINFO bi{}; bi.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
-                    bi.bmiHeader.biWidth=pw.w; bi.bmiHeader.biHeight=-pw.h; bi.bmiHeader.biPlanes=1;
-                    bi.bmiHeader.biBitCount=24; bi.bmiHeader.biCompression=BI_RGB;
-                    SetDIBitsToDevice(pdc,0,0,pw.w,pw.h,0,0,0,pw.h,snap.data(),&bi,DIB_RGB_COLORS);
-                    ++pw.presented;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(period));
-            }
-            ReleaseDC(hwnd, pdc);
-        });
 
         vector<PTri> ground, cubes;
         for (int gz=-12; gz<12; gz+=3) for (int gx=-12; gx<12; gx+=3) {
@@ -11089,6 +11059,38 @@ Interpreter::Interpreter() {
         PVec light = pnorm({0.45,1.0,0.35});
         PVec cam{0,1.7,4.5};
         double yaw = 0, pitch = -0.05;
+        pw.capture = true; SetCapture(hwnd); ShowCursor(FALSE);
+        std::thread presenter([&]() {
+            HDC pdc = GetDC(hwnd);
+            HDC sdc = GetDC(nullptr);
+            int refresh = GetDeviceCaps(sdc, VREFRESH); ReleaseDC(nullptr, sdc);
+            if (refresh < 1) refresh = 60;
+            pw.refreshRate = refresh;
+            int period = std::max(1, 1000 / refresh);
+            vector<unsigned char> snap;
+            while (!pw.stop.load()) {
+                int sw = 0, sh = 0;
+                { std::lock_guard<std::mutex> lk(pw.mtx); snap = pw.bgr; sw = pw.w; sh = pw.h; }
+                if (!snap.empty() && snap.size() >= (size_t)sw * sh * 3) {
+                    BITMAPINFO bi{}; bi.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
+                    bi.bmiHeader.biWidth=sw; bi.bmiHeader.biHeight=-sh; bi.bmiHeader.biPlanes=1;
+                    bi.bmiHeader.biBitCount=24; bi.bmiHeader.biCompression=BI_RGB;
+                    SetDIBitsToDevice(pdc,0,0,sw,sh,0,0,0,sh,snap.data(),&bi,DIB_RGB_COLORS);
+                    ++pw.presented;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(period));
+            }
+            ReleaseDC(hwnd, pdc);
+        });
+        struct PlayerGuard {
+            PlayerWin& p; HWND h; std::thread& t;
+            ~PlayerGuard() {
+                p.stop = true;
+                if (GetCapture() == h) ReleaseCapture();
+                ShowCursor(TRUE);
+                if (t.joinable()) t.join();
+            }
+        } guard{pw, hwnd, presenter};
         vector<double> zbuf;
         long long frames = 0; double elapsed = 0;
         auto t0 = std::chrono::steady_clock::now();
