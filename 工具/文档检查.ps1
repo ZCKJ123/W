@@ -93,5 +93,29 @@ foreach ($doc in $docs) {
         }
     }
 }
+$tmpErr = [IO.Path]::GetTempFileName() + '.wen'
+[IO.File]::WriteAllText($tmpErr, '打印 +' + "`n", (New-Object Text.UTF8Encoding($false)))
+$jout = [IO.Path]::GetTempFileName()
+$jerr = [IO.Path]::GetTempFileName()
+try {
+    $jp = Start-Process -FilePath $exe -ArgumentList @('--检查', '--json', $tmpErr) `
+        -WorkingDirectory $root -RedirectStandardOutput $jout -RedirectStandardError $jerr `
+        -NoNewWindow -Wait -PassThru
+    $body = [IO.File]::ReadAllText($jout, [Text.Encoding]::UTF8).Trim()
+    $obj = $body | ConvertFrom-Json
+    if ($jp.ExitCode -ne 1 -or $obj.ok -ne $false -or
+        $obj.diagnostics[0].code -ne 'WEN-SYN-001' -or
+        $obj.diagnostics[0].severity -ne 'error') {
+        $fail++
+        Write-Host "失败：--检查 --json 错误协议不符合（code/severity/exit）"
+    } else {
+        Write-Host "错误协议：通过（WEN-SYN-001 / error / exit 1）"
+    }
+} catch {
+    $fail++
+    Write-Host "失败：--检查 --json 协议检查异常：$_"
+} finally {
+    Remove-Item $tmpErr, $jout, $jerr -Force -ErrorAction SilentlyContinue
+}
 Write-Host ("文档代码块：{0} 个，失败 {1} 个" -f $total, $fail)
 if ($fail -gt 0) { exit 1 }

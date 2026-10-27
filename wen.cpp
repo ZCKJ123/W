@@ -15071,6 +15071,23 @@ static string errorOrigin(const string& kind) {
     return "你的脚本";
 }
 
+static string errorCode(const string& kind) {
+    if (kind == "词法错误") return "WEN-LEX-001";
+    if (kind == "语法错误") return "WEN-SYN-001";
+    if (kind == "静态错误") return "WEN-STA-001";
+    if (kind == "运行时错误") return "WEN-RUN-001";
+    if (kind == "编译错误") return "WEN-CMP-001";
+    if (kind == "文件错误") return "WEN-IO-001";
+    if (kind == "库冲突") return "WEN-LIB-001";
+    if (kind == "兼容冲突") return "WEN-CMP-002";
+    if (kind == "翻译错误") return "WEN-TRA-001";
+    if (kind == "外派错误") return "WEN-EXP-001";
+    if (kind == "安全权限") return "WEN-SEC-001";
+    if (kind == "权限错误") return "WEN-PERM-001";
+    if (kind == "引擎错误") return "WEN-ENG-001";
+    return "WEN-ERR-000";
+}
+
 static string errorExplanation(const string& kind) {
     if (kind == "词法错误")
         return "脚本里有无法识别的字符，或文本/引号没有闭合。";
@@ -15144,6 +15161,7 @@ static void printWenError(const WenError& e, const string& filename,
         } catch (...) {}
     }
     std::cerr << "【" << e.kind << "】\n";
+    std::cerr << "代码：" << errorCode(e.kind) << "\n";
     std::cerr << "来源：" << errorOrigin(e.kind) << "\n";
     std::cerr << "位置：" << (filename.empty() ? "<未知>" : filename)
               << " 第 " << e.line << " 行";
@@ -15645,6 +15663,8 @@ static void printDiagnostics(const vector<WenError>& errors, const string& filen
             out += "{\"kind\":" + jsonQuote(e.kind) +
                    ",\"line\":" + std::to_string(e.line) +
                    ",\"column\":" + std::to_string(e.col) +
+                   ",\"code\":" + jsonQuote(errorCode(e.kind)) +
+                   ",\"severity\":\"error\"" +
                    ",\"reason\":" + jsonQuote(e.what()) +
                    ",\"detail\":" + jsonQuote(errorExplanation(e.kind)) +
                    ",\"message\":" + jsonQuote(humanError(e)) +

@@ -209,6 +209,8 @@ export function apply(ctx, config) {
             type: 'object',
             properties: {
               kind: { type: 'string' },
+              code: { type: 'string' },
+              severity: { type: 'string' },
               line: { type: 'integer' },
               column: { type: 'integer' },
               reason: { type: 'string' },
