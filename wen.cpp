@@ -2569,11 +2569,13 @@ static bool validUtf8Bytes(const string& s) {
     return true;
 }
 
-// 中文 Windows 下常见 GBK 源码；非 UTF-8 时按 936 转一次。
+// 中文 Windows 下常见 GBK/GB18030 源码；非 UTF-8 时先按 54936，再按 936。
 static string normalizeWenSource(const string& s) {
     if (s.empty() || validUtf8Bytes(s)) return s;
 #ifdef _WIN32
-    string out = codePageToUtf8(s, 936);
+    string out = codePageToUtf8(s, 54936);
+    if (!out.empty() && validUtf8Bytes(out)) return out;
+    out = codePageToUtf8(s, 936);
     if (!out.empty() && validUtf8Bytes(out)) return out;
 #endif
     return s;
