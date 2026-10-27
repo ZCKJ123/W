@@ -5199,7 +5199,12 @@ struct VpWindowData { int w; int h; std::vector<unsigned char> bgr; };
 static VpWindowData* gVpWin = nullptr;struct PlayerWin {
     HWND hwnd = nullptr;
     int w = 0, h = 0;
-    vector<unsigned char> bgr;
+    vector<unsigned char> bgr;   // front
+    vector<unsigned char> back;  // render
+    std::mutex mtx;
+    std::atomic<bool> stop{false};
+    std::atomic<long long> presented{0};
+    std::atomic<int> refreshRate{60};
     bool closed = false;
     bool capture = false;
     int mdx = 0, mdy = 0;
@@ -5211,8 +5216,8 @@ static PlayerWin* gPlayer = nullptr;
 static LRESULT CALLBACK playerWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_ERASEBKGND) return 1;
     if (msg == WM_PAINT && gPlayer) {
-        if (gPlayer->glRC) { ValidateRect(hwnd, nullptr); return 0; }
         PAINTSTRUCT ps; HDC dc = BeginPaint(hwnd, &ps);
+        std::lock_guard<std::mutex> lk(gPlayer->mtx);
         if (!gPlayer->bgr.empty()) {
             BITMAPINFO bi{}; bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
             bi.bmiHeader.biWidth = gPlayer->w; bi.bmiHeader.biHeight = -gPlayer->h;
@@ -5235,14 +5240,11 @@ static LRESULT CALLBACK playerWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
     if (msg == WM_SIZE && gPlayer && wp != SIZE_MINIMIZED) {
+        std::lock_guard<std::mutex> lk(gPlayer->mtx);
         gPlayer->w = std::max(1, (int)LOWORD(lp));
         gPlayer->h = std::max(1, (int)HIWORD(lp));
         gPlayer->bgr.assign((size_t)gPlayer->w * gPlayer->h * 3, 0);
-        if (gPlayer->glRC && gPlayer->glTex) {
-            glBindTexture(GL_TEXTURE_2D, gPlayer->glTex);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, gPlayer->w, gPlayer->h, 0,
-                         GL_BGR_EXT, GL_UNSIGNED_BYTE, gPlayer->bgr.data());
-        }
+        gPlayer->back.assign((size_t)gPlayer->w * gPlayer->h * 3, 0);
         return 0;
     }
     if (msg == WM_KILLFOCUS && gPlayer && gPlayer->capture) {
@@ -10842,7 +10844,7 @@ Interpreter::Interpreter() {
             if (!RegisterClassW(&wc)) throw WenError("运行时错误", line, 0, "玩家窗口注册失败");
             reg = true;
         }
-        PlayerWin pw; pw.w = w; pw.h = h; pw.bgr.assign((size_t)w*h*3, 0);
+        PlayerWin pw; pw.w = w; pw.h = h; pw.back.assign((size_t)w*h*3, 0); pw.back.assign((size_t)w*h*3, 0);
         gPlayer = &pw;
         RECT rc{0,0,w,h};
         DWORD style = full ? (WS_POPUP | WS_VISIBLE) : (WS_OVERLAPPEDWINDOW | WS_VISIBLE);
@@ -10854,28 +10856,29 @@ Interpreter::Interpreter() {
             nullptr, nullptr, inst, nullptr);
         if (!hwnd) { gPlayer = nullptr; throw WenError("运行时错误", line, 0, "玩家窗口创建失败"); }
         pw.hwnd = hwnd;
-        HDC gdc = GetDC(hwnd);
-        PIXELFORMATDESCRIPTOR pfd{};
-        pfd.nSize = sizeof(pfd); pfd.nVersion = 1;
-        pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
-        pfd.iPixelType = PFD_TYPE_RGBA; pfd.cColorBits = 24; pfd.iLayerType = PFD_MAIN_PLANE;
-        int pf = ChoosePixelFormat(gdc, &pfd);
-        if (pf && SetPixelFormat(gdc, pf, &pfd)) {
-            pw.glRC = wglCreateContext(gdc);
-            if (pw.glRC && wglMakeCurrent(gdc, pw.glRC)) {
-                pw.glDC = gdc;
-                auto swapInt = (BOOL (WINAPI*)(int))wglGetProcAddress("wglSwapIntervalEXT");
-                if (swapInt) swapInt(0);
-                glGenTextures(1, &pw.glTex);
-                glBindTexture(GL_TEXTURE_2D, pw.glTex);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_BGR_EXT, GL_UNSIGNED_BYTE, pw.bgr.data());
-            } else { if (pw.glRC) { wglDeleteContext(pw.glRC); pw.glRC = nullptr; } }
-        }
         ShowWindow(hwnd, SW_SHOW); SetForegroundWindow(hwnd); SetFocus(hwnd);
+        std::thread presenter([&]() {
+            HDC pdc = GetDC(hwnd);
+            HDC sdc = GetDC(nullptr);
+            int refresh = GetDeviceCaps(sdc, VREFRESH); ReleaseDC(nullptr, sdc);
+            if (refresh < 1) refresh = 60;
+            pw.refreshRate = refresh;
+            int period = std::max(1, 1000 / refresh);
+            vector<unsigned char> snap;
+            while (!pw.stop.load()) {
+                { std::lock_guard<std::mutex> lk(pw.mtx); snap = pw.bgr; }
+                if (!snap.empty()) {
+                    BITMAPINFO bi{}; bi.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
+                    bi.bmiHeader.biWidth=pw.w; bi.bmiHeader.biHeight=-pw.h; bi.bmiHeader.biPlanes=1;
+                    bi.bmiHeader.biBitCount=24; bi.bmiHeader.biCompression=BI_RGB;
+                    SetDIBitsToDevice(pdc,0,0,pw.w,pw.h,0,0,0,pw.h,snap.data(),&bi,DIB_RGB_COLORS);
+                    ++pw.presented;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(period));
+            }
+            ReleaseDC(hwnd, pdc);
+        });
+
         vector<PTri> ground, cubes;
         for (int gz=-12; gz<12; gz+=3) for (int gx=-12; gx<12; gx+=3) {
             unsigned c = (((gx+gz)/3)&1) ? 0x2f3d38u : 0x3b4c45u;
@@ -10941,6 +10944,7 @@ Interpreter::Interpreter() {
         long long frames = 0; double elapsed = 0;
         auto t0 = std::chrono::steady_clock::now();
         while (!pw.closed && !(GetAsyncKeyState(VK_ESCAPE) & 0x8000)) {
+            auto frameStart=std::chrono::steady_clock::now();
             MSG msg;
             while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
             if (pw.capture) {
@@ -10971,7 +10975,7 @@ Interpreter::Interpreter() {
             for (int y=0;y<h;++y) {
                 double k=(double)y/h;
                 unsigned char rr=(unsigned char)(30+50*(1-k)), gg=(unsigned char)(45+70*(1-k)), bb=(unsigned char)(70+80*(1-k));
-                for (int x=0;x<w;++x){ size_t i=((size_t)y*w+x)*3; pw.bgr[i]=rr; pw.bgr[i+1]=gg; pw.bgr[i+2]=bb; }
+                for (int x=0;x<w;++x){ size_t i=((size_t)y*w+x)*3; pw.back[i]=rr; pw.back[i+1]=gg; pw.back[i+2]=bb; }
             }
             zbuf.assign((size_t)w*h, 1e30);
             auto project=[&](PVec p, double& sx, double& sy, double& z)->bool{
@@ -10997,9 +11001,9 @@ Interpreter::Interpreter() {
                     double z=w0*z0+w1*z1+w2*z2-zoff; if(z<=0) continue;
                     size_t i=(size_t)y*w+x; if(z>=zbuf[i]) continue; zbuf[i]=z;
                     double fog=std::max(0.25,1.0-z/28.0);
-                    pw.bgr[i*3]=(unsigned char)std::min(255.0,cr*lit*fog);
-                    pw.bgr[i*3+1]=(unsigned char)std::min(255.0,cg*lit*fog);
-                    pw.bgr[i*3+2]=(unsigned char)std::min(255.0,cb*lit*fog);
+                    pw.back[i*3]=(unsigned char)std::min(255.0,cr*lit*fog);
+                    pw.back[i*3+1]=(unsigned char)std::min(255.0,cg*lit*fog);
+                    pw.back[i*3+2]=(unsigned char)std::min(255.0,cb*lit*fog);
                 }
             };
             for(auto& t:ground) drawTri(t.a,t.b,t.c,t.color,0);
@@ -11013,50 +11017,35 @@ Interpreter::Interpreter() {
             for(auto& t:cubes) drawTri(t.a,t.b,t.c,t.color,0);
             for(int y=-2;y<=2;++y) for(int x=-2;x<=2;++x){
                 if(std::abs(x)<=1&&std::abs(y)<=1) continue;
-                size_t i=(size_t)(h/2+y)*w+(w/2+x); if(i*3+2<pw.bgr.size()){pw.bgr[i*3]=230;pw.bgr[i*3+1]=240;pw.bgr[i*3+2]=255;}
+                size_t i=(size_t)(h/2+y)*w+(w/2+x); if(i*3+2<pw.back.size()){pw.back[i*3]=230;pw.back[i*3+1]=240;pw.back[i*3+2]=255;}
             }
-            if (pw.glRC) {
-                glViewport(0, 0, w, h);
-                glClearColor(0, 0, 0, 1); glClear(GL_COLOR_BUFFER_BIT);
-                glMatrixMode(GL_PROJECTION); glLoadIdentity();
-                glOrtho(-1, 1, -1, 1, -1, 1);
-                glMatrixMode(GL_MODELVIEW); glLoadIdentity();
-                glEnable(GL_TEXTURE_2D);
-                glBindTexture(GL_TEXTURE_2D, pw.glTex);
-                glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_BGR_EXT, GL_UNSIGNED_BYTE, pw.bgr.data());
-                glBegin(GL_QUADS);
-                glTexCoord2f(0, 1); glVertex2f(-1, -1);
-                glTexCoord2f(1, 1); glVertex2f(1, -1);
-                glTexCoord2f(1, 0); glVertex2f(1, 1);
-                glTexCoord2f(0, 0); glVertex2f(-1, 1);
-                glEnd();
-                SwapBuffers(pw.glDC);
-            } else {
-                HDC dc = GetDC(hwnd);
-                BITMAPINFO bi{}; bi.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
-                bi.bmiHeader.biWidth=w; bi.bmiHeader.biHeight=-h; bi.bmiHeader.biPlanes=1;
-                bi.bmiHeader.biBitCount=24; bi.bmiHeader.biCompression=BI_RGB;
-                SetDIBitsToDevice(dc,0,0,w,h,0,0,0,h,pw.bgr.data(),&bi,DIB_RGB_COLORS);
-                ReleaseDC(hwnd,dc);
+            {
+                std::lock_guard<std::mutex> lk(pw.mtx);
+                std::swap(pw.back, pw.back);
             }
             ++frames;
             auto now=std::chrono::steady_clock::now();
             elapsed=std::chrono::duration<double>(now-t0).count();
             if (frames%20==0) {
-                std::wstring t=title+(pw.glRC?L" GL":L" GDI")+L"  FPS " + std::to_wstring((int)(frames/std::max(0.001,elapsed))) +
+                std::wstring t=title+L"  刷新 " + std::to_wstring(pw.refreshRate.load()) +
+                    L"  渲染 " + std::to_wstring((int)(frames/std::max(0.001,elapsed))) +
+                    L"  显示 " + std::to_wstring((int)(pw.presented.load()/std::max(0.001,elapsed))) +
                     L"  x " + std::to_wstring((int)cam.x) + L" z " + std::to_wstring((int)cam.z);
                 SetWindowTextW(hwnd,t.c_str());
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            auto frameEnd=std::chrono::steady_clock::now();
+            double frameMs=std::chrono::duration<double,std::milli>(frameEnd-frameStart).count();
+            if (frameMs < 1000.0/240.0)
+                std::this_thread::sleep_for(std::chrono::duration<double,std::milli>(1000.0/240.0-frameMs));
         }
-        if (pw.glRC) { if (pw.glTex) glDeleteTextures(1, &pw.glTex); wglMakeCurrent(nullptr, nullptr); wglDeleteContext(pw.glRC); }
-        if (pw.glDC) ReleaseDC(hwnd, pw.glDC);
+        pw.stop = true;
+        if (presenter.joinable()) presenter.join();
         DestroyWindow(hwnd); gPlayer = nullptr;
         auto d=std::make_shared<Dict>();
         d->items["帧数"]=vNum((double)frames);
         d->items["平均帧率"]=vNum(frames/std::max(0.001,elapsed));
-        d->items["OpenGL"]=vBool(pw.glRC != nullptr);
+        d->items["显示帧率"]=vNum(pw.presented.load()/std::max(0.001,elapsed));
+        d->items["刷新率"]=vNum(pw.refreshRate.load());
         auto pos=std::make_shared<List>(); pos->items.push_back(vNum(cam.x)); pos->items.push_back(vNum(cam.y)); pos->items.push_back(vNum(cam.z));
         d->items["位置"]=vList(pos);
         return vDict(d);
