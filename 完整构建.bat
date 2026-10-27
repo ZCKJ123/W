@@ -10,4 +10,9 @@ if errorlevel 1 (
     exit /b 1
 )
 echo 完整构建成功：wen_full.exe
-echo 文语言 WEN-LANG-0.1
+call "%~dp0构建-32.bat"
+if errorlevel 1 (
+    echo 32 位构建失败。
+    exit /b 1
+)
+echo 文语言 WEN-LANG-0.1（64 位 + 32 位）

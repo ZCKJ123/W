@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 function 失败($msg) { Write-Host "发货检查失败：$msg" -ForegroundColor Red; exit 1 }
 
@@ -17,7 +17,7 @@ $sign = .\wen_full.exe --签名
 if ($sign -notmatch 'WEN-LANG-0\.1') { 失败 "内置签名不对" }
 
 Write-Host "4/5 二进制标记"
-foreach ($exe in @('wen_full.exe')) {
+foreach ($exe in @('wen_full.exe', 'wen32.exe')) {
     $a = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes((Resolve-Path $exe)))
     if (-not $a.Contains('WEN-EMBEDDED-MARK')) { 失败 "$exe 缺少内嵌标记" }
 }
@@ -29,4 +29,4 @@ foreach ($name in @('时间库', '编码库', '正则库', 'CPU库', '路径库'
 }
 if ($libs -match 'GPU库') { 失败 "V0.1 不应带 GPU 库" }
 
-Write-Host "发货检查通过：127/127，版本、签名、标记、库都正常。" -ForegroundColor Green
+Write-Host "发货检查通过：129/129，版本、签名、标记、库都正常。" -ForegroundColor Green

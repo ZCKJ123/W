@@ -59,6 +59,14 @@ using std::string;
 using std::vector;
 namespace fs = std::filesystem;
 
+#if defined(__SIZEOF_INT128__)
+using WenI128 = __int128;
+using WenU128 = unsigned __int128;
+#else
+using WenI128 = long long;
+using WenU128 = unsigned long long;
+#endif
+
 // ============================================================
 // 0. 基础工具
 // ============================================================
@@ -3178,17 +3186,17 @@ static Value applyBinary(const string& op, const Value& a, const Value& b, int l
         bool s = a.isSigned && b.isSigned;
         uint64_t ua = a.i & intMask(a.width), ub = b.i & intMask(b.width);
         int64_t sa = intSigned(a), sb = intSigned(b);
-        auto mk = [&](__int128 v) { return vInt((uint64_t)v, w, s); };
-        if (op == "+") return mk((__int128)(s ? sa : ua) + (s ? sb : ub));
-        if (op == "-") return mk((__int128)(s ? sa : ua) - (s ? sb : ub));
-        if (op == "*") return mk((__int128)(s ? sa : ua) * (s ? sb : ub));
+        auto mk = [&](WenI128 v) { return vInt((uint64_t)v, w, s); };
+        if (op == "+") return mk((WenI128)(s ? sa : ua) + (s ? sb : ub));
+        if (op == "-") return mk((WenI128)(s ? sa : ua) - (s ? sb : ub));
+        if (op == "*") return mk((WenI128)(s ? sa : ua) * (s ? sb : ub));
         if (op == "/" || op == "//") {
             if ((s ? sb : ub) == 0) throw WenError("运行时错误", line, 0, "除数不能为 0");
-            return mk(s ? (__int128)(sa / sb) : (__int128)(ua / ub));
+            return mk(s ? (WenI128)(sa / sb) : (WenI128)(ua / ub));
         }
         if (op == "%") {
             if ((s ? sb : ub) == 0) throw WenError("运行时错误", line, 0, "除数不能为 0");
-            return mk(s ? (__int128)(sa % sb) : (__int128)(ua % ub));
+            return mk(s ? (WenI128)(sa % sb) : (WenI128)(ua % ub));
         }
         if (op == "&") return vInt(ua & ub, w, s);
         if (op == "|") return vInt(ua | ub, w, s);
@@ -3827,6 +3835,11 @@ void Interpreter::加载模块(const string& rawName, int line) {
             throw WenError("库冲突", line, 0,
                            "函数「" + kv.first + "」已被「" + owner->second +
                                "」占用；依赖「" + name + "」会覆盖它，请改名或去掉其中一个库");
+        Value existing;
+        if (globals->lookup(internSymbol(kv.first), existing))
+            throw WenError("库冲突", line, 0,
+                           "用户代码已定义「" + kv.first + "」，与「" + name +
+                               "」同名；依赖会覆盖它，请改名");
         globals->set(kv.first, kv.second);
         symbolOwner[kv.first] = name;
         if (auto b = std::dynamic_pointer_cast<Builtin>(kv.second.callable)) {
@@ -4013,7 +4026,7 @@ void Interpreter::execProgram(const vector<StmtPtr>& program, shared_ptr<Scope> 
     }
 }
 
-static string int128ToString(__int128 x);
+static string int128ToString(WenI128 x);
 static bool fastLinearSumWhile(Interpreter& vm, const StmtPtr& s,
                                 const shared_ptr<Scope>& scope) {
     if (gNoFast) return false;
@@ -4067,14 +4080,16 @@ static bool fastLinearSumWhile(Interpreter& vm, const StmtPtr& s,
         else count = std::floor((long double)limit - (long double)i) + 1.0L;
         if (count >= 1000000.0L) {
             auto isInt = [](double x) { return std::trunc(x) == x && std::fabs(x) < 9.0e15; };
+#if defined(__SIZEOF_INT128__)
             if (isInt(a) && isInt(i) && isInt(limit) && count < 9.0e18L) {
-                __int128 c = (__int128)count;
-                __int128 series = c * (2 * (__int128)(long long)i + (c - 1)) / 2;
-                __int128 sum = (__int128)(long long)a + series;
+                WenI128 c = (WenI128)count;
+                WenI128 series = c * (2 * (WenI128)(long long)i + (c - 1)) / 2;
+                WenI128 sum = (WenI128)(long long)a + series;
                 vm.globals->fastSet(acc, vBig(int128ToString(sum)));
                 vm.globals->fastSet(cond, vNum(i + (double)c));
                 return true;
             }
+#endif
             long double series = count * (2.0L * (long double)i + count - 1.0L) / 2.0L;
             a += (double)series;
             i += (double)count;
@@ -4384,7 +4399,7 @@ Value Interpreter::eval(const ExprPtr& e, shared_ptr<Scope> scope) {
         case Expr::K::Unary: {
             Value a = eval(e->args[0], scope);
             if (e->op == "-") {
-            if (a.type == VT::Int) return vInt((uint64_t)(-(__int128)intSigned(a)), a.width, a.isSigned);
+            if (a.type == VT::Int) return vInt((uint64_t)(-(WenI128)intSigned(a)), a.width, a.isSigned);
             return vNum(-needNum(a, "负号", e->line));
         }
             if (e->op == "+") return vNum(needNum(a, "正号", e->line));
@@ -6985,10 +7000,10 @@ static bool netAllowed(const std::vector<std::pair<string, bool>>& rules, const 
         if (netWildcard(r.first, host)) return r.second;
     return false;
 }
-static string int128ToString(__int128 x) {
+static string int128ToString(WenI128 x) {
     if (x == 0) return "0";
     bool neg = x < 0;
-    unsigned __int128 u = neg ? (unsigned __int128)(-x) : (unsigned __int128)x;
+    WenU128 u = neg ? (WenU128)(-x) : (WenU128)x;
     string s;
     while (u) { s.push_back(char('0' + (int)(u % 10))); u /= 10; }
     if (neg) s.push_back('-');
@@ -13212,6 +13227,7 @@ Interpreter::Interpreter() {
         if (it == globals->vars.end()) continue;
         libraryFunctions[kv.second][kv.first] = it->second;
         globals->vars.erase(it);
+        globals->idVars.erase(internSymbol(kv.first));
     }
 }
 
