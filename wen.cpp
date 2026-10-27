@@ -1814,6 +1814,55 @@ struct Value {
 struct List { vector<Value> items; };
 struct Dict { map<string, Value> items; };
 
+
+static std::set<string> gCallableNames;
+
+static std::vector<uint32_t> nameCps(const string& s) {
+    std::vector<uint32_t> out;
+    for (size_t i = 0; i < s.size();) {
+        unsigned char c = (unsigned char)s[i];
+        uint32_t cp = c; int n = 0;
+        if ((c & 0xE0) == 0xC0) { cp = c & 0x1F; n = 1; }
+        else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; n = 2; }
+        else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; n = 3; }
+        for (int k = 1; k <= n && i + (size_t)k < s.size(); ++k)
+            cp = (cp << 6) | ((unsigned char)s[i + (size_t)k] & 0x3F);
+        out.push_back(cp);
+        i += (size_t)n + 1;
+        if (i > s.size()) break;
+    }
+    return out;
+}
+
+static size_t editDistance(const std::vector<uint32_t>& a, const std::vector<uint32_t>& b) {
+    std::vector<size_t> prev(b.size() + 1), cur(b.size() + 1);
+    for (size_t j = 0; j <= b.size(); ++j) prev[j] = j;
+    for (size_t i = 1; i <= a.size(); ++i) {
+        cur[0] = i;
+        for (size_t j = 1; j <= b.size(); ++j)
+            cur[j] = std::min({prev[j] + 1, cur[j - 1] + 1,
+                               prev[j - 1] + (a[i - 1] == b[j - 1] ? 0 : 1)});
+        prev.swap(cur);
+    }
+    return prev[b.size()];
+}
+
+static string nearestName(const string& name) {
+    auto a = nameCps(name);
+    if (a.empty()) return {};
+    string best;
+    size_t bestD = (size_t)-1;
+    for (const auto& cand : gCallableNames) {
+        if (cand == name || cand.empty()) continue;
+        auto b = nameCps(cand);
+        size_t d = editDistance(a, b);
+        if (cand.find(name) != string::npos || name.find(cand) != string::npos) d = std::min<size_t>(d, 1);
+        if (d < bestD) { bestD = d; best = cand; }
+    }
+    size_t limit = std::max<size_t>(2, a.size() / 3 + 1);
+    return bestD <= limit ? best : string();
+}
+
 struct Scope {
     map<string, Value> vars;
     unordered_map<SymId, Value> idVars;
@@ -2346,7 +2395,6 @@ struct SecEntry {
     string decision;
 };
 static std::vector<SecEntry> gSecEntries;
-static std::set<string> gCallableNames;
 static string gSecurityPolicy = "观察";
 static bool gSecAdmin = false;
 static bool gProbeActive = false;
@@ -3696,7 +3744,9 @@ public:
             throw WenError("运行时错误", line, 0,
                            "「" + name + "」属于「" + ci->second +
                                "」，请先在使用前写「依赖 " + ci->second + "」");
-        throw WenError("运行时错误", line, 0, "变量「" + name + "」还没有值");
+        string hint = nearestName(name);
+        throw WenError("运行时错误", line, 0, "变量「" + name + "」还没有值" +
+                       (hint.empty() ? "" : "；你是不是要找「" + hint + "」？"));
     }
 };
 

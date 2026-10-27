@@ -72,27 +72,56 @@ foreach ($pair in @(@('解释器', $expected), @('字节码', $bc), @('Python', 
     }
 }
 
-# 值的长相：真/假/空、列表、字典
+# 值的长相：布尔、空、列表、字典、大整数、小数
 $vsrc = Join-Path $dir 'values_py.wen'
 $vpy = Join-Path $dir 'values_py.py'
 $vrunner = Join-Path $dir 'values_runner.wen'
+$vcpp = Join-Path $dir 'values_cpp.cpp'
+$vex = Join-Path $dir 'values_cpp.exe'
 $vtext = @'
 # 外派: python
 打印 真, 假, 空
 打印 [1, "甲", 真, 空]
 打印 {"甲": 1, "乙": [真]}
+打印 1234567890123456
+打印 2 ** 53
+打印 0.000001
+打印 1 / 3
+打印 1e20
 '@
 Write-Utf8 $vsrc $vtext
 Write-Utf8 $vrunner ("依赖 外派库`n外派翻译(`"$vsrc`", `"$vpy`")`n")
 $vi = (Run-Exe $vsrc) -replace "`r`n", "`n"
 Run-Exe $vrunner | Out-Null
 $vp = ((& python $vpy 2>&1) -join "`n") -replace "`r`n", "`n"
-if ($vp -ne $vi) {
-    $ok = $false
-    Write-Host "失败：Python 值文本不等价"
-    Write-Host ("  期望：{0}" -f ($vi -replace "`n", ' / '))
-    Write-Host ("  实际：{0}" -f ($vp -replace "`n", ' / '))
+
+$nsrc = Join-Path $dir 'values_num.wen'
+$ncpp = Join-Path $dir 'values_num.cpp'
+$nex = Join-Path $dir 'values_num.exe'
+$ntext = @'
+打印 1234567890123456
+打印 2 ** 53
+打印 0.000001
+打印 1 / 3
+打印 1e20
+'@
+Write-Utf8 $nsrc $ntext
+$ni = (Run-Exe $nsrc) -replace "`r`n", "`n"
+& $exe --生成C++ $nsrc $ncpp 2>&1 | Out-Null
+$cp = Start-Process -FilePath 'C:\msys64\ucrt64\bin\g++.exe' `
+    -ArgumentList @('-std=c++17', '-O2', '-static', $ncpp, '-o', $nex) `
+    -NoNewWindow -Wait -PassThru
+if ($cp.ExitCode -ne 0) { throw 'C++ 数字文本编译失败' }
+$nc = (((& $nex 2>&1) | Out-String).Trim()) -replace "`r`n", "`n"
+
+foreach ($pair in @(@('Python 值文本', $vp, $vi), @('C++ 数字文本', $nc, $ni))) {
+    if ($pair[1] -ne $pair[2]) {
+        $ok = $false
+        Write-Host ("失败：{0} 不等价" -f $pair[0])
+        Write-Host ("  期望：{0}" -f ($pair[2] -replace "`n", ' / '))
+        Write-Host ("  实际：{0}" -f ($pair[1] -replace "`n", ' / '))
+    }
 }
 
 if (-not $ok) { exit 1 }
-Write-Host ("跨目标矩阵：解释器 / 字节码 / Python / C++ 全部等价（函数+递归+√）")
+Write-Host ("跨目标矩阵：解释器 / 字节码 / Python / C++ 全部等价（函数+递归+√+值文本）")

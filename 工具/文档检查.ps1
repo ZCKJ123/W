@@ -2,9 +2,20 @@
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $exe = Join-Path $root 'wen.exe'
-$docs = @('使用规范.md', '使用教程.md', '语法总表.md')
+$docs = @('使用规范.md', '使用教程.md', '语法总表.md', '语言规范.md')
 $fail = 0
 $total = 0
+$skipDocs = [ordered]@{
+    '破坏性变更.md' = '故意展示旧写法/破坏性示例，不能直接运行'
+    '0.2/语法公理.md' = '提案与反例伪代码，含故意不成立的写法'
+}
+foreach ($sd in $skipDocs.Keys) {
+    $sp = Join-Path $root $sd
+    if (Test-Path $sp) {
+        $n = ([regex]::Matches([IO.File]::ReadAllText($sp, [Text.Encoding]::UTF8), "```wen\r?\n")).Count
+        Write-Host ("跳过：{0}（{1} 块）：{2}" -f $sd, $n, $skipDocs[$sd])
+    }
+}
 
 $ebnfPath = Join-Path $root '语法.ebnf'
 $ebnf = [IO.File]::ReadAllText($ebnfPath, [Text.Encoding]::UTF8)
