@@ -15790,17 +15790,6 @@ static LRESULT CALLBACK uiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SetDIBitsToDevice(dc, 0, 0, gUi.w, gUi.h, 0, 0, 0, gUi.h,
                                   gUi.bgr.data(), &bi, DIB_RGB_COLORS);
             }
-            SetBkMode(dc, TRANSPARENT);
-            for (const auto& t : gUi.texts) {
-                HFONT font = CreateFontW(-t.size, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                    DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
-                HFONT old = (HFONT)SelectObject(dc, font);
-                SetTextColor(dc, RGB((t.color >> 16) & 255, (t.color >> 8) & 255, t.color & 255));
-                TextOutW(dc, t.x, t.y, t.text.c_str(), (int)t.text.size());
-                SelectObject(dc, old);
-                DeleteObject(font);
-            }
             EndPaint(hwnd, &ps);
             return 0;
         }
@@ -15908,14 +15897,63 @@ static Value uiLine(Interpreter&, vector<Value>& a, int line) {
     }
     return vNone();
 }
+static void uiBurnText(int x, int y, const std::wstring& text, int color, int size) {
+    if (text.empty()) return;
+    HDC screen = GetDC(nullptr);
+    HDC dc = CreateCompatibleDC(screen);
+    HFONT font = CreateFontW(-size, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
+    HFONT oldFont = (HFONT)SelectObject(dc, font);
+    SIZE extent{};
+    GetTextExtentPoint32W(dc, text.c_str(), (int)text.size(), &extent);
+    int tw = std::max(1, (int)extent.cx), th = std::max(1, size + 8);
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = tw;
+    bi.bmiHeader.biHeight = -th;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    HBITMAP oldBmp = (HBITMAP)SelectObject(dc, bmp);
+    std::memset(bits, 0, (size_t)tw * th * 4);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(255, 255, 255));
+    SetTextAlign(dc, TA_TOP | TA_LEFT);
+    TextOutW(dc, 0, 0, text.c_str(), (int)text.size());
+    auto* px = (unsigned char*)bits;
+    int r = (color >> 16) & 255, g = (color >> 8) & 255, b = color & 255;
+    for (int yy = 0; yy < th; ++yy) {
+        int dy = y + yy;
+        if (dy < 0 || dy >= gUi.h) continue;
+        for (int xx = 0; xx < tw; ++xx) {
+            int dx = x + xx;
+            if (dx < 0 || dx >= gUi.w) continue;
+            unsigned char* p = px + ((size_t)yy * tw + xx) * 4;
+            int a = std::max({p[0], p[1], p[2]});
+            if (a == 0) continue;
+            size_t i = ((size_t)dy * gUi.w + dx) * 3;
+            gUi.bgr[i] = (unsigned char)((gUi.bgr[i] * (255 - a) + b * a) / 255);
+            gUi.bgr[i + 1] = (unsigned char)((gUi.bgr[i + 1] * (255 - a) + g * a) / 255);
+            gUi.bgr[i + 2] = (unsigned char)((gUi.bgr[i + 2] * (255 - a) + r * a) / 255);
+        }
+    }
+    SelectObject(dc, oldBmp);
+    DeleteObject(bmp);
+    SelectObject(dc, oldFont);
+    DeleteObject(font);
+    DeleteDC(dc);
+    ReleaseDC(nullptr, screen);
+}
 static Value uiText(Interpreter&, vector<Value>& a, int line) {
-    WenUiText t;
-    t.x = (int)needNum(a[0], "界面文本", line);
-    t.y = (int)needNum(a[1], "界面文本", line);
-    t.text = utf8ToWide(needStr(a[2], "界面文本", line));
-    t.color = vpColor(a[3], line);
-    t.size = a.size() >= 5 ? (int)needNum(a[4], "界面文本", line) : 18;
-    gUi.texts.push_back(std::move(t));
+    int x = (int)needNum(a[0], "界面文本", line);
+    int y = (int)needNum(a[1], "界面文本", line);
+    std::wstring text = utf8ToWide(needStr(a[2], "界面文本", line));
+    int color = vpColor(a[3], line);
+    int size = a.size() >= 5 ? (int)needNum(a[4], "界面文本", line) : 18;
+    uiBurnText(x, y, text, color, size);
     return vNone();
 }
 static Value uiRefresh(Interpreter&, vector<Value>&, int line) {
