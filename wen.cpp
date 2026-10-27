@@ -223,8 +223,31 @@ static string describeToken(const Token& t) {
 class Lexer {
 public:
     explicit Lexer(string src, int startLine = 1)
-        : src_(std::move(src)), line_(startLine) {}
-
+        : src_(std::move(src)), line_(startLine) { protectDeclaredNames(); }
+private:
+    std::set<string> protectedNames_;
+    void protectDeclaredNames() {
+        for (const string& kw : {string("函数"), string("将"), string("对于")}) {
+            size_t p = 0;
+            while ((p = src_.find(kw, p)) != string::npos) {
+                size_t q = p + kw.size();
+                while (q < src_.size() && (src_[q] == ' ' || src_[q] == '\t' || src_[q] == '\r')) ++q;
+                size_t e = q;
+                while (e < src_.size() && src_[e] != ' ' && src_[e] != '\t' &&
+                       src_[e] != '\r' && src_[e] != '\n' && src_[e] != ',' && src_[e] != '，')
+                    ++e;
+                if (e > q) {
+                    string name = src_.substr(q, e - q);
+                    if (name.size() > 9 &&
+                        (name.compare(name.size() - 9, 9, "的平方") == 0 ||
+                         name.compare(name.size() - 9, 9, "的立方") == 0))
+                        protectedNames_.insert(name);
+                }
+                p = q;
+            }
+        }
+    }
+public:
     vector<Token> scan() {
         // 去掉 UTF-8 BOM
         if (startsWith(src_, 0, "\xEF\xBB\xBF")) {
@@ -518,6 +541,10 @@ private:
         string word = src_.substr(start, pos_ - start);
         if (word.empty()) {
             throw WenError("词法错误", line_, col_, "不认识的符号");
+        }
+        if (protectedNames_.count(word)) {
+            add(TT::Name, word, ln, cl);
+            return;
         }
 
         static const std::map<string, string> wordOps = {
