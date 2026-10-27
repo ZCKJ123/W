@@ -117,5 +117,55 @@ try {
 } finally {
     Remove-Item $tmpErr, $jout, $jerr -Force -ErrorAction SilentlyContinue
 }
+# 错误输出回归：rule / --精简 / --简短 / frames
+$regDir = Join-Path ([IO.Path]::GetTempPath()) ('wen_err_' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Force $regDir | Out-Null
+$regCases = @(
+    @{ name = 'newline'; text = '打印 1 打印 2'; rule = 'syntax.need_newline'; runtime = $false },
+    @{ name = 'undefined'; text = '打印 不存在'; rule = 'static.undefined_name'; runtime = $false },
+    @{ name = 'arity'; text = "函数 f x 则`n返回 x`n结束`n打印 f(1, 2)`n"; rule = 'static.arity'; runtime = $false },
+    @{ name = 'runtime'; text = "函数 甲 则`n乙()`n结束`n函数 乙 则`n打印 1 / 0`n结束`n甲()`n"; rule = 'runtime.divide_zero'; runtime = $true }
+)
+try {
+    foreach ($c in $regCases) {
+        $fp = Join-Path $regDir ($c.name + '.wen')
+        [IO.File]::WriteAllText($fp, $c.text, (New-Object Text.UTF8Encoding($false)))
+        $out = Join-Path $regDir ($c.name + '.json')
+        $err = Join-Path $regDir ($c.name + '.err')
+        $pargs = if ($c.runtime) { @('--json', '--精简', $fp) } else { @('--检查', '--json', '--精简', $fp) }
+        $rp = Start-Process -FilePath $exe -ArgumentList $pargs -WorkingDirectory $root `
+            -RedirectStandardOutput $out -RedirectStandardError $err -NoNewWindow -Wait -PassThru
+        $j = [IO.File]::ReadAllText($out, [Text.Encoding]::UTF8).Trim() | ConvertFrom-Json
+        if ($rp.ExitCode -ne 1 -or $j.ok -ne $false -or $j.diagnostics[0].rule -ne $c.rule) {
+            $fail++
+            Write-Host ("失败：错误回归 rule {0}（得到 {1}）" -f $c.rule, $j.diagnostics[0].rule)
+        }
+        if ($j.diagnostics[0].PSObject.Properties.Name -contains 'detail' -or
+            $j.diagnostics[0].PSObject.Properties.Name -contains 'message') {
+            $fail++
+            Write-Host ("失败：--精简 仍含 detail/message（{0}）" -f $c.name)
+        }
+        if ($c.runtime -and -not $j.diagnostics[0].frames) {
+            $fail++
+            Write-Host "失败：运行时 JSON 缺少 frames 调用栈"
+        }
+    }
+    $briefOut = Join-Path $regDir 'brief.out'
+    $briefErr = Join-Path $regDir 'brief.err'
+    Start-Process -FilePath $exe -ArgumentList @('--简短', (Join-Path $regDir 'runtime.wen')) `
+        -WorkingDirectory $root -RedirectStandardOutput $briefOut -RedirectStandardError $briefErr `
+        -NoNewWindow -Wait | Out-Null
+    $briefText = [IO.File]::ReadAllText($briefErr, [Text.Encoding]::UTF8)
+    if ($briefText.Contains('说明：')) {
+        $fail++
+        Write-Host "失败：--简短 仍在打印「说明：」"
+    }
+    if ($fail -eq 0) { Write-Host "错误回归：rule / --精简 / --简短 / frames 通过" }
+} catch {
+    $fail++
+    Write-Host "失败：错误回归异常：$_"
+} finally {
+    Remove-Item $regDir -Recurse -Force -ErrorAction SilentlyContinue
+}
 Write-Host ("文档代码块：{0} 个，失败 {1} 个" -f $total, $fail)
 if ($fail -gt 0) { exit 1 }

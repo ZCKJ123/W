@@ -16185,8 +16185,10 @@ static void printDiagnostics(const vector<WenError>& errors, const string& filen
                    ",\"reason\":" + jsonQuote(e.what()) +
                    (gCompactJson ? string() :
                     ",\"detail\":" + jsonQuote(errorExplanation(e.kind)) +
-                    ",\"message\":" + jsonQuote(humanError(e))) +
-                   ",\"hint\":" + jsonQuote(errorSuggestion(e));
+                    ",\"message\":" + jsonQuote(humanError(e)));
+            string hint = errorSuggestion(e);
+            if (!gCompactJson || !hint.empty())
+                out += ",\"hint\":" + jsonQuote(hint);
             if (!e.frames.empty()) {
                 out += ",\"frames\":[";
                 for (size_t k = 0; k < e.frames.size(); ++k) {
