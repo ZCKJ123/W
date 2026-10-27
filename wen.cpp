@@ -2551,7 +2551,34 @@ static bool looksLikeGbk(const string& body) {
 }
 #endif
 
-// 抓取网页正文。Windows 用 WinHTTP（支持 https 与重定向）。
+static bool validUtf8Bytes(const string& s) {
+    size_t i = 0;
+    while (i < s.size()) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x80) { ++i; continue; }
+        int n = 0;
+        if ((c & 0xE0) == 0xC0) n = 1;
+        else if ((c & 0xF0) == 0xE0) n = 2;
+        else if ((c & 0xF8) == 0xF0) n = 3;
+        else return false;
+        if (i + (size_t)n >= s.size()) return false;
+        for (int k = 1; k <= n; ++k)
+            if (((unsigned char)s[i + k] & 0xC0) != 0x80) return false;
+        i += (size_t)n + 1;
+    }
+    return true;
+}
+
+// 中文 Windows 下常见 GBK 源码；非 UTF-8 时按 936 转一次。
+static string normalizeWenSource(const string& s) {
+    if (s.empty() || validUtf8Bytes(s)) return s;
+#ifdef _WIN32
+    string out = codePageToUtf8(s, 936);
+    if (!out.empty() && validUtf8Bytes(out)) return out;
+#endif
+    return s;
+}
+
 static bool unsafeNetHost(const string& url) {
     auto p = url.find("://");
     if (p == string::npos) return true;
@@ -3999,6 +4026,7 @@ void Interpreter::加载外部库(const string& name, int line) {
     moduleExports.clear();
     try {
         string src = readWholeFile(found.u8string());
+        src = normalizeWenSource(src);
         filename = found.u8string();
         sourceLines = splitLines(src);
         auto program = parseSource(src);
@@ -15074,6 +15102,7 @@ static int runFile(const string& path) {
     Interpreter vm;
     try {
         string src = readWholeFile(resolveWenPath(path));
+        src = normalizeWenSource(src);
         string secAbs = fs::absolute(fs::u8path(path)).u8string();
         if (gSecBlack.count(secAbs)) { std::cerr << "【安全拒绝】黑名单文件：" << path << "\n"; return 1; }
         if (!gSecWhite.count(secAbs) && gSecurityPolicy != "观察") {
@@ -15143,6 +15172,7 @@ static int checkFile(const string& path) {
     Interpreter vm;  // 初始化内置名字表，供静态负数参数检查
     try {
         string src = readWholeFile(resolveWenPath(path));
+        src = normalizeWenSource(src);
         vector<WenError> errors;
         string expanded;
         processSaveBlocks(src, false, expanded, errors);
@@ -15208,6 +15238,7 @@ static int dumpTokens(const string& path) {
     vector<string> lines;
     try {
         string src = readWholeFile(resolveWenPath(path));
+        src = normalizeWenSource(src);
         lines = splitLines(src);
         Lexer lex(src);
         auto toks = lex.scan();
@@ -15284,6 +15315,7 @@ static int compileFile(const string& path, const string& output, bool build) {
     vector<string> lines;
     try {
         string src = readWholeFile(resolveWenPath(path));
+        src = normalizeWenSource(src);
         vector<WenError> errors;
         string expanded;
         int blocks = processSaveBlocks(src, false, expanded, errors);

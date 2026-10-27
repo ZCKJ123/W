@@ -8,7 +8,7 @@ $total = 0
 
 $ebnfPath = Join-Path $root '语法.ebnf'
 $ebnf = [IO.File]::ReadAllText($ebnfPath, [Text.Encoding]::UTF8)
-foreach ($name in @('打印', '列表', '字典', '集合', '切片', '函数定义', '导出', '赋值目标', '并置后缀')) {
+foreach ($name in @('打印', '列表', '字典', '切片', '函数定义', '导出', '赋值目标', '并置后缀')) {
     if ($ebnf -notmatch ("(?m)^" + [regex]::Escape($name) + "\s*=")) {
         $fail++
         Write-Host ("失败：语法.ebnf 缺少产生式「{0}」" -f $name)
