@@ -5205,6 +5205,7 @@ static VpWindowData* gVpWin = nullptr;struct PlayerWin {
     std::atomic<bool> stop{false};
     std::atomic<long long> presented{0};
     std::atomic<int> refreshRate{60};
+    bool keys[256] = {};
     bool closed = false;
     bool capture = false;
     int mdx = 0, mdy = 0;
@@ -5213,6 +5214,16 @@ static VpWindowData* gVpWin = nullptr;struct PlayerWin {
     unsigned glTex = 0;
 };
 static PlayerWin* gPlayer = nullptr;
+static void playerForceFocus(HWND hwnd) {
+    DWORD fg = GetWindowThreadProcessId(GetForegroundWindow(), nullptr);
+    DWORD me = GetCurrentThreadId();
+    if (fg && fg != me) AttachThreadInput(me, fg, TRUE);
+    BringWindowToTop(hwnd); SetActiveWindow(hwnd); SetForegroundWindow(hwnd); SetFocus(hwnd);
+    SwitchToThisWindow(hwnd, TRUE);
+    SetWindowPos(hwnd, HWND_TOPMOST, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE);
+    SetWindowPos(hwnd, HWND_NOTOPMOST, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE);
+    if (fg && fg != me) AttachThreadInput(me, fg, FALSE);
+}
 static LRESULT CALLBACK playerWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_ERASEBKGND) return 1;
     if (msg == WM_PAINT && gPlayer) {
@@ -5228,9 +5239,20 @@ static LRESULT CALLBACK playerWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         EndPaint(hwnd, &ps); return 0;
     }
     if (msg == WM_LBUTTONDOWN) {
-        if (gPlayer) { gPlayer->capture = true; SetCapture(hwnd); ShowCursor(FALSE); }
+        if (gPlayer) {
+            playerForceFocus(hwnd);
+            gPlayer->capture = true; SetCapture(hwnd); ShowCursor(FALSE);
+        }
         return 0;
     }
+    if (msg == WM_RBUTTONDOWN && gPlayer) {
+        gPlayer->capture = !gPlayer->capture;
+        if (gPlayer->capture) { SetCapture(hwnd); ShowCursor(FALSE); }
+        else { ReleaseCapture(); ShowCursor(TRUE); }
+        return 0;
+    }
+    if (msg == WM_KEYDOWN && wp < 256) gPlayer->keys[wp] = true;
+    if (msg == WM_KEYUP && wp < 256) gPlayer->keys[wp] = false;
     if (msg == WM_MOUSEMOVE && gPlayer && gPlayer->capture) {
         POINT p; GetCursorPos(&p);
         RECT r; GetWindowRect(hwnd, &r);
@@ -10981,7 +11003,9 @@ Interpreter::Interpreter() {
             nullptr, nullptr, inst, nullptr);
         if (!hwnd) { gPlayer = nullptr; throw WenError("运行时错误", line, 0, "玩家窗口创建失败"); }
         pw.hwnd = hwnd;
-        ShowWindow(hwnd, SW_SHOW); SetForegroundWindow(hwnd); SetFocus(hwnd);
+        ShowWindow(hwnd, SW_SHOW);
+        playerForceFocus(hwnd);
+        pw.capture = true; SetCapture(hwnd); ShowCursor(FALSE);
         std::thread presenter([&]() {
             HDC pdc = GetDC(hwnd);
             HDC sdc = GetDC(nullptr);
@@ -11068,7 +11092,7 @@ Interpreter::Interpreter() {
         vector<double> zbuf;
         long long frames = 0; double elapsed = 0;
         auto t0 = std::chrono::steady_clock::now();
-        while (!pw.closed && !(GetAsyncKeyState(VK_ESCAPE) & 0x8000)) {
+        while (!pw.closed && !(GetAsyncKeyState(VK_ESCAPE) & 0x8000) && !pw.keys[VK_ESCAPE]) {
             auto frameStart=std::chrono::steady_clock::now();
             MSG msg;
             while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
@@ -11081,12 +11105,13 @@ Interpreter::Interpreter() {
             PVec fwd{std::sin(yaw), 0, -std::cos(yaw)};
             PVec right{std::cos(yaw), 0, std::sin(yaw)};
             PVec want = cam;
-            if (GetAsyncKeyState('W') & 0x8000) want = padd(want, pmul(fwd, speed*0.016));
-            if (GetAsyncKeyState('S') & 0x8000) want = psub(want, pmul(fwd, speed*0.016));
-            if (GetAsyncKeyState('A') & 0x8000) want = psub(want, pmul(right, speed*0.016));
-            if (GetAsyncKeyState('D') & 0x8000) want = padd(want, pmul(right, speed*0.016));
-            if (GetAsyncKeyState(VK_SPACE) & 0x8000) want.y += speed*0.016;
-            if (GetAsyncKeyState(VK_SHIFT) & 0x8000) want.y = std::max(0.5, want.y-speed*0.016);
+            auto down = [&](int k) { return (GetAsyncKeyState(k) & 0x8000) || (k >= 0 && k < 256 && pw.keys[k]); };
+            if (down('W')) want = padd(want, pmul(fwd, speed*0.016));
+            if (down('S')) want = psub(want, pmul(fwd, speed*0.016));
+            if (down('A')) want = psub(want, pmul(right, speed*0.016));
+            if (down('D')) want = padd(want, pmul(right, speed*0.016));
+            if (down(VK_SPACE)) want.y += speed*0.016;
+            if (down(VK_SHIFT)) want.y = std::max(0.5, want.y-speed*0.016);
             auto blocked = [&](PVec p) {
                 for (const auto& b : boxes)
                     if (std::fabs(p.x-b.c.x) < b.s+0.35 && std::fabs(p.z-b.c.z) < b.s+0.35 &&
@@ -11164,6 +11189,8 @@ Interpreter::Interpreter() {
                 std::this_thread::sleep_for(std::chrono::duration<double,std::milli>(1000.0/240.0-frameMs));
         }
         pw.stop = true;
+        if (GetCapture() == hwnd) ReleaseCapture();
+        ShowCursor(TRUE);
         if (presenter.joinable()) presenter.join();
         DestroyWindow(hwnd); gPlayer = nullptr;
         auto d=std::make_shared<Dict>();
