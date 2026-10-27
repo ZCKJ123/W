@@ -15476,6 +15476,71 @@ static int runMain(vector<string> args) {
         std::cout << "文语言 0.1.0\n";
         return 0;
     }
+    if (cmd == "--帮助" || cmd == "-h" || cmd == "帮助") {
+        std::cout <<
+            "文语言 0.1.0\n"
+            "用法：\n"
+            "  wen.exe 文件.wen                 运行\n"
+            "  wen.exe --检查 文件.wen         只做词法/语法/静态检查\n"
+            "  wen.exe --查 关键词             在教程/规范/错误说明里找答案\n"
+            "  wen.exe --编译 文件.wen         编译成原生 exe\n"
+            "  wen.exe --翻译 文件.wen 目标    翻译（python/javascript/json/java/字节码/C++/汇编）\n"
+            "  wen.exe --验证                   自检\n"
+            "  wen.exe --帮助                   本页\n\n"
+            "先看：使用教程.md、使用规范.md、语法总表.md、破坏性变更.md\n"
+            "查错误：wen.exe --查 错误\n"
+            "查单位：wen.exe --查 查找\n";
+        return 0;
+    }
+    if (cmd == "--查" || cmd == "-s") {
+        if (args.size() < 3) {
+            std::cerr << "用法：wen.exe --查 关键词\n";
+            return 1;
+        }
+        string q;
+        for (size_t i = 2; i < args.size(); ++i) {
+            if (!q.empty()) q += " ";
+            q += args[i];
+        }
+        if (q == "错误" || q == "报错") {
+            std::cout << errorExplanation("词法错误") << "\n"
+                      << errorExplanation("语法错误") << "\n"
+                      << errorExplanation("静态错误") << "\n"
+                      << errorExplanation("运行时错误") << "\n";
+            return 0;
+        }
+        vector<fs::path> roots;
+        roots.push_back(fs::current_path());
+        fs::path exeDir = fs::path(args[0]).parent_path();
+        if (!exeDir.empty()) roots.push_back(exeDir);
+        vector<string> names = {"使用教程.md", "使用规范.md", "语法总表.md",
+                                "破坏性变更.md", "0.1/已知缺口.md", "README.md"};
+        std::set<string> seen;
+        int hits = 0;
+        for (const auto& root : roots) {
+            for (const auto& name : names) {
+                fs::path p = root / fs::u8path(name);
+                string key = p.u8string();
+                if (seen.count(key) || !fs::exists(p)) continue;
+                seen.insert(key);
+                std::ifstream in(p);
+                string line;
+                int n = 0;
+                while (std::getline(in, line)) {
+                    ++n;
+                    if (line.find(q) == string::npos) continue;
+                    std::cout << name << ":" << n << " | " << trimText(line) << "\n";
+                    if (++hits >= 30) break;
+                }
+                if (hits >= 30) break;
+            }
+        }
+        if (hits == 0) {
+            std::cout << "没找到「" << q << "」。先试：--查 错误、--查 查找、--查 负数\n";
+            return 1;
+        }
+        return 0;
+    }
     if (cmd == "--版本" || cmd == "-v") {
         std::cout << "文语言 v0.1 · 作者 Akm / 筑宸科技 · 2026-10-25 首次发布\n";
         std::cout << "版本: " << WEN_VERSION << "\n";
