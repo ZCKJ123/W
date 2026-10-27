@@ -6559,10 +6559,22 @@ struct StackEmitter {
                 break;
             }
             case Expr::K::Index:
-            case Expr::K::Slice:
+                expr(e->args[0]);
+                expr(e->args[1]);
+                emit("index", "", "INDEX");
+                break;
             case Expr::K::List:
+                for (const auto& a : e->args) expr(a);
+                emit("list", "\"n\":" + std::to_string(e->args.size()),
+                     "LIST " + std::to_string(e->args.size()));
+                break;
             case Expr::K::Dict:
-                diag(e->line, "字节码/汇编暂不支持列表/字典/下标/切片");
+                for (const auto& kv : e->pairs) { expr(kv.first); expr(kv.second); }
+                emit("dict", "\"n\":" + std::to_string(e->pairs.size()),
+                     "DICT " + std::to_string(e->pairs.size()));
+                break;
+            case Expr::K::Slice:
+                diag(e->line, "字节码/汇编暂不支持切片");
                 break;
         }
     }
@@ -8241,6 +8253,23 @@ Interpreter::Interpreter() {
                 Value b = pop(), aa = pop();
                 if (op == "and") stack.push_back(vBool(truthy(aa) && truthy(b)));
                 else stack.push_back(vBool(truthy(aa) || truthy(b)));
+            } else if (op == "list") {
+                int n = (int)needIndex(arg("n"), "字节码 list", line);
+                auto l = std::make_shared<List>();
+                l->items.resize((size_t)n);
+                for (int i = n - 1; i >= 0; --i) l->items[(size_t)i] = pop();
+                stack.push_back(vList(l));
+            } else if (op == "dict") {
+                int n = (int)needIndex(arg("n"), "字节码 dict", line);
+                auto d = std::make_shared<Dict>();
+                for (int i = n - 1; i >= 0; --i) {
+                    Value v = pop(), k = pop();
+                    d->items[toText(k)] = v;
+                }
+                stack.push_back(vDict(d));
+            } else if (op == "index") {
+                Value idx = pop(), obj = pop();
+                stack.push_back(getIndex(obj, idx, line));
             } else if (op == "call") {
                 string fname = needStr(arg("name"), "字节码 call", line);
                 int n = (int)needIndex(arg("n"), "字节码 call", line);
