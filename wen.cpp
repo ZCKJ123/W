@@ -3529,7 +3529,7 @@ static const std::map<string, string>& functionModules() {
         {"新建神经层", "神经网络库"}, {"神经链", "神经网络库"}, {"前向", "神经网络库"},
         {"颜色", "视口库"}, {"新建视口", "视口库"}, {"视口清空", "视口库"}, {"视口画点", "视口库"},
         {"视口画线", "视口库"}, {"视口画三角形", "视口库"}, {"视口尺寸", "视口库"}, {"视口保存", "视口库"},
-        {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"}, {"视口显示", "视口库"}, {"玩家视口", "视口库"}, {"视口加载模型", "视口库"}, {"光追渲染", "视口库"}, {"材质检查", "视口库"}, {"视口取色", "视口库"},
+        {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"}, {"视口显示", "视口库"}, {"玩家视口", "视口库"}, {"视口加载模型", "视口库"}, {"光追渲染", "视口库"}, {"材质检查", "视口库"}, {"材质预设", "视口库"}, {"视口取色", "视口库"},
         {"硬件信息", "硬件库"}, {"高精度计时", "硬件库"}, {"内存状态", "硬件库"}, {"屏幕尺寸", "硬件库"}, {"磁盘空间", "硬件库"},
         {"大整数幂", "大整数库"}, {"大整数乘", "大整数库"}, {"大整数加", "大整数库"}, {"大整数阶乘", "大整数库"},
         {"阶乘位数", "大整数库"}, {"阶乘末尾零", "大整数库"}, {"阶乘概览", "大整数库"},
@@ -10451,6 +10451,42 @@ Interpreter::Interpreter() {
         d->items["深度"] = vList(depth);
         return vDict(d);
     });
+    registerBuiltin("材质预设", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string name = needStr(a[0], "材质预设", line);
+        auto d = std::make_shared<Dict>();
+        if (name == "金") {
+            d->items["粗糙度"] = vNum(0.12); d->items["金属度"] = vNum(1.0);
+            d->items["颜色"] = vNum(0xD4AF37); d->items["纹理"] = vStr("无");
+        } else if (name == "银") {
+            d->items["粗糙度"] = vNum(0.08); d->items["金属度"] = vNum(1.0);
+            d->items["颜色"] = vNum(0xD8DDE2); d->items["纹理"] = vStr("无");
+        } else if (name == "铜") {
+            d->items["粗糙度"] = vNum(0.22); d->items["金属度"] = vNum(1.0);
+            d->items["颜色"] = vNum(0xB87333); d->items["纹理"] = vStr("无");
+        } else if (name == "玻璃") {
+            d->items["粗糙度"] = vNum(0.03); d->items["金属度"] = vNum(0.0);
+            d->items["折射率"] = vNum(1.5); d->items["透射"] = vNum(0.95);
+            d->items["颜色"] = vNum(0xF2FAFF); d->items["纹理"] = vStr("无");
+        } else if (name == "水") {
+            d->items["粗糙度"] = vNum(0.04); d->items["金属度"] = vNum(0.0);
+            d->items["折射率"] = vNum(1.33); d->items["透射"] = vNum(0.9);
+            d->items["颜色"] = vNum(0x2A6070); d->items["纹理"] = vStr("无");
+        } else if (name == "陶瓷") {
+            d->items["粗糙度"] = vNum(0.32); d->items["金属度"] = vNum(0.0);
+            d->items["清漆"] = vNum(0.7); d->items["颜色"] = vNum(0xF2EDE4);
+            d->items["纹理"] = vStr("无");
+        } else if (name == "橡胶") {
+            d->items["粗糙度"] = vNum(0.85); d->items["金属度"] = vNum(0.0);
+            d->items["颜色"] = vNum(0x222428); d->items["纹理"] = vStr("噪波");
+        } else if (name == "自发光") {
+            d->items["自发光"] = vNum(4.0); d->items["颜色"] = vNum(0x66CCFF);
+            d->items["粗糙度"] = vNum(0.5); d->items["金属度"] = vNum(0.0);
+        } else {
+            throw WenError("运行时错误", line, 0,
+                           "未知材质预设「" + name + "」；可用：金 银 铜 玻璃 水 陶瓷 橡胶 自发光");
+        }
+        return vDict(d);
+    });
     registerBuiltin("材质检查", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
         auto ml = needList(a[0], "材质检查", line);
         auto out = std::make_shared<List>();
@@ -10474,6 +10510,14 @@ Interpreter::Interpreter() {
             d->items["金属度"] = vNum(metal);
             d->items["折射率"] = vNum(ior);
             d->items["颜色"] = vNum((double)(color & 0xFFFFFF));
+            auto ti = md->items.find("纹理");
+            if (ti != md->items.end()) d->items["纹理"] = vStr(needStr(ti->second, "纹理", line));
+            auto ei = md->items.find("自发光");
+            if (ei != md->items.end()) d->items["自发光"] = vNum(needNum(ei->second, "自发光", line));
+            auto cl = md->items.find("清漆");
+            if (cl != md->items.end()) d->items["清漆"] = vNum(needNum(cl->second, "清漆", line));
+            auto tr = md->items.find("透射");
+            if (tr != md->items.end()) d->items["透射"] = vNum(needNum(tr->second, "透射", line));
             out->items.push_back(vDict(d));
         }
         return vList(out);
@@ -10490,7 +10534,7 @@ Interpreter::Interpreter() {
         int w = std::max(1, (int)(outW * scale));
         int h = std::max(1, (int)(outH * scale));
         samples = std::max(1, std::min(samples, 32));
-        struct PBR { double rough = 0.5, metal = 0.0, ior = 1.5; std::array<double,3> color{0.8,0.2,0.2}; };
+        struct PBR { double rough = 0.5, metal = 0.0, ior = 1.5; double emission = 0, clearcoat = 0, transmission = 0; string tex = "无"; std::array<double,3> color{0.8,0.2,0.2}; };
         std::vector<PBR> pbr(4);
         pbr[0].rough = 0.85; pbr[0].metal = 0.0; pbr[0].color = {0.82,0.20,0.18};
         pbr[1].rough = 0.18; pbr[1].metal = 0.9; pbr[1].color = {0.25,0.78,0.32};
@@ -10512,6 +10556,14 @@ Interpreter::Interpreter() {
                 if (ii != md->items.end()) pbr[i].ior = std::max(1.0, std::min(3.0, needNum(ii->second, "折射率", line)));
                 auto ci = md->items.find("颜色");
                 if (ci != md->items.end()) pbr[i].color = rgbOf(ci->second, line);
+                auto ti = md->items.find("纹理");
+                if (ti != md->items.end()) pbr[i].tex = needStr(ti->second, "纹理", line);
+                auto ei = md->items.find("自发光");
+                if (ei != md->items.end()) pbr[i].emission = std::max(0.0, std::min(20.0, needNum(ei->second, "自发光", line)));
+                auto cl = md->items.find("清漆");
+                if (cl != md->items.end()) pbr[i].clearcoat = std::max(0.0, std::min(1.0, needNum(cl->second, "清漆", line)));
+                auto tr = md->items.find("透射");
+                if (tr != md->items.end()) pbr[i].transmission = std::max(0.0, std::min(1.0, needNum(tr->second, "透射", line)));
             }
         }
         auto buf = std::make_shared<std::vector<unsigned char>>((size_t)w * h * 3);
@@ -10602,6 +10654,21 @@ Interpreter::Interpreter() {
                 albedo = check ? std::array<double,3>{0.75,0.80,0.78}
                                : std::array<double,3>{0.16,0.26,0.30};
             }
+            if (pbr[mi].emission > 0)
+                return std::array<double,3>{pbr[mi].color[0]*pbr[mi].emission,
+                                            pbr[mi].color[1]*pbr[mi].emission,
+                                            pbr[mi].color[2]*pbr[mi].emission};
+            if (pbr[mi].tex == "棋盘") {
+                int ck = ((int)std::floor(h.p[0]*8) + (int)std::floor(h.p[1]*8) + (int)std::floor(h.p[2]*8)) & 1;
+                if (ck) { albedo[0]*=0.45; albedo[1]*=0.45; albedo[2]*=0.45; }
+            } else if (pbr[mi].tex == "条纹") {
+                double s = 0.55 + 0.45 * std::sin(h.p[1]*18.0);
+                albedo[0]*=s; albedo[1]*=s; albedo[2]*=s;
+            } else if (pbr[mi].tex == "噪波") {
+                double n = std::sin(h.p[0]*31.0 + h.p[1]*17.0 + h.p[2]*23.0);
+                double s = 0.7 + 0.3*n*n;
+                albedo[0]*=s; albedo[1]*=s; albedo[2]*=s;
+            }
             std::array<double,3> out{0,0,0};
             if (kind == 0 || kind == 1) {
                 auto direct = sampleLight(h.p, h.n, albedo);
@@ -10652,6 +10719,14 @@ Interpreter::Interpreter() {
                     auto refl = radiance({h.p[0]+h.n[0]*1e-3, h.p[1]+h.n[1]*1e-3, h.p[2]+h.n[2]*1e-3}, dir, depth-1);
                     out[0] += fr*refl[0]; out[1] += fr*refl[1]; out[2] += fr*refl[2];
                 }
+            }
+            if (pbr[mi].clearcoat > 0.01 && depth > 0) {
+                double dot = d[0]*h.n[0] + d[1]*h.n[1] + d[2]*h.n[2];
+                auto rc = norm({d[0]-2*dot*h.n[0], d[1]-2*dot*h.n[1], d[2]-2*dot*h.n[2]});
+                auto cc = radiance({h.p[0]+h.n[0]*1e-3, h.p[1]+h.n[1]*1e-3, h.p[2]+h.n[2]*1e-3}, rc, depth-1);
+                out[0] = out[0]*(1-pbr[mi].clearcoat) + cc[0]*pbr[mi].clearcoat;
+                out[1] = out[1]*(1-pbr[mi].clearcoat) + cc[1]*pbr[mi].clearcoat;
+                out[2] = out[2]*(1-pbr[mi].clearcoat) + cc[2]*pbr[mi].clearcoat;
             }
             if (kind == 0) {
                 std::array<double,3> dir2{ (rnd()*2-1), (rnd()*2-1), (rnd()*2-1) };
