@@ -22,7 +22,7 @@
   "wen": {
     "official": true,
     "signature": "WEN-LANG-0.2",
-    "version": "0.2.0"
+    "version": "0.2.0-snapshot"
   },
   "dsh": {
     "bundle": {

@@ -44,7 +44,7 @@
 #include <io.h>
 
 // 源码自带标签：任何二进制都能用 --签名 打印出来。
-static const char* WEN_VERSION = "0.2.0";
+static const char* WEN_VERSION = "0.2.0-snapshot";
 static const char* WEN_SIGNATURE =
     "文语言（wen） · 内置签名 WEN-LANG-0.2 · 2026 · 作者 Akm / 筑宸科技";
 static std::string openWenWorkbench(const std::string& title, const std::string& initial, int line);
@@ -7761,6 +7761,15 @@ static void bigGuard(long double digits, int line = 0) {
     throw WenError("运行时错误", line, 0, "大整数参数需要数字或文本");
 }
 
+static Value uiNew(Interpreter&, vector<Value>& a, int line);
+static Value uiClear(Interpreter&, vector<Value>& a, int line);
+static Value uiRect(Interpreter&, vector<Value>& a, int line);
+static Value uiLine(Interpreter&, vector<Value>& a, int line);
+static Value uiText(Interpreter&, vector<Value>& a, int line);
+static Value uiRefresh(Interpreter&, vector<Value>& a, int line);
+static Value uiEvent(Interpreter&, vector<Value>& a, int line);
+static Value uiClose(Interpreter&, vector<Value>& a, int line);
+
 Interpreter::Interpreter() {
     globals = std::make_shared<Scope>();
     globals->set("圆周率", vNum(piValue()));
@@ -7772,6 +7781,14 @@ Interpreter::Interpreter() {
         string initial = a.size() >= 2 ? needStr(a[1], "工作台", line) : "";
         return vStr(openWenWorkbench(title, initial, line));
     });
+    registerBuiltin("界面新建", 3, 3, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return uiNew(vm, a, line); });
+    registerBuiltin("界面清屏", 1, 1, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return uiClear(vm, a, line); });
+    registerBuiltin("界面矩形", 5, 5, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return uiRect(vm, a, line); });
+    registerBuiltin("界面线", 5, 5, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return uiLine(vm, a, line); });
+    registerBuiltin("界面文本", 4, 5, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return uiText(vm, a, line); });
+    registerBuiltin("界面刷新", 0, 0, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return uiRefresh(vm, a, line); });
+    registerBuiltin("界面事件", 0, 0, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return uiEvent(vm, a, line); });
+    registerBuiltin("界面关闭", 0, 0, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return uiClose(vm, a, line); });
 
     // ---------- 核心（不需要依赖）---------
     registerBuiltin("调用", 2, 2, [](Interpreter& vm, vector<Value>& a, int line) -> Value {
@@ -15697,6 +15714,238 @@ static string openWenWorkbench(const string&, const string&, int line) {
 }
 #endif
 
+#ifdef _WIN32
+struct WenUiText { int x, y, color, size; std::wstring text; };
+struct WenUiEvent { string type, value; };
+struct WenUiState {
+    HWND hwnd = nullptr;
+    int w = 0, h = 0;
+    vector<unsigned char> bgr;
+    vector<WenUiText> texts;
+    std::deque<WenUiEvent> events;
+    bool closed = false;
+};
+static WenUiState gUi;
+
+static LRESULT CALLBACK uiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC dc = BeginPaint(hwnd, &ps);
+            if (!gUi.bgr.empty()) {
+                BITMAPINFO bi{};
+                bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                bi.bmiHeader.biWidth = gUi.w;
+                bi.bmiHeader.biHeight = -gUi.h;
+                bi.bmiHeader.biPlanes = 1;
+                bi.bmiHeader.biBitCount = 24;
+                bi.bmiHeader.biCompression = BI_RGB;
+                SetDIBitsToDevice(dc, 0, 0, gUi.w, gUi.h, 0, 0, 0, gUi.h,
+                                  gUi.bgr.data(), &bi, DIB_RGB_COLORS);
+            }
+            SetBkMode(dc, TRANSPARENT);
+            for (const auto& t : gUi.texts) {
+                HFONT font = CreateFontW(-t.size, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                    DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
+                HFONT old = (HFONT)SelectObject(dc, font);
+                SetTextColor(dc, RGB((t.color >> 16) & 255, (t.color >> 8) & 255, t.color & 255));
+                TextOutW(dc, t.x, t.y, t.text.c_str(), (int)t.text.size());
+                SelectObject(dc, old);
+                DeleteObject(font);
+            }
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        case WM_CHAR: {
+            wchar_t ch = (wchar_t)wp;
+            if (ch == L'\r') ch = L'\n';
+            if (ch == L'\b') gUi.events.push_back({"按键", "退格"});
+            else if (ch >= 32 || ch == L'\n') {
+                std::wstring one(1, ch);
+                gUi.events.push_back({"字符", wideToUtf8(one)});
+            }
+            return 0;
+        }
+        case WM_KEYDOWN:
+            if (wp == VK_BACK) gUi.events.push_back({"按键", "退格"});
+            else if (wp == VK_RETURN) gUi.events.push_back({"字符", "\n"});
+            else if (wp == VK_LEFT) gUi.events.push_back({"按键", "左"});
+            else if (wp == VK_RIGHT) gUi.events.push_back({"按键", "右"});
+            else if (wp == VK_UP) gUi.events.push_back({"按键", "上"});
+            else if (wp == VK_DOWN) gUi.events.push_back({"按键", "下"});
+            else if (wp == VK_ESCAPE) gUi.events.push_back({"关闭", ""});
+            else if ((GetKeyState(VK_CONTROL) & 0x8000) && wp == 'S')
+                gUi.events.push_back({"按键", "保存"});
+            return 0;
+        case WM_CLOSE:
+            gUi.events.push_back({"关闭", ""});
+            gUi.closed = true;
+            DestroyWindow(hwnd);
+            return 0;
+        case WM_DESTROY:
+            PostQuitMessage(0);
+            return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static Value uiNew(Interpreter&, vector<Value>& a, int line) {
+    if (gUi.hwnd) { DestroyWindow(gUi.hwnd); gUi = WenUiState{}; }
+    gUi.w = std::max(200, (int)needNum(a[0], "界面新建", line));
+    gUi.h = std::max(200, (int)needNum(a[1], "界面新建", line));
+    gUi.bgr.assign((size_t)gUi.w * gUi.h * 3, 0);
+    static bool reg = false;
+    HINSTANCE inst = GetModuleHandleW(nullptr);
+    if (!reg) {
+        WNDCLASSW wc{};
+        wc.lpfnWndProc = uiWndProc;
+        wc.hInstance = inst;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        wc.lpszClassName = L"WenUiWindow";
+        if (!RegisterClassW(&wc)) throw WenError("运行时错误", line, 0, "界面窗口注册失败");
+        reg = true;
+    }
+    std::wstring title = utf8ToWide(needStr(a[2], "界面新建", line));
+    RECT rc{0, 0, gUi.w, gUi.h};
+    AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
+    gUi.hwnd = CreateWindowExW(0, L"WenUiWindow", title.c_str(), WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top,
+        nullptr, nullptr, inst, nullptr);
+    if (!gUi.hwnd) throw WenError("运行时错误", line, 0, "界面窗口创建失败");
+    SetFocus(gUi.hwnd);
+    return vBool(true);
+}
+static Value uiClear(Interpreter&, vector<Value>& a, int line) {
+    int c = vpColor(a[0], line);
+    for (size_t i = 0; i < gUi.bgr.size(); i += 3) {
+        gUi.bgr[i] = (unsigned char)(c & 255);
+        gUi.bgr[i + 1] = (unsigned char)((c >> 8) & 255);
+        gUi.bgr[i + 2] = (unsigned char)((c >> 16) & 255);
+    }
+    gUi.texts.clear();
+    return vNone();
+}
+static Value uiRect(Interpreter&, vector<Value>& a, int line) {
+    int x = (int)needNum(a[0], "界面矩形", line), y = (int)needNum(a[1], "界面矩形", line);
+    int w = (int)needNum(a[2], "界面矩形", line), h = (int)needNum(a[3], "界面矩形", line);
+    int c = vpColor(a[4], line);
+    for (int yy = std::max(0, y); yy < std::min(gUi.h, y + h); ++yy)
+        for (int xx = std::max(0, x); xx < std::min(gUi.w, x + w); ++xx) {
+            size_t i = ((size_t)yy * gUi.w + xx) * 3;
+            gUi.bgr[i] = (unsigned char)(c & 255);
+            gUi.bgr[i + 1] = (unsigned char)((c >> 8) & 255);
+            gUi.bgr[i + 2] = (unsigned char)((c >> 16) & 255);
+        }
+    return vNone();
+}
+static Value uiLine(Interpreter&, vector<Value>& a, int line) {
+    int x0 = (int)needNum(a[0], "界面线", line), y0 = (int)needNum(a[1], "界面线", line);
+    int x1 = (int)needNum(a[2], "界面线", line), y1 = (int)needNum(a[3], "界面线", line);
+    int c = vpColor(a[4], line);
+    int dx = std::abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -std::abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    while (true) {
+        if (x0 >= 0 && y0 >= 0 && x0 < gUi.w && y0 < gUi.h) {
+            size_t i = ((size_t)y0 * gUi.w + x0) * 3;
+            gUi.bgr[i] = (unsigned char)(c & 255);
+            gUi.bgr[i + 1] = (unsigned char)((c >> 8) & 255);
+            gUi.bgr[i + 2] = (unsigned char)((c >> 16) & 255);
+        }
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+    return vNone();
+}
+static Value uiText(Interpreter&, vector<Value>& a, int line) {
+    WenUiText t;
+    t.x = (int)needNum(a[0], "界面文本", line);
+    t.y = (int)needNum(a[1], "界面文本", line);
+    t.text = utf8ToWide(needStr(a[2], "界面文本", line));
+    t.color = vpColor(a[3], line);
+    t.size = a.size() >= 5 ? (int)needNum(a[4], "界面文本", line) : 18;
+    gUi.texts.push_back(std::move(t));
+    return vNone();
+}
+static Value uiRefresh(Interpreter&, vector<Value>&, int line) {
+    if (!gUi.hwnd) throw WenError("运行时错误", line, 0, "界面还没有打开");
+    InvalidateRect(gUi.hwnd, nullptr, TRUE);
+    UpdateWindow(gUi.hwnd);
+    return vNone();
+}
+static Value uiEvent(Interpreter&, vector<Value>&, int line) {
+    if (!gUi.hwnd && gUi.events.empty())
+        return vDict(std::make_shared<Dict>());
+    MSG msg{};
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+        if (!gUi.events.empty()) break;
+    }
+    if (gUi.events.empty()) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    auto d = std::make_shared<Dict>();
+    if (gUi.events.empty()) {
+        d->items["类型"] = vStr("无");
+        d->items["值"] = vStr("");
+    } else {
+        auto e = gUi.events.front();
+        gUi.events.pop_front();
+        d->items["类型"] = vStr(e.type);
+        d->items["值"] = vStr(e.value);
+    }
+    return vDict(d);
+}
+static Value uiClose(Interpreter&, vector<Value>&, int) {
+    if (gUi.hwnd) { DestroyWindow(gUi.hwnd); gUi = WenUiState{}; }
+    return vNone();
+}
+#else
+static Value uiNew(Interpreter&, vector<Value>&, int line) { throw WenError("运行时错误", line, 0, "界面只支持 Windows"); }
+static Value uiClear(Interpreter&, vector<Value>&, int) { return vNone(); }
+static Value uiRect(Interpreter&, vector<Value>& a, int line) {
+    int x = (int)needNum(a[0], "界面矩形", line), y = (int)needNum(a[1], "界面矩形", line);
+    int w = (int)needNum(a[2], "界面矩形", line), h = (int)needNum(a[3], "界面矩形", line);
+    int c = vpColor(a[4], line);
+    for (int yy = std::max(0, y); yy < std::min(gUi.h, y + h); ++yy)
+        for (int xx = std::max(0, x); xx < std::min(gUi.w, x + w); ++xx) {
+            size_t i = ((size_t)yy * gUi.w + xx) * 3;
+            gUi.bgr[i] = (unsigned char)(c & 255);
+            gUi.bgr[i + 1] = (unsigned char)((c >> 8) & 255);
+            gUi.bgr[i + 2] = (unsigned char)((c >> 16) & 255);
+        }
+    return vNone();
+}
+static Value uiLine(Interpreter&, vector<Value>& a, int line) {
+    int x0 = (int)needNum(a[0], "界面线", line), y0 = (int)needNum(a[1], "界面线", line);
+    int x1 = (int)needNum(a[2], "界面线", line), y1 = (int)needNum(a[3], "界面线", line);
+    int c = vpColor(a[4], line);
+    int dx = std::abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -std::abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    while (true) {
+        if (x0 >= 0 && y0 >= 0 && x0 < gUi.w && y0 < gUi.h) {
+            size_t i = ((size_t)y0 * gUi.w + x0) * 3;
+            gUi.bgr[i] = (unsigned char)(c & 255);
+            gUi.bgr[i + 1] = (unsigned char)((c >> 8) & 255);
+            gUi.bgr[i + 2] = (unsigned char)((c >> 16) & 255);
+        }
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+    return vNone();
+}
+static Value uiText(Interpreter&, vector<Value>&, int) { return vNone(); }
+static Value uiRefresh(Interpreter&, vector<Value>&, int) { return vNone(); }
+static Value uiEvent(Interpreter&, vector<Value>&, int) { return vDict(std::make_shared<Dict>()); }
+static Value uiClose(Interpreter&, vector<Value>&, int) { return vNone(); }
+#endif
+
 static int runMain(vector<string> args) {
     if (args.size() > 1 && args[1] == "--不快") { gNoFast = true; args.erase(args.begin() + 1); }
     if (args.size() >= 3 && args[1] == "--大整数上限") {
@@ -15736,12 +15985,12 @@ static int runMain(vector<string> args) {
         if (a == "--json" || a == "--诊断JSON") gJsonDiagnostics = true;
     }
     if (cmd == "--快照版本") {
-        std::cout << "文语言 0.2.0\n";
+        std::cout << "文语言 0.2.0-snapshot\n";
         return 0;
     }
     if (cmd == "--帮助" || cmd == "-h" || cmd == "帮助") {
         std::cout <<
-            "文语言 0.2.0\n"
+            "文语言 0.2.0-snapshot\n"
             "用法：\n"
             "  wen.exe 文件.wen                 运行\n"
             "  wen.exe --检查 文件.wen         只做词法/语法/静态检查\n"
