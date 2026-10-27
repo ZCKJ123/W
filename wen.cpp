@@ -4602,7 +4602,7 @@ Value Interpreter::eval(const ExprPtr& e, shared_ptr<Scope> scope) {
             for (const auto& p : e->pairs) {
                 Value k = eval(p.first, scope);
                 if (k.type != VT::Str)
-                    rtError(e->line, "字典的键必须是文本（C++ 版 v0.1 限制）");
+                    rtError(e->line, "字典的键必须是文本（C++ 版 v0.2 限制）");
                 d->items[k.str] = eval(p.second, scope);
             }
             return vDict(d);
@@ -14978,7 +14978,7 @@ static void printEngineError(const std::exception& e, const string& context) {
 }
 
 static void repl(Interpreter& vm) {
-    std::cout << "=== 「文」语言 C++ 版 v0.1 ===\n";
+    std::cout << "=== 「文」语言 C++ 版 v0.2 ===\n";
     std::cout << "输入「退出」离开；多行块会自动续行。\n\n";
     string buffer;
     while (true) {
@@ -15621,7 +15621,7 @@ static LRESULT CALLBACK workbenchProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 WS_CHILD | WS_VISIBLE, 116, 8, 80, 26, h, (HMENU)1003, nullptr, nullptr);
             CreateWindowExW(0, L"BUTTON", L"关闭",
                 WS_CHILD | WS_VISIBLE, 204, 8, 80, 26, h, (HMENU)1004, nullptr, nullptr);
-            st->status = CreateWindowExW(0, L"STATIC", L"在这里写文代码；Ctrl+S 保存",
+            st->status = CreateWindowExW(0, L"STATIC", L"在这里写文代码；用上方按钮保存 / 运行",
                 WS_CHILD | WS_VISIBLE, 300, 12, 480, 22, h, (HMENU)1005, nullptr, nullptr);
             HFONT font = CreateFontW(-18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                 DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,

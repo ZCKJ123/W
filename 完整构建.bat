@@ -1,4 +1,4 @@
-@echo off
+﻿@echo off
 chcp 65001 >nul
 setlocal
 set "PATH=C:\msys64\ucrt64\bin;%PATH%"
@@ -15,4 +15,4 @@ if errorlevel 1 (
     echo 32 位构建失败。
     exit /b 1
 )
-echo 文语言 WEN-LANG-0.1（64 位 + 32 位）
+echo 文语言 WEN-LANG-0.2（64 位 + 32 位）

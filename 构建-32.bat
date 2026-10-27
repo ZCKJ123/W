@@ -13,4 +13,4 @@ if errorlevel 1 (
     exit /b 1
 )
 echo 32 位构建成功：wen32.exe
-echo 文语言 WEN-LANG-0.1
+echo 文语言 WEN-LANG-0.2

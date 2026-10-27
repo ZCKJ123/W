@@ -10,4 +10,4 @@ if errorlevel 1 (
     exit /b 1
 )
 echo 构建成功：wen.exe
-echo 文语言 WEN-LANG-0.1
+echo 文语言 WEN-LANG-0.2
