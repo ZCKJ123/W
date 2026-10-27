@@ -11,6 +11,7 @@
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <complex>
 #include <cstdint>
 #include <ctime>
 #include <cstdio>
@@ -3468,6 +3469,9 @@ static const std::map<string, string>& functionModules() {
         {"二次函数", "数学库"}, {"多项式求值", "数学库"},
         {"二元二次求值", "数学库"}, {"解二元一次方程组", "数学库"},
         {"解线性方程组", "数学库"},
+        {"复数", "复数库"}, {"实部", "复数库"}, {"虚部", "复数库"},
+        {"复数加", "复数库"}, {"复数减", "复数库"}, {"复数乘", "复数库"}, {"复数除", "复数库"},
+        {"复数共轭", "复数库"}, {"复数模", "复数库"}, {"复数平方根", "复数库"}, {"复数幂", "复数库"}, {"复数文本", "复数库"},
 
         // 图形库
         {"圆面积", "图形库"}, {"圆周长", "图形库"}, {"球体积", "图形库"},
@@ -7861,6 +7865,28 @@ static Value uiEvent(Interpreter&, vector<Value>& a, int line);
 static Value uiClose(Interpreter&, vector<Value>& a, int line);
 static Value uiSize(Interpreter&, vector<Value>& a, int line);
 
+static std::complex<double> needComplex(const Value& v, int line) {
+    auto d = needDict(v, "复数", line);
+    auto ri = d->items.find("实");
+    auto ii = d->items.find("虚");
+    if (ri == d->items.end() || ii == d->items.end())
+        throw WenError("运行时错误", line, 0, "不是复数对象");
+    return {needNum(ri->second, "复数实部", line), needNum(ii->second, "复数虚部", line)};
+}
+static Value vComplex(const std::complex<double>& z) {
+    auto d = std::make_shared<Dict>();
+    d->items["实"] = vNum(z.real());
+    d->items["虚"] = vNum(z.imag());
+    return vDict(d);
+}
+static string complexText(const std::complex<double>& z) {
+    string r = numberToString(z.real());
+    string i = numberToString(std::fabs(z.imag()));
+    if (std::fabs(z.imag()) < 1e-15) return r;
+    if (std::fabs(z.real()) < 1e-15) return (z.imag() < 0 ? "-" : "") + i + "i";
+    return r + (z.imag() < 0 ? "-" : "+") + i + "i";
+}
+
 Interpreter::Interpreter() {
     globals = std::make_shared<Scope>();
     globals->set("圆周率", vNum(piValue()));
@@ -11583,6 +11609,48 @@ Interpreter::Interpreter() {
         double sum = 0;
         for (const auto& v : l->items) sum += needNum(v, "平均数", line);
         return vNum(sum / (double)l->items.size());
+    });
+    registerBuiltin("复数", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        double re = needNum(a[0], "复数", line);
+        double im = a.size() >= 2 ? needNum(a[1], "复数", line) : 0;
+        return vComplex({re, im});
+    });
+    registerBuiltin("实部", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        return vNum(needComplex(a[0], line).real());
+    });
+    registerBuiltin("虚部", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        return vNum(needComplex(a[0], line).imag());
+    });
+    registerBuiltin("复数加", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        return vComplex(needComplex(a[0], line) + needComplex(a[1], line));
+    });
+    registerBuiltin("复数减", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        return vComplex(needComplex(a[0], line) - needComplex(a[1], line));
+    });
+    registerBuiltin("复数乘", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        return vComplex(needComplex(a[0], line) * needComplex(a[1], line));
+    });
+    registerBuiltin("复数除", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto z = needComplex(a[1], line);
+        if (std::fabs(z.real()) < 1e-15 && std::fabs(z.imag()) < 1e-15)
+            throw WenError("运行时错误", line, 0, "复数除数不能是 0");
+        return vComplex(needComplex(a[0], line) / z);
+    });
+    registerBuiltin("复数共轭", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        return vComplex(std::conj(needComplex(a[0], line)));
+    });
+    registerBuiltin("复数模", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        return vNum(std::abs(needComplex(a[0], line)));
+    });
+    registerBuiltin("复数平方根", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        return vComplex(std::sqrt(needComplex(a[0], line)));
+    });
+    registerBuiltin("复数幂", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long n = needIndex(a[1], "复数幂", line);
+        return vComplex(std::pow(needComplex(a[0], line), (double)n));
+    });
+    registerBuiltin("复数文本", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        return vStr(complexText(needComplex(a[0], line)));
     });
     registerBuiltin("中位数", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
         auto l = needList(a[0], "中位数", line);
