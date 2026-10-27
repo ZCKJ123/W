@@ -32,6 +32,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <future>
 #include <vector>
 
 #ifdef _WIN32
@@ -7371,11 +7372,18 @@ static vector<uint32_t> bigFactorialPrime(uint32_t n) {
     }
     return bigProductList(factors, 0, factors.size());
 }
-static vector<uint32_t> bigProductRange(uint32_t l, uint32_t r) {
+static vector<uint32_t> bigProductRange(uint32_t l, uint32_t r, int depth = 0) {
     if (l > r) return {1};
     if (l == r) return bigFromU64(l);
     uint32_t m = l + (r - l) / 2;
-    return bigMul(bigProductRange(l, m), bigProductRange(m + 1, r));
+    if (depth < 2 && r - l >= 20000 && std::thread::hardware_concurrency() > 1) {
+        auto left = std::async(std::launch::async, [l, m, depth] {
+            return bigProductRange(l, m, depth + 1);
+        });
+        auto right = bigProductRange(m + 1, r, depth + 1);
+        return bigMul(left.get(), right);
+    }
+    return bigMul(bigProductRange(l, m, depth + 1), bigProductRange(m + 1, r, depth + 1));
 }
 static vector<uint32_t> bigPow(vector<uint32_t> base, long long exp) {
     vector<uint32_t> out{1};
