@@ -12,6 +12,9 @@
 #include <chrono>
 #include <cmath>
 #include <complex>
+#ifdef _WIN32
+#include <GL/gl.h>
+#endif
 #include <cstdint>
 #include <ctime>
 #include <cstdio>
@@ -3526,7 +3529,7 @@ static const std::map<string, string>& functionModules() {
         {"新建神经层", "神经网络库"}, {"神经链", "神经网络库"}, {"前向", "神经网络库"},
         {"颜色", "视口库"}, {"新建视口", "视口库"}, {"视口清空", "视口库"}, {"视口画点", "视口库"},
         {"视口画线", "视口库"}, {"视口画三角形", "视口库"}, {"视口尺寸", "视口库"}, {"视口保存", "视口库"},
-        {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"}, {"视口显示", "视口库"}, {"视口加载模型", "视口库"}, {"光追渲染", "视口库"}, {"视口取色", "视口库"},
+        {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"}, {"视口显示", "视口库"}, {"玩家视口", "视口库"}, {"视口加载模型", "视口库"}, {"光追渲染", "视口库"}, {"视口取色", "视口库"},
         {"硬件信息", "硬件库"}, {"高精度计时", "硬件库"}, {"内存状态", "硬件库"}, {"屏幕尺寸", "硬件库"}, {"磁盘空间", "硬件库"},
         {"大整数幂", "大整数库"}, {"大整数乘", "大整数库"}, {"大整数加", "大整数库"}, {"大整数阶乘", "大整数库"},
         {"阶乘位数", "大整数库"}, {"阶乘末尾零", "大整数库"}, {"阶乘概览", "大整数库"},
@@ -5193,7 +5196,65 @@ static void writeFixed(vector<unsigned char>& b, size_t off, int width, uint64_t
 }
 #ifdef _WIN32
 struct VpWindowData { int w; int h; std::vector<unsigned char> bgr; };
-static VpWindowData* gVpWin = nullptr;
+static VpWindowData* gVpWin = nullptr;struct PlayerWin {
+    HWND hwnd = nullptr;
+    int w = 0, h = 0;
+    vector<unsigned char> bgr;
+    bool closed = false;
+    bool capture = false;
+    int mdx = 0, mdy = 0;
+    HDC glDC = nullptr;
+    HGLRC glRC = nullptr;
+    unsigned glTex = 0;
+};
+static PlayerWin* gPlayer = nullptr;
+static LRESULT CALLBACK playerWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_ERASEBKGND) return 1;
+    if (msg == WM_PAINT && gPlayer) {
+        if (gPlayer->glRC) { ValidateRect(hwnd, nullptr); return 0; }
+        PAINTSTRUCT ps; HDC dc = BeginPaint(hwnd, &ps);
+        if (!gPlayer->bgr.empty()) {
+            BITMAPINFO bi{}; bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            bi.bmiHeader.biWidth = gPlayer->w; bi.bmiHeader.biHeight = -gPlayer->h;
+            bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 24; bi.bmiHeader.biCompression = BI_RGB;
+            SetDIBitsToDevice(dc, 0, 0, gPlayer->w, gPlayer->h, 0, 0, 0, gPlayer->h,
+                              gPlayer->bgr.data(), &bi, DIB_RGB_COLORS);
+        }
+        EndPaint(hwnd, &ps); return 0;
+    }
+    if (msg == WM_LBUTTONDOWN) {
+        if (gPlayer) { gPlayer->capture = true; SetCapture(hwnd); ShowCursor(FALSE); }
+        return 0;
+    }
+    if (msg == WM_MOUSEMOVE && gPlayer && gPlayer->capture) {
+        POINT p; GetCursorPos(&p);
+        RECT r; GetWindowRect(hwnd, &r);
+        int cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2;
+        gPlayer->mdx += p.x - cx; gPlayer->mdy += p.y - cy;
+        SetCursorPos(cx, cy);
+        return 0;
+    }
+    if (msg == WM_KEYDOWN && wp == VK_ESCAPE && gPlayer) { gPlayer->closed = true; return 0; }
+    if (msg == WM_CLOSE && gPlayer) { gPlayer->closed = true; return 0; }
+    if (msg == WM_DESTROY) { PostQuitMessage(0); return 0; }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+struct PVec { double x, y, z; };
+static PVec pv(double x, double y, double z) { return {x,y,z}; }
+static PVec padd(PVec a, PVec b) { return {a.x+b.x,a.y+b.y,a.z+b.z}; }
+static PVec psub(PVec a, PVec b) { return {a.x-b.x,a.y-b.y,a.z-b.z}; }
+static PVec pmul(PVec a, double k) { return {a.x*k,a.y*k,a.z*k}; }
+static double pdot(PVec a, PVec b) { return a.x*b.x+a.y*b.y+a.z*b.z; }
+static PVec pcross(PVec a, PVec b) { return {a.y*b.z-a.z*b.y, a.z*b.x-a.x*b.z, a.x*b.y-a.y*b.x}; }
+static PVec pnorm(PVec a) { double l=std::sqrt(pdot(a,a)); return l<1e-9?pv(0,1,0):pmul(a,1/l); }
+struct PTri { PVec a,b,c; unsigned color; };
+static void addCube(vector<PTri>& out, PVec c, double s, unsigned col) {
+    auto v=[&](double x,double y,double z){return pv(c.x+x*s,c.y+y*s,c.z+z*s);};
+    PVec p[8]={v(-1,-1,-1),v(1,-1,-1),v(1,1,-1),v(-1,1,-1),v(-1,-1,1),v(1,-1,1),v(1,1,1),v(-1,1,1)};
+    int f[6][4]={{0,1,2,3},{4,5,6,7},{0,1,5,4},{2,3,7,6},{0,3,7,4},{1,2,6,5}};
+    for(auto& q:f){ out.push_back({p[q[0]],p[q[1]],p[q[2]],col}); out.push_back({p[q[0]],p[q[2]],p[q[3]],col}); }
+}
+
 static LRESULT CALLBACK vpWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_PAINT && gVpWin) {
         PAINTSTRUCT ps;
@@ -10745,6 +10806,183 @@ Interpreter::Interpreter() {
             vpPut(d,x,y,(r<<16)|(g<<8)|b);
         }
         return a[0];
+    });
+    registerBuiltin("玩家视口", 2, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
+#ifdef _WIN32
+        int w = std::max(320, std::min(1280, (int)needNum(a[0], "玩家视口", line)));
+        int h = std::max(180, std::min(720, (int)needNum(a[1], "玩家视口", line)));
+        std::wstring title = utf8ToWide(a.size() >= 3 ? needStr(a[2], "玩家视口", line) : "玩家视角");
+        static bool reg = false;
+        HINSTANCE inst = GetModuleHandleW(nullptr);
+        if (!reg) {
+            WNDCLASSW wc{}; wc.lpfnWndProc = playerWndProc; wc.hInstance = inst;
+            wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); wc.hbrBackground = nullptr;
+            wc.lpszClassName = L"WenPlayerWindow";
+            if (!RegisterClassW(&wc)) throw WenError("运行时错误", line, 0, "玩家窗口注册失败");
+            reg = true;
+        }
+        PlayerWin pw; pw.w = w; pw.h = h; pw.bgr.assign((size_t)w*h*3, 0);
+        gPlayer = &pw;
+        RECT rc{0,0,w,h}; AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
+        HWND hwnd = CreateWindowExW(0, L"WenPlayerWindow", title.c_str(), WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            CW_USEDEFAULT, CW_USEDEFAULT, rc.right-rc.left, rc.bottom-rc.top,
+            nullptr, nullptr, inst, nullptr);
+        if (!hwnd) { gPlayer = nullptr; throw WenError("运行时错误", line, 0, "玩家窗口创建失败"); }
+        pw.hwnd = hwnd;
+        HDC gdc = GetDC(hwnd);
+        PIXELFORMATDESCRIPTOR pfd{};
+        pfd.nSize = sizeof(pfd); pfd.nVersion = 1;
+        pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
+        pfd.iPixelType = PFD_TYPE_RGBA; pfd.cColorBits = 24; pfd.iLayerType = PFD_MAIN_PLANE;
+        int pf = ChoosePixelFormat(gdc, &pfd);
+        if (pf && SetPixelFormat(gdc, pf, &pfd)) {
+            pw.glRC = wglCreateContext(gdc);
+            if (pw.glRC && wglMakeCurrent(gdc, pw.glRC)) {
+                pw.glDC = gdc;
+                auto swapInt = (BOOL (WINAPI*)(int))wglGetProcAddress("wglSwapIntervalEXT");
+                if (swapInt) swapInt(0);
+                glGenTextures(1, &pw.glTex);
+                glBindTexture(GL_TEXTURE_2D, pw.glTex);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_BGR_EXT, GL_UNSIGNED_BYTE, pw.bgr.data());
+            } else { if (pw.glRC) { wglDeleteContext(pw.glRC); pw.glRC = nullptr; } }
+        }
+        ShowWindow(hwnd, SW_SHOW); SetForegroundWindow(hwnd); SetFocus(hwnd);
+        vector<PTri> ground, cubes;
+        for (int gz=-12; gz<12; gz+=3) for (int gx=-12; gx<12; gx+=3) {
+            unsigned c = (((gx+gz)/3)&1) ? 0x2f3d38u : 0x3b4c45u;
+            PTri t1{{(double)gx,0,(double)gz},{(double)gx+3,0,(double)gz},{(double)gx+3,0,(double)gz+3},c};
+            PTri t2{{(double)gx,0,(double)gz},{(double)gx+3,0,(double)gz+3},{(double)gx,0,(double)gz+3},c};
+            ground.push_back(t1); ground.push_back(t2);
+        }
+        addCube(cubes, {0,0.8,-3}, 0.8, 0xd05040);
+        addCube(cubes, {-2.2,1.0,-6}, 1.0, 0x4fa060);
+        addCube(cubes, {2.0,0.6,-5}, 0.6, 0x4070c0);
+        addCube(cubes, {0.2,0.5,-9}, 0.5, 0xd0b040);
+        PVec light = pnorm({0.45,1.0,0.35});
+        PVec cam{0,1.7,4.5};
+        double yaw = 0, pitch = -0.05;
+        vector<double> zbuf;
+        long long frames = 0; double elapsed = 0;
+        auto t0 = std::chrono::steady_clock::now();
+        while (!pw.closed && !(GetAsyncKeyState(VK_ESCAPE) & 0x8000)) {
+            MSG msg;
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+            if (pw.capture) {
+                yaw += pw.mdx * 0.0028; pitch -= pw.mdy * 0.0028;
+                pitch = std::max(-1.2, std::min(1.2, pitch));
+                pw.mdx = pw.mdy = 0;
+            }
+            double speed = 3.2;
+            PVec fwd{std::sin(yaw), 0, -std::cos(yaw)};
+            PVec right{std::cos(yaw), 0, std::sin(yaw)};
+            if (GetAsyncKeyState('W') & 0x8000) cam = padd(cam, pmul(fwd, speed*0.016));
+            if (GetAsyncKeyState('S') & 0x8000) cam = psub(cam, pmul(fwd, speed*0.016));
+            if (GetAsyncKeyState('A') & 0x8000) cam = psub(cam, pmul(right, speed*0.016));
+            if (GetAsyncKeyState('D') & 0x8000) cam = padd(cam, pmul(right, speed*0.016));
+            if (GetAsyncKeyState(VK_SPACE) & 0x8000) cam.y += speed*0.016;
+            if (GetAsyncKeyState(VK_SHIFT) & 0x8000) cam.y = std::max(0.5, cam.y-speed*0.016);
+            PVec f{std::sin(yaw)*std::cos(pitch), std::sin(pitch), -std::cos(yaw)*std::cos(pitch)};
+            PVec r{std::cos(yaw), 0, std::sin(yaw)};
+            PVec u = pnorm(pcross(r, f));
+            for (int y=0;y<h;++y) {
+                double k=(double)y/h;
+                unsigned char rr=(unsigned char)(30+50*(1-k)), gg=(unsigned char)(45+70*(1-k)), bb=(unsigned char)(70+80*(1-k));
+                for (int x=0;x<w;++x){ size_t i=((size_t)y*w+x)*3; pw.bgr[i]=rr; pw.bgr[i+1]=gg; pw.bgr[i+2]=bb; }
+            }
+            zbuf.assign((size_t)w*h, 1e30);
+            auto project=[&](PVec p, double& sx, double& sy, double& z)->bool{
+                PVec d=psub(p,cam); double zz=pdot(d,f); if(zz<=0.08) return false;
+                double xx=pdot(d,r), yy=pdot(d,u); double fl=(double)h*0.95;
+                sx=w*0.5+xx*fl/zz; sy=h*0.5-yy*fl/zz; z=zz; return true;
+            };
+            auto drawTri=[&](PVec pa, PVec pb, PVec pc, unsigned col, double zoff){
+                double x0,y0,z0,x1,y1,z1,x2,y2,z2;
+                if(!project(pa,x0,y0,z0)||!project(pb,x1,y1,z1)||!project(pc,x2,y2,z2)) return;
+                double minx=std::max(0.0,std::floor(std::min({x0,x1,x2}))), maxx=std::min((double)w-1,std::ceil(std::max({x0,x1,x2})));
+                double miny=std::max(0.0,std::floor(std::min({y0,y1,y2}))), maxy=std::min((double)h-1,std::ceil(std::max({y0,y1,y2})));
+                double den=(y1-y2)*(x0-x2)+(x2-x1)*(y0-y2); if(std::fabs(den)<1e-9) return;
+                PVec n=pnorm(pcross(psub(pb,pa),psub(pc,pa)));
+                double ndl=std::fabs(pdot(n,light)); double lit=0.35+0.65*ndl;
+                int cr=(int)((col>>16)&255), cg=(int)((col>>8)&255), cb=(int)(col&255);
+                for(int y=(int)miny;y<=(int)maxy;++y) for(int x=(int)minx;x<=(int)maxx;++x){
+                    double px=x+0.5, py=y+0.5;
+                    double w0=((y1-y2)*(px-x2)+(x2-x1)*(py-y2))/den;
+                    double w1=((y2-y0)*(px-x2)+(x0-x2)*(py-y2))/den;
+                    double w2=1-w0-w1;
+                    if(w0<-1e-6||w1<-1e-6||w2<-1e-6) continue;
+                    double z=w0*z0+w1*z1+w2*z2-zoff; if(z<=0) continue;
+                    size_t i=(size_t)y*w+x; if(z>=zbuf[i]) continue; zbuf[i]=z;
+                    double fog=std::max(0.25,1.0-z/28.0);
+                    pw.bgr[i*3]=(unsigned char)std::min(255.0,cr*lit*fog);
+                    pw.bgr[i*3+1]=(unsigned char)std::min(255.0,cg*lit*fog);
+                    pw.bgr[i*3+2]=(unsigned char)std::min(255.0,cb*lit*fog);
+                }
+            };
+            for(auto& t:ground) drawTri(t.a,t.b,t.c,t.color,0);
+            for(auto& t:cubes){
+                PVec sa,sb,sc; double tt;
+                tt=t.a.y/light.y; sa={t.a.x-light.x*tt,0,t.a.z-light.z*tt};
+                tt=t.b.y/light.y; sb={t.b.x-light.x*tt,0,t.b.z-light.z*tt};
+                tt=t.c.y/light.y; sc={t.c.x-light.x*tt,0,t.c.z-light.z*tt};
+                drawTri(sa,sb,sc,0x1a2226,0.01);
+            }
+            for(auto& t:cubes) drawTri(t.a,t.b,t.c,t.color,0);
+            for(int y=-2;y<=2;++y) for(int x=-2;x<=2;++x){
+                if(std::abs(x)<=1&&std::abs(y)<=1) continue;
+                size_t i=(size_t)(h/2+y)*w+(w/2+x); if(i*3+2<pw.bgr.size()){pw.bgr[i*3]=230;pw.bgr[i*3+1]=240;pw.bgr[i*3+2]=255;}
+            }
+            if (pw.glRC) {
+                glViewport(0, 0, w, h);
+                glClearColor(0, 0, 0, 1); glClear(GL_COLOR_BUFFER_BIT);
+                glMatrixMode(GL_PROJECTION); glLoadIdentity();
+                glOrtho(-1, 1, -1, 1, -1, 1);
+                glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+                glEnable(GL_TEXTURE_2D);
+                glBindTexture(GL_TEXTURE_2D, pw.glTex);
+                glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_BGR_EXT, GL_UNSIGNED_BYTE, pw.bgr.data());
+                glBegin(GL_QUADS);
+                glTexCoord2f(0, 1); glVertex2f(-1, -1);
+                glTexCoord2f(1, 1); glVertex2f(1, -1);
+                glTexCoord2f(1, 0); glVertex2f(1, 1);
+                glTexCoord2f(0, 0); glVertex2f(-1, 1);
+                glEnd();
+                SwapBuffers(pw.glDC);
+            } else {
+                HDC dc = GetDC(hwnd);
+                BITMAPINFO bi{}; bi.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
+                bi.bmiHeader.biWidth=w; bi.bmiHeader.biHeight=-h; bi.bmiHeader.biPlanes=1;
+                bi.bmiHeader.biBitCount=24; bi.bmiHeader.biCompression=BI_RGB;
+                SetDIBitsToDevice(dc,0,0,w,h,0,0,0,h,pw.bgr.data(),&bi,DIB_RGB_COLORS);
+                ReleaseDC(hwnd,dc);
+            }
+            ++frames;
+            auto now=std::chrono::steady_clock::now();
+            elapsed=std::chrono::duration<double>(now-t0).count();
+            if (frames%20==0) {
+                std::wstring t=title+(pw.glRC?L" GL":L" GDI")+L"  FPS " + std::to_wstring((int)(frames/std::max(0.001,elapsed))) +
+                    L"  x " + std::to_wstring((int)cam.x) + L" z " + std::to_wstring((int)cam.z);
+                SetWindowTextW(hwnd,t.c_str());
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (pw.glRC) { if (pw.glTex) glDeleteTextures(1, &pw.glTex); wglMakeCurrent(nullptr, nullptr); wglDeleteContext(pw.glRC); }
+        if (pw.glDC) ReleaseDC(hwnd, pw.glDC);
+        DestroyWindow(hwnd); gPlayer = nullptr;
+        auto d=std::make_shared<Dict>();
+        d->items["帧数"]=vNum((double)frames);
+        d->items["平均帧率"]=vNum(frames/std::max(0.001,elapsed));
+        d->items["OpenGL"]=vBool(pw.glRC != nullptr);
+        auto pos=std::make_shared<List>(); pos->items.push_back(vNum(cam.x)); pos->items.push_back(vNum(cam.y)); pos->items.push_back(vNum(cam.z));
+        d->items["位置"]=vList(pos);
+        return vDict(d);
+#else
+        throw WenError("运行时错误", line, 0, "玩家视口只支持 Windows");
+#endif
     });
     registerBuiltin("视口显示", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
 #ifdef _WIN32
