@@ -6489,6 +6489,7 @@ struct StackEmitter {
     const vector<StmtPtr>& program;
     vector<string> diags;
     vector<StackIns> code;
+    int tempCounter = 0;
 
     explicit StackEmitter(const vector<StmtPtr>& p) : program(p) {}
 
@@ -6634,9 +6635,37 @@ struct StackEmitter {
             case Stmt::K::Func:
                 diag(s->line, "字节码/汇编暂不支持函数定义");
                 break;
-            case Stmt::K::For:
-                diag(s->line, "字节码/汇编暂不支持对于循环");
+            case Stmt::K::For: {
+                if (!s->name2.empty()) {
+                    diag(s->line, "字节码/汇编暂不支持字典键值遍历");
+                    break;
+                }
+                string listVar = "__for_list_" + std::to_string(tempCounter);
+                string idxVar = "__for_i_" + std::to_string(tempCounter);
+                ++tempCounter;
+                expr(s->expr);
+                emit("store", "\"name\":" + quoteText(listVar), "STORE " + listVar);
+                emit("push", "\"v\":0", "PUSH 0");
+                emit("store", "\"name\":" + quoteText(idxVar), "STORE " + idxVar);
+                int start = (int)code.size();
+                emit("load", "\"name\":" + quoteText(idxVar), "LOAD " + idxVar);
+                emit("load", "\"name\":" + quoteText(listVar), "LOAD " + listVar);
+                emit("call", "\"name\":\"长度\",\"n\":1", "CALL 长度 1");
+                emit("lt", "", "LT");
+                int exitJump = emit("jz", "\"to\":0", "JZ 0");
+                emit("load", "\"name\":" + quoteText(listVar), "LOAD " + listVar);
+                emit("load", "\"name\":" + quoteText(idxVar), "LOAD " + idxVar);
+                emit("index", "", "INDEX");
+                emit("store", "\"name\":" + quoteText(s->name), "STORE " + s->name);
+                for (const auto& bodyStmt : s->body) stmt(bodyStmt);
+                emit("load", "\"name\":" + quoteText(idxVar), "LOAD " + idxVar);
+                emit("push", "\"v\":1", "PUSH 1");
+                emit("add", "", "ADD");
+                emit("store", "\"name\":" + quoteText(idxVar), "STORE " + idxVar);
+                emit("jmp", "\"to\":" + std::to_string(start), "JMP " + std::to_string(start));
+                patch(exitJump, (int)code.size());
                 break;
+            }
             case Stmt::K::Try:
                 diag(s->line, "字节码/汇编暂不支持尝试/捕获");
                 break;
