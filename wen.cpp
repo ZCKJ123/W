@@ -7228,6 +7228,43 @@ static vector<uint32_t> bigMulNTT(const vector<uint32_t>& a, const vector<uint32
 }
 
 #else
+
+template <int MOD>
+static uint64_t nttPowT(uint64_t a, uint64_t e) {
+    uint64_t r = 1;
+    while (e) { if (e & 1) r = r * a % MOD; a = a * a % MOD; e >>= 1; }
+    return r;
+}
+template <int MOD>
+static void nttT(vector<int>& a, bool inv) {
+    int n = (int)a.size();
+    for (int i = 1, j = 0; i < n; ++i) {
+        int bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) std::swap(a[i], a[j]);
+    }
+    for (int len = 2; len <= n; len <<= 1) {
+        uint64_t wlen = nttPowT<MOD>(3, (uint64_t)(MOD - 1) / len);
+        if (inv) wlen = nttPowT<MOD>(wlen, MOD - 2);
+        for (int i = 0; i < n; i += len) {
+            uint64_t w = 1;
+            int half = len >> 1;
+            for (int j = 0; j < half; ++j) {
+                int u = a[i + j];
+                int v = (int)((uint64_t)a[i + j + half] * w % MOD);
+                int x = u + v; if (x >= MOD) x -= MOD;
+                int y = u - v; if (y < 0) y += MOD;
+                a[i + j] = x; a[i + j + half] = y;
+                w = w * wlen % MOD;
+            }
+        }
+    }
+    if (inv) {
+        uint64_t invn = nttPowT<MOD>(n, MOD - 2);
+        for (int& x : a) x = (int)((uint64_t)x * invn % MOD);
+    }
+}
 static vector<uint32_t> bigMulNTT32(const vector<uint32_t>& a, const vector<uint32_t>& b) {
     auto to3 = [](const vector<uint32_t>& x) {
         vector<uint32_t> o;
@@ -7244,17 +7281,23 @@ static vector<uint32_t> bigMulNTT32(const vector<uint32_t>& a, const vector<uint
     while (n < need) n <<= 1;
     static const int MODS[2] = {998244353, 1004535809};
     vector<vector<int>> conv(2, vector<int>(n));
-    for (int k = 0; k < 2; ++k) {
+    {
         vector<int> fa(n), fb(n);
-        for (size_t i = 0; i < x.size(); ++i) fa[i] = (int)(x[i] % MODS[k]);
-        for (size_t i = 0; i < y.size(); ++i) fb[i] = (int)(y[i] % MODS[k]);
-        ntt(fa, false, MODS[k], 3);
-        ntt(fb, false, MODS[k], 3);
-        for (size_t i = 0; i < n; ++i) fa[i] = (int)((uint64_t)fa[i] * fb[i] % MODS[k]);
-        ntt(fa, true, MODS[k], 3);
-        conv[k] = std::move(fa);
+        for (size_t i = 0; i < x.size(); ++i) fa[i] = (int)x[i];
+        for (size_t i = 0; i < y.size(); ++i) fb[i] = (int)y[i];
+        ntt(fa, false, 998244353, 3); ntt(fb, false, 998244353, 3);
+        for (size_t i = 0; i < n; ++i) fa[i] = (int)((uint64_t)fa[i] * fb[i] % 998244353);
+        ntt(fa, true, 998244353, 3); conv[0] = std::move(fa);
     }
-    uint64_t inv = nttPow(MODS[0] % MODS[1], MODS[1] - 2, MODS[1]);
+    {
+        vector<int> fa(n), fb(n);
+        for (size_t i = 0; i < x.size(); ++i) fa[i] = (int)x[i];
+        for (size_t i = 0; i < y.size(); ++i) fb[i] = (int)y[i];
+        ntt(fa, false, 1004535809, 3); ntt(fb, false, 1004535809, 3);
+        for (size_t i = 0; i < n; ++i) fa[i] = (int)((uint64_t)fa[i] * fb[i] % 1004535809);
+        ntt(fa, true, 1004535809, 3); conv[1] = std::move(fa);
+    }
+    uint64_t inv = nttPow(998244353, 1004535809 - 2, 1004535809);
     vector<uint64_t> c(need);
     for (size_t i = 0; i < need; ++i) {
         uint64_t r1 = (uint64_t)conv[0][i];
@@ -7266,9 +7309,8 @@ static vector<uint32_t> bigMulNTT32(const vector<uint32_t>& a, const vector<uint
     uint64_t carry = 0;
     for (size_t i = 0; i < need; ++i) {
         uint64_t cur = c[i] + carry;
-        uint32_t d = (uint32_t)(cur % 1000);
+        out.push_back((uint32_t)(cur % 1000));
         carry = cur / 1000;
-        out.push_back(d);
     }
     while (carry) { out.push_back((uint32_t)(carry % 1000)); carry /= 1000; }
     vector<uint32_t> res;
