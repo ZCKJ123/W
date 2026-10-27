@@ -2267,6 +2267,7 @@ static const char* WEN_SOURCE_SUFFIXES[] = {".脚本", ".程序", ".wen"};
 static bool gNoFast = false;
 static size_t gBigMaxDigits = 50000000;
 static std::set<string> gAdminPerms;
+static int gPiDigits = 50;
 static long long gExecuted = 0;
 static size_t gMemoryMaxBytes = 64 * 1024 * 1024;
 static long long gTotal = 0;
@@ -7165,6 +7166,31 @@ static vector<uint32_t> bigPow(vector<uint32_t> base, long long exp) {
     }
     return out;
 }
+static vector<uint32_t> bigAtanInv(uint32_t x, const vector<uint32_t>& scale) {
+    auto p = bigDivSmall(scale, x);
+    vector<uint32_t> sum{0};
+    uint32_t x2 = x * x;
+    int k = 0;
+    bool plus = true;
+    while (!(p.size() == 1 && p[0] == 0)) {
+        auto term = bigDivSmall(p, (uint32_t)(2 * k + 1));
+        sum = plus ? bigAdd(sum, term) : bigSub(sum, term);
+        p = bigDivSmall(p, x2);
+        ++k;
+        plus = !plus;
+    }
+    return sum;
+}
+static string piText(int digits) {
+    int guard = 12;
+    auto scale = bigPow(bigFromU64(10), digits + guard);
+    auto a = bigMul(bigAtanInv(5, scale), bigFromU64(16));
+    auto b = bigMul(bigAtanInv(239, scale), bigFromU64(4));
+    string s = bigStr(bigSub(a, b));
+    size_t need = (size_t)digits + 1;
+    if (s.size() < need) s.append(need - s.size(), '0');
+    return s.substr(0, 1) + "." + s.substr(1, digits);
+}
 static long double bigDigitEstimate(const vector<uint32_t>& base, long long exp) {
     if (exp <= 0 || base.empty()) return 1;
     long double d = 0;
@@ -9892,6 +9918,19 @@ Interpreter::Interpreter() {
     registerBuiltin("换行符", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value { return vStr("\n"); });
     registerBuiltin("制表符", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value { return vStr("\t"); });
     registerBuiltin("回车符", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value { return vStr("\r"); });
+    registerBuiltin("高精度圆周率", 0, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        int d = a.empty() ? gPiDigits : (int)needIndex(a[0], "高精度圆周率", line);
+        if (d < 1 || d > 10000) throw WenError("运行时错误", line, 0, "圆周率位数必须在 1..10000");
+        return vStr(piText(d));
+    });
+    registerBuiltin("圆周率精度", 0, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (!a.empty()) {
+            int d = (int)needIndex(a[0], "圆周率精度", line);
+            if (d < 1 || d > 10000) throw WenError("运行时错误", line, 0, "圆周率位数必须在 1..10000");
+            gPiDigits = d;
+        }
+        return vNum(gPiDigits);
+    });
     registerBuiltin("新建布局", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         bool packed = false;
         if (a.size() > 1) {
