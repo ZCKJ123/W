@@ -5211,6 +5211,7 @@ static LRESULT CALLBACK vpWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         EndPaint(hwnd, &ps);
         return 0;
     }
+    if (msg == WM_ERASEBKGND) return 1;
     if (msg == WM_DESTROY) { PostQuitMessage(0); return 0; }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -10423,7 +10424,9 @@ Interpreter::Interpreter() {
             test({0,0,0}, 0.60, 0);
             test({-1.10,-0.12,0.10}, 0.36, 1);
             test({1.10,0.02,0.02}, 0.42, 2);
-            test({0,2.35,-1.25}, 0.16, 4);
+            double lcx = -1.6 + 1.4 * std::cos(tm * 0.7);
+            double lcz = -1.25 + 1.4 * std::sin(tm * 0.7);
+            test({lcx, 2.35, lcz}, 0.16, 4);
             if (d[1] < -1e-6) {
                 double t = (-0.86 - o[1]) / d[1];
                 if (t > 1e-4 && t < bt) {
@@ -10442,7 +10445,9 @@ Interpreter::Interpreter() {
         };
         auto sampleLight = [&](std::array<double,3> p, std::array<double,3> n,
                                std::array<double,3> albedo) {
-            double lx = -1.4 + (rnd()-0.5)*1.2, ly = 3.2, lz = -1.2 + (rnd()-0.5)*1.2;
+            double lx = -1.6 + 1.4 * std::cos(tm * 0.7) + (rnd()-0.5)*1.0;
+            double ly = 2.35;
+            double lz = -1.25 + 1.4 * std::sin(tm * 0.7) + (rnd()-0.5)*1.0;
             std::array<double,3> toL{lx-p[0], ly-p[1], lz-p[2]};
             double dist2 = toL[0]*toL[0] + toL[1]*toL[1] + toL[2]*toL[2];
             double dist = std::sqrt(dist2);
@@ -16385,10 +16390,16 @@ struct WenUiEvent { string type, value; };
 struct WenUiState {
     HWND hwnd = nullptr;
     int w = 0, h = 0;
-    vector<unsigned char> bgr;
+    vector<unsigned char> bgr;   // front
+    vector<unsigned char> back;  // drawing buffer
+    std::mutex mtx;
     vector<WenUiText> texts;
     std::deque<WenUiEvent> events;
     bool closed = false;
+    void reset() {
+        hwnd = nullptr; w = 0; h = 0;
+        bgr.clear(); back.clear(); texts.clear(); events.clear(); closed = false;
+    }
 };
 static WenUiState gUi;
 
@@ -16402,6 +16413,7 @@ static LRESULT CALLBACK uiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_PAINT: {
             PAINTSTRUCT ps;
             HDC dc = BeginPaint(hwnd, &ps);
+            std::lock_guard<std::mutex> lk(gUi.mtx);
             if (!gUi.bgr.empty()) {
                 BITMAPINFO bi{};
                 bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -16414,6 +16426,22 @@ static LRESULT CALLBACK uiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                   gUi.bgr.data(), &bi, DIB_RGB_COLORS);
             }
             EndPaint(hwnd, &ps);
+            return 0;
+        }
+        case WM_SIZE:
+            if (wp != SIZE_MINIMIZED) {
+                std::lock_guard<std::mutex> lk(gUi.mtx);
+                gUi.w = std::max(1, (int)LOWORD(lp));
+                gUi.h = std::max(1, (int)HIWORD(lp));
+                gUi.bgr.assign((size_t)gUi.w * gUi.h * 3, 0);
+                gUi.back.assign((size_t)gUi.w * gUi.h * 3, 0);
+            }
+            return 0;
+        case WM_DPICHANGED: {
+            RECT* r = (RECT*)lp;
+            SetWindowPos(hwnd, nullptr, r->left, r->top,
+                         r->right - r->left, r->bottom - r->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
             return 0;
         }
         /* WM_CHAR 只保留非 ASCII 的输入法字符；ASCII 统一在 WM_KEYDOWN
@@ -16475,10 +16503,13 @@ static LRESULT CALLBACK uiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 static Value uiNew(Interpreter&, vector<Value>& a, int line) {
-    if (gUi.hwnd) { DestroyWindow(gUi.hwnd); gUi = WenUiState{}; }
+    if (gUi.hwnd) { DestroyWindow(gUi.hwnd); gUi.reset(); }
     gUi.w = std::max(200, (int)needNum(a[0], "界面新建", line));
     gUi.h = std::max(200, (int)needNum(a[1], "界面新建", line));
     gUi.bgr.assign((size_t)gUi.w * gUi.h * 3, 0);
+    gUi.back.assign((size_t)gUi.w * gUi.h * 3, 0);
+    static bool dpi = false;
+    if (!dpi) { SetProcessDPIAware(); dpi = true; }
     static bool reg = false;
     HINSTANCE inst = GetModuleHandleW(nullptr);
     if (!reg) {
@@ -16513,10 +16544,10 @@ static Value uiNew(Interpreter&, vector<Value>& a, int line) {
 }
 static Value uiClear(Interpreter&, vector<Value>& a, int line) {
     int c = vpColor(a[0], line);
-    for (size_t i = 0; i < gUi.bgr.size(); i += 3) {
-        gUi.bgr[i] = (unsigned char)(c & 255);
-        gUi.bgr[i + 1] = (unsigned char)((c >> 8) & 255);
-        gUi.bgr[i + 2] = (unsigned char)((c >> 16) & 255);
+    for (size_t i = 0; i < gUi.back.size(); i += 3) {
+        gUi.back[i] = (unsigned char)(c & 255);
+        gUi.back[i + 1] = (unsigned char)((c >> 8) & 255);
+        gUi.back[i + 2] = (unsigned char)((c >> 16) & 255);
     }
     gUi.texts.clear();
     return vNone();
@@ -16528,9 +16559,9 @@ static Value uiRect(Interpreter&, vector<Value>& a, int line) {
     for (int yy = std::max(0, y); yy < std::min(gUi.h, y + h); ++yy)
         for (int xx = std::max(0, x); xx < std::min(gUi.w, x + w); ++xx) {
             size_t i = ((size_t)yy * gUi.w + xx) * 3;
-            gUi.bgr[i] = (unsigned char)(c & 255);
-            gUi.bgr[i + 1] = (unsigned char)((c >> 8) & 255);
-            gUi.bgr[i + 2] = (unsigned char)((c >> 16) & 255);
+            gUi.back[i] = (unsigned char)(c & 255);
+            gUi.back[i + 1] = (unsigned char)((c >> 8) & 255);
+            gUi.back[i + 2] = (unsigned char)((c >> 16) & 255);
         }
     return vNone();
 }
@@ -16544,9 +16575,9 @@ static Value uiLine(Interpreter&, vector<Value>& a, int line) {
     while (true) {
         if (x0 >= 0 && y0 >= 0 && x0 < gUi.w && y0 < gUi.h) {
             size_t i = ((size_t)y0 * gUi.w + x0) * 3;
-            gUi.bgr[i] = (unsigned char)(c & 255);
-            gUi.bgr[i + 1] = (unsigned char)((c >> 8) & 255);
-            gUi.bgr[i + 2] = (unsigned char)((c >> 16) & 255);
+            gUi.back[i] = (unsigned char)(c & 255);
+            gUi.back[i + 1] = (unsigned char)((c >> 8) & 255);
+            gUi.back[i + 2] = (unsigned char)((c >> 16) & 255);
         }
         if (x0 == x1 && y0 == y1) break;
         int e2 = 2 * err;
@@ -16593,9 +16624,9 @@ static void uiBurnText(int x, int y, const std::wstring& text, int color, int si
             int a = std::max({p[0], p[1], p[2]});
             if (a == 0) continue;
             size_t i = ((size_t)dy * gUi.w + dx) * 3;
-            gUi.bgr[i] = (unsigned char)((gUi.bgr[i] * (255 - a) + b * a) / 255);
-            gUi.bgr[i + 1] = (unsigned char)((gUi.bgr[i + 1] * (255 - a) + g * a) / 255);
-            gUi.bgr[i + 2] = (unsigned char)((gUi.bgr[i + 2] * (255 - a) + r * a) / 255);
+            gUi.back[i] = (unsigned char)((gUi.back[i] * (255 - a) + b * a) / 255);
+            gUi.back[i + 1] = (unsigned char)((gUi.back[i + 1] * (255 - a) + g * a) / 255);
+            gUi.back[i + 2] = (unsigned char)((gUi.back[i + 2] * (255 - a) + r * a) / 255);
         }
     }
     SelectObject(dc, oldBmp);
@@ -16616,8 +16647,12 @@ static Value uiText(Interpreter&, vector<Value>& a, int line) {
 }
 static Value uiRefresh(Interpreter&, vector<Value>&, int line) {
     if (!gUi.hwnd) throw WenError("运行时错误", line, 0, "界面还没有打开");
-    /* 第三个参数 FALSE：不擦背景，直接等 WM_PAINT 贴 DIB。
-       TRUE 会让系统先用背景色填一遍，和下一帧之间就是白闪。 */
+    {
+        std::lock_guard<std::mutex> lk(gUi.mtx);
+        if (gUi.back.size() != gUi.bgr.size()) gUi.back.resize(gUi.bgr.size(), 0);
+        std::swap(gUi.bgr, gUi.back);
+    }
+    /* 第三个参数 FALSE：不擦背景，直接等 WM_PAINT 贴完整 DIB。 */
     InvalidateRect(gUi.hwnd, nullptr, FALSE);
     UpdateWindow(gUi.hwnd);
     return vNone();
@@ -16651,7 +16686,7 @@ static Value uiSize(Interpreter&, vector<Value>&, int) {
     return vList(l);
 }
 static Value uiClose(Interpreter&, vector<Value>&, int) {
-    if (gUi.hwnd) { DestroyWindow(gUi.hwnd); gUi = WenUiState{}; }
+    if (gUi.hwnd) { DestroyWindow(gUi.hwnd); gUi.reset(); }
     return vNone();
 }
 #else
@@ -16664,9 +16699,9 @@ static Value uiRect(Interpreter&, vector<Value>& a, int line) {
     for (int yy = std::max(0, y); yy < std::min(gUi.h, y + h); ++yy)
         for (int xx = std::max(0, x); xx < std::min(gUi.w, x + w); ++xx) {
             size_t i = ((size_t)yy * gUi.w + xx) * 3;
-            gUi.bgr[i] = (unsigned char)(c & 255);
-            gUi.bgr[i + 1] = (unsigned char)((c >> 8) & 255);
-            gUi.bgr[i + 2] = (unsigned char)((c >> 16) & 255);
+            gUi.back[i] = (unsigned char)(c & 255);
+            gUi.back[i + 1] = (unsigned char)((c >> 8) & 255);
+            gUi.back[i + 2] = (unsigned char)((c >> 16) & 255);
         }
     return vNone();
 }
@@ -16680,9 +16715,9 @@ static Value uiLine(Interpreter&, vector<Value>& a, int line) {
     while (true) {
         if (x0 >= 0 && y0 >= 0 && x0 < gUi.w && y0 < gUi.h) {
             size_t i = ((size_t)y0 * gUi.w + x0) * 3;
-            gUi.bgr[i] = (unsigned char)(c & 255);
-            gUi.bgr[i + 1] = (unsigned char)((c >> 8) & 255);
-            gUi.bgr[i + 2] = (unsigned char)((c >> 16) & 255);
+            gUi.back[i] = (unsigned char)(c & 255);
+            gUi.back[i + 1] = (unsigned char)((c >> 8) & 255);
+            gUi.back[i + 2] = (unsigned char)((c >> 16) & 255);
         }
         if (x0 == x1 && y0 == y1) break;
         int e2 = 2 * err;
