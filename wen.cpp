@@ -10260,114 +10260,179 @@ Interpreter::Interpreter() {
         d->items["深度"] = vList(depth);
         return vDict(d);
     });
-    registerBuiltin("光追渲染", 2, 4, [](Interpreter&, vector<Value>& a, int line) -> Value {
+    registerBuiltin("光追渲染", 2, 5, [](Interpreter&, vector<Value>& a, int line) -> Value {
         int w = (int)needIndex(a[0], "光追渲染", line);
         int h = (int)needIndex(a[1], "光追渲染", line);
+        int samples = a.size() >= 3 ? (int)needIndex(a[2], "光追渲染", line) : 4;
+        double tm = a.size() >= 4 ? needNum(a[3], "光追渲染", line) : 0;
         if (w < 1 || h < 1 || w > 2048 || h > 2048)
             throw WenError("运行时错误", line, 0, "光追尺寸必须在 1..2048");
+        samples = std::max(1, std::min(samples, 32));
         auto buf = std::make_shared<std::vector<unsigned char>>((size_t)w * h * 3);
-        auto hit = [](double ox, double oy, double oz, double dx, double dy, double dz,
-                      double cx, double cy, double cz, double r, double& t) {
-            double lx = ox - cx, ly = oy - cy, lz = oz - cz;
-            double b = lx * dx + ly * dy + lz * dz;
-            double c = lx * lx + ly * ly + lz * lz - r * r;
-            double d = b * b - c;
-            if (d < 0) return false;
-            double s = std::sqrt(d), tt = -b - s;
-            if (tt < 1e-4) tt = -b + s;
+        auto rnd = []() {
+            thread_local std::mt19937 g(std::random_device{}());
+            return std::uniform_real_distribution<double>(0, 1)(g);
+        };
+        auto norm = [](std::array<double, 3> v) {
+            double l = std::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+            if (l < 1e-12) return std::array<double,3>{0,1,0};
+            return std::array<double,3>{v[0]/l, v[1]/l, v[2]/l};
+        };
+        struct Hit { double t; std::array<double,3> p, n; int mat; };
+        auto hitSphere = [](std::array<double,3> o, std::array<double,3> d,
+                            std::array<double,3> c, double r, double& t) {
+            std::array<double,3> l{o[0]-c[0], o[1]-c[1], o[2]-c[2]};
+            double b = l[0]*d[0] + l[1]*d[1] + l[2]*d[2];
+            double cc = l[0]*l[0] + l[1]*l[1] + l[2]*l[2] - r*r;
+            double disc = b*b - cc;
+            if (disc < 0) return false;
+            double sq = std::sqrt(disc), tt = -b - sq;
+            if (tt < 1e-4) tt = -b + sq;
             if (tt < 1e-4) return false;
             t = tt;
             return true;
         };
-        auto nearest = [&](double ox, double oy, double oz, double dx, double dy, double dz,
-                           double& t, double& nx, double& ny, double& nz, int& mat) {
+        auto traceScene = [&](std::array<double,3> o, std::array<double,3> d, Hit& hit) {
             bool any = false;
-            double bt = 1e30, bx = 0, by = 0, bz = 0;
-            auto test = [&](double cx, double cy, double cz, double r, int m) {
-                double tt;
-                if (hit(ox, oy, oz, dx, dy, dz, cx, cy, cz, r, tt) && tt < bt) {
-                    bt = tt; bx = cx; by = cy; bz = cz; mat = m; any = true;
+            double bt = 1e30;
+            auto test = [&](std::array<double,3> c, double r, int m) {
+                double t;
+                if (hitSphere(o, d, c, r, t) && t < bt) {
+                    bt = t; hit.t = t; hit.mat = m; any = true;
+                    hit.p = {o[0]+d[0]*t, o[1]+d[1]*t, o[2]+d[2]*t};
+                    hit.n = norm({hit.p[0]-c[0], hit.p[1]-c[1], hit.p[2]-c[2]});
                 }
             };
-            test(0, 0, 0, 0.62, 0);
-            test(-1.1, -0.16, 0.18, 0.36, 1);
-            test(1.12, 0.08, 0.05, 0.42, 2);
-            if (dy < -1e-6) {
-                double tt = (-0.86 - oy) / dy;
-                if (tt > 1e-4 && tt < bt) { bt = tt; bx = 0; by = 1; bz = 0; mat = 3; any = true; }
+            test({0,0,0}, 0.60, 0);
+            test({-1.10,-0.12,0.10}, 0.36, 1);
+            test({1.10,0.02,0.02}, 0.42, 2);
+            test({0,2.35,-1.25}, 0.16, 4);
+            if (d[1] < -1e-6) {
+                double t = (-0.86 - o[1]) / d[1];
+                if (t > 1e-4 && t < bt) {
+                    bt = t; hit.t = t; hit.mat = 3; any = true;
+                    hit.p = {o[0]+d[0]*t, -0.86, o[2]+d[2]*t};
+                    double wx = 0.10 * std::sin(hit.p[0]*7.0 + tm*2.0);
+                    double wz = 0.08 * std::cos(hit.p[2]*9.0 + tm*1.3);
+                    hit.n = norm({wx, 1.0, wz});
+                }
             }
-            if (!any) return false;
-            t = bt;
-            nx = (ox + dx * t - bx);
-            ny = (oy + dy * t - by);
-            nz = (oz + dz * t - bz);
-            if (mat != 3) {
-                double l = std::sqrt(nx * nx + ny * ny + nz * nz);
-                nx /= l; ny /= l; nz /= l;
-            } else { nx = 0; ny = 1; nz = 0; }
-            return true;
+            return any;
         };
-        double tm = a.size() >= 4 ? needNum(a[3], "光追渲染", line) : 0;
-        std::function<std::array<double, 3>(double, double, double, double, double, double, int)> color;
-        color = [&](double ox, double oy, double oz, double dx, double dy, double dz, int depth) {
-            double t, nx, ny, nz; int mat = 0;
-            if (!nearest(ox, oy, oz, dx, dy, dz, t, nx, ny, nz, mat))
-                return std::array<double, 3>{0.35 + 0.25 * (dy + 0.5), 0.45, 0.7};
-            double px = ox + dx * t, py = oy + dy * t, pz = oz + dz * t;
-            if (mat == 3) {
-                double w1 = 0.10 * std::sin(px * 7.0 + tm * 2.0);
-                double w2 = 0.06 * std::sin(pz * 11.0 + tm * 1.7);
-                nx = w1; nz = 0.08 * std::cos(pz * 9.0 + tm * 1.3); ny = 1.0;
-                double l = std::sqrt(nx * nx + ny * ny + nz * nz);
-                nx /= l; ny /= l; nz /= l;
+        auto sky = [](std::array<double,3> d) {
+            double k = 0.5 + 0.5 * std::max(-1.0, std::min(1.0, d[1]));
+            return std::array<double,3>{0.25+0.45*k, 0.35+0.5*k, 0.7+0.25*k};
+        };
+        auto sampleLight = [&](std::array<double,3> p, std::array<double,3> n,
+                               std::array<double,3> albedo) {
+            double lx = -1.4 + (rnd()-0.5)*1.2, ly = 3.2, lz = -1.2 + (rnd()-0.5)*1.2;
+            std::array<double,3> toL{lx-p[0], ly-p[1], lz-p[2]};
+            double dist2 = toL[0]*toL[0] + toL[1]*toL[1] + toL[2]*toL[2];
+            double dist = std::sqrt(dist2);
+            std::array<double,3> l = norm(toL);
+            double cosT = std::max(0.0, n[0]*l[0] + n[1]*l[1] + n[2]*l[2]);
+            if (cosT <= 0) return std::array<double,3>{0,0,0};
+            std::array<double,3> o{p[0]+n[0]*1e-3, p[1]+n[1]*1e-3, p[2]+n[2]*1e-3};
+            Hit sh;
+            if (traceScene(o, l, sh) && sh.t < dist - 1e-3) return std::array<double,3>{0,0,0};
+            double atten = 8.0 * cosT / (1.0 + dist2);
+            return std::array<double,3>{albedo[0]*atten, albedo[1]*atten, albedo[2]*atten};
+        };
+        std::function<std::array<double,3>(std::array<double,3>, std::array<double,3>, int)> radiance;
+        radiance = [&](std::array<double,3> o, std::array<double,3> d, int depth) {
+            Hit h;
+            if (!traceScene(o, d, h)) return sky(d);
+            if (h.mat == 4) return std::array<double,3>{8,7.5,6};
+            if (depth <= 0) return std::array<double,3>{0,0,0};
+            std::array<double,3> albedo{0.82,0.20,0.18};
+            int kind = 0; // 0 diffuse, 1 metal, 2 glass, 3 water
+            if (h.mat == 1) { albedo = {0.25,0.78,0.32}; kind = 1; }
+            else if (h.mat == 2) { albedo = {0.85,0.92,1.0}; kind = 2; }
+            else if (h.mat == 3) {
+                int check = ((int)std::floor(h.p[0]*2) + (int)std::floor(h.p[2]*2)) & 1;
+                albedo = check ? std::array<double,3>{0.75,0.80,0.78}
+                               : std::array<double,3>{0.16,0.26,0.30};
+                kind = 3;
             }
-            double lx = -1.6, ly = 3.2, lz = 2.4;
-            double ll = std::sqrt(lx * lx + ly * ly + lz * lz);
-            lx /= ll; ly /= ll; lz /= ll;
-            double diff = std::max(0.0, nx * lx + ny * ly + nz * lz);
-            double sh = nearest(px + nx * 1e-3, py + ny * 1e-3, pz + nz * 1e-3,
-                                lx, ly, lz, t, nx, ny, nz, mat) ? 0.25 : 1.0;
-            std::array<double, 3> base{0.85, 0.22, 0.2};
-            double refl = 0.15;
-            if (mat == 1) { base = {0.2, 0.75, 0.35}; refl = 0.1; }
-            else if (mat == 2) { base = {0.25, 0.45, 0.95}; refl = 0.72; }
-            else if (mat == 3) {
-                int check = ((int)std::floor(px * 2) + (int)std::floor(pz * 2)) & 1;
-                base = check ? std::array<double, 3>{0.80, 0.82, 0.80}
-                             : std::array<double, 3>{0.20, 0.30, 0.35};
-                refl = 0.45;
+            std::array<double,3> out{0,0,0};
+            if (kind == 0 || kind == 1) {
+                auto direct = sampleLight(h.p, h.n, albedo);
+                out = {direct[0], direct[1], direct[2]};
             }
-            double k = 0.12 + 0.88 * diff;
-            std::array<double, 3> out{base[0] * k * sh, base[1] * k * sh, base[2] * k * sh};
-            if (depth > 0) {
-                double dot = dx * nx + dy * ny + dz * nz;
-                double rx = dx - 2 * dot * nx, ry = dy - 2 * dot * ny, rz = dz - 2 * dot * nz;
-                auto r = color(px + nx * 1e-3, py + ny * 1e-3, pz + nz * 1e-3,
-                               rx, ry, rz, depth - 1);
-                out[0] = out[0] * (1 - refl) + r[0] * refl;
-                out[1] = out[1] * (1 - refl) + r[1] * refl;
-                out[2] = out[2] * (1 - refl) + r[2] * refl;
+            std::array<double,3> dir;
+            if (kind == 1) {
+                double dot = d[0]*h.n[0] + d[1]*h.n[1] + d[2]*h.n[2];
+                dir = norm({d[0]-2*dot*h.n[0] + (rnd()-0.5)*0.25,
+                            d[1]-2*dot*h.n[1] + (rnd()-0.5)*0.25,
+                            d[2]-2*dot*h.n[2] + (rnd()-0.5)*0.25});
+                auto inc = radiance({h.p[0]+h.n[0]*1e-3, h.p[1]+h.n[1]*1e-3, h.p[2]+h.n[2]*1e-3}, dir, depth-1);
+                out[0] += albedo[0]*inc[0]; out[1] += albedo[1]*inc[1]; out[2] += albedo[2]*inc[2];
+            } else if (kind == 2) {
+                double eta = 1.0/1.5;
+                double cosI = -(d[0]*h.n[0] + d[1]*h.n[1] + d[2]*h.n[2]);
+                std::array<double,3> nn = h.n;
+                if (cosI < 0) { nn = {-h.n[0],-h.n[1],-h.n[2]}; cosI = -cosI; }
+                double sin2 = 1.0 - cosI*cosI;
+                double k = 1.0 - eta*eta*sin2;
+                if (k < 0) {
+                    double dot = d[0]*nn[0] + d[1]*nn[1] + d[2]*nn[2];
+                    dir = norm({d[0]-2*dot*nn[0], d[1]-2*dot*nn[1], d[2]-2*dot*nn[2]});
+                } else {
+                    double cosT = std::sqrt(k);
+                    dir = norm({eta*d[0] + (eta*cosI - cosT)*nn[0],
+                                eta*d[1] + (eta*cosI - cosT)*nn[1],
+                                eta*d[2] + (eta*cosI - cosT)*nn[2]});
+                }
+                auto inc = radiance({h.p[0]+dir[0]*1e-3, h.p[1]+dir[1]*1e-3, h.p[2]+dir[2]*1e-3}, dir, depth-1);
+                out[0] += 0.9*inc[0]; out[1] += 0.95*inc[1]; out[2] += 1.0*inc[2];
+            } else {
+                // 水面：Fresnel 混合反射与漫反射
+                double cosI = std::max(0.0, -(d[0]*h.n[0] + d[1]*h.n[1] + d[2]*h.n[2]));
+                double fr = 0.04 + 0.96 * std::pow(1.0-cosI, 5.0);
+                if (rnd() < fr) {
+                    double dot = d[0]*h.n[0] + d[1]*h.n[1] + d[2]*h.n[2];
+                    dir = norm({d[0]-2*dot*h.n[0], d[1]-2*dot*h.n[1], d[2]-2*dot*h.n[2]});
+                } else {
+                    dir = norm({(rnd()*2-1), std::fabs(rnd())+0.2, (rnd()*2-1)});
+                }
+                auto inc = radiance({h.p[0]+h.n[0]*1e-3, h.p[1]+h.n[1]*1e-3, h.p[2]+h.n[2]*1e-3}, dir, depth-1);
+                out[0] += albedo[0]*inc[0]*(1-fr); out[1] += albedo[1]*inc[1]*(1-fr); out[2] += albedo[2]*inc[2]*(1-fr);
+                if (rnd() < fr) {
+                    double dot = d[0]*h.n[0] + d[1]*h.n[1] + d[2]*h.n[2];
+                    dir = norm({d[0]-2*dot*h.n[0], d[1]-2*dot*h.n[1], d[2]-2*dot*h.n[2]});
+                    auto refl = radiance({h.p[0]+h.n[0]*1e-3, h.p[1]+h.n[1]*1e-3, h.p[2]+h.n[2]*1e-3}, dir, depth-1);
+                    out[0] += fr*refl[0]; out[1] += fr*refl[1]; out[2] += fr*refl[2];
+                }
+            }
+            if (kind == 0) {
+                std::array<double,3> dir2{ (rnd()*2-1), (rnd()*2-1), (rnd()*2-1) };
+                if (dir2[0]*h.n[0]+dir2[1]*h.n[1]+dir2[2]*h.n[2] < 0) dir2 = {-dir2[0],-dir2[1],-dir2[2]};
+                dir2 = norm(dir2);
+                auto inc = radiance({h.p[0]+h.n[0]*1e-3, h.p[1]+h.n[1]*1e-3, h.p[2]+h.n[2]*1e-3}, dir2, depth-1);
+                out[0] += albedo[0]*inc[0]; out[1] += albedo[1]*inc[1]; out[2] += albedo[2]*inc[2];
             }
             return out;
         };
         auto renderRows = [&](int y0, int y1) {
             for (int y = y0; y < y1; ++y) for (int x = 0; x < w; ++x) {
-                double px = (2.0 * (x + 0.5) / w - 1.0) * (double)w / h * 0.7;
-                double py = (1.0 - 2.0 * (y + 0.5) / h) * 0.7;
-                double len = std::sqrt(px * px + py * py + 1.0);
-                auto c = color(0, 0, 2.4, px / len, py / len, -1.0 / len, 1);
-                size_t i = ((size_t)y * w + x) * 3;
-                (*buf)[i] = (unsigned char)(255 * std::max(0.0, std::min(1.0, c[0])));
-                (*buf)[i + 1] = (unsigned char)(255 * std::max(0.0, std::min(1.0, c[1])));
-                (*buf)[i + 2] = (unsigned char)(255 * std::max(0.0, std::min(1.0, c[2])));
+                std::array<double,3> col{0,0,0};
+                for (int s = 0; s < samples; ++s) {
+                    double jx = rnd()-0.5, jy = rnd()-0.5;
+                    double px = (2.0*(x+0.5+jx)/w - 1.0) * (double)w/h * 0.72;
+                    double py = (1.0 - 2.0*(y+0.5+jy)/h) * 0.72;
+                    auto d = norm({px, py, -1.0});
+                    auto c = radiance({0,0,2.6}, d, 5);
+                    col[0]+=c[0]; col[1]+=c[1]; col[2]+=c[2];
+                }
+                auto tone = [&](double v){ v /= samples; v = v/(1.0+v); return (unsigned char)(255*std::pow(v, 1.0/2.2)); };
+                size_t i = ((size_t)y*w+x)*3;
+                (*buf)[i] = tone(col[0]); (*buf)[i+1] = tone(col[1]); (*buf)[i+2] = tone(col[2]);
             }
         };
         unsigned nt = std::max(2u, std::min(8u, std::thread::hardware_concurrency()));
         std::vector<std::thread> workers;
-        for (unsigned k = 0; k < nt; ++k) {
-            int y0 = h * (int)k / (int)nt, y1 = h * (int)(k + 1) / (int)nt;
-            workers.emplace_back(renderRows, y0, y1);
-        }
+        for (unsigned k = 0; k < nt; ++k)
+            workers.emplace_back(renderRows, h*(int)k/(int)nt, h*(int)(k+1)/(int)nt);
         for (auto& th : workers) th.join();
         auto d = std::make_shared<Dict>();
         d->items["宽"] = vNum(w);
