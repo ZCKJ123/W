@@ -5576,6 +5576,12 @@ struct PyEmitter {
                     {"指数", "exp"}, {"反余弦", "acos"}, {"反正弦", "asin"},
                     {"反正切", "atan"}, {"双曲正弦", "sinh"}, {"双曲余弦", "cosh"},
                     {"双曲正切", "tanh"}, {"向上取整", "ceil"}, {"向下取整", "floor"}};
+                if (name == "有键" && e->args.size() == 3)
+                    return "(" + expr(e->args[2]) + " in " + expr(e->args[1]) + ")";
+                if (name == "键" && e->args.size() == 2)
+                    return expr(e->args[1]) + ".keys()";
+                if (name == "值" && e->args.size() == 2)
+                    return expr(e->args[1]) + ".values()";
                 auto mit = userFuncs.count(name) ? mathNames.end() : mathNames.find(name);
                 if (mit != mathNames.end()) {
                     usedMath = true;
@@ -5585,8 +5591,7 @@ struct PyEmitter {
                     if (it != pyNames.end()) callee = it->second;
                     else if (name == "随机") { usedRandom = true; callee = "random.random"; }
                     else if (name == "随机整数") { usedRandom = true; callee = "random.randint"; }
-                    else if (!name.empty() && functionModules().count(name) &&
-                             !pyNames.count(name) && !userFuncs.count(name)) {
+                    else if (!name.empty() && !userFuncs.count(name)) {
                         diag(e->line, "内置函数「" + name + "」没有 Python 映射");
                     }
                 }
@@ -5646,7 +5651,7 @@ struct PyEmitter {
                 string args;
                 for (size_t i = 0; i < s->args.size(); ++i) {
                     if (i) args += ", ";
-                    args += expr(s->args[i]);
+                    args += "_文(" + expr(s->args[i]) + ")";
                 }
                 line("print(" + args + ")");
                 break;
@@ -5710,6 +5715,10 @@ struct PyEmitter {
     string generate() {
         for (const auto& s : program) stmt(s);
         string head = "# 由「文」外派库生成 · WEN-LANG-0.2\n";
+        head += "def _文(v):\n";
+        head += "    if isinstance(v, float) and v.is_integer():\n";
+        head += "        return str(int(v))\n";
+        head += "    return str(v)\n";
         if (usedMath) head += "import math\n";
         if (usedRandom) head += "import random\n";
         return head + out.str();
