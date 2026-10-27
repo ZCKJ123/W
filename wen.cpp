@@ -7059,11 +7059,15 @@ static vector<uint32_t> bigParse(string s) {
 }
 static string bigStr(const vector<uint32_t>& a) {
     if (a.empty()) return "0";
-    std::ostringstream ss;
-    ss << a.back();
-    for (int i = (int)a.size() - 2; i >= 0; --i)
-        ss << std::setw(9) << std::setfill('0') << a[(size_t)i];
-    return ss.str();
+    string out;
+    out.reserve(a.size() * 9 + 1);
+    out += std::to_string(a.back());
+    char buf[16];
+    for (int i = (int)a.size() - 2; i >= 0; --i) {
+        std::snprintf(buf, sizeof(buf), "%09u", a[(size_t)i]);
+        out += buf;
+    }
+    return out;
 }
 static void bigTrim(vector<uint32_t>& a) {
     while (a.size() > 1 && a.back() == 0) a.pop_back();
@@ -7139,7 +7143,6 @@ static void bigAddShift(vector<uint32_t>& c, const vector<uint32_t>& a, size_t s
     }
     bigTrim(c);
 }
-#if defined(__SIZEOF_INT128__)
 static uint64_t nttPow(uint64_t a, uint64_t e, uint64_t mod) {
     uint64_t r = 1;
     while (e) { if (e & 1) r = r * a % mod; a = a * a % mod; e >>= 1; }
@@ -7175,6 +7178,7 @@ static void ntt(vector<int>& a, bool inv, int mod, int root) {
         for (int& x : a) x = (int)((uint64_t)x * invn % mod);
     }
 }
+#if defined(__SIZEOF_INT128__)
 static vector<uint32_t> bigMulNTT(const vector<uint32_t>& a, const vector<uint32_t>& b) {
     static const int MODS[3] = {998244353, 1004535809, 469762049};
     static const int ROOT = 3;
@@ -7222,10 +7226,69 @@ static vector<uint32_t> bigMulNTT(const vector<uint32_t>& a, const vector<uint32
     bigTrim(out);
     return out;
 }
+
+#else
+static vector<uint32_t> bigMulNTT32(const vector<uint32_t>& a, const vector<uint32_t>& b) {
+    auto to3 = [](const vector<uint32_t>& x) {
+        vector<uint32_t> o;
+        for (uint32_t v0 : x) {
+            uint32_t v = v0;
+            for (int j = 0; j < 3; ++j) { o.push_back(v % 1000); v /= 1000; }
+        }
+        bigTrim(o);
+        return o;
+    };
+    auto x = to3(a), y = to3(b);
+    size_t need = x.size() + y.size();
+    size_t n = 1;
+    while (n < need) n <<= 1;
+    static const int MODS[2] = {998244353, 1004535809};
+    vector<vector<int>> conv(2, vector<int>(n));
+    for (int k = 0; k < 2; ++k) {
+        vector<int> fa(n), fb(n);
+        for (size_t i = 0; i < x.size(); ++i) fa[i] = (int)(x[i] % MODS[k]);
+        for (size_t i = 0; i < y.size(); ++i) fb[i] = (int)(y[i] % MODS[k]);
+        ntt(fa, false, MODS[k], 3);
+        ntt(fb, false, MODS[k], 3);
+        for (size_t i = 0; i < n; ++i) fa[i] = (int)((uint64_t)fa[i] * fb[i] % MODS[k]);
+        ntt(fa, true, MODS[k], 3);
+        conv[k] = std::move(fa);
+    }
+    uint64_t inv = nttPow(MODS[0] % MODS[1], MODS[1] - 2, MODS[1]);
+    vector<uint64_t> c(need);
+    for (size_t i = 0; i < need; ++i) {
+        uint64_t r1 = (uint64_t)conv[0][i];
+        uint64_t r2 = (uint64_t)conv[1][i];
+        uint64_t t = (r2 + MODS[1] - r1 % MODS[1]) % MODS[1] * inv % MODS[1];
+        c[i] = r1 + (uint64_t)MODS[0] * t;
+    }
+    vector<uint32_t> out;
+    uint64_t carry = 0;
+    for (size_t i = 0; i < need; ++i) {
+        uint64_t cur = c[i] + carry;
+        uint32_t d = (uint32_t)(cur % 1000);
+        carry = cur / 1000;
+        out.push_back(d);
+    }
+    while (carry) { out.push_back((uint32_t)(carry % 1000)); carry /= 1000; }
+    vector<uint32_t> res;
+    uint32_t limb = 0, mul = 1;
+    int cnt = 0;
+    for (uint32_t d : out) {
+        limb += d * mul;
+        mul *= 1000;
+        if (++cnt == 3) { res.push_back(limb); limb = 0; mul = 1; cnt = 0; }
+    }
+    if (cnt) res.push_back(limb);
+    bigTrim(res);
+    return res;
+}
 #endif
 static vector<uint32_t> bigMul(const vector<uint32_t>& a, const vector<uint32_t>& b) {
 #if defined(__SIZEOF_INT128__)
     if (std::min(a.size(), b.size()) >= 1024) return bigMulNTT(a, b);
+#else
+    if (std::min(a.size(), b.size()) >= 512) return bigMulNTT32(a, b);
 #endif
     if (a.empty() || b.empty()) return {0};
     if (std::min(a.size(), b.size()) <= 128) return bigMulSchool(a, b);
