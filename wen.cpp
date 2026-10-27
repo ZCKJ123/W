@@ -8,6 +8,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -37,6 +38,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <imm.h>
 #include <shellapi.h>
 #include <psapi.h>
 #include <winhttp.h>
@@ -2093,19 +2095,28 @@ static string numberToString(double d) {
     if (std::isnan(d)) return "非数";
     if (std::isinf(d)) return d < 0 ? "负无穷" : "无穷";
     if (d == 0) return "0";
-    // 极小/极大的数用科学计数法，别被下面的整数判断吞成 0。
-    if (std::fabs(d) < 1e-12 || std::fabs(d) >= 1e15) {
+    double a = std::fabs(d);
+    // 极端值才用科学计数法；整数到 1e17 都按完整数字输出。
+    if (a < 1e-9 || a >= 1e17) {
         std::ostringstream oss;
         oss << std::setprecision(6) << std::scientific << d;
         return oss.str();
     }
     double r = std::round(d);
-    if (std::fabs(d - r) < 1e-12 && std::fabs(d) < 1e15) {
+    if (std::fabs(d - r) < 1e-9) {
         return std::to_string((long long)r);
     }
     std::ostringstream oss;
     oss << std::setprecision(16) << std::defaultfloat << d;
-    return oss.str();
+    string s = oss.str();
+    if (s.find('e') != string::npos || s.find('E') != string::npos) {
+        std::ostringstream fx;
+        fx << std::fixed << std::setprecision(16) << d;
+        s = fx.str();
+        while (!s.empty() && s.back() == '0') s.pop_back();
+        if (!s.empty() && s.back() == '.') s.pop_back();
+    }
+    return s;
 }
 
 static string quoteText(const string& s) {
@@ -3459,7 +3470,7 @@ static const std::map<string, string>& functionModules() {
         {"新建神经层", "神经网络库"}, {"神经链", "神经网络库"}, {"前向", "神经网络库"},
         {"颜色", "视口库"}, {"新建视口", "视口库"}, {"视口清空", "视口库"}, {"视口画点", "视口库"},
         {"视口画线", "视口库"}, {"视口画三角形", "视口库"}, {"视口尺寸", "视口库"}, {"视口保存", "视口库"},
-        {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"}, {"视口显示", "视口库"}, {"视口加载模型", "视口库"}, {"光追渲染", "视口库"},
+        {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"}, {"视口显示", "视口库"}, {"视口加载模型", "视口库"}, {"光追渲染", "视口库"}, {"视口取色", "视口库"},
         {"硬件信息", "硬件库"}, {"高精度计时", "硬件库"}, {"内存状态", "硬件库"}, {"屏幕尺寸", "硬件库"}, {"磁盘空间", "硬件库"},
         {"大整数幂", "大整数库"}, {"大整数乘", "大整数库"}, {"大整数加", "大整数库"}, {"大整数阶乘", "大整数库"},
         {"阶乘位数", "大整数库"}, {"阶乘末尾零", "大整数库"}, {"阶乘概览", "大整数库"},
@@ -10364,6 +10375,16 @@ Interpreter::Interpreter() {
         d->items["像素"] = vBytes(buf);
         return vDict(d);
     });
+    registerBuiltin("视口取色", 3, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto d = vpDict(a[0], line);
+        int w = (int)needNum(d->items.at("宽"), "视口", line);
+        int h = (int)needNum(d->items.at("高"), "视口", line);
+        int x = (int)needIndex(a[1], "视口取色", line), y = (int)needIndex(a[2], "视口取色", line);
+        if (x < 0 || y < 0 || x >= w || y >= h) return vNum(0);
+        auto& p = vpPixels(d);
+        size_t i = ((size_t)y * w + x) * 3;
+        return vNum((double)((p[i] << 16) | (p[i + 1] << 8) | p[i + 2]));
+    });
     registerBuiltin("视口清空", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         auto d = vpDict(a[0], line);
         int c = a.size() > 1 ? vpColor(a[1], line) : 0;
@@ -15891,6 +15912,11 @@ static WenUiState gUi;
 
 static LRESULT CALLBACK uiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+        case WM_ERASEBKGND:
+            /* 自绘窗口自己会整块 DIB 贴上去，绝不能让系统先刷一遍白底。
+               这一句就是“界面狂闪”的根因：每帧 InvalidateRect(TRUE) 先擦白，
+               再贴图，眼睛看到的就是一帧白一帧内容。 */
+            return 1;
         case WM_PAINT: {
             PAINTSTRUCT ps;
             HDC dc = BeginPaint(hwnd, &ps);
@@ -15908,11 +15934,12 @@ static LRESULT CALLBACK uiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             EndPaint(hwnd, &ps);
             return 0;
         }
+        /* WM_CHAR 只保留非 ASCII 的输入法字符；ASCII 统一在 WM_KEYDOWN
+           里用 ToUnicodeEx 生成。否则同一次按键会先走 WM_KEYDOWN 兜底、
+           再收到 WM_CHAR，打出两个字符。 */
         case WM_CHAR: {
             wchar_t ch = (wchar_t)wp;
-            if (ch == L'\r') ch = L'\n';
-            if (ch == L'\b') gUi.events.push_back({"按键", "退格"});
-            else if (ch >= 32 || ch == L'\n') {
+            if (ch >= 0x80) {
                 std::wstring one(1, ch);
                 gUi.events.push_back({"字符", wideToUtf8(one)});
             }
@@ -15928,6 +15955,30 @@ static LRESULT CALLBACK uiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else if (wp == VK_ESCAPE) gUi.events.push_back({"关闭", ""});
             else if ((GetKeyState(VK_CONTROL) & 0x8000) && wp == 'S')
                 gUi.events.push_back({"按键", "保存"});
+            else {
+                /* ★ 不依赖 WM_CHAR ★
+                   中文输入法/某些远程桌面会把 WM_CHAR 吃掉；WM_KEYDOWN
+                   仍然会到窗口。这里直接查键盘状态并 ToUnicodeEx，
+                   字母、数字、Shift 符号都能还原成字符。 */
+                BYTE state[256]{};
+                wchar_t buf[8]{};
+                if (GetKeyboardState(state)) {
+                    int n = ToUnicodeEx((UINT)wp, (UINT)((lp >> 16) & 0xFFu),
+                                        state, buf, 8, 0, GetKeyboardLayout(0));
+                    for (int i = 0; i < n; i++) {
+                        if (buf[i] >= 32) {
+                            std::wstring one(1, buf[i]);
+                            gUi.events.push_back({"字符", wideToUtf8(one)});
+                        }
+                    }
+                }
+            }
+            return 0;
+        case WM_LBUTTONDOWN:
+            /* 用户点画面时把键盘焦点拿回来。某些远程桌面/多显示器环境下
+               CreateWindow 后的 SetFocus 会被前台窗口抢走。 */
+            SetForegroundWindow(hwnd);
+            SetFocus(hwnd);
             return 0;
         case WM_CLOSE:
             gUi.events.push_back({"关闭", ""});
@@ -15953,7 +16004,8 @@ static Value uiNew(Interpreter&, vector<Value>& a, int line) {
         wc.lpfnWndProc = uiWndProc;
         wc.hInstance = inst;
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        /* 不设背景刷：避免系统在 WM_PAINT 前擦白闪屏 */
+        wc.hbrBackground = nullptr;
         wc.lpszClassName = L"WenUiWindow";
         if (!RegisterClassW(&wc)) throw WenError("运行时错误", line, 0, "界面窗口注册失败");
         reg = true;
@@ -15965,6 +16017,15 @@ static Value uiNew(Interpreter&, vector<Value>& a, int line) {
         CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top,
         nullptr, nullptr, inst, nullptr);
     if (!gUi.hwnd) throw WenError("运行时错误", line, 0, "界面窗口创建失败");
+
+    /* 自绘界面只需要原始按键，不需要输入法。
+       中文输入法开启时，WM_CHAR 会被 IME 截走，脚本收不到 "字符" 事件，
+       表现就是窗口里鼠标能动、键盘按什么都没反应。 */
+    ImmDisableIME(0);
+    ImmAssociateContext(gUi.hwnd, nullptr);
+
+    ShowWindow(gUi.hwnd, SW_SHOW);
+    SetForegroundWindow(gUi.hwnd);
     SetFocus(gUi.hwnd);
     return vBool(true);
 }
@@ -16073,7 +16134,9 @@ static Value uiText(Interpreter&, vector<Value>& a, int line) {
 }
 static Value uiRefresh(Interpreter&, vector<Value>&, int line) {
     if (!gUi.hwnd) throw WenError("运行时错误", line, 0, "界面还没有打开");
-    InvalidateRect(gUi.hwnd, nullptr, TRUE);
+    /* 第三个参数 FALSE：不擦背景，直接等 WM_PAINT 贴 DIB。
+       TRUE 会让系统先用背景色填一遍，和下一帧之间就是白闪。 */
+    InvalidateRect(gUi.hwnd, nullptr, FALSE);
     UpdateWindow(gUi.hwnd);
     return vNone();
 }

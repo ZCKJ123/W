@@ -1,6 +1,6 @@
 # 文光追 0.2-snapshot
 
-CPU 光追渲染，不依赖 GPU。
+CPU 光追渲染，不依赖 GPU。渲染器是 C++ 内置 `光追渲染`；文语言负责场景调用、保存和界面。
 
 ```powershell
 .\wen.exe 工程\光追\光追.wen
