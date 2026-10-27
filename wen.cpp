@@ -7676,7 +7676,22 @@ Interpreter::Interpreter() {
     registerBuiltin("查找", 2, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
         string s = needStr(a[0], "查找", line);
         string sub = needStr(a[1], "查找", line);
-        long long from = a.size() == 3 ? needIndex(a[2], "查找", line) : 0;
+        long long fromChar = a.size() == 3 ? needIndex(a[2], "查找", line) : 0;
+        if (fromChar < 0) fromChar = 0;
+        size_t fromByte = 0, seen = 0;
+        while (seen < (size_t)fromChar && fromByte < s.size()) {
+            fromByte += utf8CharLen((unsigned char)s[fromByte]);
+            ++seen;
+        }
+        if (fromByte > s.size()) return vNum(-1);
+        size_t pos = s.find(sub, fromByte);
+        if (pos == string::npos) return vNum(-1);
+        return vNum((double)utf8Length(s.substr(0, pos)));
+    });
+    registerBuiltin("查找字节", 2, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string s = needStr(a[0], "查找字节", line);
+        string sub = needStr(a[1], "查找字节", line);
+        long long from = a.size() == 3 ? needIndex(a[2], "查找字节", line) : 0;
         if (from < 0) from = 0;
         if ((size_t)from > s.size()) return vNum(-1);
         size_t pos = s.find(sub, (size_t)from);
