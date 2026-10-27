@@ -6490,6 +6490,8 @@ struct StackEmitter {
     vector<string> diags;
     vector<StackIns> code;
     int tempCounter = 0;
+    vector<vector<int>> breakJumps;
+    vector<vector<int>> continueJumps;
 
     explicit StackEmitter(const vector<StmtPtr>& p) : program(p) {}
 
@@ -6629,8 +6631,12 @@ struct StackEmitter {
                 break;
             }
             case Stmt::K::Break:
+                if (breakJumps.empty()) diag(s->line, "「中断」只能用在循环里");
+                else breakJumps.back().push_back(emit("jmp", "\"to\":0", "JMP 0"));
+                break;
             case Stmt::K::Continue:
-                diag(s->line, "字节码/汇编暂不支持中断/继续");
+                if (continueJumps.empty()) diag(s->line, "「继续」只能用在循环里");
+                else continueJumps.back().push_back(emit("jmp", "\"to\":0", "JMP 0"));
                 break;
             case Stmt::K::Func:
                 diag(s->line, "字节码/汇编暂不支持函数定义");
@@ -6657,13 +6663,21 @@ struct StackEmitter {
                 emit("load", "\"name\":" + quoteText(idxVar), "LOAD " + idxVar);
                 emit("index", "", "INDEX");
                 emit("store", "\"name\":" + quoteText(s->name), "STORE " + s->name);
+                breakJumps.push_back({});
+                continueJumps.push_back({});
                 for (const auto& bodyStmt : s->body) stmt(bodyStmt);
+                int contTarget = (int)code.size();
+                for (int j : continueJumps.back()) patch(j, contTarget);
                 emit("load", "\"name\":" + quoteText(idxVar), "LOAD " + idxVar);
                 emit("push", "\"v\":1", "PUSH 1");
                 emit("add", "", "ADD");
                 emit("store", "\"name\":" + quoteText(idxVar), "STORE " + idxVar);
                 emit("jmp", "\"to\":" + std::to_string(start), "JMP " + std::to_string(start));
-                patch(exitJump, (int)code.size());
+                int loopEnd = (int)code.size();
+                for (int j : breakJumps.back()) patch(j, loopEnd);
+                breakJumps.pop_back();
+                continueJumps.pop_back();
+                patch(exitJump, loopEnd);
                 break;
             }
             case Stmt::K::Try:
