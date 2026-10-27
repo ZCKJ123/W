@@ -15455,6 +15455,7 @@ static void printCompileError(const CompileError& e, const string& filename) {
 static void printIoError(const IoError& e, const string& context) {
     std::cout.flush();
     std::cerr << "【文件错误】\n";
+    std::cerr << "代码：WEN-IO-001\n";
     std::cerr << "来源：你的脚本（文件路径或权限）\n";
     if (!context.empty()) std::cerr << "位置：" << context << "\n";
     std::cerr << "原因：" << e.what() << "\n";
@@ -15464,6 +15465,7 @@ static void printIoError(const IoError& e, const string& context) {
 static void printEngineError(const std::exception& e, const string& context) {
     std::cout.flush();
     std::cerr << "【引擎错误】\n";
+    std::cerr << "代码：WEN-ENG-001\n";
     std::cerr << "来源：引擎内部（不是你的脚本写错）\n";
     if (!context.empty()) std::cerr << "位置：" << context << "\n";
     std::cerr << "详情：" << e.what() << "\n";
@@ -15805,16 +15807,32 @@ static int checkFile(const string& path) {
         std::cout << "语法通过：顶层 " << program.size() << " 条语句\n";
         return 0;
     } catch (IncompleteError& e) {
-        printIncompleteError(e, path, lines);
+        if (gJsonDiagnostics) {
+            printDiagnostics({WenError("语法错误", e.line, 0, e.what())}, path, lines);
+        } else {
+            printIncompleteError(e, path, lines);
+        }
         return 1;
     } catch (WenError& e) {
-        printWenError(e, path, lines);
+        if (gJsonDiagnostics) {
+            printDiagnostics({e}, path, lines);
+        } else {
+            printWenError(e, path, lines);
+        }
         return 1;
     } catch (IoError& e) {
-        printIoError(e, path);
+        if (gJsonDiagnostics) {
+            printDiagnostics({WenError("文件错误", 1, 0, e.what())}, path, lines);
+        } else {
+            printIoError(e, path);
+        }
         return 1;
     } catch (std::exception& e) {
-        printEngineError(e, path);
+        if (gJsonDiagnostics) {
+            printDiagnostics({WenError("引擎错误", 1, 0, e.what())}, path, lines);
+        } else {
+            printEngineError(e, path);
+        }
         return 1;
     }
 }
