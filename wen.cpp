@@ -1817,6 +1817,8 @@ struct Dict { map<string, Value> items; };
 
 
 static std::set<string> gCallableNames;
+static std::map<string, std::pair<int,int>> gBuiltinArity;
+static bool gNoNameCheck = false;
 
 static std::vector<uint32_t> nameCps(const string& s) {
     std::vector<uint32_t> out;
@@ -2996,7 +2998,7 @@ static string jsonDump(const Value& v, int line) {
             if (!std::isfinite(v.num))
                 throw WenError("运行时错误", line, 0, "结构化文本不能表示无穷或非数");
             std::ostringstream os;
-            os << std::setprecision(15) << v.num;
+            os << std::setprecision(17) << v.num;
             return os.str();
         }
         case VT::Str: return jsonQuote(v.str);
@@ -3768,13 +3770,34 @@ void Interpreter::registerBuiltin(
     b->fn = std::move(fn);
     globals->set(name, vFunc(b));
     gCallableNames.insert(name);
+    gBuiltinArity[name] = {minArgs, maxArgs};
 }
+
+static void collectCallables(const vector<StmtPtr>&, std::set<string>&);
+static void checkStmtStatic(const vector<StmtPtr>&, const std::set<string>&, vector<WenError>&);
+static void collectStaticDefs(const vector<StmtPtr>&, std::set<string>&, std::map<string,int>&);
+static void checkStmtNames(const vector<StmtPtr>&, const std::set<string>&,
+                           const std::map<string,int>&, vector<WenError>&, bool);
 
 vector<StmtPtr> Interpreter::parseSource(const string& src) {
     Lexer lex(src);
     auto toks = lex.scan();
     Parser p(std::move(toks));
-    return p.parseProgram();
+    auto ast = p.parseProgram();
+    std::set<string> callables = gCallableNames;
+    collectCallables(ast, callables);
+    vector<WenError> errs;
+    checkStmtStatic(ast, callables, errs);
+    if (!gNoNameCheck) {
+        std::set<string> vars;
+        std::map<string,int> funcs;
+        collectStaticDefs(ast, vars, funcs);
+        checkStmtNames(ast, vars, funcs, errs,
+                       src.find("依赖") != string::npos || src.find("别名") != string::npos ||
+                       src.find("后缀") != string::npos);
+    }
+    if (!errs.empty()) throw errs.front();
+    return ast;
 }
 
 void Interpreter::scanPull(const string& src) {
@@ -15088,6 +15111,41 @@ static string errorCode(const string& kind) {
     return "WEN-ERR-000";
 }
 
+static string errorRule(const WenError& e) {
+    const string& k = e.kind;
+    string r = e.what();
+    if (k == "词法错误") {
+        if (r.find("文本没有闭合") != string::npos) return "lex.unclosed_text";
+        if (r.find("插值文本") != string::npos) return "lex.unclosed_template";
+        return "lex.invalid_char";
+    }
+    if (k == "语法错误") {
+        if (r.find("缺少「结束」") != string::npos) return "syntax.missing_end";
+        if (r.find("期望「则」") != string::npos) return "syntax.missing_then";
+        if (r.find("语句之间需要换行") != string::npos) return "syntax.need_newline";
+        if (r.find("连续空了两行") != string::npos) return "syntax.blank_lines";
+        if (r.find("括号") != string::npos) return "syntax.bracket";
+        return "syntax.invalid";
+    }
+    if (k == "静态错误") {
+        if (r.find("没有定义名字") != string::npos) return "static.undefined_name";
+        if (r.find("不能调用") != string::npos) return "static.call_non_function";
+        if (r.find("参数") != string::npos) return "static.arity";
+        if (r.find("负数参数") != string::npos) return "static.negative_arg";
+        return "static.invalid";
+    }
+    if (k == "运行时错误") {
+        if (r.find("除数") != string::npos) return "runtime.divide_zero";
+        if (r.find("下标") != string::npos) return "runtime.index";
+        if (r.find("参数") != string::npos) return "runtime.arity";
+        return "runtime.error";
+    }
+    if (k == "文件错误") return "io.file";
+    if (k == "库冲突") return "lib.conflict";
+    if (k == "兼容冲突") return "compat.target";
+    return "error.generic";
+}
+
 static string errorExplanation(const string& kind) {
     if (kind == "词法错误")
         return "脚本里有无法识别的字符，或文本/引号没有闭合。";
@@ -15634,6 +15692,90 @@ static void checkStmtStatic(const vector<StmtPtr>& ps, const std::set<string>& c
     }
 }
 
+static void collectStaticDefs(const vector<StmtPtr>& ps, std::set<string>& vars,
+                              std::map<string,int>& funcs) {
+    for (const auto& s : ps) {
+        if (!s) continue;
+        if (s->k == Stmt::K::Assign && s->target && s->target->k == Expr::K::Var)
+            vars.insert(s->target->text);
+        if (s->k == Stmt::K::Func) {
+            funcs[s->name] = (int)s->params.size();
+            vars.insert(s->name);
+            for (const auto& p : s->params) vars.insert(p);
+        }
+        if (s->k == Stmt::K::For) {
+            if (!s->name.empty()) vars.insert(s->name);
+            if (!s->name2.empty()) vars.insert(s->name2);
+        }
+        if (s->k == Stmt::K::Try && !s->name.empty()) vars.insert(s->name);
+        collectStaticDefs(s->body, vars, funcs);
+        collectStaticDefs(s->elseBody, vars, funcs);
+        collectStaticDefs(s->finallyBody, vars, funcs);
+        for (const auto& br : s->branches) collectStaticDefs(br.second, vars, funcs);
+    }
+}
+
+static void checkExprNames(const ExprPtr& e, const std::set<string>& vars,
+                           const std::map<string,int>& funcs, vector<WenError>& errors,
+                           bool skipUndefined) {
+    if (!e) return;
+    if (e->k == Expr::K::Var) {
+        static const std::set<string> builtinVars = {"π", "圆周率", "自然常数"};
+        if (!skipUndefined && !vars.count(e->text) && !gCallableNames.count(e->text) &&
+            !builtinVars.count(e->text)) {
+            errors.push_back(WenError("静态错误", e->line, 0,
+                "没有定义名字「" + e->text + "」；先赋值，或检查拼写"));
+        }
+    }
+    if (e->k == Expr::K::Call && !e->args.empty() && e->args[0] &&
+        (e->args[0]->k == Expr::K::Num || e->args[0]->k == Expr::K::Str ||
+         e->args[0]->k == Expr::K::Bool || e->args[0]->k == Expr::K::None ||
+         e->args[0]->k == Expr::K::List || e->args[0]->k == Expr::K::Dict)) {
+        errors.push_back(WenError("静态错误", e->line, 0, "这个值不能调用：它不是函数"));
+    }
+    if (e->k == Expr::K::Call && !e->args.empty() && e->args[0] &&
+        e->args[0]->k == Expr::K::Var) {
+        const string& callee = e->args[0]->text;
+        int n = (int)e->args.size() - 1;
+        auto uf = funcs.find(callee);
+        auto bi = gBuiltinArity.find(callee);
+        if (uf != funcs.end() && n != uf->second) {
+            errors.push_back(WenError("静态错误", e->line, 0,
+                "函数「" + callee + "」需要 " + std::to_string(uf->second) +
+                " 个参数，收到 " + std::to_string(n) + " 个"));
+        } else if (uf == funcs.end() && bi != gBuiltinArity.end() &&
+                   (n < bi->second.first || (bi->second.second >= 0 && n > bi->second.second))) {
+            errors.push_back(WenError("静态错误", e->line, 0,
+                "函数「" + callee + "」需要 " +
+                std::to_string(bi->second.first) + ".." + std::to_string(bi->second.second) +
+                " 个参数，收到 " + std::to_string(n) + " 个"));
+        }
+    }
+    for (const auto& a : e->args) checkExprNames(a, vars, funcs, errors, skipUndefined);
+    for (const auto& kv : e->pairs) {
+        checkExprNames(kv.first, vars, funcs, errors, skipUndefined);
+        checkExprNames(kv.second, vars, funcs, errors, skipUndefined);
+    }
+}
+
+static void checkStmtNames(const vector<StmtPtr>& ps, const std::set<string>& vars,
+                           const std::map<string,int>& funcs, vector<WenError>& errors,
+                           bool skipUndefined) {
+    for (const auto& s : ps) {
+        if (!s) continue;
+        checkExprNames(s->target, vars, funcs, errors, skipUndefined);
+        checkExprNames(s->expr, vars, funcs, errors, skipUndefined);
+        for (const auto& a : s->args) checkExprNames(a, vars, funcs, errors, skipUndefined);
+        checkStmtNames(s->body, vars, funcs, errors, skipUndefined);
+        checkStmtNames(s->elseBody, vars, funcs, errors, skipUndefined);
+        checkStmtNames(s->finallyBody, vars, funcs, errors, skipUndefined);
+        for (const auto& br : s->branches) {
+            checkExprNames(br.first, vars, funcs, errors, skipUndefined);
+            checkStmtNames(br.second, vars, funcs, errors, skipUndefined);
+        }
+    }
+}
+
 static vector<StmtPtr> parseDiagnostic(const string& src, vector<WenError>& errors) {
     try {
         Lexer lex(src);
@@ -15644,6 +15786,14 @@ static vector<StmtPtr> parseDiagnostic(const string& src, vector<WenError>& erro
             std::set<string> callables = gCallableNames;
             collectCallables(ast, callables);
             checkStmtStatic(ast, callables, errors);
+            if (!gNoNameCheck) {
+                std::set<string> vars;
+                std::map<string,int> funcs;
+                collectStaticDefs(ast, vars, funcs);
+                checkStmtNames(ast, vars, funcs, errors,
+                               src.find("依赖") != string::npos || src.find("别名") != string::npos ||
+                               src.find("后缀") != string::npos);
+            }
         }
         return ast;
     } catch (WenError& e) {
@@ -15666,6 +15816,7 @@ static void printDiagnostics(const vector<WenError>& errors, const string& filen
                    ",\"line\":" + std::to_string(e.line) +
                    ",\"column\":" + std::to_string(e.col) +
                    ",\"code\":" + jsonQuote(errorCode(e.kind)) +
+                   ",\"rule\":" + jsonQuote(errorRule(e)) +
                    ",\"severity\":\"error\"" +
                    ",\"reason\":" + jsonQuote(e.what()) +
                    ",\"detail\":" + jsonQuote(errorExplanation(e.kind)) +
@@ -16558,6 +16709,10 @@ static int runMain(vector<string> args) {
         Interpreter vm;
         repl(vm);
         return 0;
+    }
+    for (auto it = args.begin() + 1; it != args.end();) {
+        if (*it == "--不查名字") { gNoNameCheck = true; it = args.erase(it); }
+        else ++it;
     }
     const string& cmd = args[1];
     for (const auto& a : args) {

@@ -8,7 +8,6 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const runFile = promisify(execFile);
-const LEGACY_EXE = 'C:\\Users\\Acer\\Desktop\\zhongwen_lang\\wen.exe';
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url));
 const MAX_LIMIT = 200;
 
@@ -25,7 +24,6 @@ function exeCandidates(config, cached) {
     cached || '',
     'wen',
     'wen.exe',
-    LEGACY_EXE,
   ];
   return [...new Set(list.filter(Boolean))];
 }
@@ -210,6 +208,7 @@ export function apply(ctx, config) {
             properties: {
               kind: { type: 'string' },
               code: { type: 'string' },
+              rule: { type: 'string' },
               severity: { type: 'string' },
               line: { type: 'integer' },
               column: { type: 'integer' },

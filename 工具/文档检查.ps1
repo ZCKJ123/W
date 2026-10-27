@@ -79,7 +79,7 @@ foreach ($doc in $docs) {
         $outFile = [IO.Path]::GetTempFileName()
         $errFile = [IO.Path]::GetTempFileName()
         try {
-            $p = Start-Process -FilePath $exe -ArgumentList @('--检查', $tmp) `
+            $p = Start-Process -FilePath $exe -ArgumentList @('--检查', '--不查名字', $tmp) `
                 -WorkingDirectory $root -RedirectStandardOutput $outFile `
                 -RedirectStandardError $errFile -NoNewWindow -Wait -PassThru
             $out = [IO.File]::ReadAllText($errFile, [Text.Encoding]::UTF8)
