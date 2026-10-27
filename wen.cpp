@@ -69,6 +69,11 @@ using WenU128 = unsigned long long;
 
 static string piText(int digits);
 static double piValue();
+static double wenSqrt(double x);
+static double wenExp(double x);
+static double wenE();
+static double wenTanh(double x);
+static double wenPow(double x, double y);
 
 // ============================================================
 // 0. 基础工具
@@ -744,6 +749,7 @@ struct Expr {
     mutable int localSlot = -1;
     bool b = false;
     bool commandCall = false;
+    bool juxtaposed = false;
     string op;
     vector<ExprPtr> args;
     vector<std::pair<ExprPtr, ExprPtr>> pairs;
@@ -1473,6 +1479,11 @@ private:
         return parseComparison();
     }
 
+    void rejectJuxt(ExprPtr e) {
+        if (e && e->juxtaposed)
+            err(peek(), "并置调用不能直接和二元运算符混写；请用括号分组");
+    }
+
     ExprPtr parseComparison() {
         ExprPtr left = parseAdd();
         if (peek().type == TT::Op) {
@@ -1480,8 +1491,10 @@ private:
             if (op == "==" || op == "=" || op == "!=" || op == "<" ||
                 op == "<=" || op == ">" || op == ">=") {
                 int line = peek().line;
+                rejectJuxt(left);
                 ++idx_;
                 ExprPtr right = parseAdd();
+                rejectJuxt(right);
                 ExprPtr result = mkBinary(op, left, right, line);
                 if (peek().type == TT::Op &&
                     (peek().text == "==" || peek().text == "=" || peek().text == "!=" ||
@@ -1492,7 +1505,9 @@ private:
         }
         if (matchKw("在")) {
             int line = peek().line;
+            rejectJuxt(left);
             ExprPtr right = parseAdd();
+            rejectJuxt(right);
             expectKw("中");
             return mkBinary("在", left, right, line);
         }
@@ -1504,8 +1519,10 @@ private:
         while (atOp("+") || atOp("-")) {
             string op = peek().text;
             int line = peek().line;
+            rejectJuxt(left);
             ++idx_;
             ExprPtr right = parseMul();
+            rejectJuxt(right);
             left = mkBinary(op, left, right, line);
         }
         return left;
@@ -1516,8 +1533,10 @@ private:
         while (atOp("*") || atOp("/") || atOp("//") || atOp("%")) {
             string op = peek().text;
             int line = peek().line;
+            rejectJuxt(left);
             ++idx_;
             ExprPtr right = parseUnary();
+            rejectJuxt(right);
             left = mkBinary(op, left, right, line);
         }
         return left;
@@ -1527,9 +1546,7 @@ private:
         if (atOp("√")) {
             int line = peek().line;
             ++idx_;
-            ExprPtr v = parseUnary();
-            vector<ExprPtr> args{v};
-            return mkCall(mkVar("平方根", line), std::move(args), line);
+            return mkUnary("√", parseUnary(), line);
         }
         if (atOp("-")) {
             int line = peek().line;
@@ -1547,7 +1564,9 @@ private:
         ExprPtr left = parsePostfix();
         if (matchOp("**")) {
             int line = peek().line;
+            rejectJuxt(left);
             ExprPtr right = parseUnary();
+            rejectJuxt(right);
             return mkBinary("**", left, right, line);
         }
         return left;
@@ -1567,8 +1586,7 @@ private:
                 if (atOp("°")) {
                     int line = peek().line;
                     ++idx_;
-                    vector<ExprPtr> args{e};
-                    e = mkCall(mkVar("角度转弧度", line), std::move(args), line);
+                    e = mkUnary("°", e, line);
                     continue;
                 }
             }
@@ -1599,6 +1617,7 @@ private:
                 ExprPtr arg = parseUnary();
                 vector<ExprPtr> args{arg};
                 e = mkCall(e, std::move(args), line);
+                e->juxtaposed = true;
                 continue;
             }
             break;
@@ -1888,7 +1907,7 @@ struct Function : Callable {
 
     Value call(Interpreter& vm, vector<Value>& args, int line) override;
     string display() const override { return "<函数 " + name + ">"; }
-    bool zeroArgCall() const override { return params.empty(); }
+    bool zeroArgCall() const override { return false; }
     string memoKey() const override { return name; }
 };
 
@@ -1904,7 +1923,7 @@ struct Builtin : Callable {
 
     Value call(Interpreter& vm, vector<Value>& args, int line) override;
     string display() const override { return "<内置函数 " + name + ">"; }
-    bool zeroArgCall() const override { return minArgs == 0; }
+    bool zeroArgCall() const override { return false; }
     bool cacheable() const override { return cacheableFn; }
 };
 
@@ -3881,7 +3900,7 @@ void Interpreter::加载模块(const string& rawName, int line) {
         const double pi = piValue();
         globals->set("圆周率", vNum(pi));
         globals->set("π", vNum(pi));
-        globals->set("自然常数", vNum(std::exp(1.0)));
+        globals->set("自然常数", vNum(wenE()));
     } else if (name == "物理库") {
         globals->set("重力加速度", vNum(9.80665));
         globals->set("光速", vNum(299792458.0));
@@ -4408,6 +4427,12 @@ Value Interpreter::eval(const ExprPtr& e, shared_ptr<Scope> scope) {
         }
             if (e->op == "+") return vNum(needNum(a, "正号", e->line));
             if (e->op == "非") return vBool(!truthy(a));
+            if (e->op == "√") {
+                double x = needNum(a, "根号", e->line);
+                if (x < 0) rtError(e->line, "根号不能对负数开平方");
+                return vNum(wenSqrt(x));
+            }
+            if (e->op == "°") return vNum(needNum(a, "角度", e->line) * piValue() / 180.0);
             rtError(e->line, "未知一元运算：" + e->op);
         }
         case Expr::K::Binary: {
@@ -6833,10 +6858,10 @@ static Value compatParse(const string& lang0, const string& code, int line) {
     }
 }
 static double nnAct(double x, const string& act) {
-    if (act == "tanh") return std::tanh(x);
+    if (act == "tanh") return wenTanh(x);
     if (act == "relu") return x > 0 ? x : 0;
     if (act == "linear") return x;
-    return 1.0 / (1.0 + std::exp(-x));
+    return 1.0 / (1.0 + wenExp(-x));
 }
 static double nnActDeriv(double z, double y, const string& act) {
     if (act == "tanh") return 1 - y * y;
@@ -6849,7 +6874,7 @@ static Value nnLayer(int in, int out, string act, int line) {
         throw WenError("运行时错误", line, 0, "神经层尺寸必须在 1..4096");
     if (act.empty()) act = "sigmoid";
     std::mt19937 rng(std::random_device{}());
-    double limit = std::sqrt(6.0 / (in + out));
+    double limit = wenSqrt(6.0 / (in + out));
     std::uniform_real_distribution<double> dist(-limit, limit);
     auto weights = std::make_shared<List>();
     for (int j = 0; j < out; ++j) {
@@ -7198,6 +7223,96 @@ static double piValue() {
     static const double v = std::stod(piText(40));
     return v;
 }
+static double wenSqrt(double x) {
+    if (x <= 0) return 0;
+    double r = x > 1 ? x : 1;
+    for (int i = 0; i < 50; ++i) r = 0.5 * (r + x / r);
+    return r;
+}
+static double wenAtanh(double z) {
+    double z2 = z * z, term = z, sum = 0;
+    for (int n = 0; n < 80; ++n) {
+        sum += term / (2 * n + 1);
+        term *= z2;
+    }
+    return 2 * sum;
+}
+static double wenLn2() {
+    static const double v = wenAtanh(1.0 / 3.0);
+    return v;
+}
+static double wenE() {
+    static const double v = [] {
+        double sum = 1, term = 1;
+        for (int n = 1; n < 40; ++n) { term /= n; sum += term; }
+        return sum;
+    }();
+    return v;
+}
+static double wenExp(double x) {
+    if (x > 700) return std::numeric_limits<double>::infinity();
+    if (x < -700) return 0;
+    double k = std::floor(x);
+    double r = x - k;
+    double sum = 1, term = 1;
+    for (int n = 1; n < 40; ++n) { term *= r / n; sum += term; }
+    double e = wenE();
+    for (int i = 0; i < (int)k; ++i) sum *= e;
+    for (int i = 0; i < (int)(-k); ++i) sum /= e;
+    return sum;
+}
+static double wenLog(double x) {
+    if (x <= 0) return -std::numeric_limits<double>::infinity();
+    int k = 0;
+    while (x >= 2) { x /= 2; ++k; }
+    while (x < 1) { x *= 2; --k; }
+    return k * wenLn2() + wenAtanh((x - 1) / (x + 1));
+}
+static double wenAtan(double x) {
+    if (std::fabs(x) > 1) {
+        double s = x > 0 ? 1 : -1;
+        return s * piValue() / 2 - wenAtan(1 / x);
+    }
+    int k = 0;
+    while (std::fabs(x) > 0.2) {
+        x = x / (1 + wenSqrt(1 + x * x));
+        ++k;
+    }
+    double x2 = x * x, term = x, sum = 0;
+    for (int n = 0; n < 60; ++n) {
+        sum += term / (2 * n + 1);
+        term *= -x2;
+    }
+    for (int i = 0; i < k; ++i) sum *= 2;
+    return sum;
+}
+static double wenAsin(double x) {
+    if (x <= -1) return -piValue() / 2;
+    if (x >= 1) return piValue() / 2;
+    return wenAtan(x / wenSqrt(1 - x * x));
+}
+static double wenAcos(double x) { return piValue() / 2 - wenAsin(x); }
+static double wenPow(double x, double y) {
+    double yi = std::floor(y);
+    if (yi == y && std::fabs(y) < 1e9) {
+        long long n = (long long)y;
+        bool neg = n < 0;
+        if (neg) n = -n;
+        double r = 1, b = x;
+        while (n) {
+            if (n & 1) r *= b;
+            b *= b;
+            n >>= 1;
+        }
+        return neg ? 1 / r : r;
+    }
+    if (x < 0) return std::numeric_limits<double>::quiet_NaN();
+    if (x == 0) return y > 0 ? 0 : std::numeric_limits<double>::infinity();
+    return wenExp(y * wenLog(x));
+}
+static double wenSinh(double x) { return (wenExp(x) - wenExp(-x)) / 2; }
+static double wenCosh(double x) { return (wenExp(x) + wenExp(-x)) / 2; }
+static double wenTanh(double x) { double a = wenExp(x), b = wenExp(-x); return (a - b) / (a + b); }
 static long double bigDigitEstimate(const vector<uint32_t>& base, long long exp) {
     if (exp <= 0 || base.empty()) return 1;
     long double d = 0;
@@ -7220,6 +7335,9 @@ static void bigGuard(long double digits, int line = 0) {
 
 Interpreter::Interpreter() {
     globals = std::make_shared<Scope>();
+    globals->set("圆周率", vNum(piValue()));
+    globals->set("π", vNum(piValue()));
+    globals->set("自然常数", vNum(wenE()));
     rng.seed(std::random_device{}());
 
     // ---------- 核心（不需要依赖）---------
@@ -7906,7 +8024,7 @@ Interpreter::Interpreter() {
                 else if (op == "div") stack.push_back(vNum(x / y));
                 else if (op == "idiv") stack.push_back(vNum(std::floor(x / y)));
                 else if (op == "mod") stack.push_back(vNum(std::fmod(x, y)));
-                else stack.push_back(vNum(std::pow(x, y)));
+                else stack.push_back(vNum(wenPow(x, y)));
             } else if (op == "eq" || op == "ne" || op == "lt" || op == "le" ||
                        op == "gt" || op == "ge") {
                 Value b = pop(), aa = pop();
@@ -10391,13 +10509,13 @@ Interpreter::Interpreter() {
     m1("取整", [](double x) { return std::round(x); });
     m1("向下取整", [](double x) { return std::floor(x); });
     m1("向上取整", [](double x) { return std::ceil(x); });
-    m1("指数", [](double x) { return std::exp(x); });
+    m1("指数", wenExp);
     m1("正弦", mySin);
     m1("余弦", myCos);
     m1("正切", [mySin, myCos](double x) { return mySin(x) / myCos(x); });
-    m1("双曲正弦", [](double x) { return std::sinh(x); });
-    m1("双曲余弦", [](double x) { return std::cosh(x); });
-    m1("双曲正切", [](double x) { return std::tanh(x); });
+    m1("双曲正弦", wenSinh);
+    m1("双曲余弦", wenCosh);
+    m1("双曲正切", wenTanh);
     m1("角度转弧度", [](double x) { return x * piValue() / 180.0; });
     m1("弧度转角度", [](double x) { return x * 180.0 / piValue(); });
 
@@ -10411,7 +10529,7 @@ Interpreter::Interpreter() {
     registerBuiltin("幂", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double x = needNum(a[0], "幂", line);
         double y = needNum(a[1], "幂", line);
-        double r = std::pow(x, y);
+        double r = wenPow(x, y);
         if (std::isnan(r))
             throw WenError("运行时错误", line, 0, "幂运算的结果不是实数");
         return vNum(r);
@@ -10419,36 +10537,40 @@ Interpreter::Interpreter() {
     registerBuiltin("对数", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double x = needNum(a[0], "对数", line);
         if (x <= 0) throw WenError("运行时错误", line, 0, "对数的真数必须大于 0");
-        if (a.size() == 1) return vNum(std::log(x));
+        if (a.size() == 1) return vNum(wenLog(x));
         double b = needNum(a[1], "对数", line);
         if (b <= 0 || b == 1)
             throw WenError("运行时错误", line, 0, "对数的底必须大于 0 且不等于 1");
-        return vNum(std::log(x) / std::log(b));
+        return vNum(wenLog(x) / wenLog(b));
     });
     registerBuiltin("对数10", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double x = needNum(a[0], "对数10", line);
         if (x <= 0) throw WenError("运行时错误", line, 0, "对数的真数必须大于 0");
-        return vNum(std::log10(x));
+        return vNum(wenLog(x) / wenLog(10));
     });
     registerBuiltin("反正弦", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double x = needNum(a[0], "反正弦", line);
         if (x < -1 || x > 1)
             throw WenError("运行时错误", line, 0, "反正弦的输入必须在 -1 到 1 之间");
-        return vNum(std::asin(x));
+        return vNum(wenAsin(x));
     });
     registerBuiltin("反余弦", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double x = needNum(a[0], "反余弦", line);
         if (x < -1 || x > 1)
             throw WenError("运行时错误", line, 0, "反余弦的输入必须在 -1 到 1 之间");
-        return vNum(std::acos(x));
+        return vNum(wenAcos(x));
     });
     registerBuiltin("反正切", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
-        return vNum(std::atan(needNum(a[0], "反正切", line)));
+        return vNum(wenAtan(needNum(a[0], "反正切", line)));
     });
     registerBuiltin("反正切2", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double y = needNum(a[0], "反正切2", line);
         double x = needNum(a[1], "反正切2", line);
-        return vNum(std::atan2(y, x));
+        if (x > 0) return vNum(wenAtan(y / x));
+        if (x < 0) return vNum((y >= 0 ? piValue() : -piValue()) + wenAtan(y / x));
+        if (y > 0) return vNum(piValue() / 2);
+        if (y < 0) return vNum(-piValue() / 2);
+        return vNum(0);
     });
     registerBuiltin("符号", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double x = needNum(a[0], "符号", line);
@@ -10584,7 +10706,7 @@ Interpreter::Interpreter() {
             double d = needNum(v, "标准差", line) - mean;
             acc += d * d;
         }
-        return vNum(std::sqrt(acc / (double)l->items.size()));
+        return vNum(wenSqrt(acc / (double)l->items.size()));
     });
     registerBuiltin("样本标准差", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
         auto l = needList(a[0], "样本标准差", line);
@@ -10599,7 +10721,7 @@ Interpreter::Interpreter() {
             double d = needNum(v, "样本标准差", line) - mean;
             acc += d * d;
         }
-        return vNum(std::sqrt(acc / (double)(n - 1)));
+        return vNum(wenSqrt(acc / (double)(n - 1)));
     });
     registerBuiltin("矩阵乘", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         auto readMat = [&](const Value& v, const string& name) {
@@ -10715,12 +10837,12 @@ Interpreter::Interpreter() {
         auto out = std::make_shared<Dict>();
         out->items["判别式"] = vNum(D);
         if (D >= 0) {
-            double s = std::sqrt(D);
+            double s = wenSqrt(D);
             out->items["根1"] = root((-B + s) / (2 * A), 0);
             out->items["根2"] = root((-B - s) / (2 * A), 0);
             out->items["实根数"] = vNum(D > 1e-12 ? 2 : 1);
         } else {
-            double s = std::sqrt(-D);
+            double s = wenSqrt(-D);
             out->items["根1"] = root(-B / (2 * A), s / (2 * A));
             out->items["根2"] = root(-B / (2 * A), -s / (2 * A));
             out->items["实根数"] = vNum(0);
@@ -11249,12 +11371,12 @@ Interpreter::Interpreter() {
     registerBuiltin("勾股斜边", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double x = needNum(a[0], "勾股斜边", line);
         double y = needNum(a[1], "勾股斜边", line);
-        return vNum(std::sqrt(x * x + y * y));
+        return vNum(wenSqrt(x * x + y * y));
     });
     registerBuiltin("两点距离", 4, 4, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double dx = needNum(a[2], "两点距离", line) - needNum(a[0], "两点距离", line);
         double dy = needNum(a[3], "两点距离", line) - needNum(a[1], "两点距离", line);
-        return vNum(std::sqrt(dx * dx + dy * dy));
+        return vNum(wenSqrt(dx * dx + dy * dy));
     });
     registerBuiltin("扇形面积", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double r = needNum(a[0], "扇形面积", line);
@@ -11283,13 +11405,13 @@ Interpreter::Interpreter() {
         double r = needNum(a[0], "圆锥表面积", line);
         double h = needNum(a[1], "圆锥表面积", line);
         double pi = piValue();
-        double l = std::sqrt(r * r + h * h);
+        double l = wenSqrt(r * r + h * h);
         return vNum(pi * r * (r + l));
     });
     registerBuiltin("圆锥侧面积", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double r = needNum(a[0], "圆锥侧面积", line);
         double h = needNum(a[1], "圆锥侧面积", line);
-        double l = std::sqrt(r * r + h * h);
+        double l = wenSqrt(r * r + h * h);
         return vNum(piValue() * r * l);
     });
     registerBuiltin("长方体表面积", 3, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
@@ -11333,7 +11455,7 @@ Interpreter::Interpreter() {
         if (shape == "圆柱") return vNum(2.0 * pi * num(1) * (num(1) + num(2)));
         if (shape == "圆锥") {
             double r = num(1), h = num(2);
-            return vNum(pi * r * (r + std::sqrt(r * r + h * h)));
+            return vNum(pi * r * (r + wenSqrt(r * r + h * h)));
         }
         if (shape == "长方体") {
             double x = num(1), y = num(2), z = num(3);
@@ -11354,7 +11476,7 @@ Interpreter::Interpreter() {
         if (shape == "圆柱") return vNum(2.0 * pi * num(1) * num(2));
         if (shape == "圆锥") {
             double r = num(1), h = num(2);
-            return vNum(pi * r * std::sqrt(r * r + h * h));
+            return vNum(pi * r * wenSqrt(r * r + h * h));
         }
         throw WenError("运行时错误", line, 0, "「侧面积」不认识的形状：" + shape);
     });
@@ -11436,7 +11558,7 @@ Interpreter::Interpreter() {
         if (sigma <= 0) throw WenError("运行时错误", line, 0, "正态分布的标准差必须大于 0");
         double z = (x - mu) / sigma;
         return vNum(std::exp(-0.5 * z * z) /
-                    (sigma * std::sqrt(2.0 * piValue())));
+                    (sigma * wenSqrt(2.0 * piValue())));
     });
     registerBuiltin("正态累积", 3, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double x = needNum(a[0], "正态累积", line);
@@ -11444,7 +11566,7 @@ Interpreter::Interpreter() {
         double sigma = needNum(a[2], "正态累积", line);
         if (sigma <= 0)
             throw WenError("运行时错误", line, 0, "正态分布的标准差必须大于 0");
-        return vNum(0.5 * (1.0 + std::erf((x - mu) / (sigma * std::sqrt(2.0)))));
+        return vNum(0.5 * (1.0 + std::erf((x - mu) / (sigma * wenSqrt(2.0)))));
     });
     registerBuiltin("均匀概率", 3, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double lo = needNum(a[0], "均匀概率", line);
@@ -11696,7 +11818,7 @@ Interpreter::Interpreter() {
         auto ty = [&](double y) { return y - miny + 70; };
         vector<RenderPoint> tpts;
         for (const auto& p : pts) tpts.push_back({tx(p.x), ty(p.y)});
-        double cell = std::sqrt(area / (double)n);
+        double cell = wenSqrt(area / (double)n);
         double r = std::max(3.0, std::min(40.0, cell * 0.32));
         std::ostringstream o;
         o << "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" << (int)w
@@ -11892,7 +12014,7 @@ Interpreter::Interpreter() {
                 for (size_t i = 0; i < pts.size(); ++i) {
                     if (i) code << ", ";
                     code << "{" << f3(pts[i].x) << "," << f3(pts[i].y) << "," << f3(pts[i].z) << "}";
-                    maxr = std::max(maxr, std::sqrt(pts[i].x * pts[i].x + pts[i].y * pts[i].y + pts[i].z * pts[i].z));
+                    maxr = std::max(maxr, wenSqrt(pts[i].x * pts[i].x + pts[i].y * pts[i].y + pts[i].z * pts[i].z));
                 }
                 code << "}, " << f3(rgb[0]) << ", " << f3(rgb[1]) << ", " << f3(rgb[2]) << "},\n";
             }
@@ -12094,7 +12216,7 @@ Interpreter::Interpreter() {
                 double s = needNum(d->items["强度"], "强度", line);
                 bool vol = type == "体积光3D";
                 auto lightAt = [&](double x, double y) {
-                    double dist = std::sqrt((x - lx) * (x - lx) + (y - ly) * (y - ly));
+                    double dist = wenSqrt((x - lx) * (x - lx) + (y - ly) * (y - ly));
                     double scale = vol ? 220.0 : 120.0;
                     double g = s * std::exp(-dist / scale);
                     if (vol) g += 0.35 * s * std::exp(-dist / (scale * 2.2));
@@ -12240,7 +12362,7 @@ Interpreter::Interpreter() {
                 double s = needNum(d->items["强度"], "强度", line);
                 bool vol = type == "体积光3D";
                 auto lightAt = [&](double x, double y) {
-                    double dist = std::sqrt((x - lx) * (x - lx) + (y - ly) * (y - ly));
+                    double dist = wenSqrt((x - lx) * (x - lx) + (y - ly) * (y - ly));
                     double scale = vol ? 220.0 : 120.0;
                     double g = s * std::exp(-dist / scale);
                     if (vol) g += 0.35 * s * std::exp(-dist / (scale * 2.2));
@@ -12388,7 +12510,7 @@ Interpreter::Interpreter() {
         double g = a.size() == 2 ? needNum(a[1], "自由落体时间", line) : 9.80665;
         if (h < 0 || g <= 0)
             throw WenError("运行时错误", line, 0, "高度不能为负，重力加速度必须大于 0");
-        return vNum(std::sqrt(2.0 * h / g));
+        return vNum(wenSqrt(2.0 * h / g));
     });
     registerBuiltin("自由落体速度", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double t = needNum(a[0], "自由落体速度", line);
@@ -12460,7 +12582,7 @@ Interpreter::Interpreter() {
         double g = a.size() == 2 ? needNum(a[1], "单摆周期", line) : 9.80665;
         if (L < 0 || g <= 0)
             throw WenError("运行时错误", line, 0, "摆长不能为负，重力加速度必须大于 0");
-        return vNum(2.0 * piValue() * std::sqrt(L / g));
+        return vNum(2.0 * piValue() * wenSqrt(L / g));
     });
     registerBuiltin("弹性势能", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double k = needNum(a[0], "弹性势能", line);
@@ -12602,14 +12724,14 @@ Interpreter::Interpreter() {
         double M = needNum(a[0], "第一宇宙速度", line);
         double r = needNum(a[1], "第一宇宙速度", line);
         if (r <= 0) throw WenError("运行时错误", line, 0, "半径必须大于 0");
-        return vNum(std::sqrt(6.67430e-11 * M / r));
+        return vNum(wenSqrt(6.67430e-11 * M / r));
     });
     registerBuiltin("轨道周期", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double M = needNum(a[0], "轨道周期", line);
         double r = needNum(a[1], "轨道周期", line);
         if (M <= 0 || r <= 0)
             throw WenError("运行时错误", line, 0, "中心质量和轨道半径必须大于 0");
-        return vNum(2.0 * piValue() * std::sqrt(r * r * r / (6.67430e-11 * M)));
+        return vNum(2.0 * piValue() * wenSqrt(r * r * r / (6.67430e-11 * M)));
     });
 
     // ---------- 函数库 ----------
