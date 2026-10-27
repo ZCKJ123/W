@@ -5732,6 +5732,16 @@ struct PyEmitter {
         string head = "# 由「文」外派库生成 · WEN-LANG-0.2\n";
         head += "import sys\n";
         head += "sys.stdout.reconfigure(encoding='utf-8')\n";
+        head += "def _文数(v):\n";
+        head += "    v = float(v)\n";
+        head += "    if v == 0: return '0'\n";
+        head += "    a = abs(v)\n";
+        head += "    if a < 1e-9 or a >= 1e17: return format(v, '.6e')\n";
+        head += "    if v == int(v): return str(int(v))\n";
+        head += "    s = format(v, '.16g')\n";
+        head += "    if 'e' in s or 'E' in s:\n";
+        head += "        s = format(v, '.16f').rstrip('0').rstrip('.')\n";
+        head += "    return s\n";
         head += "def _文值(v):\n";
         head += "    if v is True: return '\u771f'\n";
         head += "    if v is False: return '\u5047'\n";
@@ -5744,7 +5754,7 @@ struct PyEmitter {
         head += "    if v is True: return '\u771f'\n";
         head += "    if v is False: return '\u5047'\n";
         head += "    if v is None: return '\u7a7a'\n";
-        head += "    if isinstance(v, float) and v.is_integer(): return str(int(v))\n";
+        head += "    if isinstance(v, (int, float)) and not isinstance(v, bool): return _文数(v)\n";
         head += "    if isinstance(v, str): return v\n";
         head += "    if isinstance(v, list): return '[' + ', '.join(_文值(x) for x in v) + ']'\n";
         head += "    if isinstance(v, dict): return '{' + ', '.join(_文值(k) + ': ' + _文值(x) for k, x in sorted(v.items(), key=lambda kv: str(kv[0]).encode('utf-8'))) + '}'\n";
@@ -7799,6 +7809,7 @@ static Value uiText(Interpreter&, vector<Value>& a, int line);
 static Value uiRefresh(Interpreter&, vector<Value>& a, int line);
 static Value uiEvent(Interpreter&, vector<Value>& a, int line);
 static Value uiClose(Interpreter&, vector<Value>& a, int line);
+static Value uiSize(Interpreter&, vector<Value>& a, int line);
 
 Interpreter::Interpreter() {
     globals = std::make_shared<Scope>();
@@ -7819,6 +7830,7 @@ Interpreter::Interpreter() {
     registerBuiltin("界面刷新", 0, 0, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return uiRefresh(vm, a, line); });
     registerBuiltin("界面事件", 0, 0, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return uiEvent(vm, a, line); });
     registerBuiltin("界面关闭", 0, 0, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return uiClose(vm, a, line); });
+    registerBuiltin("界面尺寸", 0, 0, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return uiSize(vm, a, line); });
 
     // ---------- 核心（不需要依赖）---------
     registerBuiltin("调用", 2, 2, [](Interpreter& vm, vector<Value>& a, int line) -> Value {
@@ -14378,11 +14390,25 @@ static string fmt(double d) {
     if (isnan(d)) return "非数";
     if (isinf(d)) return d < 0 ? "负无穷" : "无穷";
     if (d == 0) return "0";
+    double a = fabs(d);
+    if (a < 1e-9 || a >= 1e17) {
+        ostringstream o;
+        o << setprecision(6) << scientific << d;
+        return o.str();
+    }
     double r = round(d);
-    if (fabs(d - r) < 1e-12 && fabs(d) < 1e15) return to_string((long long)r);
+    if (fabs(d - r) < 1e-9) return to_string((long long)r);
     ostringstream o;
     o << setprecision(16) << defaultfloat << d;
-    return o.str();
+    string s = o.str();
+    if (s.find('e') != string::npos || s.find('E') != string::npos) {
+        ostringstream fx;
+        fx << fixed << setprecision(16) << d;
+        s = fx.str();
+        while (!s.empty() && s.back() == '0') s.pop_back();
+        if (!s.empty() && s.back() == '.') s.pop_back();
+    }
+    return s;
 }
 static string fmtb(bool b) { return b ? "真" : "假"; }
 static mt19937 rng((unsigned)chrono::steady_clock::now().time_since_epoch().count());
@@ -16284,6 +16310,12 @@ static Value uiEvent(Interpreter&, vector<Value>&, int line) {
     }
     return vDict(d);
 }
+static Value uiSize(Interpreter&, vector<Value>&, int) {
+    auto l = std::make_shared<List>();
+    l->items.push_back(vNum(gUi.w));
+    l->items.push_back(vNum(gUi.h));
+    return vList(l);
+}
 static Value uiClose(Interpreter&, vector<Value>&, int) {
     if (gUi.hwnd) { DestroyWindow(gUi.hwnd); gUi = WenUiState{}; }
     return vNone();
@@ -16328,6 +16360,12 @@ static Value uiLine(Interpreter&, vector<Value>& a, int line) {
 static Value uiText(Interpreter&, vector<Value>&, int) { return vNone(); }
 static Value uiRefresh(Interpreter&, vector<Value>&, int) { return vNone(); }
 static Value uiEvent(Interpreter&, vector<Value>&, int) { return vDict(std::make_shared<Dict>()); }
+static Value uiSize(Interpreter&, vector<Value>&, int) {
+    auto l = std::make_shared<List>();
+    l->items.push_back(vNum(0));
+    l->items.push_back(vNum(0));
+    return vList(l);
+}
 static Value uiClose(Interpreter&, vector<Value>&, int) { return vNone(); }
 #endif
 
@@ -16547,7 +16585,7 @@ static int runMain(vector<string> args) {
     if (cmd == "--库" || cmd == "--库列表") {
         Interpreter vm;
         std::cout << "核心（不需要依赖）\n";
-        std::cout << "界面新建、界面清屏、界面矩形、界面线、界面文本、界面刷新、界面事件、界面关闭\n";
+        std::cout << "界面新建、界面清屏、界面矩形、界面线、界面文本、界面刷新、界面事件、界面尺寸、界面关闭\n";
         std::cout << "求和、平均数、最大、最小、中位数、新建集合、集合添加、集合存在\n\n";
         for (const auto& lib : vm.libraryFunctions) {
             std::cout << lib.first << "（" << lib.second.size() << " 个函数）\n";
