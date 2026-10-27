@@ -43,7 +43,7 @@
 #include <io.h>
 
 // 源码自带标签：任何二进制都能用 --签名 打印出来。
-static const char* WEN_VERSION = "0.1.0-snapshot";
+static const char* WEN_VERSION = "0.1.0";
 static const char* WEN_SIGNATURE =
     "文语言（wen） · 内置签名 WEN-LANG-0.1 · 2026 · 作者 Akm / 筑宸科技";
 
@@ -15372,7 +15372,7 @@ static int runMain(vector<string> args) {
         if (a == "--json" || a == "--诊断JSON") gJsonDiagnostics = true;
     }
     if (cmd == "--快照版本") {
-        std::cout << "文语言 0.1.0-snapshot\n";
+        std::cout << "文语言 0.1.0\n";
         return 0;
     }
     if (cmd == "--版本" || cmd == "-v") {
