@@ -10438,39 +10438,58 @@ Interpreter::Interpreter() {
         for (unsigned k = 0; k < nt; ++k)
             workers.emplace_back(renderRows, h*(int)k/(int)nt, h*(int)(k+1)/(int)nt);
         for (auto& th : workers) th.join();
-        auto finalBuf = std::make_shared<std::vector<unsigned char>>((size_t)outW * outH * 3);
-        if (scale <= 0.5) {
-            for (int oy = 0; oy < outH; ++oy) {
-                int sy = std::min(h - 1, oy * h / outH);
-                for (int ox = 0; ox < outW; ++ox) {
-                    int sx = std::min(w - 1, ox * w / outW);
-                    size_t si = ((size_t)sy * w + sx) * 3;
-                    size_t di = ((size_t)oy * outW + ox) * 3;
-                    (*finalBuf)[di] = (*buf)[si];
-                    (*finalBuf)[di + 1] = (*buf)[si + 1];
-                    (*finalBuf)[di + 2] = (*buf)[si + 2];
+        // 低采样边缘保留降噪，再双线性放大。
+        if (samples <= 2 && w > 2 && h > 2) {
+            auto src = buf;
+            auto den = std::make_shared<std::vector<unsigned char>>(src->size());
+            for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) {
+                size_t oi = ((size_t)y * w + x) * 3;
+                double sum[3] = {0,0,0}, wsum = 0;
+                for (int dy = -1; dy <= 1; ++dy) for (int dx = -1; dx <= 1; ++dx) {
+                    int xx = x + dx, yy = y + dy;
+                    if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+                    size_t si = ((size_t)yy * w + xx) * 3;
+                    double d = std::abs((int)(*src)[si] - (int)(*src)[oi]) +
+                               std::abs((int)(*src)[si+1] - (int)(*src)[oi+1]) +
+                               std::abs((int)(*src)[si+2] - (int)(*src)[oi+2]);
+                    double ww = (1.0 / (1.0 + d * 0.05)) * (dx == 0 && dy == 0 ? 2.0 : 1.0);
+                    sum[0] += (*src)[si] * ww; sum[1] += (*src)[si+1] * ww; sum[2] += (*src)[si+2] * ww;
+                    wsum += ww;
                 }
+                (*den)[oi] = (unsigned char)(sum[0]/wsum);
+                (*den)[oi+1] = (unsigned char)(sum[1]/wsum);
+                (*den)[oi+2] = (unsigned char)(sum[2]/wsum);
             }
-        } else {
-            for (int oy = 0; oy < outH; ++oy) for (int ox = 0; ox < outW; ++ox) {
+            buf = den;
+        }
+        auto finalBuf = std::make_shared<std::vector<unsigned char>>((size_t)outW * outH * 3);
+        auto upRows = [&](int y0, int y1) {
+            for (int oy = y0; oy < y1; ++oy) for (int ox = 0; ox < outW; ++ox) {
                 double sx = (ox + 0.5) * w / outW - 0.5;
                 double sy = (oy + 0.5) * h / outH - 0.5;
                 int x0 = std::max(0, std::min(w - 1, (int)std::floor(sx)));
-                int y0 = std::max(0, std::min(h - 1, (int)std::floor(sy)));
+                int y0i = std::max(0, std::min(h - 1, (int)std::floor(sy)));
                 int x1 = std::max(0, std::min(w - 1, x0 + 1));
-                int y1 = std::max(0, std::min(h - 1, y0 + 1));
-                double fx = sx - x0, fy = sy - y0;
+                int y1i = std::max(0, std::min(h - 1, y0i + 1));
+                double fx = sx - x0, fy = sy - y0i;
                 size_t oi = ((size_t)oy * outW + ox) * 3;
                 for (int ch = 0; ch < 3; ++ch) {
-                    double v00 = (*buf)[((size_t)y0 * w + x0) * 3 + ch];
-                    double v10 = (*buf)[((size_t)y0 * w + x1) * 3 + ch];
-                    double v01 = (*buf)[((size_t)y1 * w + x0) * 3 + ch];
-                    double v11 = (*buf)[((size_t)y1 * w + x1) * 3 + ch];
+                    double v00 = (*buf)[((size_t)y0i * w + x0) * 3 + ch];
+                    double v10 = (*buf)[((size_t)y0i * w + x1) * 3 + ch];
+                    double v01 = (*buf)[((size_t)y1i * w + x0) * 3 + ch];
+                    double v11 = (*buf)[((size_t)y1i * w + x1) * 3 + ch];
                     double v = v00 * (1 - fx) * (1 - fy) + v10 * fx * (1 - fy) +
                                v01 * (1 - fx) * fy + v11 * fx * fy;
                     (*finalBuf)[oi + ch] = (unsigned char)std::max(0.0, std::min(255.0, v));
                 }
             }
+        };
+        {
+            std::vector<std::thread> up;
+            unsigned un = std::max(2u, std::min(8u, std::thread::hardware_concurrency()));
+            for (unsigned k = 0; k < un; ++k)
+                up.emplace_back(upRows, outH * (int)k / (int)un, outH * (int)(k + 1) / (int)un);
+            for (auto& th : up) th.join();
         }
         auto d = std::make_shared<Dict>();
         d->items["宽"] = vNum(outW);

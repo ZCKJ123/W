@@ -99,7 +99,7 @@ $ray = @'
 打印 20 / 秒
 '@
 
-$ray = $ray.Replace("0.25", $(if ($32) { "0.15" } else { "0.25" }))
+$ray = $ray.Replace("0.25", $(if ($32) { "0.1" } else { "0.25" }))
 $ta = Run-Script $arith
 $tf = Run-Script $fn
 $tp = Run-Script $pi
