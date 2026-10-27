@@ -2303,6 +2303,7 @@ struct SecEntry {
     string decision;
 };
 static std::vector<SecEntry> gSecEntries;
+static std::set<string> gCallableNames;
 static string gSecurityPolicy = "观察";
 static bool gSecAdmin = false;
 static bool gProbeActive = false;
@@ -3639,6 +3640,7 @@ void Interpreter::registerBuiltin(
     b->maxArgs = maxArgs;
     b->fn = std::move(fn);
     globals->set(name, vFunc(b));
+    gCallableNames.insert(name);
 }
 
 vector<StmtPtr> Interpreter::parseSource(const string& src) {
@@ -14430,6 +14432,8 @@ static string errorExplanation(const string& kind) {
         return "脚本里有无法识别的字符，或文本/引号没有闭合。";
     if (kind == "语法错误")
         return "脚本结构不符合语法，例如缺「则」/「结束」、连续空了两行、括号不配对。";
+    if (kind == "静态错误")
+        return "语法能读，但写法有歧义或明显会害人；例如负数参数没加括号。";
     if (kind == "运行时错误")
         return "语法没问题，但执行到这一步失败，例如变量不存在、类型不匹配、除零、下标越界。";
     if (kind == "编译错误")
@@ -14917,12 +14921,66 @@ static int processSaveBlocks(const string& src, bool write, string& out,
     return blocks;
 }
 
+static void collectCallables(const vector<StmtPtr>& ps, std::set<string>& out) {
+    for (const auto& s : ps) {
+        if (!s) continue;
+        if (s->k == Stmt::K::Func) out.insert(s->name);
+        collectCallables(s->body, out);
+        collectCallables(s->elseBody, out);
+        collectCallables(s->finallyBody, out);
+        for (const auto& br : s->branches) collectCallables(br.second, out);
+    }
+}
+
+static void checkExprStatic(const ExprPtr& e, const std::set<string>& callables,
+                            vector<WenError>& errors) {
+    if (!e) return;
+    if (e->k == Expr::K::Binary && e->op == "-" &&
+        e->args.size() == 2 && e->args[0]->k == Expr::K::Var) {
+        const ExprPtr& r = e->args[1];
+        bool numeric = (r->k == Expr::K::Num) ||
+                       (r->k == Expr::K::Unary && (r->op == "-" || r->op == "+") &&
+                        !r->args.empty() && r->args[0]->k == Expr::K::Num);
+        if (numeric && callables.count(e->args[0]->text))
+            errors.push_back(WenError("静态错误", e->line, 0,
+                "负数参数必须加括号：写「" + e->args[0]->text + "(-5)」，不要写「" +
+                e->args[0]->text + " -5」"));
+    }
+    for (const auto& a : e->args) checkExprStatic(a, callables, errors);
+    for (const auto& kv : e->pairs) {
+        checkExprStatic(kv.first, callables, errors);
+        checkExprStatic(kv.second, callables, errors);
+    }
+}
+
+static void checkStmtStatic(const vector<StmtPtr>& ps, const std::set<string>& callables,
+                            vector<WenError>& errors) {
+    for (const auto& s : ps) {
+        if (!s) continue;
+        checkExprStatic(s->target, callables, errors);
+        checkExprStatic(s->expr, callables, errors);
+        for (const auto& a : s->args) checkExprStatic(a, callables, errors);
+        checkStmtStatic(s->body, callables, errors);
+        checkStmtStatic(s->elseBody, callables, errors);
+        checkStmtStatic(s->finallyBody, callables, errors);
+        for (const auto& br : s->branches) {
+            checkExprStatic(br.first, callables, errors);
+            checkStmtStatic(br.second, callables, errors);
+        }
+    }
+}
+
 static vector<StmtPtr> parseDiagnostic(const string& src, vector<WenError>& errors) {
     try {
         Lexer lex(src);
         Parser parser(lex.scan(), true);
         auto ast = parser.parseProgram();
         errors = parser.errors();
+        if (errors.empty()) {
+            std::set<string> callables = gCallableNames;
+            collectCallables(ast, callables);
+            checkStmtStatic(ast, callables, errors);
+        }
         return ast;
     } catch (WenError& e) {
         errors.push_back(e);
@@ -15055,6 +15113,7 @@ static int runFile(const string& path) {
 
 static int checkFile(const string& path) {
     vector<string> lines;
+    Interpreter vm;  // 初始化内置名字表，供静态负数参数检查
     try {
         string src = readWholeFile(resolveWenPath(path));
         vector<WenError> errors;
