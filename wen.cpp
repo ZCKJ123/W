@@ -1819,6 +1819,8 @@ struct Dict { map<string, Value> items; };
 static std::set<string> gCallableNames;
 static std::map<string, std::pair<int,int>> gBuiltinArity;
 static bool gNoNameCheck = false;
+static bool gBriefErrors = false;   // --简短：不打印每条的通用「说明」
+static bool gCompactJson = false;   // --精简：JSON 省略 detail/message
 
 static std::vector<uint32_t> nameCps(const string& s) {
     std::vector<uint32_t> out;
@@ -15226,7 +15228,7 @@ static void printWenError(const WenError& e, const string& filename,
     if (e.col > 0) std::cerr << " 第 " << e.col << " 列";
     std::cerr << "\n";
     std::cerr << "原因：" << e.what() << "\n";
-    std::cerr << "说明：" << errorExplanation(e.kind) << "\n";
+    if (!gBriefErrors) std::cerr << "说明：" << errorExplanation(e.kind) << "\n";
     if (e.line >= 1 && (size_t)e.line <= lines.size()) {
         std::cerr << "  " << std::setw(4) << e.line << " | "
                   << lines[(size_t)e.line - 1] << "\n";
@@ -15819,9 +15821,18 @@ static void printDiagnostics(const vector<WenError>& errors, const string& filen
                    ",\"rule\":" + jsonQuote(errorRule(e)) +
                    ",\"severity\":\"error\"" +
                    ",\"reason\":" + jsonQuote(e.what()) +
-                   ",\"detail\":" + jsonQuote(errorExplanation(e.kind)) +
-                   ",\"message\":" + jsonQuote(humanError(e)) +
+                   (gCompactJson ? string() :
+                    ",\"detail\":" + jsonQuote(errorExplanation(e.kind)) +
+                    ",\"message\":" + jsonQuote(humanError(e))) +
                    ",\"hint\":" + jsonQuote(errorSuggestion(e));
+            if (!e.frames.empty()) {
+                out += ",\"frames\":[";
+                for (size_t k = 0; k < e.frames.size(); ++k) {
+                    if (k) out += ",";
+                    out += jsonQuote(e.frames[k]);
+                }
+                out += "]";
+            }
             if (e.line >= 1 && (size_t)e.line <= lines.size()) {
                 out += ",\"sourceLine\":{\"number\":" + std::to_string(e.line) +
                        ",\"text\":" + jsonQuote(lines[(size_t)e.line - 1]) + "}";
@@ -15915,16 +15926,32 @@ static int runFile(const string& path) {
             log << "错误：" << e.kind << "：" << e.what() << "\n";
             log << "位置：第 " << e.line << " 行 第 " << e.col << " 列\n";
         }
-        printWenError(e, path, vm.sourceLines);
+        if (gJsonDiagnostics) {
+            printDiagnostics({e}, path, vm.sourceLines);
+        } else {
+            printWenError(e, path, vm.sourceLines);
+        }
         return 1;
     } catch (IncompleteError& e) {
-        printIncompleteError(e, path, vm.sourceLines);
+        if (gJsonDiagnostics) {
+            printDiagnostics({WenError("语法错误", e.line, 0, e.what())}, path, vm.sourceLines);
+        } else {
+            printIncompleteError(e, path, vm.sourceLines);
+        }
         return 1;
     } catch (IoError& e) {
-        printIoError(e, path);
+        if (gJsonDiagnostics) {
+            printDiagnostics({WenError("文件错误", 1, 0, e.what())}, path, vm.sourceLines);
+        } else {
+            printIoError(e, path);
+        }
         return 1;
     } catch (std::exception& e) {
-        printEngineError(e, path);
+        if (gJsonDiagnostics) {
+            printDiagnostics({WenError("引擎错误", 1, 0, e.what())}, path, vm.sourceLines);
+        } else {
+            printEngineError(e, path);
+        }
         return 1;
     }
 }
@@ -16712,6 +16739,9 @@ static int runMain(vector<string> args) {
     }
     for (auto it = args.begin() + 1; it != args.end();) {
         if (*it == "--不查名字") { gNoNameCheck = true; it = args.erase(it); }
+        else if (*it == "--简短") { gBriefErrors = true; it = args.erase(it); }
+        else if (*it == "--精简") { gCompactJson = true; gJsonDiagnostics = true; it = args.erase(it); }
+        else if (*it == "--json" || *it == "--诊断JSON") { gJsonDiagnostics = true; it = args.erase(it); }
         else ++it;
     }
     const string& cmd = args[1];

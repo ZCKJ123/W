@@ -208,7 +208,7 @@ export function apply(ctx, config) {
             properties: {
               kind: { type: 'string' },
               code: { type: 'string' },
-              rule: { type: 'string' },
+              rule: { type: 'string' },\n              frames: { type: 'array', items: { type: 'string' } },
               severity: { type: 'string' },
               line: { type: 'integer' },
               column: { type: 'integer' },
