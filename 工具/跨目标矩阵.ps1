@@ -71,5 +71,28 @@ foreach ($pair in @(@('解释器', $expected), @('字节码', $bc), @('Python', 
         Write-Host ("  实际：{0}" -f ($pair[1] -replace "`n", ' / '))
     }
 }
+
+# 值的长相：真/假/空、列表、字典
+$vsrc = Join-Path $dir 'values_py.wen'
+$vpy = Join-Path $dir 'values_py.py'
+$vrunner = Join-Path $dir 'values_runner.wen'
+$vtext = @'
+# 外派: python
+打印 真, 假, 空
+打印 [1, "甲", 真, 空]
+打印 {"甲": 1, "乙": [真]}
+'@
+Write-Utf8 $vsrc $vtext
+Write-Utf8 $vrunner ("依赖 外派库`n外派翻译(`"$vsrc`", `"$vpy`")`n")
+$vi = (Run-Exe $vsrc) -replace "`r`n", "`n"
+Run-Exe $vrunner | Out-Null
+$vp = ((& python $vpy 2>&1) -join "`n") -replace "`r`n", "`n"
+if ($vp -ne $vi) {
+    $ok = $false
+    Write-Host "失败：Python 值文本不等价"
+    Write-Host ("  期望：{0}" -f ($vi -replace "`n", ' / '))
+    Write-Host ("  实际：{0}" -f ($vp -replace "`n", ' / '))
+}
+
 if (-not $ok) { exit 1 }
 Write-Host ("跨目标矩阵：解释器 / 字节码 / Python / C++ 全部等价（函数+递归+√）")

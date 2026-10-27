@@ -1212,9 +1212,11 @@ private:
 
     StmtPtr parsePrint() {
         int line = peek().line;
+        int kwCol = peek().col;
         ++idx_;
         vector<ExprPtr> args;
-        if (matchOp("(")) {
+        bool grouped = atOp("(") && peek().col > kwCol + 2;
+        if (!grouped && matchOp("(")) {
             if (!atOp(")")) {
                 args.push_back(parseExpr());
                 while (matchOp(",")) {
@@ -1743,6 +1745,7 @@ private:
         if (matchOp("(")) {
             ExprPtr e = parseExpr();
             expectOp(")");
+            e->juxtaposed = false;  // 显式括号是分组边界
             return e;
         }
         if (matchOp("[")) {
@@ -5716,9 +5719,24 @@ struct PyEmitter {
     string generate() {
         for (const auto& s : program) stmt(s);
         string head = "# 由「文」外派库生成 · WEN-LANG-0.2\n";
+        head += "import sys\n";
+        head += "sys.stdout.reconfigure(encoding='utf-8')\n";
+        head += "def _文值(v):\n";
+        head += "    if v is True: return '\u771f'\n";
+        head += "    if v is False: return '\u5047'\n";
+        head += "    if v is None: return '\u7a7a'\n";
+        head += "    if isinstance(v, str): return '\"' + v.replace('\\\\', '\\\\\\\\').replace('\"', '\\\\\"') + '\"'\n";
+        head += "    if isinstance(v, list): return '[' + ', '.join(_文值(x) for x in v) + ']'\n";
+        head += "    if isinstance(v, dict): return '{' + ', '.join(_文值(k) + ': ' + _文值(x) for k, x in sorted(v.items(), key=lambda kv: str(kv[0]).encode('utf-8'))) + '}'\n";
+        head += "    return _文(v)\n";
         head += "def _文(v):\n";
-        head += "    if isinstance(v, float) and v.is_integer():\n";
-        head += "        return str(int(v))\n";
+        head += "    if v is True: return '\u771f'\n";
+        head += "    if v is False: return '\u5047'\n";
+        head += "    if v is None: return '\u7a7a'\n";
+        head += "    if isinstance(v, float) and v.is_integer(): return str(int(v))\n";
+        head += "    if isinstance(v, str): return v\n";
+        head += "    if isinstance(v, list): return '[' + ', '.join(_文值(x) for x in v) + ']'\n";
+        head += "    if isinstance(v, dict): return '{' + ', '.join(_文值(k) + ': ' + _文值(x) for k, x in sorted(v.items(), key=lambda kv: str(kv[0]).encode('utf-8'))) + '}'\n";
         head += "    return str(v)\n";
         if (usedMath) head += "import math\n";
         if (usedRandom) head += "import random\n";
@@ -7654,9 +7672,9 @@ static double piValue() {
 }
 static double wenSqrt(double x) {
     if (x <= 0) return 0;
-    double r = x > 1 ? x : 1;
-    for (int i = 0; i < 50; ++i) r = 0.5 * (r + x / r);
-    return r;
+    long double r = x > 1 ? (long double)x : 1.0L;
+    for (int i = 0; i < 80; ++i) r = 0.5L * (r + (long double)x / r);
+    return (double)r;
 }
 static double wenAtanh(double z) {
     double z2 = z * z, term = z, sum = 0;
@@ -11069,10 +11087,7 @@ Interpreter::Interpreter() {
     });
     // ---------- 数学 ----------
     auto mySqrt = [](double x) {
-        if (x <= 0) return 0.0;
-        double r = x > 1 ? x : 1.0;
-        for (int i = 0; i < 40; ++i) r = 0.5 * (r + x / r);
-        return r;
+        return wenSqrt(x);
     };
     auto mySin = [](double x) {
         const double p = piValue();
