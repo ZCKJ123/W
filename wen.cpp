@@ -3459,7 +3459,7 @@ static const std::map<string, string>& functionModules() {
         {"新建神经层", "神经网络库"}, {"神经链", "神经网络库"}, {"前向", "神经网络库"},
         {"颜色", "视口库"}, {"新建视口", "视口库"}, {"视口清空", "视口库"}, {"视口画点", "视口库"},
         {"视口画线", "视口库"}, {"视口画三角形", "视口库"}, {"视口尺寸", "视口库"}, {"视口保存", "视口库"},
-        {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"}, {"视口显示", "视口库"}, {"视口加载模型", "视口库"},
+        {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"}, {"视口显示", "视口库"}, {"视口加载模型", "视口库"}, {"光追渲染", "视口库"},
         {"硬件信息", "硬件库"}, {"高精度计时", "硬件库"}, {"内存状态", "硬件库"}, {"屏幕尺寸", "硬件库"}, {"磁盘空间", "硬件库"},
         {"大整数幂", "大整数库"}, {"大整数乘", "大整数库"}, {"大整数加", "大整数库"}, {"大整数阶乘", "大整数库"},
         {"阶乘位数", "大整数库"}, {"阶乘末尾零", "大整数库"}, {"阶乘概览", "大整数库"},
@@ -10247,6 +10247,97 @@ Interpreter::Interpreter() {
         auto depth = std::make_shared<List>();
         for (int k = 0; k < w * h; ++k) depth->items.push_back(vNum(1e30));
         d->items["深度"] = vList(depth);
+        return vDict(d);
+    });
+    registerBuiltin("光追渲染", 2, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        int w = (int)needIndex(a[0], "光追渲染", line);
+        int h = (int)needIndex(a[1], "光追渲染", line);
+        if (w < 1 || h < 1 || w > 2048 || h > 2048)
+            throw WenError("运行时错误", line, 0, "光追尺寸必须在 1..2048");
+        auto buf = std::make_shared<std::vector<unsigned char>>((size_t)w * h * 3);
+        auto hit = [](double ox, double oy, double oz, double dx, double dy, double dz,
+                      double cx, double cy, double cz, double r, double& t) {
+            double lx = ox - cx, ly = oy - cy, lz = oz - cz;
+            double b = lx * dx + ly * dy + lz * dz;
+            double c = lx * lx + ly * ly + lz * lz - r * r;
+            double d = b * b - c;
+            if (d < 0) return false;
+            double s = std::sqrt(d), tt = -b - s;
+            if (tt < 1e-4) tt = -b + s;
+            if (tt < 1e-4) return false;
+            t = tt;
+            return true;
+        };
+        auto nearest = [&](double ox, double oy, double oz, double dx, double dy, double dz,
+                           double& t, double& nx, double& ny, double& nz, int& mat) {
+            bool any = false;
+            double bt = 1e30, bx = 0, by = 0, bz = 0;
+            auto test = [&](double cx, double cy, double cz, double r, int m) {
+                double tt;
+                if (hit(ox, oy, oz, dx, dy, dz, cx, cy, cz, r, tt) && tt < bt) {
+                    bt = tt; bx = cx; by = cy; bz = cz; mat = m; any = true;
+                }
+            };
+            test(0, 0, 0, 0.62, 0);
+            test(-1.1, -0.16, 0.18, 0.36, 1);
+            test(1.12, 0.08, 0.05, 0.42, 2);
+            if (dy < -1e-6) {
+                double tt = (-0.86 - oy) / dy;
+                if (tt > 1e-4 && tt < bt) { bt = tt; bx = 0; by = 1; bz = 0; mat = 3; any = true; }
+            }
+            if (!any) return false;
+            t = bt;
+            nx = (ox + dx * t - bx);
+            ny = (oy + dy * t - by);
+            nz = (oz + dz * t - bz);
+            if (mat != 3) {
+                double l = std::sqrt(nx * nx + ny * ny + nz * nz);
+                nx /= l; ny /= l; nz /= l;
+            } else { nx = 0; ny = 1; nz = 0; }
+            return true;
+        };
+        auto color = [&](double ox, double oy, double oz, double dx, double dy, double dz) {
+            double t, nx, ny, nz; int mat = 0;
+            if (!nearest(ox, oy, oz, dx, dy, dz, t, nx, ny, nz, mat))
+                return std::array<double, 3>{0.35 + 0.25 * (dy + 0.5), 0.45, 0.7};
+            double px = ox + dx * t, py = oy + dy * t, pz = oz + dz * t;
+            double lx = -1.6, ly = 3.2, lz = 2.4;
+            double ll = std::sqrt(lx * lx + ly * ly + lz * lz);
+            lx /= ll; ly /= ll; lz /= ll;
+            double diff = std::max(0.0, nx * lx + ny * ly + nz * lz);
+            double sh = nearest(px + nx * 1e-3, py + ny * 1e-3, pz + nz * 1e-3, lx, ly, lz, t, nx, ny, nz, mat) ? 0.25 : 1.0;
+            std::array<double, 3> base{0.85, 0.22, 0.2};
+            if (mat == 1) base = {0.2, 0.75, 0.35};
+            else if (mat == 2) base = {0.25, 0.45, 0.95};
+            else if (mat == 3) base = (((int)std::floor(px * 2) + (int)std::floor(pz * 2)) & 1)
+                                      ? std::array<double, 3>{0.8, 0.8, 0.75}
+                                      : std::array<double, 3>{0.25, 0.28, 0.32};
+            double k = 0.12 + 0.88 * diff;
+            return std::array<double, 3>{base[0] * k * sh, base[1] * k * sh, base[2] * k * sh};
+        };
+        auto renderRows = [&](int y0, int y1) {
+            for (int y = y0; y < y1; ++y) for (int x = 0; x < w; ++x) {
+                double px = (2.0 * (x + 0.5) / w - 1.0) * (double)w / h * 0.7;
+                double py = (1.0 - 2.0 * (y + 0.5) / h) * 0.7;
+                double len = std::sqrt(px * px + py * py + 1.0);
+                auto c = color(0, 0, 2.4, px / len, py / len, -1.0 / len);
+                size_t i = ((size_t)y * w + x) * 3;
+                (*buf)[i] = (unsigned char)(255 * std::max(0.0, std::min(1.0, c[0])));
+                (*buf)[i + 1] = (unsigned char)(255 * std::max(0.0, std::min(1.0, c[1])));
+                (*buf)[i + 2] = (unsigned char)(255 * std::max(0.0, std::min(1.0, c[2])));
+            }
+        };
+        unsigned nt = std::max(2u, std::min(8u, std::thread::hardware_concurrency()));
+        std::vector<std::thread> workers;
+        for (unsigned k = 0; k < nt; ++k) {
+            int y0 = h * (int)k / (int)nt, y1 = h * (int)(k + 1) / (int)nt;
+            workers.emplace_back(renderRows, y0, y1);
+        }
+        for (auto& th : workers) th.join();
+        auto d = std::make_shared<Dict>();
+        d->items["宽"] = vNum(w);
+        d->items["高"] = vNum(h);
+        d->items["像素"] = vBytes(buf);
         return vDict(d);
     });
     registerBuiltin("视口清空", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {

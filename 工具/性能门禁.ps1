@@ -15,6 +15,17 @@ function Run-Script([string]$text) {
     }
 }
 
+function Run-Fps([string]$text) {
+    $p = [IO.Path]::GetTempFileName() + '.wen'
+    [IO.File]::WriteAllText($p, $text, (New-Object Text.UTF8Encoding($false)))
+    try {
+        $out = & $exe $p 2>$null
+        $last = ($out | Select-Object -Last 1)
+        return [double]$last
+    } finally {
+        Remove-Item $p -Force -ErrorAction SilentlyContinue
+    }
+}
 $arith = @'
 将 i 变成 0
 将 和 变成 0
@@ -23,6 +34,17 @@ $arith = @'
 将 i 变成 i + 1
 结束
 打印 和
+'@
+$ray = @'
+依赖 视口库, 时间库
+将 起 变成 高精度时间()
+将 i 变成 0
+当 i 小于 20 则
+将 图 变成 光追渲染(640, 360)
+将 i 变成 i + 1
+结束
+将 秒 变成 高精度时间() - 起
+打印 20 / 秒
 '@
 $fn = @'
 函数 加一 x 则
@@ -35,6 +57,17 @@ $fn = @'
 将 i 变成 i + 1
 结束
 打印 和
+'@
+$ray = @'
+依赖 视口库, 时间库
+将 起 变成 高精度时间()
+将 i 变成 0
+当 i 小于 20 则
+将 图 变成 光追渲染(640, 360)
+将 i 变成 i + 1
+结束
+将 秒 变成 高精度时间() - 起
+打印 20 / 秒
 '@
 $fac = @'
 依赖 大整数库
@@ -54,11 +87,23 @@ $lib = @'
 结束
 打印 和
 '@
+$ray = @'
+依赖 视口库, 时间库
+将 起 变成 高精度时间()
+将 i 变成 0
+当 i 小于 20 则
+将 图 变成 光追渲染(640, 360)
+将 i 变成 i + 1
+结束
+将 秒 变成 高精度时间() - 起
+打印 20 / 秒
+'@
 
 $ta = Run-Script $arith
 $tf = Run-Script $fn
 $tp = Run-Script $pi
 $tl = Run-Script $lib
+$rayFps = Run-Fps $ray
 $t1 = Run-Script $fac
 $t2 = Run-Script $fac
 $tbig = [Math]::Min($t1, $t2)
@@ -67,6 +112,8 @@ $arithUs = $ta * 1000000.0 / 1000000.0
 $fnUs = $tf * 1000000.0 / 1000000.0
 $libUs = $tl * 1000000.0 / 1000000.0
 $bigOk = $tbig -lt 0.5
+$rayTarget = if ($32) { 200 } else { 240 }
+$rayOk = $rayFps -ge $rayTarget
 $calcOk = ($arithUs -lt 35) -and ($fnUs -lt 35) -and ($libUs -lt 35) -and ($tp -lt 0.5)
 
 [pscustomobject]@{
@@ -76,8 +123,10 @@ $calcOk = ($arithUs -lt 35) -and ($fnUs -lt 35) -and ($libUs -lt 35) -and ($tp -
     库调用微秒 = [Math]::Round($libUs, 3)
     阶乘秒 = [Math]::Round($tbig, 3)
     圆周率秒 = [Math]::Round($tp, 3)
+    光追帧 = [Math]::Round($rayFps, 1)
     单次达标 = $calcOk
     庞大达标 = $bigOk
+    光追达标 = $rayOk
 } | Format-Table -AutoSize
 
-if (-not ($calcOk -and $bigOk)) { exit 1 }
+if (-not ($calcOk -and $bigOk -and $rayOk)) { exit 1 }
