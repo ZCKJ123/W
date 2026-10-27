@@ -36,6 +36,12 @@ foreach ($doc in $docs) {
             Write-Host ("失败：{0} 第 {1} 个代码块含零参裸调用" -f $doc, $i)
             continue
         }
+        $mix = [regex]::Match($code, '(?m)^\s*([\u4e00-\u9fa5A-Za-z_][\u4e00-\u9fa5A-Za-z0-9_]*)\s+([\u4e00-\u9fa5A-Za-z0-9_]+)\s*(\*|/|//|%)')
+        if ($mix.Success -and $mix.Groups[1].Value -notin @('打印','将','如果','当','对于','返回','依赖','函数','结束','否则','尝试','捕获','存入','运行','读取','写文件')) {
+            $fail++
+            Write-Host ("失败：{0} 第 {1} 个代码块疑似并置混写：{2}" -f $doc, $i, $mix.Value.Trim())
+            continue
+        }
         $total++
         $tmp = [IO.Path]::GetTempFileName() + '.脚本'
         [IO.File]::WriteAllText($tmp, $code, (New-Object Text.UTF8Encoding($false)))
