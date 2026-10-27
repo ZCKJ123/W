@@ -67,6 +67,9 @@ using WenI128 = long long;
 using WenU128 = unsigned long long;
 #endif
 
+static string piText(int digits);
+static double piValue();
+
 // ============================================================
 // 0. 基础工具
 // ============================================================
@@ -3875,7 +3878,7 @@ void Interpreter::加载模块(const string& rawName, int line) {
     } else if (name == "网络库") {
         aliasFn("抓取结构化文本", "抓取JSON");
     }    if (name == "数学库") {
-        const double pi = std::acos(-1.0);
+        const double pi = piValue();
         globals->set("圆周率", vNum(pi));
         globals->set("π", vNum(pi));
         globals->set("自然常数", vNum(std::exp(1.0)));
@@ -5166,7 +5169,7 @@ static Value make3Sphere(double cx, double cy, double cz, double r, int segs,
     if (segs < 3) segs = 3;
     if (segs > 64) segs = 64;
     auto list = std::make_shared<List>();
-    const double pi = std::acos(-1.0);
+    const double pi = piValue();
     auto at = [&](int i, int j) {
         double th = pi * (double)i / segs;
         double ph = 2.0 * pi * (double)j / segs;
@@ -5293,7 +5296,7 @@ static string renderMotif(const string& pattern, double x, double y, double r) {
     if (pattern == "星") {
         o << "<polygon points=\"";
         for (int k = 0; k < 10; ++k) {
-            double ang = -std::acos(-1.0) / 2.0 + k * std::acos(-1.0) / 5.0;
+            double ang = -piValue() / 2.0 + k * piValue() / 5.0;
             double rr = (k % 2 == 0) ? r : r * 0.42;
             if (k) o << " ";
             o << (x + std::cos(ang) * rr) << "," << (y + std::sin(ang) * rr);
@@ -5308,7 +5311,7 @@ static string renderMotif(const string& pattern, double x, double y, double r) {
         const int steps = 48;
         for (int k = 0; k <= steps; ++k) {
             double t = (double)k / steps;
-            double ang = t * 5.0 * std::acos(-1.0);
+            double ang = t * 5.0 * piValue();
             double rr = r * (0.15 + 0.85 * t);
             if (k) o << " ";
             o << (x + std::cos(ang) * rr) << "," << (y + std::sin(ang) * rr);
@@ -7190,6 +7193,10 @@ static string piText(int digits) {
     size_t need = (size_t)digits + 1;
     if (s.size() < need) s.append(need - s.size(), '0');
     return s.substr(0, 1) + "." + s.substr(1, digits);
+}
+static double piValue() {
+    static const double v = std::stod(piText(40));
+    return v;
 }
 static long double bigDigitEstimate(const vector<uint32_t>& base, long long exp) {
     if (exp <= 0 || base.empty()) return 1;
@@ -10344,7 +10351,37 @@ Interpreter::Interpreter() {
         return vNum((double)(crc ^ 0xFFFFFFFFu));
     });
     // ---------- 数学 ----------
-    auto m1 = [this](const string& name, double (*f)(double)) {
+    auto mySqrt = [](double x) {
+        if (x <= 0) return 0.0;
+        double r = x > 1 ? x : 1.0;
+        for (int i = 0; i < 40; ++i) r = 0.5 * (r + x / r);
+        return r;
+    };
+    auto mySin = [](double x) {
+        const double p = piValue();
+        x = std::fmod(x, 2 * p);
+        if (x > p) x -= 2 * p;
+        if (x < -p) x += 2 * p;
+        double term = x, sum = x;
+        for (int n = 1; n < 20; ++n) {
+            term *= -x * x / ((2.0 * n) * (2.0 * n + 1.0));
+            sum += term;
+        }
+        return sum;
+    };
+    auto myCos = [](double x) {
+        const double p = piValue();
+        x = std::fmod(x, 2 * p);
+        if (x > p) x -= 2 * p;
+        if (x < -p) x += 2 * p;
+        double term = 1, sum = 1;
+        for (int n = 1; n < 20; ++n) {
+            term *= -x * x / ((2.0 * n - 1.0) * (2.0 * n));
+            sum += term;
+        }
+        return sum;
+    };
+    auto m1 = [this](const string& name, std::function<double(double)> f) {
         registerBuiltin(name, 1, 1,
                         [name, f](Interpreter&, vector<Value>& a, int line) -> Value {
                             return vNum(f(needNum(a[0], name, line)));
@@ -10355,21 +10392,21 @@ Interpreter::Interpreter() {
     m1("向下取整", [](double x) { return std::floor(x); });
     m1("向上取整", [](double x) { return std::ceil(x); });
     m1("指数", [](double x) { return std::exp(x); });
-    m1("正弦", [](double x) { return std::sin(x); });
-    m1("余弦", [](double x) { return std::cos(x); });
-    m1("正切", [](double x) { return std::tan(x); });
+    m1("正弦", mySin);
+    m1("余弦", myCos);
+    m1("正切", [mySin, myCos](double x) { return mySin(x) / myCos(x); });
     m1("双曲正弦", [](double x) { return std::sinh(x); });
     m1("双曲余弦", [](double x) { return std::cosh(x); });
     m1("双曲正切", [](double x) { return std::tanh(x); });
-    m1("角度转弧度", [](double x) { return x * std::acos(-1.0) / 180.0; });
-    m1("弧度转角度", [](double x) { return x * 180.0 / std::acos(-1.0); });
+    m1("角度转弧度", [](double x) { return x * piValue() / 180.0; });
+    m1("弧度转角度", [](double x) { return x * 180.0 / piValue(); });
 
-    registerBuiltin("平方根", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+    registerBuiltin("平方根", 1, 1, [mySqrt](Interpreter&, vector<Value>& a, int line) -> Value {
         double x = needNum(a[0], "平方根", line);
         if (x < 0)
             throw WenError("运行时错误", line, 0,
                            "负数不能开平方根（结果是复数；请用解二次方程）");
-        return vNum(std::sqrt(x));
+        return vNum(mySqrt(x));
     });
     registerBuiltin("幂", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double x = needNum(a[0], "幂", line);
@@ -11168,29 +11205,29 @@ Interpreter::Interpreter() {
     // ---------- 图形库 ----------
     registerBuiltin("圆面积", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double r = needNum(a[0], "圆面积", line);
-        return vNum(std::acos(-1.0) * r * r);
+        return vNum(piValue() * r * r);
     });
     registerBuiltin("圆周长", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double r = needNum(a[0], "圆周长", line);
-        return vNum(2.0 * std::acos(-1.0) * r);
+        return vNum(2.0 * piValue() * r);
     });
     registerBuiltin("球体积", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double r = needNum(a[0], "球体积", line);
-        return vNum(4.0 / 3.0 * std::acos(-1.0) * r * r * r);
+        return vNum(4.0 / 3.0 * piValue() * r * r * r);
     });
     registerBuiltin("球表面积", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double r = needNum(a[0], "球表面积", line);
-        return vNum(4.0 * std::acos(-1.0) * r * r);
+        return vNum(4.0 * piValue() * r * r);
     });
     registerBuiltin("圆柱体积", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double r = needNum(a[0], "圆柱体积", line);
         double h = needNum(a[1], "圆柱体积", line);
-        return vNum(std::acos(-1.0) * r * r * h);
+        return vNum(piValue() * r * r * h);
     });
     registerBuiltin("圆锥体积", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double r = needNum(a[0], "圆锥体积", line);
         double h = needNum(a[1], "圆锥体积", line);
-        return vNum(std::acos(-1.0) * r * r * h / 3.0);
+        return vNum(piValue() * r * r * h / 3.0);
     });
     registerBuiltin("长方形面积", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         return vNum(needNum(a[0], "长方形面积", line) * needNum(a[1], "长方形面积", line));
@@ -11222,30 +11259,30 @@ Interpreter::Interpreter() {
     registerBuiltin("扇形面积", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double r = needNum(a[0], "扇形面积", line);
         double deg = needNum(a[1], "扇形面积", line);
-        return vNum(std::acos(-1.0) * r * r * deg / 360.0);
+        return vNum(piValue() * r * r * deg / 360.0);
     });
 
     // 曲面/立体按整体公式直接算，不做三角面近似。
     registerBuiltin("圆环面积", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double R = needNum(a[0], "圆环面积", line);
         double r = needNum(a[1], "圆环面积", line);
-        return vNum(std::acos(-1.0) * (R * R - r * r));
+        return vNum(piValue() * (R * R - r * r));
     });
     registerBuiltin("圆柱表面积", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double r = needNum(a[0], "圆柱表面积", line);
         double h = needNum(a[1], "圆柱表面积", line);
-        double pi = std::acos(-1.0);
+        double pi = piValue();
         return vNum(2.0 * pi * r * (r + h));
     });
     registerBuiltin("圆柱侧面积", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double r = needNum(a[0], "圆柱侧面积", line);
         double h = needNum(a[1], "圆柱侧面积", line);
-        return vNum(2.0 * std::acos(-1.0) * r * h);
+        return vNum(2.0 * piValue() * r * h);
     });
     registerBuiltin("圆锥表面积", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double r = needNum(a[0], "圆锥表面积", line);
         double h = needNum(a[1], "圆锥表面积", line);
-        double pi = std::acos(-1.0);
+        double pi = piValue();
         double l = std::sqrt(r * r + h * h);
         return vNum(pi * r * (r + l));
     });
@@ -11253,7 +11290,7 @@ Interpreter::Interpreter() {
         double r = needNum(a[0], "圆锥侧面积", line);
         double h = needNum(a[1], "圆锥侧面积", line);
         double l = std::sqrt(r * r + h * h);
-        return vNum(std::acos(-1.0) * r * l);
+        return vNum(piValue() * r * l);
     });
     registerBuiltin("长方体表面积", 3, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double x = needNum(a[0], "长方体表面积", line);
@@ -11273,7 +11310,7 @@ Interpreter::Interpreter() {
                 throw WenError("运行时错误", line, 0, "「面积」参数不够：" + shape);
             return needNum(a[i], "面积", line);
         };
-        const double pi = std::acos(-1.0);
+        const double pi = piValue();
         if (shape == "圆") return vNum(pi * num(1) * num(1));
         if (shape == "圆环") return vNum(pi * (num(1) * num(1) - num(2) * num(2)));
         if (shape == "长方形" || shape == "矩形") return vNum(num(1) * num(2));
@@ -11291,7 +11328,7 @@ Interpreter::Interpreter() {
                 throw WenError("运行时错误", line, 0, "「表面积」参数不够：" + shape);
             return needNum(a[i], "表面积", line);
         };
-        const double pi = std::acos(-1.0);
+        const double pi = piValue();
         if (shape == "球") return vNum(4.0 * pi * num(1) * num(1));
         if (shape == "圆柱") return vNum(2.0 * pi * num(1) * (num(1) + num(2)));
         if (shape == "圆锥") {
@@ -11313,7 +11350,7 @@ Interpreter::Interpreter() {
                 throw WenError("运行时错误", line, 0, "「侧面积」参数不够：" + shape);
             return needNum(a[i], "侧面积", line);
         };
-        const double pi = std::acos(-1.0);
+        const double pi = piValue();
         if (shape == "圆柱") return vNum(2.0 * pi * num(1) * num(2));
         if (shape == "圆锥") {
             double r = num(1), h = num(2);
@@ -11399,7 +11436,7 @@ Interpreter::Interpreter() {
         if (sigma <= 0) throw WenError("运行时错误", line, 0, "正态分布的标准差必须大于 0");
         double z = (x - mu) / sigma;
         return vNum(std::exp(-0.5 * z * z) /
-                    (sigma * std::sqrt(2.0 * std::acos(-1.0))));
+                    (sigma * std::sqrt(2.0 * piValue())));
     });
     registerBuiltin("正态累积", 3, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double x = needNum(a[0], "正态累积", line);
@@ -11618,7 +11655,7 @@ Interpreter::Interpreter() {
         double deg = needNum(a[1], "旋转面", line);
         double cx = needNum(a[2], "旋转面", line);
         double cy = needNum(a[3], "旋转面", line);
-        double rad = deg * std::acos(-1.0) / 180.0;
+        double rad = deg * piValue() / 180.0;
         double cs = std::cos(rad), sn = std::sin(rad);
         for (auto& p : pts) {
             double x = p.x - cx, y = p.y - cy;
@@ -12091,8 +12128,8 @@ Interpreter::Interpreter() {
                     const int seg = 16;
                     const double r = 4.0;
                     for (int k = 0; k < seg; ++k) {
-                        double a1 = k * 2 * std::acos(-1.0) / seg;
-                        double a2 = (k + 1) * 2 * std::acos(-1.0) / seg;
+                        double a1 = k * 2 * piValue() / seg;
+                        double a2 = (k + 1) * 2 * piValue() / seg;
                         tri(nx(dot.x), ny(dot.y), {0.15f, 0.15f, 0.15f},
                             nx(dot.x + std::cos(a1) * r), ny(dot.y + std::sin(a1) * r),
                             {0.15f, 0.15f, 0.15f},
@@ -12236,8 +12273,8 @@ Interpreter::Interpreter() {
                     const int seg = 16;
                     const double r = 4.0;
                     for (int k = 0; k < seg; ++k) {
-                        double a1 = k * 2 * std::acos(-1.0) / seg;
-                        double a2 = (k + 1) * 2 * std::acos(-1.0) / seg;
+                        double a1 = k * 2 * piValue() / seg;
+                        double a2 = (k + 1) * 2 * piValue() / seg;
                         tri(nx(dot.x), ny(dot.y), {0.15f, 0.15f, 0.15f},
                             nx(dot.x + std::cos(a1) * r), ny(dot.y + std::sin(a1) * r),
                             {0.15f, 0.15f, 0.15f},
@@ -12410,20 +12447,20 @@ Interpreter::Interpreter() {
     registerBuiltin("角速度", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double T = needNum(a[0], "角速度", line);
         if (T == 0) throw WenError("运行时错误", line, 0, "周期不能为 0");
-        return vNum(2.0 * std::acos(-1.0) / T);
+        return vNum(2.0 * piValue() / T);
     });
     registerBuiltin("线速度", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double r = needNum(a[0], "线速度", line);
         double T = needNum(a[1], "线速度", line);
         if (T == 0) throw WenError("运行时错误", line, 0, "周期不能为 0");
-        return vNum(2.0 * std::acos(-1.0) * r / T);
+        return vNum(2.0 * piValue() * r / T);
     });
     registerBuiltin("单摆周期", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double L = needNum(a[0], "单摆周期", line);
         double g = a.size() == 2 ? needNum(a[1], "单摆周期", line) : 9.80665;
         if (L < 0 || g <= 0)
             throw WenError("运行时错误", line, 0, "摆长不能为负，重力加速度必须大于 0");
-        return vNum(2.0 * std::acos(-1.0) * std::sqrt(L / g));
+        return vNum(2.0 * piValue() * std::sqrt(L / g));
     });
     registerBuiltin("弹性势能", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double k = needNum(a[0], "弹性势能", line);
@@ -12522,15 +12559,15 @@ Interpreter::Interpreter() {
         double n1 = needNum(a[1], "折射定律", line);
         double n2 = needNum(a[2], "折射定律", line);
         if (n2 == 0) throw WenError("运行时错误", line, 0, "折射率不能为 0");
-        double s = n1 / n2 * std::sin(theta1 * std::acos(-1.0) / 180.0);
+        double s = n1 / n2 * std::sin(theta1 * piValue() / 180.0);
         if (s < -1 || s > 1)
             throw WenError("运行时错误", line, 0, "发生全反射，没有折射角");
-        return vNum(std::asin(s) * 180.0 / std::acos(-1.0));
+        return vNum(std::asin(s) * 180.0 / piValue());
     });
     registerBuiltin("临界角", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double n = needNum(a[0], "临界角", line);
         if (n <= 1) throw WenError("运行时错误", line, 0, "折射率必须大于 1");
-        return vNum(std::asin(1.0 / n) * 180.0 / std::acos(-1.0));
+        return vNum(std::asin(1.0 / n) * 180.0 / piValue());
     });
     registerBuiltin("透镜像距", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         double u = needNum(a[0], "透镜像距", line);
@@ -12572,7 +12609,7 @@ Interpreter::Interpreter() {
         double r = needNum(a[1], "轨道周期", line);
         if (M <= 0 || r <= 0)
             throw WenError("运行时错误", line, 0, "中心质量和轨道半径必须大于 0");
-        return vNum(2.0 * std::acos(-1.0) * std::sqrt(r * r * r / (6.67430e-11 * M)));
+        return vNum(2.0 * piValue() * std::sqrt(r * r * r / (6.67430e-11 * M)));
     });
 
     // ---------- 函数库 ----------
@@ -13188,14 +13225,14 @@ Interpreter::Interpreter() {
                                  "#7c3aed", "#0891b2", "#db2777", "#65a30d"};
         std::ostringstream o;
         o << svgStart(title, W, H);
-        double start = -std::acos(-1.0) / 2.0;
+        double start = -piValue() / 2.0;
         for (size_t i = 0; i < data->items.size(); ++i) {
             double v = needNum(data->items[i], "饼图", line);
-            double ang = 2.0 * std::acos(-1.0) * v / sum;
+            double ang = 2.0 * piValue() * v / sum;
             double end = start + ang;
             double x1 = cx + r * std::cos(start), y1 = cy + r * std::sin(start);
             double x2 = cx + r * std::cos(end), y2 = cy + r * std::sin(end);
-            int large = ang > std::acos(-1.0) ? 1 : 0;
+            int large = ang > piValue() ? 1 : 0;
             o << "<path d=\"M " << cx << " " << cy << " L " << x1 << " " << y1
               << " A " << r << " " << r << " 0 " << large << " 1 " << x2 << " " << y2
               << " Z\" fill=\"" << palette[i % 8] << "\" stroke=\"#fff\" stroke-width=\"2\"/>\n";
