@@ -5234,6 +5234,20 @@ static LRESULT CALLBACK playerWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         SetCursorPos(cx, cy);
         return 0;
     }
+    if (msg == WM_SIZE && gPlayer && wp != SIZE_MINIMIZED) {
+        gPlayer->w = std::max(1, (int)LOWORD(lp));
+        gPlayer->h = std::max(1, (int)HIWORD(lp));
+        gPlayer->bgr.assign((size_t)gPlayer->w * gPlayer->h * 3, 0);
+        if (gPlayer->glRC && gPlayer->glTex) {
+            glBindTexture(GL_TEXTURE_2D, gPlayer->glTex);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, gPlayer->w, gPlayer->h, 0,
+                         GL_BGR_EXT, GL_UNSIGNED_BYTE, gPlayer->bgr.data());
+        }
+        return 0;
+    }
+    if (msg == WM_KILLFOCUS && gPlayer && gPlayer->capture) {
+        gPlayer->capture = false; ReleaseCapture(); ShowCursor(TRUE);
+    }
     if (msg == WM_KEYDOWN && wp == VK_ESCAPE && gPlayer) { gPlayer->closed = true; return 0; }
     if (msg == WM_CLOSE && gPlayer) { gPlayer->closed = true; return 0; }
     if (msg == WM_DESTROY) { PostQuitMessage(0); return 0; }
@@ -10807,10 +10821,17 @@ Interpreter::Interpreter() {
         }
         return a[0];
     });
-    registerBuiltin("玩家视口", 2, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
+    registerBuiltin("玩家视口", 2, 6, [](Interpreter&, vector<Value>& a, int line) -> Value {
 #ifdef _WIN32
         int w = std::max(320, std::min(1280, (int)needNum(a[0], "玩家视口", line)));
         int h = std::max(180, std::min(720, (int)needNum(a[1], "玩家视口", line)));
+        bool full = false;
+        const Value* sceneArg = nullptr;
+        if (a.size() >= 4) {
+            if (a[3].type == VT::List) sceneArg = &a[3];
+            else full = truthy(a[3]);
+        }
+        if (a.size() >= 5) full = truthy(a[4]);
         std::wstring title = utf8ToWide(a.size() >= 3 ? needStr(a[2], "玩家视口", line) : "玩家视角");
         static bool reg = false;
         HINSTANCE inst = GetModuleHandleW(nullptr);
@@ -10823,9 +10844,13 @@ Interpreter::Interpreter() {
         }
         PlayerWin pw; pw.w = w; pw.h = h; pw.bgr.assign((size_t)w*h*3, 0);
         gPlayer = &pw;
-        RECT rc{0,0,w,h}; AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
-        HWND hwnd = CreateWindowExW(0, L"WenPlayerWindow", title.c_str(), WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT, CW_USEDEFAULT, rc.right-rc.left, rc.bottom-rc.top,
+        RECT rc{0,0,w,h};
+        DWORD style = full ? (WS_POPUP | WS_VISIBLE) : (WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+        if (!full) AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
+        else { rc.right = GetSystemMetrics(SM_CXSCREEN); rc.bottom = GetSystemMetrics(SM_CYSCREEN); }
+        HWND hwnd = CreateWindowExW(full ? WS_EX_TOPMOST : 0, L"WenPlayerWindow", title.c_str(), style,
+            full ? 0 : CW_USEDEFAULT, full ? 0 : CW_USEDEFAULT,
+            full ? rc.right : rc.right-rc.left, full ? rc.bottom : rc.bottom-rc.top,
             nullptr, nullptr, inst, nullptr);
         if (!hwnd) { gPlayer = nullptr; throw WenError("运行时错误", line, 0, "玩家窗口创建失败"); }
         pw.hwnd = hwnd;
@@ -10858,10 +10883,57 @@ Interpreter::Interpreter() {
             PTri t2{{(double)gx,0,(double)gz},{(double)gx+3,0,(double)gz+3},{(double)gx,0,(double)gz+3},c};
             ground.push_back(t1); ground.push_back(t2);
         }
-        addCube(cubes, {0,0.8,-3}, 0.8, 0xd05040);
-        addCube(cubes, {-2.2,1.0,-6}, 1.0, 0x4fa060);
-        addCube(cubes, {2.0,0.6,-5}, 0.6, 0x4070c0);
-        addCube(cubes, {0.2,0.5,-9}, 0.5, 0xd0b040);
+        struct Box { PVec c; double s; };
+        vector<Box> boxes;
+        auto addBox = [&](PVec c, double s, unsigned col) { addCube(cubes, c, s, col); boxes.push_back({c, s}); };
+        if (sceneArg) {
+            auto list = needList(*sceneArg, "玩家视口场景", line);
+            for (const auto& it : list->items) {
+                auto d = needDict(it, "玩家视口场景", line);
+                PVec c{0, 0.8, -3}; double s = 0.8; unsigned col = 0xd05040;
+                auto pi = d->items.find("位置");
+                if (pi != d->items.end()) {
+                    auto pl = needList(pi->second, "位置", line);
+                    if (pl->items.size() != 3) throw WenError("运行时错误", line, 0, "位置必须是 [x,y,z]");
+                    c = {needNum(pl->items[0], "x", line), needNum(pl->items[1], "y", line), needNum(pl->items[2], "z", line)};
+                }
+                auto si = d->items.find("大小");
+                if (si != d->items.end()) s = std::max(0.05, needNum(si->second, "大小", line));
+                auto ci = d->items.find("颜色");
+                if (ci != d->items.end()) col = (unsigned)vpColor(ci->second, line);
+                addBox(c, s, col);
+            }
+        } else {
+            addBox({0,0.8,-3}, 0.8, 0xd05040);
+            addBox({-2.2,1.0,-6}, 1.0, 0x4fa060);
+            addBox({2.0,0.6,-5}, 0.6, 0x4070c0);
+            addBox({0.2,0.5,-9}, 0.5, 0xd0b040);
+        }
+        if (a.size() >= 6 && a[5].type == VT::Str) {
+            std::ifstream mf(fs::u8path(a[5].str));
+            if (!mf) throw WenError("文件错误", line, 0, "打不开模型：" + a[5].str);
+            vector<PVec> vs; string ln;
+            while (std::getline(mf, ln)) {
+                std::istringstream ss(ln);
+                string tag; ss >> tag;
+                if (tag == "v") {
+                    double x,y,z; ss >> x >> y >> z; vs.push_back({x,y,z});
+                } else if (tag == "f") {
+                    vector<int> idx; string tok;
+                    while (ss >> tok) {
+                        size_t slash = tok.find('/');
+                        int i = std::atoi(tok.substr(0, slash).c_str());
+                        if (i < 0) i = (int)vs.size() + i + 1;
+                        idx.push_back(i - 1);
+                    }
+                    for (size_t k = 1; k + 1 < idx.size(); ++k) {
+                        if (idx[0] < 0 || idx[k] < 0 || idx[k+1] < 0 ||
+                            idx[0] >= (int)vs.size() || idx[k] >= (int)vs.size() || idx[k+1] >= (int)vs.size()) continue;
+                        cubes.push_back({vs[idx[0]], vs[idx[k]], vs[idx[k+1]], 0xb8c0c8});
+                    }
+                }
+            }
+        }
         PVec light = pnorm({0.45,1.0,0.35});
         PVec cam{0,1.7,4.5};
         double yaw = 0, pitch = -0.05;
@@ -10879,12 +10951,20 @@ Interpreter::Interpreter() {
             double speed = 3.2;
             PVec fwd{std::sin(yaw), 0, -std::cos(yaw)};
             PVec right{std::cos(yaw), 0, std::sin(yaw)};
-            if (GetAsyncKeyState('W') & 0x8000) cam = padd(cam, pmul(fwd, speed*0.016));
-            if (GetAsyncKeyState('S') & 0x8000) cam = psub(cam, pmul(fwd, speed*0.016));
-            if (GetAsyncKeyState('A') & 0x8000) cam = psub(cam, pmul(right, speed*0.016));
-            if (GetAsyncKeyState('D') & 0x8000) cam = padd(cam, pmul(right, speed*0.016));
-            if (GetAsyncKeyState(VK_SPACE) & 0x8000) cam.y += speed*0.016;
-            if (GetAsyncKeyState(VK_SHIFT) & 0x8000) cam.y = std::max(0.5, cam.y-speed*0.016);
+            PVec want = cam;
+            if (GetAsyncKeyState('W') & 0x8000) want = padd(want, pmul(fwd, speed*0.016));
+            if (GetAsyncKeyState('S') & 0x8000) want = psub(want, pmul(fwd, speed*0.016));
+            if (GetAsyncKeyState('A') & 0x8000) want = psub(want, pmul(right, speed*0.016));
+            if (GetAsyncKeyState('D') & 0x8000) want = padd(want, pmul(right, speed*0.016));
+            if (GetAsyncKeyState(VK_SPACE) & 0x8000) want.y += speed*0.016;
+            if (GetAsyncKeyState(VK_SHIFT) & 0x8000) want.y = std::max(0.5, want.y-speed*0.016);
+            auto blocked = [&](PVec p) {
+                for (const auto& b : boxes)
+                    if (std::fabs(p.x-b.c.x) < b.s+0.35 && std::fabs(p.z-b.c.z) < b.s+0.35 &&
+                        p.y > b.c.y-b.s-0.9 && p.y < b.c.y+b.s+1.7) return true;
+                return false;
+            };
+            if (!blocked(want)) cam = want;
             PVec f{std::sin(yaw)*std::cos(pitch), std::sin(pitch), -std::cos(yaw)*std::cos(pitch)};
             PVec r{std::cos(yaw), 0, std::sin(yaw)};
             PVec u = pnorm(pcross(r, f));
