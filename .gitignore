@@ -9,6 +9,7 @@ wen.exe
 例子/*.exe
 *.dll
 例子/*.svg
+例子/*.bmp
 例子/光追_*.bmp
 例子/笔记.txt
 

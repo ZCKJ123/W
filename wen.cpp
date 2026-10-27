@@ -3529,7 +3529,7 @@ static const std::map<string, string>& functionModules() {
         {"新建神经层", "神经网络库"}, {"神经链", "神经网络库"}, {"前向", "神经网络库"},
         {"颜色", "视口库"}, {"新建视口", "视口库"}, {"视口清空", "视口库"}, {"视口画点", "视口库"},
         {"视口画线", "视口库"}, {"视口画三角形", "视口库"}, {"视口尺寸", "视口库"}, {"视口保存", "视口库"},
-        {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"}, {"视口显示", "视口库"}, {"玩家视口", "视口库"}, {"视口加载模型", "视口库"}, {"光追渲染", "视口库"}, {"视口取色", "视口库"},
+        {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"}, {"视口显示", "视口库"}, {"玩家视口", "视口库"}, {"视口加载模型", "视口库"}, {"光追渲染", "视口库"}, {"材质检查", "视口库"}, {"视口取色", "视口库"},
         {"硬件信息", "硬件库"}, {"高精度计时", "硬件库"}, {"内存状态", "硬件库"}, {"屏幕尺寸", "硬件库"}, {"磁盘空间", "硬件库"},
         {"大整数幂", "大整数库"}, {"大整数乘", "大整数库"}, {"大整数加", "大整数库"}, {"大整数阶乘", "大整数库"},
         {"阶乘位数", "大整数库"}, {"阶乘末尾零", "大整数库"}, {"阶乘概览", "大整数库"},
@@ -10451,6 +10451,33 @@ Interpreter::Interpreter() {
         d->items["深度"] = vList(depth);
         return vDict(d);
     });
+    registerBuiltin("材质检查", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto ml = needList(a[0], "材质检查", line);
+        auto out = std::make_shared<List>();
+        for (const auto& it : ml->items) {
+            auto md = needDict(it, "材质检查", line);
+            auto d = std::make_shared<Dict>();
+            double rough = 0.5, metal = 0.0, ior = 1.5;
+            long long color = 0xCC3333;
+            auto ri = md->items.find("粗糙度");
+            if (ri != md->items.end()) rough = needNum(ri->second, "粗糙度", line);
+            auto mi = md->items.find("金属度");
+            if (mi != md->items.end()) metal = needNum(mi->second, "金属度", line);
+            auto ii = md->items.find("折射率");
+            if (ii != md->items.end()) ior = needNum(ii->second, "折射率", line);
+            auto ci = md->items.find("颜色");
+            if (ci != md->items.end()) color = (long long)needNum(ci->second, "颜色", line);
+            if (rough < 0 || rough > 1) throw WenError("运行时错误", line, 0, "粗糙度必须在 0..1");
+            if (metal < 0 || metal > 1) throw WenError("运行时错误", line, 0, "金属度必须在 0..1");
+            if (ior < 1 || ior > 3) throw WenError("运行时错误", line, 0, "折射率必须在 1..3");
+            d->items["粗糙度"] = vNum(rough);
+            d->items["金属度"] = vNum(metal);
+            d->items["折射率"] = vNum(ior);
+            d->items["颜色"] = vNum((double)(color & 0xFFFFFF));
+            out->items.push_back(vDict(d));
+        }
+        return vList(out);
+    });
     registerBuiltin("光追渲染", 2, 6, [](Interpreter&, vector<Value>& a, int line) -> Value {
         int outW = (int)needIndex(a[0], "光追渲染", line);
         int outH = (int)needIndex(a[1], "光追渲染", line);
@@ -10463,6 +10490,30 @@ Interpreter::Interpreter() {
         int w = std::max(1, (int)(outW * scale));
         int h = std::max(1, (int)(outH * scale));
         samples = std::max(1, std::min(samples, 32));
+        struct PBR { double rough = 0.5, metal = 0.0, ior = 1.5; std::array<double,3> color{0.8,0.2,0.2}; };
+        std::vector<PBR> pbr(4);
+        pbr[0].rough = 0.85; pbr[0].metal = 0.0; pbr[0].color = {0.82,0.20,0.18};
+        pbr[1].rough = 0.18; pbr[1].metal = 0.9; pbr[1].color = {0.25,0.78,0.32};
+        pbr[2].rough = 0.04; pbr[2].metal = 0.0; pbr[2].ior = 1.5; pbr[2].color = {0.85,0.92,1.0};
+        pbr[3].rough = 0.10; pbr[3].metal = 0.0; pbr[3].ior = 1.33; pbr[3].color = {0.16,0.26,0.30};
+        auto rgbOf = [&](const Value& v, int ln) -> std::array<double,3> {
+            long long c = (long long)needNum(v, "材质颜色", ln);
+            return {((c>>16)&255)/255.0, ((c>>8)&255)/255.0, (c&255)/255.0};
+        };
+        if (a.size() >= 6 && a[5].type == VT::List) {
+            auto ml = needList(a[5], "材质", line);
+            for (size_t i = 0; i < ml->items.size() && i < 4; ++i) {
+                auto md = needDict(ml->items[i], "材质", line);
+                auto ri = md->items.find("粗糙度");
+                if (ri != md->items.end()) pbr[i].rough = std::max(0.0, std::min(1.0, needNum(ri->second, "粗糙度", line)));
+                auto mi = md->items.find("金属度");
+                if (mi != md->items.end()) pbr[i].metal = std::max(0.0, std::min(1.0, needNum(mi->second, "金属度", line)));
+                auto ii = md->items.find("折射率");
+                if (ii != md->items.end()) pbr[i].ior = std::max(1.0, std::min(3.0, needNum(ii->second, "折射率", line)));
+                auto ci = md->items.find("颜色");
+                if (ci != md->items.end()) pbr[i].color = rgbOf(ci->second, line);
+            }
+        }
         auto buf = std::make_shared<std::vector<unsigned char>>((size_t)w * h * 3);
         auto rnd = []() {
             thread_local std::mt19937 g(std::random_device{}());
@@ -10543,15 +10594,13 @@ Interpreter::Interpreter() {
             if (!traceScene(o, d, h)) return sky(d);
             if (h.mat == 4) return std::array<double,3>{8,7.5,6};
             if (depth <= 0) return std::array<double,3>{0,0,0};
-            std::array<double,3> albedo{0.82,0.20,0.18};
-            int kind = 0; // 0 diffuse, 1 metal, 2 glass, 3 water
-            if (h.mat == 1) { albedo = {0.25,0.78,0.32}; kind = 1; }
-            else if (h.mat == 2) { albedo = {0.85,0.92,1.0}; kind = 2; }
-            else if (h.mat == 3) {
+            int mi = std::max(0, std::min(3, h.mat));
+            std::array<double,3> albedo = pbr[mi].color;
+            int kind = h.mat == 3 ? 3 : (h.mat == 2 ? 2 : (pbr[mi].metal > 0.5 ? 1 : 0));
+            if (h.mat == 3) {
                 int check = ((int)std::floor(h.p[0]*2) + (int)std::floor(h.p[2]*2)) & 1;
                 albedo = check ? std::array<double,3>{0.75,0.80,0.78}
                                : std::array<double,3>{0.16,0.26,0.30};
-                kind = 3;
             }
             std::array<double,3> out{0,0,0};
             if (kind == 0 || kind == 1) {
@@ -10561,13 +10610,14 @@ Interpreter::Interpreter() {
             std::array<double,3> dir;
             if (kind == 1) {
                 double dot = d[0]*h.n[0] + d[1]*h.n[1] + d[2]*h.n[2];
-                dir = norm({d[0]-2*dot*h.n[0] + (rnd()-0.5)*0.25,
-                            d[1]-2*dot*h.n[1] + (rnd()-0.5)*0.25,
-                            d[2]-2*dot*h.n[2] + (rnd()-0.5)*0.25});
+                double rough = pbr[mi].rough * 0.9 + 0.01;
+                dir = norm({d[0]-2*dot*h.n[0] + (rnd()-0.5)*rough,
+                            d[1]-2*dot*h.n[1] + (rnd()-0.5)*rough,
+                            d[2]-2*dot*h.n[2] + (rnd()-0.5)*rough});
                 auto inc = radiance({h.p[0]+h.n[0]*1e-3, h.p[1]+h.n[1]*1e-3, h.p[2]+h.n[2]*1e-3}, dir, depth-1);
                 out[0] += albedo[0]*inc[0]; out[1] += albedo[1]*inc[1]; out[2] += albedo[2]*inc[2];
             } else if (kind == 2) {
-                double eta = 1.0/1.5;
+                double eta = 1.0 / pbr[mi].ior;
                 double cosI = -(d[0]*h.n[0] + d[1]*h.n[1] + d[2]*h.n[2]);
                 std::array<double,3> nn = h.n;
                 if (cosI < 0) { nn = {-h.n[0],-h.n[1],-h.n[2]}; cosI = -cosI; }
