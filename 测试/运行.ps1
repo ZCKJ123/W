@@ -144,4 +144,6 @@ Write-Host ("`n通过 {0}/{1}" -f ($total - $fail), $total)
 if ($fail -gt 0) { exit 1 }
 & (Join-Path $PSScriptRoot '错误协议.ps1')
 if ($LASTEXITCODE -ne 0) { exit 1 }
+& (Join-Path $PSScriptRoot '防崩溃.ps1')
+if ($LASTEXITCODE -ne 0) { exit 1 }
 exit 0

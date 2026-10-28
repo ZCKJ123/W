@@ -3453,6 +3453,7 @@ static const std::map<string, string>& functionModules() {
         // 时间 / 编码 / 正则
         {"现在", "时间库"}, {"时间戳", "时间库"}, {"毫秒时间", "时间库"},
         {"时间分量", "时间库"}, {"高精度时间", "时间库"}, {"帧同步", "时间库"},
+        {"时刻表新建", "时间库"}, {"时刻表添加", "时间库"}, {"时刻表到点", "时间库"}, {"时刻表剩余", "时间库"},
         {"格式化时间", "时间库"}, {"解析时间", "时间库"}, {"休眠", "时间库"},
         {"Base64编码", "编码库"}, {"Base64解码", "编码库"},
         {"URL编码", "编码库"}, {"URL解码", "编码库"},
@@ -3694,6 +3695,7 @@ public:
     std::map<string, Value> memoryTemp;   // 内存库：临时
     std::map<string, string> memoryCompressed;  // 内存库：压缩区
     std::map<string, size_t> memoryOrigSize;    // 压缩前字节数
+    std::map<string, string> decompressCache;    // 压缩文本 -> 解压结果
 
     size_t memoryUsageBytes() const {
         size_t bytes = 0;
@@ -3884,6 +3886,7 @@ static vector<string> memoryTokens(const string& s) {
 }
 
 void Interpreter::buildMemoryDict(const string& extra) {
+    decompressCache.clear();
     vector<std::pair<string, string>> compRaws;
     for (const auto& kv : memoryCompressed)
         compRaws.push_back({kv.first, decompressMemoryText(kv.second, 0)});
@@ -3977,6 +3980,8 @@ string Interpreter::leapKey(const Value& key, int line) {
 }
 
 string Interpreter::decompressMemoryText(const string& text, int line) {
+    auto cache = decompressCache.find(text);
+    if (cache != decompressCache.end()) return cache->second;
     string out;
     for (size_t i = 0; i < text.size(); ++i) {
         unsigned char c = text[i];
@@ -11863,7 +11868,64 @@ Interpreter::Interpreter() {
         double dt = std::chrono::duration<double>(end - last).count();
         last = end;
         return vNum(dt);
-    });    registerBuiltin("现在", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+    });    registerBuiltin("时刻表新建", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+        auto d = std::make_shared<Dict>();
+        d->items["开始"] = vNum(std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count());
+        d->items["条目"] = vList(std::make_shared<List>());
+        return vDict(d);
+    });
+    registerBuiltin("时刻表添加", 3, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto d = needDict(a[0], "时刻表添加", line);
+        double sec = needNum(a[1], "时刻表添加", line);
+        string name = needStr(a[2], "时刻表添加", line);
+        if (sec < 0) throw WenError("运行时错误", line, 0, "时刻不能为负");
+        auto li = d->items.find("条目");
+        if (li == d->items.end() || li->second.type != VT::List)
+            throw WenError("运行时错误", line, 0, "不是时刻表");
+        auto item = std::make_shared<Dict>();
+        item->items["时间"] = vNum(needNum(d->items["开始"], "时刻表", line) + sec);
+        item->items["名称"] = vStr(name);
+        item->items["完成"] = vBool(false);
+        li->second.list->items.push_back(vDict(item));
+        return vNone();
+    });
+    registerBuiltin("时刻表到点", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto d = needDict(a[0], "时刻表到点", line);
+        double now = a.size() >= 2 ? needNum(a[1], "时刻表到点", line)
+            : std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto li = d->items.find("条目");
+        if (li == d->items.end() || li->second.type != VT::List)
+            throw WenError("运行时错误", line, 0, "不是时刻表");
+        auto out = std::make_shared<List>();
+        for (auto& v : li->second.list->items) {
+            auto it = needDict(v, "时刻表", line);
+            if (it->items["完成"].b) continue;
+            if (now >= it->items["时间"].num) {
+                it->items["完成"] = vBool(true);
+                out->items.push_back(it->items["名称"]);
+            }
+        }
+        return vList(out);
+    });
+    registerBuiltin("时刻表剩余", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto d = needDict(a[0], "时刻表剩余", line);
+        double now = a.size() >= 2 ? needNum(a[1], "时刻表剩余", line)
+            : std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto li = d->items.find("条目");
+        if (li == d->items.end() || li->second.type != VT::List)
+            throw WenError("运行时错误", line, 0, "不是时刻表");
+        auto out = std::make_shared<List>();
+        for (auto& v : li->second.list->items) {
+            auto it = needDict(v, "时刻表", line);
+            if (it->items["完成"].b) continue;
+            auto row = std::make_shared<Dict>();
+            row->items["名称"] = it->items["名称"];
+            row->items["剩余秒"] = vNum(std::max(0.0, it->items["时间"].num - now));
+            out->items.push_back(vDict(row));
+        }
+        return vList(out);
+    });
+    registerBuiltin("现在", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
         std::time_t t = std::time(nullptr);
         std::tm lt = *std::localtime(&t);
         char buf[32];
