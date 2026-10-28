@@ -11460,7 +11460,7 @@ Interpreter::Interpreter() {
             }
         }
         PVec light = pnorm({0.45,1.0,0.35});
-        PVec cam{0,1.7,4.5};
+        PVec cam{0,1.7,7.5};
         double yaw = 0, pitch = 0.02;
         pw.capture = false; ShowCursor(TRUE);
         std::thread presenter([&]() {
@@ -11503,7 +11503,7 @@ Interpreter::Interpreter() {
             auto frameStart=std::chrono::steady_clock::now();
             {
                 double ts = std::chrono::duration<double>(frameStart - t0).count();
-                light = pnorm({0.45 + 0.35 * std::sin(ts * 0.7), 1.0, 0.35 + 0.35 * std::cos(ts * 0.5)});
+                light = pnorm({0.45 + 0.35 * std::sin(ts * 0.12), 1.0, 0.35 + 0.35 * std::cos(ts * 0.09)});
             }
             MSG msg;
             while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
@@ -11730,12 +11730,14 @@ Interpreter::Interpreter() {
                 double xx=pdot(d,r), yy=pdot(d,u); double fl=(double)h*0.95;
                 sx=w*0.5+xx*fl/zz; sy=h*0.5-yy*fl/zz; z=zz; return true;
             };
-            const int SM = 256;
+            const int SM = 512;
             vector<float> shadowMap;
             PVec lright, lup, lfwd;
             auto buildShadowMap = [&]() {
                 shadowMap.assign((size_t)SM * SM, 1e30f);
-                PVec center{0, 2.0, -2.0};
+                // 阴影框跟随相机并做纹素对齐，避免移动时整片阴影抖动
+                double texel = 30.0 / SM;
+                PVec center{std::floor(cam.x / texel) * texel, 2.0, std::floor(cam.z / texel) * texel};
                 PVec lc = padd(center, pmul(light, 20.0));
                 lfwd = pmul(light, -1.0);
                 lright = pnorm(pcross(lfwd, pv(0,1,0)));
@@ -11770,14 +11772,19 @@ Interpreter::Interpreter() {
                     }
                 }
             };
-            auto sampleShadow = [&](PVec p) {
+            auto sampleShadow = [&](PVec p, PVec n) {
                 if (shadowMap.empty()) return 1.0;
-                PVec center{0, 2.0, -2.0};
+                // 法线偏移：把采样点推离表面，避免自阴影和阴影脱离物体
+                PVec sp = padd(p, pmul(n, 0.035));
+                double texel = 30.0 / SM;
+                PVec center{std::floor(cam.x / texel) * texel, 2.0, std::floor(cam.z / texel) * texel};
                 PVec lc = padd(center, pmul(light, 20.0));
-                PVec d = psub(p, lc);
+                PVec d = psub(sp, lc);
                 double sx = (pdot(d, lright) + 15.0) / 30.0 * SM;
                 double sy = (pdot(d, lup) + 15.0) / 30.0 * SM;
-                double dz = pdot(d, lfwd) - 0.25;
+                double slope = 1.0 - std::fabs(pdot(n, light));
+                double bias = 0.025 + 0.10 * slope;
+                double dz = pdot(d, lfwd) - bias;
                 if (sx < 1 || sy < 1 || sx >= SM-1 || sy >= SM-1) return 1.0;
                 int cx=(int)sx, cy=(int)sy, lit=0, total=0;
                 for(int oy=-1;oy<=1;++oy) for(int ox=-1;ox<=1;++ox) {
@@ -11834,7 +11841,7 @@ Interpreter::Interpreter() {
                     double wx=w0*pa.x+w1*pb.x+w2*pc.x;
                     double wy=w0*pa.y+w1*pb.y+w2*pc.y;
                     double wz=w0*pa.z+w1*pb.z+w2*pc.z;
-                    double shade = receive ? sampleShadow({wx,wy,wz}) : 1.0;
+                    double shade = receive ? sampleShadow({wx,wy,wz}, n) : 1.0;
                     if (receive && wy > 0.02) shade *= cloudShadowAt({wx,wy,wz});
                     PVec vdir = pnorm(psub(cam, {wx,wy,wz}));
                     PVec hv = pnorm(padd(light, vdir));
