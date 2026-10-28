@@ -17130,6 +17130,79 @@ static int runCommand(const string& cmd) {
 #endif
 }
 
+static int indexFile(const string& path, bool json) {
+    string src;
+    try { src = normalizeWenSource(readWholeFile(resolveWenPath(path))); }
+    catch (IoError& e) { std::cerr << e.what() << "\n"; return 1; }
+    auto lines = splitLines(src);
+    vector<string> deps;
+    vector<std::tuple<string,string,int>> funcs;
+    vector<std::tuple<string,int>> exports;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        string t = trimText(lines[i]);
+        if (t.rfind("依赖", 0) == 0) {
+            string rest = trimText(t.substr(6));
+            std::istringstream ds(rest);
+            string item;
+            while (std::getline(ds, item, ',')) {
+                size_t p = item.find('，');
+                if (p == string::npos) p = item.find('、');
+                if (p != string::npos) {
+                    deps.push_back(trimText(item.substr(0,p)));
+                    deps.push_back(trimText(item.substr(p+3)));
+                } else {
+                    string v = trimText(item);
+                    if (!v.empty()) deps.push_back(v);
+                }
+            }
+        } else if (t.rfind("函数", 0) == 0) {
+            string rest = trimText(t.substr(6));
+            size_t sp = rest.find_first_of(" \t");
+            string name = sp == string::npos ? rest : rest.substr(0, sp);
+            string params = sp == string::npos ? "" : trimText(rest.substr(sp + 1));
+            size_t then = params.find("则");
+            if (then != string::npos) params = trimText(params.substr(0, then));
+            funcs.push_back({name, params, (int)i + 1});
+        } else if (t.rfind("导出", 0) == 0) {
+            string rest = trimText(t.substr(6));
+            exports.push_back({rest, (int)i + 1});
+        }
+    }
+    if (json) {
+        auto q = [](const string& s) { return jsonQuote(s); };
+        std::cout << "{\"file\":" << q(path) << ",\"lines\":" << lines.size()
+                  << ",\"dependencies\":[";
+        for (size_t i=0;i<deps.size();++i){ if(i) std::cout<<","; std::cout<<q(deps[i]); }
+        std::cout << "],\"functions\":[";
+        for (size_t i=0;i<funcs.size();++i){
+            if(i) std::cout<<",";
+            std::cout<<"{\"name\":"<<q(std::get<0>(funcs[i]))
+                     <<",\"params\":"<<q(std::get<1>(funcs[i]))
+                     <<",\"line\":"<<std::get<2>(funcs[i])<<"}";
+        }
+        std::cout << "],\"exports\":[";
+        for (size_t i=0;i<exports.size();++i){
+            if(i) std::cout<<",";
+            std::cout<<"{\"name\":"<<q(std::get<0>(exports[i]))
+                     <<",\"line\":"<<std::get<1>(exports[i])<<"}";
+        }
+        std::cout << "]}\n";
+        return 0;
+    }
+    std::cout << "文件 " << path << "（" << lines.size() << " 行）\n";
+    if (!deps.empty()) {
+        std::cout << "依赖 ";
+        for (size_t i=0;i<deps.size();++i){ if(i) std::cout<<"、" ; std::cout<<deps[i]; }
+        std::cout << "\n";
+    }
+    for (const auto& f : funcs)
+        std::cout << "函数 " << std::get<0>(f) << "(" << std::get<1>(f) << ") 第 "
+                  << std::get<2>(f) << " 行\n";
+    for (const auto& e : exports)
+        std::cout << "导出 " << std::get<0>(e) << " 第 " << std::get<1>(e) << " 行\n";
+    return 0;
+}
+
 static int dumpTokens(const string& path) {
     vector<string> lines;
     try {
@@ -18082,6 +18155,19 @@ static int runMain(vector<string> args) {
             return 1;
         }
         return createLibrary(args[2], args.size() >= 4 ? args[3] : "");
+    }
+    if (cmd == "--索引") {
+        string target;
+        bool asJson = false;
+        for (size_t i = 2; i < args.size(); ++i) {
+            if (args[i] == "--json") asJson = true;
+            else if (args[i].rfind("--", 0) != 0 && target.empty()) target = args[i];
+        }
+        if (target.empty()) {
+            std::cerr << "用法：wen.exe --索引 [--json] 文件.wen\n";
+            return 1;
+        }
+        return indexFile(target, asJson || gJsonDiagnostics);
     }
     if (cmd == "--词法") {
         if (args.size() < 3) {
