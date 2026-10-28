@@ -11338,6 +11338,7 @@ Interpreter::Interpreter() {
             atmo.base = std::max(1.0, std::min(30.0, atmo.base));
             atmo.top = std::max(atmo.base + 0.5, std::min(35.0, atmo.top));
         }
+        bool useParticleClouds = true;
         std::wstring title = utf8ToWide(a.size() >= 3 ? needStr(a[2], "玩家视口", line) : "玩家视角");
         static bool reg = false;
         HINSTANCE inst = GetModuleHandleW(nullptr);
@@ -11677,7 +11678,7 @@ Interpreter::Interpreter() {
                 return std::max(0.0, std::min(1.0, d));
             };
             // 高层卷云：独立高度层，真正射线步进
-            if (atmo.highCover > 0.001) {
+            if (!useParticleClouds && atmo.highCover > 0.001) {
                 auto highDensity = [&](PVec p, double time) {
                     double h=(p.y-atmo.highBase)/(atmo.highTop-atmo.highBase);
                     if (h<0 || h>1) return 0.0;
@@ -11740,6 +11741,62 @@ Interpreter::Interpreter() {
                     pw.back[i+2]=(unsigned char)(pw.back[i+2]*(1-aa)+hbuf[ci]*aa);
                 }
             }
+            double tsec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (useParticleClouds) {
+                struct PC { PVec p; double d; int layer; };
+                vector<PC> parts;
+                auto addLayer = [&](double base, double top, double cover, double scale, double wind, int layer) {
+                    double t = tsec;
+                    for (double gx=-42; gx<=42; gx+=1.6)
+                    for (double gz=-42; gz<=42; gz+=1.6)
+                    for (double gy=base+0.4; gy<top; gy+=0.9) {
+                        double h=(gy-base)/(top-base);
+                        double qx=(gx+t*wind)*scale, qy=gy*scale*1.7, qz=(gz-t*wind)*scale;
+                        double f=0, amp=0.55, fr=1;
+                        for(int o=0;o<3;++o){ f += vnoise3(qx*fr,qy*fr,qz*fr)*amp; fr*=2.1; amp*=0.5; }
+                        double billow=1.0-std::fabs(2.0*f-1.0);
+                        double n=f*0.62+billow*0.38;
+                        double prof=std::pow(std::max(0.0,h),0.40)*std::pow(std::max(0.0,1-h),0.20);
+                        double d=(n*prof - (0.52-cover*0.32))*4.0;
+                        if (d <= 0.03) continue;
+                        double jx=(hash3(gx*1.3,gz*1.7,gy)-0.5)*1.8;
+                        double jz=(hash3(gz*1.1,gx*1.9,gy+7)-0.5)*1.8;
+                        parts.push_back({{gx+jx, gy, gz+jz}, std::min(1.0,d), layer});
+                        if (parts.size() > 26000) return;
+                    }
+                };
+                addLayer(atmo.base, atmo.top, atmo.cover, atmo.scale, atmo.wind, 0);
+                if (atmo.highCover > 0.01) addLayer(atmo.highBase, atmo.highTop, atmo.highCover, atmo.highScale, atmo.wind*0.6, 1);
+                std::cerr << "PARTS " << parts.size() << " cover=" << atmo.cover << "\n";
+                std::sort(parts.begin(), parts.end(), [&](const PC& a, const PC& b) {
+                    auto da=psub(a.p,cam), db=psub(b.p,cam);
+                    return pdot(da,da) > pdot(db,db);
+                });
+                auto pj = [&](PVec q, double& sx, double& sy, double& zz)->bool {
+                    PVec d=psub(q,cam); zz=pdot(d,f); if(zz<=0.2) return false;
+                    double xx=pdot(d,r), yy=pdot(d,u); double fl=(double)h*0.95;
+                    sx=w*0.5+xx*fl/zz; sy=h*0.5-yy*fl/zz; return true;
+                };
+                for (const auto& pt : parts) {
+                    double sx,sy,zz;
+                    if (!pj(pt.p,sx,sy,zz)) continue;
+                    double rad = std::max(3.0, std::min(90.0, 300.0/zz));
+                    double aa = std::min(0.55, 0.12 + pt.d*0.32) * (pt.layer ? 0.55 : 1.0);
+                    double cr = pt.layer ? 220 : 205, cg = pt.layer ? 225 : 210, cb = pt.layer ? 240 : 220;
+                    int x0=(int)(sx-rad), x1=(int)(sx+rad), y0=(int)(sy-rad), y1=(int)(sy+rad);
+                    if (x1<0||y1<0||x0>=w||y0>=h) continue;
+                    for (int y=std::max(0,y0); y<=std::min(h-1,y1); ++y) for (int x=std::max(0,x0); x<=std::min(w-1,x1); ++x) {
+                        double dx=(x+0.5-sx)/rad, dy=(y+0.5-sy)/rad;
+                        double fall=1.0-dx*dx-dy*dy; if (fall<=0) continue;
+                        double a=aa*fall*fall;
+                        size_t i=((size_t)y*w+x)*3;
+                        pw.back[i]  =(unsigned char)std::min(255.0,pw.back[i]*(1-a)+cb*a);
+                        pw.back[i+1]=(unsigned char)std::min(255.0,pw.back[i+1]*(1-a)+cg*a);
+                        pw.back[i+2]=(unsigned char)std::min(255.0,pw.back[i+2]*(1-a)+cr*a);
+                    }
+                }
+            }
+            if (!useParticleClouds) {
             // 体积云：低分辨率射线步进 + 双线性放大
             int cw = std::max(1, w / atmo.res), ch = std::max(1, h / atmo.res);
             vector<unsigned char> cloudBuf((size_t)cw*ch*4, 0);
@@ -11857,6 +11914,7 @@ Interpreter::Interpreter() {
                 std::vector<std::thread> th;
                 for(unsigned k=0;k<nt;++k) th.emplace_back(upRows, h*(int)k/(int)nt, h*(int)(k+1)/(int)nt);
                 for(auto& t:th) t.join();
+            }
             }
             zbuf.assign((size_t)w*h, 1e30);
             auto project=[&](PVec p, double& sx, double& sy, double& z)->bool{
