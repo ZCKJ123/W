@@ -12565,9 +12565,11 @@ Interpreter::Interpreter() {
                     double dz = pdot(d, cs.fwd) - bias;
                     if (sx < 1 || sy < 1 || sx >= cs.size-1 || sy >= cs.size-1) return 1.0;
                     int cx=(int)sx, cy=(int)sy, lit=0, total=0;
-                    for(int oy=-1;oy<=1;++oy) for(int ox=-1;ox<=1;++ox) {
+                    for(int oy=-2;oy<=2;++oy) for(int ox=-2;ox<=2;++ox) {
                         float sd=cs.map[(size_t)(cy+oy)*cs.size+(cx+ox)];
-                        ++total; if (dz <= sd) ++lit;
+                        int wgt = 3 - std::abs(ox) - std::abs(oy);
+                        if (wgt <= 0) continue;
+                        total += wgt; if (dz <= sd) lit += wgt;
                     }
                     return (double)lit / std::max(1,total);
                 };
@@ -12660,15 +12662,29 @@ Interpreter::Interpreter() {
                         double fres = 0.18 + 0.62 * std::pow(1.0 - std::max(0.0, pdot(n, vdir)), 3.0);
                         double alpha = 0.18 + 0.45 * fres;
                         double tr = (col>>16)&255, tg=(col>>8)&255, tb=col&255;
-                        pw.back[i*3]   = (unsigned char)(pw.back[i*3]   * (1-alpha) + tb * alpha);
-                        pw.back[i*3+1] = (unsigned char)(pw.back[i*3+1] * (1-alpha) + tg * alpha);
-                        pw.back[i*3+2] = (unsigned char)(pw.back[i*3+2] * (1-alpha) + tr * alpha);
-                        zbuf[i] = z - 0.001;  // 玻璃不遮挡后面的不透明物，但保留近层
+                        PVec inDir = pmul(vdir, -1.0);
+                        PVec rdir = pnorm(psub(inDir, pmul(n, 2.0*pdot(inDir,n))));
+                        auto env = skyColor(rdir);
+                        double rr = pw.back[i*3+2]*(1-alpha) + tr*alpha + env[2]*fres*0.55;
+                        double gg = pw.back[i*3+1]*(1-alpha) + tg*alpha + env[1]*fres*0.55;
+                        double bb = pw.back[i*3]  *(1-alpha) + tb*alpha + env[0]*fres*0.55;
+                        pw.back[i*3]   = (unsigned char)std::min(255.0, std::max(0.0, bb));
+                        pw.back[i*3+1] = (unsigned char)std::min(255.0, std::max(0.0, gg));
+                        pw.back[i*3+2] = (unsigned char)std::min(255.0, std::max(0.0, rr));
+                        zbuf[i] = z - 0.001;
                         continue;
                     }
                     double rr = cb*kd*lit*shade + spec*lb*255.0*shade;
                     double gg = cg*kd*lit*shade + spec*lg*255.0*shade;
                     double bb = cr*kd*lit*shade + spec*lr*255.0*shade;
+                    // 天空环境反射：金属明显，电介质很弱
+                    PVec inDir = pmul(vdir, -1.0);
+                        PVec rdir = pnorm(psub(inDir, pmul(n, 2.0*pdot(inDir,n))));
+                    auto env = skyColor(rdir);
+                    double envAmt = metal * 0.32 + (1.0-metal) * 0.035;
+                    rr += env[2] * envAmt * (0.35 + 0.65*rough);
+                    gg += env[1] * envAmt * (0.35 + 0.65*rough);
+                    bb += env[0] * envAmt * (0.35 + 0.65*rough);
                     rr = rr*(1-fog) + fogR*fog; gg = gg*(1-fog) + fogG*fog; bb = bb*(1-fog) + fogB*fog;
                     pw.back[i*3]=(unsigned char)std::min(255.0,std::max(0.0,rr));
                     pw.back[i*3+1]=(unsigned char)std::min(255.0,std::max(0.0,gg));
