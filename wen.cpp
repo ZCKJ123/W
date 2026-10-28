@@ -16166,7 +16166,8 @@ static string errorRule(const WenError& e) {
         return "static.invalid";
     }
     if (k == "运行时错误") {
-        if (r.find("未知材质预设") != string::npos) return "runtime.material_preset";
+        if (r.find("未知材质预设") != string::npos || r.find("未知大气预设") != string::npos)
+            return "unknown.preset";
         if (r.find("粗糙度必须") != string::npos || r.find("金属度必须") != string::npos ||
             r.find("折射率必须") != string::npos) return "runtime.material_range";
         if (r.find("除数") != string::npos) return "runtime.divide_zero";
@@ -16210,7 +16211,12 @@ static string errorExplanation(const string& kind) {
 
 static string errorSuggestion(const WenError& e) {
     string rule = errorRule(e);
-    if (rule == "runtime.material_preset") return "改用：金、银、铜、玻璃、水、陶瓷、橡胶、自发光。";
+    if (rule == "unknown.preset") {
+        string r = e.what();
+        auto pos = r.find("可用：");
+        if (pos != string::npos) return "改用：" + r.substr(pos + string("可用：").size());
+        return "改用文档里列出的预设名。";
+    }
     if (rule == "runtime.material_range") return "粗糙度/金属度/清漆/透射用 0..1，折射率用 1..3。";
     if (rule == "syntax.need_newline") return "一行只放一条语句，或用分号分隔。";
     if (rule == "syntax.missing_end") return "在「如果/函数/对于/尝试」块末尾补「结束」。";
