@@ -12,9 +12,6 @@
 #include <chrono>
 #include <cmath>
 #include <complex>
-#ifdef _WIN32
-#include <GL/gl.h>
-#endif
 #include <cstdint>
 #include <ctime>
 #include <cstdio>
