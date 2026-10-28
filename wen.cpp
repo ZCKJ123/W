@@ -11567,8 +11567,8 @@ Interpreter::Interpreter() {
                     double k = std::min(1.0, -y * 4.0);
                     r = r * (1-k) + 22 * k; g = g * (1-k) + 25 * k; b = b * (1-k) + 28 * k;
                 }
-                if (mu > 0.9995) {
-                    double d = (mu - 0.9995) / 0.0005;
+                if (mu > 0.99975) {
+                    double d = (mu - 0.99975) / 0.00025;
                     r += d * 220 * atmo.sun; g += d * 200 * atmo.sun; b += d * 140 * atmo.sun;
                 }
                 if (atmo.sun < 0.99) { r *= atmo.sun; g *= atmo.sun; b *= atmo.sun; }
@@ -11610,7 +11610,7 @@ Interpreter::Interpreter() {
                 } else if (atmo.type == "卷云") {
                     profile = std::pow(std::max(0.0, 1.0 - std::fabs(h - 0.55) * 1.8), 1.5);
                 } else {
-                    profile = std::pow(h, 0.45) * std::pow(std::max(0.0, 1.0 - h), 0.35) * 2.2;
+                    profile = std::pow(h, 0.45) * std::pow(std::max(0.0, 1.0 - h), 0.15) * 1.8;
                 }
                 if (overcast) {
                     // 阴天/层云是连续云盖，不允许阈值挖出空洞
@@ -11636,12 +11636,18 @@ Interpreter::Interpreter() {
                 for (int cx=0; cx<cw; ++cx) {
                     double nx = (((double)cx + 0.5) * atmo.res - w*0.5) / ((double)h*0.95);
                     PVec rd = pnorm(padd(f, padd(pmul(r, nx), pmul(u, ny))));
-                    if (rd.y <= 0.015) continue;
-                    double t0r = (atmo.base - cam.y) / rd.y;
-                    double t1r = (atmo.top - cam.y) / rd.y;
-                    if (t1r <= 0.05) continue;
-                    t0r = std::max(0.05, t0r);
-                    if (t1r <= t0r) continue;
+                    // 通用射线-云层 slab 求交：相机在云下、云中、云上都能命中
+                    double t0r, t1r;
+                    if (std::fabs(rd.y) < 1e-4) {
+                        if (cam.y < atmo.base || cam.y > atmo.top) continue;
+                        t0r = 0.05; t1r = 40.0;
+                    } else {
+                        t0r = (atmo.base - cam.y) / rd.y;
+                        t1r = (atmo.top - cam.y) / rd.y;
+                        if (t0r > t1r) std::swap(t0r, t1r);
+                        t0r = std::max(0.05, t0r);
+                        if (t1r <= t0r) continue;
+                    }
                     int steps = atmo.steps;
                     double dt = (t1r - t0r) / steps;
                     double jitter = hash3(cx * 1.7, cy * 2.3, 0.5);
