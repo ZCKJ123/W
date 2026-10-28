@@ -5342,10 +5342,10 @@ static PVec pmul(PVec a, double k) { return {a.x*k,a.y*k,a.z*k}; }
 static double pdot(PVec a, PVec b) { return a.x*b.x+a.y*b.y+a.z*b.z; }
 static PVec pcross(PVec a, PVec b) { return {a.y*b.z-a.z*b.y, a.z*b.x-a.x*b.z, a.x*b.y-a.y*b.x}; }
 static PVec pnorm(PVec a) { double l=std::sqrt(pdot(a,a)); return l<1e-9?pv(0,1,0):pmul(a,1/l); }
-struct PTri { PVec a,b,c; unsigned color; double metal = 0.0, rough = 0.8, emit = 0.0; bool glass = false; };
+struct PTri { PVec a,b,c; unsigned color; double metal = 0.0, rough = 0.8, emit = 0.0; bool glass = false; bool fuzzy = false; };
 static void addSphere(vector<PTri>& out, PVec c, double r, unsigned col,
                       double metal = 0.0, double rough = 0.8, int seg = 12, int ring = 6,
-                      bool glass = false) {
+                      bool glass = false, bool fuzzy = false) {
     auto at = [&](int i, int j) {
         double th = 3.14159265358979323846 * j / ring;
         double ph = 2.0 * 3.14159265358979323846 * i / seg;
@@ -5355,8 +5355,8 @@ static void addSphere(vector<PTri>& out, PVec c, double r, unsigned col,
     };
     for (int j = 0; j < ring; ++j) for (int i = 0; i < seg; ++i) {
         PVec a=at(i,j), b=at(i+1,j), d=at(i,j+1), e=at(i+1,j+1);
-        out.push_back({a,b,e,col,metal,rough,0,glass});
-        out.push_back({a,e,d,col,metal,rough,0,glass});
+        out.push_back({a,b,e,col,metal,rough,0,glass,fuzzy});
+        out.push_back({a,e,d,col,metal,rough,0,glass,fuzzy});
     }
 }
 static void addCube(vector<PTri>& out, PVec c, double s, unsigned col, double metal = 0.0, double rough = 0.8) {
@@ -11313,7 +11313,7 @@ Interpreter::Interpreter() {
             else full = truthy(a[3]);
         }
         if (a.size() >= 5) full = truthy(a[4]);
-        struct Atmo { string type="积云"; double cover=0.55, base=8, top=14, scale=0.13, wind=0.25, sun=1.0, fog=0.0; int steps=9, res=9; } atmo;
+        struct Atmo { string type="积云"; double cover=0.55, base=8, top=14, scale=0.13, wind=0.25, sun=1.0, fog=0.0; int steps=8, res=8; } atmo;
         if (a.size() >= 7 && a[6].type == VT::Dict) {
             auto ad = needDict(a[6], "大气", line);
             auto pick = [&](const char* k, double& out) {
@@ -11353,13 +11353,16 @@ Interpreter::Interpreter() {
         pw.hwnd = hwnd;
         ShowWindow(hwnd, SW_SHOW);
         playerForceFocus(hwnd);
-        pw.capture = true; SetCapture(hwnd); ShowCursor(FALSE);
+        pw.capture = false; ShowCursor(TRUE);
 
         vector<PTri> ground, cubes;
-        for (int gz=-12; gz<12; gz+=3) for (int gx=-12; gx<12; gx+=3) {
+        // 远处地面铺到地平线，避免地面边缘露出天空色带
+        ground.push_back({{-600,0,-600},{600,0,-600},{600,0,600},0x5a7088});
+        ground.push_back({{-600,0,-600},{600,0,600},{-600,0,600},0x5a7088});
+        for (int gz=-60; gz<60; gz+=6) for (int gx=-60; gx<60; gx+=6) {
             unsigned c = (((gx+gz)/3)&1) ? 0x2f3d38u : 0x3b4c45u;
-            PTri t1{{(double)gx,0,(double)gz},{(double)gx+3,0,(double)gz},{(double)gx+3,0,(double)gz+3},c};
-            PTri t2{{(double)gx,0,(double)gz},{(double)gx+3,0,(double)gz+3},{(double)gx,0,(double)gz+3},c};
+            PTri t1{{(double)gx,0,(double)gz},{(double)gx+6,0,(double)gz},{(double)gx+6,0,(double)gz+6},c};
+            PTri t2{{(double)gx,0,(double)gz},{(double)gx+6,0,(double)gz+6},{(double)gx,0,(double)gz+6},c};
             ground.push_back(t1); ground.push_back(t2);
         }
         struct Box { PVec c; double s; };
@@ -11412,12 +11415,13 @@ Interpreter::Interpreter() {
                 if (mi != d->items.end()) metal = std::max(0.0, std::min(1.0, needNum(mi->second, "金属度", line)));
                 auto ri = d->items.find("粗糙度");
                 if (ri != d->items.end()) rough = std::max(0.02, std::min(1.0, needNum(ri->second, "粗糙度", line)));
-                if (kind == "球" || kind == "玻璃球") {
+                bool fuzzy = kind == "绒毛球" || kind == "绒球";
+                if (kind == "球" || kind == "玻璃球" || fuzzy) {
                     double r = s;
                     auto rri = d->items.find("半径");
                     if (rri != d->items.end()) r = std::max(0.05, needNum(rri->second, "半径", line));
                     bool glass = kind == "玻璃球";
-                    addSphere(cubes, c, r, col, metal, rough, glass);
+                    addSphere(cubes, c, r, col, metal, rough, 12, 6, glass, fuzzy);
                     boxes.push_back({c, r});
                     if (glass) glassCenters.push_back(c);
                 } else {
@@ -11457,8 +11461,8 @@ Interpreter::Interpreter() {
         }
         PVec light = pnorm({0.45,1.0,0.35});
         PVec cam{0,1.7,4.5};
-        double yaw = 0, pitch = 0.10;
-        pw.capture = true; SetCapture(hwnd); ShowCursor(FALSE);
+        double yaw = 0, pitch = 0.02;
+        pw.capture = false; ShowCursor(TRUE);
         std::thread presenter([&]() {
             HDC pdc = GetDC(hwnd);
             HDC sdc = GetDC(nullptr);
@@ -11564,8 +11568,9 @@ Interpreter::Interpreter() {
                 double b = 70 + 180 * horizon + 70 * rayleigh + 35 * mie;
                 r += night * 8; g += night * 12; b += night * 20;
                 if (y < 0) {
-                    double k = std::min(1.0, -y * 4.0);
-                    r = r * (1-k) + 22 * k; g = g * (1-k) + 25 * k; b = b * (1-k) + 28 * k;
+                    double k = std::max(0.0, std::min(1.0, -y / 0.20));
+                    k = k*k*(3-2*k);
+                    r = r * (1-k) + 96 * k; g = g * (1-k) + 122 * k; b = b * (1-k) + 158 * k;
                 }
                 if (mu > 0.99975) {
                     double d = (mu - 0.99975) / 0.00025;
@@ -11725,7 +11730,7 @@ Interpreter::Interpreter() {
                 double xx=pdot(d,r), yy=pdot(d,u); double fl=(double)h*0.95;
                 sx=w*0.5+xx*fl/zz; sy=h*0.5-yy*fl/zz; z=zz; return true;
             };
-            const int SM = 512;
+            const int SM = 256;
             vector<float> shadowMap;
             PVec lright, lup, lfwd;
             auto buildShadowMap = [&]() {
@@ -11807,7 +11812,8 @@ Interpreter::Interpreter() {
                 double b = cloudShadowMap[(size_t)z1*CS+x0] * (1-tx) + cloudShadowMap[(size_t)z1*CS+x1] * tx;
                 return a * (1-tz) + b * tz;
             };
-            auto drawTri=[&](PVec pa, PVec pb, PVec pc, unsigned col, double zoff, bool receive, double metal, double rough, bool glass){
+            auto haze = skyColor(pv(0, 0.03, -1));
+            auto drawTri=[&](PVec pa, PVec pb, PVec pc, unsigned col, double zoff, bool receive, double metal, double rough, bool glass, bool fuzzy){
                 double x0,y0,z0,x1,y1,z1,x2,y2,z2;
                 if(!project(pa,x0,y0,z0)||!project(pb,x1,y1,z1)||!project(pc,x2,y2,z2)) return;
                 double minx=std::max(0.0,std::floor(std::min({x0,x1,x2}))), maxx=std::min((double)w-1,std::ceil(std::max({x0,x1,x2})));
@@ -11833,7 +11839,13 @@ Interpreter::Interpreter() {
                     PVec vdir = pnorm(psub(cam, {wx,wy,wz}));
                     PVec hv = pnorm(padd(light, vdir));
                     double spec = std::pow(std::max(0.0, pdot(n, hv)), 8.0 + 80.0 * rough) * metal;
-                    double fog=std::max(0.25,1.0-z/28.0);
+                    if (fuzzy) {
+                        double rim = std::pow(1.0 - std::max(0.0, pdot(n, vdir)), 2.0);
+                        lit = lit * (0.72 + 0.28 * rim) + 0.12 * rim;
+                        spec *= 0.15;
+                    }
+                    double fog=1.0 - std::exp(-z * 0.045);
+                    double fogR=haze[0], fogG=haze[1], fogB=haze[2];
                     if (glass) {
                         double fres = 0.18 + 0.62 * std::pow(1.0 - std::max(0.0, pdot(n, vdir)), 3.0);
                         double alpha = 0.18 + 0.45 * fres;
@@ -11844,15 +11856,17 @@ Interpreter::Interpreter() {
                         zbuf[i] = z - 0.001;  // 玻璃不遮挡后面的不透明物，但保留近层
                         continue;
                     }
-                    pw.back[i*3]=(unsigned char)std::min(255.0,cb*lit*shade*fog + spec*220);
-                    pw.back[i*3+1]=(unsigned char)std::min(255.0,cg*lit*shade*fog + spec*220);
-                    pw.back[i*3+2]=(unsigned char)std::min(255.0,cr*lit*shade*fog + spec*220);
+                    double rr = cb*lit*shade, gg = cg*lit*shade, bb = cr*lit*shade;
+                    rr = rr*(1-fog) + fogR*fog; gg = gg*(1-fog) + fogG*fog; bb = bb*(1-fog) + fogB*fog;
+                    pw.back[i*3]=(unsigned char)std::min(255.0,rr + spec*220);
+                    pw.back[i*3+1]=(unsigned char)std::min(255.0,gg + spec*220);
+                    pw.back[i*3+2]=(unsigned char)std::min(255.0,bb + spec*220);
                 }
             };
             buildShadowMap();
-            for(auto& t:ground) drawTri(t.a,t.b,t.c,t.color,0,true,0,t.rough,false);
-            for(auto& t:cubes) if(!t.glass) drawTri(t.a,t.b,t.c,t.color,0,true,t.metal,t.rough,false);
-            for(auto& t:cubes) if(t.glass) drawTri(t.a,t.b,t.c,t.color,0,false,t.metal,t.rough,true);
+            for(auto& t:ground) drawTri(t.a,t.b,t.c,t.color,0,true,0,t.rough,false,false);
+            for(auto& t:cubes) if(!t.glass) drawTri(t.a,t.b,t.c,t.color,0,true,t.metal,t.rough,false,t.fuzzy);
+            for(auto& t:cubes) if(t.glass) drawTri(t.a,t.b,t.c,t.color,0,false,t.metal,t.rough,true,false);
             for(int y=-2;y<=2;++y) for(int x=-2;x<=2;++x){
                 if(std::abs(x)<=1&&std::abs(y)<=1) continue;
                 size_t i=(size_t)(h/2+y)*w+(w/2+x); if(i*3+2<pw.back.size()){pw.back[i*3]=230;pw.back[i*3+1]=240;pw.back[i*3+2]=255;}
