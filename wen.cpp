@@ -11974,6 +11974,18 @@ Interpreter::Interpreter() {
                     double gy = (y+1<dh ? den[i+dw] : den[i]) - (y>0 ? den[i-dw] : den[i]);
                     double shade = 1.0 - 0.45*gy + 0.20*gx;
                     shade = std::max(0.55, std::min(1.35, shade));
+                    // 屏幕空间太阳方向散射：密度场上做几步透过率积分
+                    double sunX = pdot(light, r), sunY = -pdot(light, u);
+                    double sl = std::sqrt(sunX*sunX + sunY*sunY);
+                    if (sl < 1e-4) { sunX = 0.0; sunY = -0.8; sl = 0.8; }
+                    sunX /= sl; sunY /= sl;
+                    double od = 0.0;
+                    for (int st=1; st<=6; ++st) {
+                        int px = (int)(x + sunX*st*2.0), py = (int)(y + sunY*st*2.0);
+                        if (px>=0 && px<dw && py>=0 && py<dh) od += den[(size_t)py*dw+px];
+                    }
+                    double beam = std::exp(-od * 0.020);
+                    shade *= (0.58 + 0.42*beam);
                     cr*=shade; cg*=shade; cb*=shade;
                     for (int yy=0; yy<2 && y*2+yy<h; ++yy) for (int xx=0; xx<2 && x*2+xx<w; ++xx) {
                         size_t o=((size_t)(y*2+yy)*w+(x*2+xx))*3;
