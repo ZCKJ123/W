@@ -3562,7 +3562,7 @@ static const std::map<string, string>& functionModules() {
         {"新建神经层", "神经网络库"}, {"神经链", "神经网络库"}, {"前向", "神经网络库"},
         {"颜色", "视口库"}, {"新建视口", "视口库"}, {"视口清空", "视口库"}, {"视口画点", "视口库"},
         {"视口画线", "视口库"}, {"视口画三角形", "视口库"}, {"视口尺寸", "视口库"}, {"视口保存", "视口库"},
-        {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"}, {"视口显示", "视口库"}, {"玩家视口", "视口库"}, {"大气预设", "视口库"}, {"媒体信息", "媒体库"}, {"媒体播放", "媒体库"}, {"媒体停止", "媒体库"}, {"音频设备", "媒体库"}, {"音频录制", "媒体库"}, {"音频兼容检查", "媒体库"}, {"媒体格式支持", "媒体库"}, {"音频解析", "媒体库"}, {"音频判定", "媒体库"}, {"音频频谱", "媒体库"}, {"音频轨道", "媒体库"}, {"网格新建", "三维库"}, {"网格三角", "三维库"}, {"网格平移", "三维库"}, {"网格缩放", "三维库"}, {"网格旋转", "三维库"}, {"网格合并", "三维库"}, {"网格三角形数", "三维库"}, {"视口加载模型", "视口库"}, {"光追渲染", "视口库"}, {"体积云渲染", "视口库"}, {"材质检查", "视口库"}, {"材质预设", "视口库"}, {"视口取色", "视口库"},
+        {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"}, {"视口显示", "视口库"}, {"玩家视口", "视口库"}, {"大气预设", "视口库"}, {"媒体信息", "媒体库"}, {"媒体播放", "媒体库"}, {"媒体停止", "媒体库"}, {"声音播放", "媒体库"}, {"音频设备", "媒体库"}, {"音频录制", "媒体库"}, {"音频兼容检查", "媒体库"}, {"媒体格式支持", "媒体库"}, {"音频解析", "媒体库"}, {"音频判定", "媒体库"}, {"音频频谱", "媒体库"}, {"音频轨道", "媒体库"}, {"网格新建", "三维库"}, {"网格三角", "三维库"}, {"网格平移", "三维库"}, {"网格缩放", "三维库"}, {"网格旋转", "三维库"}, {"网格合并", "三维库"}, {"网格三角形数", "三维库"}, {"视口加载模型", "视口库"}, {"光追渲染", "视口库"}, {"体积云渲染", "视口库"}, {"材质检查", "视口库"}, {"材质预设", "视口库"}, {"视口取色", "视口库"},
         {"硬件信息", "硬件库"}, {"高精度计时", "硬件库"}, {"内存状态", "硬件库"}, {"屏幕尺寸", "硬件库"}, {"磁盘空间", "硬件库"},
         {"大整数幂", "大整数库"}, {"大整数乘", "大整数库"}, {"大整数加", "大整数库"}, {"大整数阶乘", "大整数库"},
         {"阶乘位数", "大整数库"}, {"阶乘末尾零", "大整数库"}, {"阶乘概览", "大整数库"},
@@ -9956,6 +9956,25 @@ Interpreter::Interpreter() {
         }
         return vList(list);
     });
+    static auto playPcm = [](const WavInfo& w, string& err) -> bool {
+        if (w.samples.empty() || w.rate <= 0 || (w.channels != 1 && w.channels != 2)) { err = "PCM 参数为空"; return false; }
+        HWAVEOUT out = nullptr;
+        WAVEFORMATEX fmt{};
+        fmt.wFormatTag = WAVE_FORMAT_PCM; fmt.nChannels = (WORD)w.channels;
+        fmt.nSamplesPerSec = (DWORD)w.rate; fmt.wBitsPerSample = 16;
+        fmt.nBlockAlign = (WORD)(w.channels * 2); fmt.nAvgBytesPerSec = (DWORD)(w.rate * fmt.nBlockAlign);
+        if (waveOutOpen(&out, WAVE_MAPPER, &fmt, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR) { err = "打不开播放设备"; return false; }
+        vector<short> pcm = w.samples;
+        WAVEHDR hdr{};
+        hdr.lpData = (LPSTR)pcm.data(); hdr.dwBufferLength = (DWORD)(pcm.size()*2);
+        waveOutPrepareHeader(out, &hdr, sizeof(hdr));
+        if (waveOutWrite(out, &hdr, sizeof(hdr)) != MMSYSERR_NOERROR) { waveOutClose(out); err="waveOutWrite 失败"; return false; }
+        waveOutRestart(out);
+        while (!(hdr.dwFlags & WHDR_DONE)) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        waveOutUnprepareHeader(out, &hdr, sizeof(hdr));
+        waveOutClose(out);
+        return true;
+    };
     registerBuiltin("音频解析", 1, 1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
         string path=needStr(a[0],"音频解析",line);
         string full=resolveWenPath(path);
@@ -10179,6 +10198,31 @@ Interpreter::Interpreter() {
         d->items["字节"] = vNum((double)fs::file_size(fs::u8path(full), ec));
         d->items["毫秒"] = vNum((double)ms); d->items["秒"] = vNum(ms >= 0 ? ms/1000.0 : -1.0);
         d->items["可播放"] = vBool(ms >= 0);
+        return vDict(d);
+    });
+    registerBuiltin("声音播放", 1, 2, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path=needStr(a[0],"声音播放",line);
+        bool wait=a.size()>1 ? truthy(a[1]) : true;
+        string full=resolveWenPath(path);
+        string ext=lowerAscii(fs::u8path(path).extension().u8string());
+        if(!ext.empty()&&ext[0]=='.') ext=ext.substr(1);
+        string b;
+        try { b=readWholeFile(full); } catch(IoError& e){ throw WenError("文件错误",line,0,e.what()); }
+        WavInfo w;
+        bool ok=false; string err;
+        if(ext=="wav") ok=parseWav(b,w);
+        else if(ext=="mp3") ok=decodeMp3(full,w,err);
+        else ok=decodeAudio(full,w,err);
+        if(!ok) throw WenError("音频错误",line,0,"无法解码音频：" + err);
+        if (wait) {
+            if(!playPcm(w,err)) throw WenError("音频错误",line,0,err);
+        } else {
+            WavInfo copy=w;
+            std::thread([copy]() mutable { string e; playPcm(copy,e); }).detach();
+        }
+        auto d=std::make_shared<Dict>();
+        d->items["格式"]=vStr(ext); d->items["采样率"]=vNum(w.rate); d->items["声道"]=vNum(w.channels);
+        d->items["时长"]=vNum(w.rate?(double)w.samples.size()/w.channels/w.rate:0); d->items["等待"]=vBool(wait);
         return vDict(d);
     });
     registerBuiltin("媒体播放", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
