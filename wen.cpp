@@ -11540,6 +11540,7 @@ Interpreter::Interpreter() {
         vector<double> zbuf;
         long long frames = 0; double elapsed = 0;
         double vy = 0; bool onGround = true;
+        double particleStep = 1.3;
         auto lastFrame = std::chrono::steady_clock::now();
         auto t0 = std::chrono::steady_clock::now();
         while (!pw.closed && !(GetAsyncKeyState(VK_ESCAPE) & 0x8000) && !pw.keys[VK_ESCAPE]) {
@@ -11743,12 +11744,20 @@ Interpreter::Interpreter() {
             }
             double tsec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             if (useParticleClouds) {
-                struct PC { PVec p; double d; int layer; };
+                struct PC { PVec p; double d; double shade; int layer; };
                 vector<PC> parts;
+                struct Seed { double x,z,r; };
+                vector<Seed> seeds;
+                for (int i=0;i<14;++i) {
+                    double sx = -38.0 + 76.0 * hash3(i*3.1, 1.7, 2.3);
+                    double sz = -38.0 + 76.0 * hash3(i*5.7, 4.1, 8.9);
+                    double sr = 7.0 + 8.0 * hash3(i*2.3, 9.1, 3.7);
+                    seeds.push_back({sx,sz,sr});
+                }
                 auto addLayer = [&](double base, double top, double cover, double scale, double wind, int layer) {
                     double t = tsec;
-                    for (double gx=-42; gx<=42; gx+=1.6)
-                    for (double gz=-42; gz<=42; gz+=1.6)
+                    for (double gx=-42; gx<=42; gx+=particleStep)
+                    for (double gz=-42; gz<=42; gz+=particleStep)
                     for (double gy=base+0.4; gy<top; gy+=0.9) {
                         double h=(gy-base)/(top-base);
                         double qx=(gx+t*wind)*scale, qy=gy*scale*1.7, qz=(gz-t*wind)*scale;
@@ -11759,19 +11768,26 @@ Interpreter::Interpreter() {
                         double prof=std::pow(std::max(0.0,h),0.40)*std::pow(std::max(0.0,1-h),0.20);
                         double d=(n*prof - (0.52-cover*0.32))*4.0;
                         if (d <= 0.03) continue;
+                        if (layer == 0) {
+                            double env=0;
+                            for (const auto& sd : seeds) {
+                                double dx=gx-(sd.x+t*wind), dz=gz-(sd.z-t*wind);
+                                env=std::max(env, std::exp(-(dx*dx+dz*dz)/(sd.r*sd.r)));
+                            }
+                            if (env < 0.18) continue;
+                            d *= (0.55 + 0.45*env);
+                        }
+                        double beam = 0.45 + 0.55*std::exp(-vnoise3((gx+light.x*4.0)*scale, (gy+2.5)*scale*1.4, (gz+light.z*4.0)*scale)*2.2);
+                        if (d <= 0.03) continue;
                         double jx=(hash3(gx*1.3,gz*1.7,gy)-0.5)*1.8;
                         double jz=(hash3(gz*1.1,gx*1.9,gy+7)-0.5)*1.8;
-                        parts.push_back({{gx+jx, gy, gz+jz}, std::min(1.0,d), layer});
+                        parts.push_back({{gx+jx, gy, gz+jz}, std::min(1.0,d), beam, layer});
                         if (parts.size() > 26000) return;
                     }
                 };
                 addLayer(atmo.base, atmo.top, atmo.cover, atmo.scale, atmo.wind, 0);
                 if (atmo.highCover > 0.01) addLayer(atmo.highBase, atmo.highTop, atmo.highCover, atmo.highScale, atmo.wind*0.6, 1);
                 std::cerr << "PARTS " << parts.size() << " cover=" << atmo.cover << "\n";
-                std::sort(parts.begin(), parts.end(), [&](const PC& a, const PC& b) {
-                    auto da=psub(a.p,cam), db=psub(b.p,cam);
-                    return pdot(da,da) > pdot(db,db);
-                });
                 auto pj = [&](PVec q, double& sx, double& sy, double& zz)->bool {
                     PVec d=psub(q,cam); zz=pdot(d,f); if(zz<=0.2) return false;
                     double xx=pdot(d,r), yy=pdot(d,u); double fl=(double)h*0.95;
@@ -11783,7 +11799,9 @@ Interpreter::Interpreter() {
                     double sx,sy,zz;
                     if (!pj(pt.p,sx,sy,zz)) continue;
                     double rad = std::max(3.0, std::min(120.0, 360.0/zz));
-                    double cr = pt.layer ? 220 : 205, cg = pt.layer ? 225 : 210, cb = pt.layer ? 240 : 220;
+                    double cr = (pt.layer ? 220 : 205) * (0.62 + 0.38*pt.shade);
+                    double cg = (pt.layer ? 225 : 210) * (0.62 + 0.38*pt.shade);
+                    double cb = (pt.layer ? 240 : 220) * (0.62 + 0.38*pt.shade);
                     double wgt = pt.d * (pt.layer ? 0.55 : 1.0);
                     int x0=(int)(sx-rad), x1=(int)(sx+rad), y0=(int)(sy-rad), y1=(int)(sy+rad);
                     if (x1<0||y1<0||x0>=w||y0>=h) continue;
@@ -12189,6 +12207,8 @@ Interpreter::Interpreter() {
             double frameMs=std::chrono::duration<double,std::milli>(frameEnd-frameStart).count();
             // 自适应云质量：按实际帧时间调整，先保交互，再保细节
             if (frames % 24 == 0) {
+                if (frameMs > 34.0) particleStep = std::min(2.0, particleStep + 0.08);
+                else if (frameMs < 18.0) particleStep = std::max(1.0, particleStep - 0.05);
                 if (frameMs > 34.0 && atmo.res < 14) { ++atmo.res; if (atmo.steps > 4) --atmo.steps; }
                 else if (frameMs < 18.0 && atmo.res > 6) { --atmo.res; if (atmo.steps < 10) ++atmo.steps; }
             }
