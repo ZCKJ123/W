@@ -11,12 +11,23 @@ $backupRoot = Join-Path $root '隔离备份'
 $coreFiles = @(
     'wen.cpp',
     '语法.ebnf',
+    'README.md',
+    '使用教程.md',
     '使用规范.md',
     '语言规范.md',
     '语法总表.md',
+    '破坏性变更.md',
+    '错误协议.md',
+    '隔离与回滚.md',
+    '性能基准.md',
+    '构建.bat',
+    '完整构建.bat',
+    '构建-32.bat',
+    '发布检查.ps1',
+    '.gitignore',
     '0.2\语法公理.md'
 )
-$coreDirs = @('测试', '工程', '工具', '插件')
+$coreDirs = @('测试', '工程', '工具', '插件', '例子', '库', '模板', '渲染后端', '发布')
 
 function Get-FileHashSafe([string]$path) {
     if (-not (Test-Path $path)) { return '' }
@@ -104,19 +115,38 @@ if ($恢复) {
     if (-not $确认) { Write-Host "恢复会覆盖当前源码；确认请加 -确认"; exit 1 }
     $latest = if ($快照) { Get-Item (Join-Path $backupRoot $快照) } else { LatestSnapshot }
     if (-not $latest -or -not (Test-Path $latest.FullName)) { Write-Host "找不到快照"; exit 1 }
-    foreach ($f in $coreFiles) {
-        $src = Join-Path $latest.FullName $f
-        if (-not (Test-Path $src)) { continue }
-        Copy-Item $src (Join-Path $root $f) -Force
-        Write-Host "恢复 $f"
+    $manifestFile = Join-Path $latest.FullName 'manifest.json'
+    if (-not (Test-Path $manifestFile)) { Write-Host "快照缺 manifest.json"; exit 1 }
+    $manifest = Get-Content $manifestFile -Raw -Encoding UTF8 | ConvertFrom-Json
+    $expected = @{}
+    foreach ($x in $manifest.文件) { $expected[$x.路径] = $x.哈希 }
+    $current = @{}
+    foreach ($x in Get-Snapshot) { $current[$x.路径] = $x.哈希 }
+
+    $deleted = 0
+    foreach ($k in $current.Keys) {
+        if (-not $expected.ContainsKey($k)) {
+            $p = Join-Path $root $k
+            if (Test-Path $p) { Remove-Item $p -Force; $deleted++ }
+        }
     }
-    foreach ($d in $coreDirs) {
-        $src = Join-Path $latest.FullName $d
-        if (-not (Test-Path $src)) { continue }
-        Copy-Item (Join-Path $src '*') (Join-Path $root $d) -Recurse -Force
-        Write-Host "恢复 $d"
+
+    $verified = 0
+    foreach ($k in $expected.Keys) {
+        $src = Join-Path $latest.FullName $k
+        $dst = Join-Path $root $k
+        if (-not (Test-Path $src)) { Write-Host "失败：快照缺文件 $k"; exit 1 }
+        New-Item -ItemType Directory -Force (Split-Path $dst) | Out-Null
+        Copy-Item $src $dst -Force
+        $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $dst).Hash
+        if ($actual -ne $expected[$k]) {
+            Write-Host "失败：恢复后哈希不符 $k"
+            exit 1
+        }
+        $verified++
     }
-    Write-Host "恢复完成。重新构建：.\构建.bat"
+    Write-Host ("恢复完成：{0}/{1} 校验通过，删除新增 {2} 个文件。" -f $verified, $expected.Count, $deleted)
+    Write-Host "重新构建：.\构建.bat"
     exit 0
 }
 

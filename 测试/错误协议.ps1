@@ -59,6 +59,15 @@ try {
         Write-Host "失败：--机器 缺 rule/sourceLine"
     }
 
+    $ef = Join-Path $dir 'exprframe.wen'
+    [IO.File]::WriteAllText($ef, "函数 甲 则`n返回 乙()`n结束`n函数 乙 则`n返回 丙()`n结束`n函数 丙 则`n返回 1 / 0`n结束`n甲()`n", (New-Object Text.UTF8Encoding($false)))
+    $er = Invoke-Wen @('--json', '--精简', $ef)
+    $ej = $er.out.Trim() | ConvertFrom-Json
+    if (-not $ej.diagnostics[0].frames -or $ej.diagnostics[0].frames.Count -lt 3) {
+        $fail++
+        Write-Host "失败：表达式内调用缺 frames"
+    }
+
     $rf = Join-Path $dir 'runtime.wen'
     $rb = Invoke-Wen @('--简短', $rf)
     if ($rb.err.Contains('说明：')) {
@@ -76,6 +85,6 @@ try {
     Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
 }
 if ($fail -gt 0) { exit 1 }
-Write-Host "错误协议回归：rule / --精简 / --简短 / frames / --机器 通过"
+Write-Host "错误协议回归：rule / --精简 / --简短 / frames（语句+表达式）/ --机器 通过"
 
 exit 0
