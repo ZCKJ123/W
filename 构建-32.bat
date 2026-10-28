@@ -7,7 +7,7 @@ if not exist "%GXX%" (
     echo 找不到 32 位编译器：%GXX%
     exit /b 1
 )
-"%GXX%" -std=c++17 -O3 -msse2 -march=core2 -static -municode -Wl,--stack,16777216 -o wen32.exe wen.cpp -lwinhttp -lwinmm -lgdi32 -lpsapi -limm32
+"%GXX%" -std=c++17 -O3 -msse2 -march=core2 -static -municode -Wl,--stack,16777216 -o wen32.exe wen.cpp -lwinhttp -lwinmm -lmfplat -lmfreadwrite -lmfuuid -lole32 -lgdi32 -lpsapi -limm32
 if errorlevel 1 (
     echo 32 位构建失败。
     exit /b 1

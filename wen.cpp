@@ -40,6 +40,10 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <mmsystem.h>
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
+#include <mftransform.h>
 #include <imm.h>
 #include <shellapi.h>
 #include <psapi.h>
@@ -9805,6 +9809,57 @@ Interpreter::Interpreter() {
         }
         return false;
     };
+    static auto decodeAudio = [](const string& full, WavInfo& w, string& err) -> bool {
+        HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        bool com = SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE;
+        if (FAILED(MFStartup(MF_VERSION))) { err = "MFStartup 失败"; return false; }
+        IMFSourceReader* reader = nullptr;
+        hr = MFCreateSourceReaderFromURL(utf8ToWide(full).c_str(), nullptr, &reader);
+        if (FAILED(hr) || !reader) { err = "MFCreateSourceReaderFromURL 失败"; MFShutdown(); if (SUCCEEDED(hr) && com) CoUninitialize(); return false; }
+        IMFMediaType* out = nullptr;
+        MFCreateMediaType(&out);
+        out->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+        out->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+        out->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+        hr = reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM, nullptr, out);
+        out->Release();
+        if (FAILED(hr)) { err = "不支持输出 PCM"; reader->Release(); MFShutdown(); if (com) CoUninitialize(); return false; }
+        IMFMediaType* cur = nullptr;
+        reader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM, &cur);
+        if (!cur) { err = "拿不到音频格式"; reader->Release(); MFShutdown(); if (com) CoUninitialize(); return false; }
+        cur->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, (UINT32*)&w.rate);
+        cur->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, (UINT32*)&w.channels);
+        cur->GetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, (UINT32*)&w.bits);
+        cur->Release();
+        if (w.rate <= 0 || w.channels <= 0) { err = "音频参数为空"; reader->Release(); MFShutdown(); if (com) CoUninitialize(); return false; }
+        w.samples.clear();
+        size_t limit = (size_t)w.rate * w.channels * 60 * 10;
+        while (true) {
+            DWORD flags = 0; LONGLONG ts = 0; IMFSample* sample = nullptr;
+            hr = reader->ReadSample(MF_SOURCE_READER_FIRST_AUDIO_STREAM, 0, nullptr, &flags, &ts, &sample);
+            if (FAILED(hr)) { err = "ReadSample 失败"; break; }
+            if (flags & MF_SOURCE_READERF_ENDOFSTREAM) { if (sample) sample->Release(); break; }
+            if (sample) {
+                IMFMediaBuffer* buf = nullptr;
+                if (SUCCEEDED(sample->ConvertToContiguousBuffer(&buf)) && buf) {
+                    BYTE* data = nullptr; DWORD len = 0;
+                    if (SUCCEEDED(buf->Lock(&data, nullptr, &len))) {
+                        size_t n = len / 2;
+                        w.samples.insert(w.samples.end(), (short*)data, (short*)data + n);
+                        buf->Unlock(); 
+                    }
+                    buf->Release();
+                }
+                sample->Release();
+            }
+            if (w.samples.size() >= limit) break;
+        }
+        reader->Release();
+        MFShutdown();
+        if (com) CoUninitialize();
+        if (w.samples.empty()) { err = "没有解码出音频采样"; return false; }
+        return true;
+    };
     static auto fftPeak = [](const vector<short>& src, int rate, int count) {
         const int N=2048;
         vector<std::complex<double>> a(N);
@@ -9839,6 +9894,26 @@ Interpreter::Interpreter() {
         try { b=readWholeFile(full); } catch(IoError& e){ throw WenError("文件错误",line,0,e.what()); }
         auto d=std::make_shared<Dict>();
         d->items["文件"]=vStr(path); d->items["格式"]=vStr(ext.empty()?"未知":ext);
+        if (ext != "wav") {
+            WavInfo mf;
+            string derr;
+            if (decodeAudio(full, mf, derr)) {
+                double peak=0,rms=0,zc=0,quiet=0;
+                for(size_t i=0;i<mf.samples.size();++i){
+                    double v=mf.samples[i]/32768.0; peak=std::max(peak,std::fabs(v)); rms+=v*v;
+                    if(i && ((mf.samples[i-1]<0)!=(mf.samples[i]<0))) ++zc;
+                    if(std::fabs(v)<0.02) ++quiet;
+                }
+                rms=std::sqrt(rms/std::max<size_t>(1,mf.samples.size()));
+                d->items["可解析"]=vBool(true); d->items["编码"]=vStr("Media Foundation PCM");
+                d->items["采样率"]=vNum(mf.rate); d->items["声道"]=vNum(mf.channels); d->items["位深"]=vNum(mf.bits);
+                d->items["时长"]=vNum(mf.rate? (double)mf.samples.size()/mf.channels/mf.rate : 0);
+                d->items["峰值"]=vNum(peak); d->items["均方根"]=vNum(rms);
+                d->items["过零率"]=vNum(zc/std::max<size_t>(1,mf.samples.size()-1));
+                d->items["静音比"]=vNum(quiet/std::max<size_t>(1,mf.samples.size()));
+                return vDict(d);
+            }
+        }
         if (ext=="wav") {
             WavInfo w;
             if(!parseWav(b,w)) throw WenError("音频错误",line,0,"WAV 解析失败");
@@ -9890,7 +9965,10 @@ Interpreter::Interpreter() {
         string b;
         try { b=readWholeFile(full); } catch(IoError& e){ throw WenError("文件错误",line,0,e.what()); }
         WavInfo w;
-        if(!parseWav(b,w)) throw WenError("音频错误",line,0,"音频判定只支持 PCM WAV");
+        if(!parseWav(b,w)) {
+            string derr;
+            if (!decodeAudio(full,w,derr)) throw WenError("音频错误",line,0,"无法解码音频：" + derr);
+        }
         double peak=0,rms=0; size_t zc=0,quiet=0;
         for(size_t i=0;i<w.samples.size();++i){ double v=w.samples[i]/32768.0; peak=std::max(peak,std::fabs(v)); rms+=v*v; if(i&&((w.samples[i-1]<0)!=(w.samples[i]<0)))++zc; if(std::fabs(v)<0.02)++quiet; }
         rms=std::sqrt(rms/std::max<size_t>(1,w.samples.size()));
@@ -9907,7 +9985,8 @@ Interpreter::Interpreter() {
     registerBuiltin("音频频谱", 1, 2, [this](Interpreter&, vector<Value>& a, int line) -> Value {
         string path=needStr(a[0],"音频频谱",line); int n=a.size()>1?(int)needIndex(a[1],"音频频谱",line):5;
         string b; try { b=readWholeFile(resolveWenPath(path)); } catch(IoError& e){ throw WenError("文件错误",line,0,e.what()); }
-        WavInfo w; if(!parseWav(b,w)) throw WenError("音频错误",line,0,"频谱只支持 PCM WAV");
+        WavInfo w;
+        if(!parseWav(b,w)) { string derr; if(!decodeAudio(resolveWenPath(path),w,derr)) throw WenError("音频错误",line,0,"无法解码音频：" + derr); }
         auto list=std::make_shared<List>();
         for(auto& p:fftPeak(w.samples,w.rate,std::max(1,std::min(32,n)))){
             auto d=std::make_shared<Dict>(); d->items["频率"]=vNum(p.first); d->items["幅度"]=vNum(p.second); list->items.push_back(vDict(d));
