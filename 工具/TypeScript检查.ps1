@@ -4,6 +4,7 @@ $exe = Join-Path $root 'wen.exe'
 $dir = Join-Path ([IO.Path]::GetTempPath()) ('wen_ts_' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force $dir | Out-Null
 $fail = 0
+$verified = $false
 try {
     $src = Join-Path $dir 'a.wen'
     $out = Join-Path $dir 'a.ts'
@@ -19,21 +20,26 @@ try {
         }
         $node = Get-Command node.exe -ErrorAction SilentlyContinue
         if (-not $node) {
-            foreach ($cand in @("$env:ProgramFiles\nodejs\node.exe", "${env:ProgramFiles(x86)}\nodejs\node.exe")) {
+            foreach ($cand in @("$env:ProgramFiles\nodejs\node.exe",
+                                "${env:ProgramFiles(x86)}\nodejs\node.exe",
+                                'C:\Users\Acer\AppData\Local\Programs\DeepSeek Harness\resources\runtime\primary-runtime\dependencies\node\bin\node.exe',
+                                "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\runtime\primary-runtime\dependencies\node\bin\node.exe")) {
                 if (Test-Path $cand) { $node = Get-Item $cand; break }
             }
         }
         if ($node) {
             $js = Join-Path $dir 'a.js'
             Copy-Item $out $js -Force
-            $run = (& $node.Source $js 2>&1) -join "`n"
+            $nodePath = if ($node -is [IO.FileInfo]) { $node.FullName } else { $node.Source }
+            $run = (& $nodePath $js 2>&1) -join "`n"
             if ($LASTEXITCODE -ne 0 -or $run -notmatch '结果 8') {
                 $fail++; Write-Host "失败：TypeScript 产物运行不对：$run"
             } else {
+                $verified = $true
                 Write-Host "TypeScript 产物运行：$run"
             }
         } else {
-            Write-Host 'TypeScript 产物运行跳过：本机没有 node.exe'
+            Write-Host '⚠️ TypeScript 产物运行未验证：本机没有 node.exe'
         }
     }
 } catch {
@@ -42,5 +48,9 @@ try {
     Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
 }
 if ($fail -gt 0) { exit 1 }
+if (-not $verified) {
+    Write-Host '⚠️ TypeScript 回归：生成通过，运行未验证（缺 node.exe）'
+    exit 2
+}
 Write-Host 'TypeScript 回归：生成/函数/输出 通过'
 exit 0

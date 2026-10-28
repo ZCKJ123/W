@@ -18679,6 +18679,9 @@ static int runMain(vector<string> args) {
         std::cout << "界面新建、界面清屏、界面矩形、界面线、界面文本、界面刷新、界面事件、界面尺寸、界面关闭\n";
         std::cout << "求和、平均数、最大、最小、中位数、新建集合、集合添加、集合存在\n\n";
         for (const auto& lib : vm.libraryFunctions) {
+#ifndef WEN_ADMIN_BUILD
+            if (lib.first == "管理员库") continue;
+#endif
             std::cout << lib.first << "（" << lib.second.size() << " 个函数）\n";
             bool first = true;
             for (const auto& fn : lib.second) {

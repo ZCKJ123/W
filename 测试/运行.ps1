@@ -92,6 +92,7 @@ Write-Host "`n== 用例 =="
 $caseDir = Join-Path $PSScriptRoot '用例'
 $skipAdmin = @('48管理员破坏.wen', '90管理员授权.wen')
 $skipped = 0
+$caseTotal = 0; $casePass = 0; $errorTotal = 0; $errorPass = 0
 foreach ($f in (Get-ChildItem $caseDir -Filter *.wen | Sort-Object Name)) {
     $total++
     if ($skipAdmin -contains $f.Name) {
@@ -99,6 +100,7 @@ foreach ($f in (Get-ChildItem $caseDir -Filter *.wen | Sort-Object Name)) {
         $skipped++
         continue
     }
+    $caseTotal++
     $expectedPath = [IO.Path]::ChangeExtension($f.FullName, '.期望')
     if (-not (Test-Path $expectedPath)) {
         Write-Host ("失败：{0} 缺少期望输出文件" -f $f.Name)
@@ -117,6 +119,7 @@ foreach ($f in (Get-ChildItem $caseDir -Filter *.wen | Sort-Object Name)) {
         $fail++
     } else {
         Write-Host ("通过：{0}" -f $f.Name)
+        $casePass++
     }
 }
 
@@ -126,6 +129,7 @@ $errorDir = Join-Path $PSScriptRoot '错误'
 if (Test-Path $errorDir) {
     foreach ($f in (Get-ChildItem $errorDir -Filter *.wen | Sort-Object Name)) {
         $total++
+        $errorTotal++
         $expectedPath = [IO.Path]::ChangeExtension($f.FullName, '.错误')
         if (-not (Test-Path $expectedPath)) {
             Write-Host ("失败：{0} 缺少期望错误文件" -f $f.Name)
@@ -143,20 +147,22 @@ if (Test-Path $errorDir) {
             $fail++
         } else {
             Write-Host ("通过：{0}" -f $f.Name)
+            $errorPass++
         }
     }
 }
 
 Write-Host ("`n通过 {0}/{1}（跳过 {2}）" -f ($total - $fail - $skipped), $total, $skipped)
 if ($fail -gt 0) { exit 1 }
-& (Join-Path $PSScriptRoot '错误协议.ps1')
-if ($LASTEXITCODE -ne 0) { exit 1 }
-& (Join-Path $PSScriptRoot '防崩溃.ps1')
-if ($LASTEXITCODE -ne 0) { exit 1 }
-& (Join-Path $PSScriptRoot '..\工具\索引检查.ps1')
-if ($LASTEXITCODE -ne 0) { exit 1 }
-& (Join-Path $PSScriptRoot '..\工具\自述检查.ps1')
-if ($LASTEXITCODE -ne 0) { exit 1 }
-& (Join-Path $PSScriptRoot '..\工具\TypeScript检查.ps1')
-if ($LASTEXITCODE -ne 0) { exit 1 }
+
+$protocol = '✓'; & (Join-Path $PSScriptRoot '错误协议.ps1'); if ($LASTEXITCODE -ne 0) { exit 1 }
+$crash = '✓'; & (Join-Path $PSScriptRoot '防崩溃.ps1'); if ($LASTEXITCODE -ne 0) { exit 1 }
+$index = '✓'; & (Join-Path $PSScriptRoot '..\工具\索引检查.ps1'); if ($LASTEXITCODE -ne 0) { exit 1 }
+$self = '✓'; & (Join-Path $PSScriptRoot '..\工具\自述检查.ps1'); if ($LASTEXITCODE -ne 0) { exit 1 }
+$ts = '✓'; & (Join-Path $PSScriptRoot '..\工具\TypeScript检查.ps1')
+if ($LASTEXITCODE -eq 2) { $ts = '⚠️未验证' }
+elseif ($LASTEXITCODE -ne 0) { exit 1 }
+
+Write-Host ("总账：主用例 {0}/{1}、错误 {2}/{3}、协议 {4}、防崩溃 {5}、索引 {6}、自述 {7}、TS {8}" -f `
+    $casePass, $caseTotal, $errorPass, $errorTotal, $protocol, $crash, $index, $self, $ts)
 exit 0
