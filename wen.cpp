@@ -11550,6 +11550,44 @@ Interpreter::Interpreter() {
                 double ny0=nx00*(1-fy)+nx10*fy, ny1=nx01*(1-fy)+nx11*fy;
                 return ny0*(1-fz)+ny1*fz;
             };
+            // 物理天空：Rayleigh/Mie 近似 + 太阳盘
+            auto skyColor = [&](PVec rd) {
+                double y = rd.y;
+                double mu = std::max(0.0, pdot(rd, light));
+                double sunAlt = std::max(0.0, light.y);
+                double rayleigh = 0.75 * (1.0 + mu * mu);
+                double mie = std::pow(mu, 32.0) * 0.8;
+                double horizon = std::exp(-std::max(0.0, y) * 5.0);
+                double night = std::max(0.0, 1.0 - sunAlt * 3.0);
+                double r = 28 + 95 * horizon + 55 * rayleigh + 70 * mie;
+                double g = 40 + 125 * horizon + 45 * rayleigh + 55 * mie;
+                double b = 70 + 180 * horizon + 70 * rayleigh + 35 * mie;
+                r += night * 8; g += night * 12; b += night * 20;
+                if (y < 0) {
+                    double k = std::min(1.0, -y * 4.0);
+                    r = r * (1-k) + 22 * k; g = g * (1-k) + 25 * k; b = b * (1-k) + 28 * k;
+                }
+                if (mu > 0.9995) {
+                    double d = (mu - 0.9995) / 0.0005;
+                    r += d * 220 * atmo.sun; g += d * 200 * atmo.sun; b += d * 140 * atmo.sun;
+                }
+                if (atmo.sun < 0.99) { r *= atmo.sun; g *= atmo.sun; b *= atmo.sun; }
+                return std::array<double,3>{r,g,b};
+            };
+            for (int y=0;y<h;y+=2) {
+                double ny = -((double)y + 1.0 - h*0.5) / ((double)h*0.95);
+                for (int x=0;x<w;x+=2) {
+                    double nx = ((double)x + 1.0 - w*0.5) / ((double)h*0.95);
+                    PVec rd = pnorm(padd(f, padd(pmul(r, nx), pmul(u, ny))));
+                    auto sc = skyColor(rd);
+                    for (int yy=0; yy<2 && y+yy<h; ++yy) for (int xx=0; xx<2 && x+xx<w; ++xx) {
+                        size_t i=((size_t)(y+yy)*w+(x+xx))*3;
+                        pw.back[i]=(unsigned char)std::max(0.0,std::min(255.0,sc[2]));
+                        pw.back[i+1]=(unsigned char)std::max(0.0,std::min(255.0,sc[1]));
+                        pw.back[i+2]=(unsigned char)std::max(0.0,std::min(255.0,sc[0]));
+                    }
+                }
+            }
             auto cloudDensity = [&](PVec p, double time) {
                 double h = (p.y - atmo.base) / (atmo.top - atmo.base);
                 if (h < 0 || h > 1) return 0.0;
@@ -11582,10 +11620,10 @@ Interpreter::Interpreter() {
                     return std::max(0.0, std::min(1.0, d));
                 }
                 // 积云/晴天：软边而不是硬阈值，避免一片云被挖成洞
-                double threshold = 0.62 - atmo.cover * 0.34;
-                double shape = std::max(0.0, std::min(1.0, (n * profile - threshold) / 0.16));
+                double threshold = 0.70 - atmo.cover * 0.20;
+                double shape = std::max(0.0, std::min(1.0, (n * profile - threshold) / 0.14));
                 shape = shape * shape * (3.0 - 2.0 * shape);
-                double d = shape * (0.45 + 0.55 * n);
+                double d = shape * (0.35 + 0.65 * n);
                 if (atmo.type == "卷云") d *= 0.75;
                 return std::max(0.0, std::min(1.0, d));
             };
@@ -11608,6 +11646,8 @@ Interpreter::Interpreter() {
                     double dt = (t1r - t0r) / steps;
                     double jitter = hash3(cx * 1.7, cy * 2.3, 0.5);
                     double T = 1.0, cr = 0, cg = 0, cb = 0;
+                    auto amb = skyColor(rd);
+                    double ar = amb[0]/255.0, ag = amb[1]/255.0, ab = amb[2]/255.0;
                     double mu = pdot(rd, light);
                     double g = atmo.type == "卷云" ? 0.35 : 0.62;
                     auto hg = [&](double gg) {
@@ -11626,15 +11666,16 @@ Interpreter::Interpreter() {
                             od += cloudDensity(lp, tsec) * 0.35;
                         }
                         double beam = std::exp(-od * 2.0);
-                        double a = 1.0 - std::exp(-dens * dt * 1.8);
+                        double a = 1.0 - std::exp(-dens * std::min(dt, 1.6) * 1.8);
                         // 多次散射的粗糙近似：直射 + 环境
                         double powder = 1.0 - std::exp(-dens * 4.0);
                         double ms = 1.0 / (1.0 + 0.22 * od);
                         double lit = (0.50 + 0.50 * std::max(0.0, beam * atmo.sun)) *
                                      (0.65 + 0.35 * phase * 8.0) * (0.55 + 0.45 * powder) * (0.75 + 0.25 * ms);
-                        cr += T * a * (0.90 * lit + 0.10);
-                        cg += T * a * (0.93 * lit + 0.10);
-                        cb += T * a * (1.00 * lit + 0.12);
+                        // 环境光不是灰色：从当前天空取 Rayleigh/Mie 颜色
+                        cr += T * a * (0.74 * lit + 0.26 * ar);
+                        cg += T * a * (0.78 * lit + 0.22 * ag);
+                        cb += T * a * (0.82 * lit + 0.18 * ab);
                         T *= (1.0 - a);
                         if (T < 0.015) break;
                     }
@@ -11729,6 +11770,32 @@ Interpreter::Interpreter() {
                 }
                 return (double)lit / std::max(1,total);
             };
+            // 云影：把云层密度沿太阳方向投到地面，低分辨率网格 + 双线性
+            const int CS = 64;
+            vector<float> cloudShadowMap((size_t)CS*CS, 1.0f);
+            if (light.y > 0.05) {
+                for (int gy=0; gy<CS; ++gy) for (int gx=0; gx<CS; ++gx) {
+                    double wx = -24.0 + 48.0 * (gx + 0.5) / CS;
+                    double wz = -24.0 + 48.0 * (gy + 0.5) / CS;
+                    double t = (atmo.base - 0.0) / light.y;
+                    PVec q{wx + light.x * t, atmo.base, wz + light.z * t};
+                    double d = cloudDensity(q, tsec);
+                    cloudShadowMap[(size_t)gy*CS+gx] = (float)(1.0 - 0.62 * d);
+                }
+            }
+            auto cloudShadowAt = [&](PVec p) {
+                if (light.y <= 0.05) return 1.0;
+                double fx = (p.x + 24.0) / 48.0 * CS - 0.5;
+                double fz = (p.z + 24.0) / 48.0 * CS - 0.5;
+                int x0 = std::max(0, std::min(CS-1, (int)std::floor(fx)));
+                int z0 = std::max(0, std::min(CS-1, (int)std::floor(fz)));
+                int x1 = std::max(0, std::min(CS-1, x0+1));
+                int z1 = std::max(0, std::min(CS-1, z0+1));
+                double tx = fx - x0, tz = fz - z0;
+                double a = cloudShadowMap[(size_t)z0*CS+x0] * (1-tx) + cloudShadowMap[(size_t)z0*CS+x1] * tx;
+                double b = cloudShadowMap[(size_t)z1*CS+x0] * (1-tx) + cloudShadowMap[(size_t)z1*CS+x1] * tx;
+                return a * (1-tz) + b * tz;
+            };
             auto drawTri=[&](PVec pa, PVec pb, PVec pc, unsigned col, double zoff, bool receive, double metal, double rough, bool glass){
                 double x0,y0,z0,x1,y1,z1,x2,y2,z2;
                 if(!project(pa,x0,y0,z0)||!project(pb,x1,y1,z1)||!project(pc,x2,y2,z2)) return;
@@ -11751,6 +11818,7 @@ Interpreter::Interpreter() {
                     double wy=w0*pa.y+w1*pb.y+w2*pc.y;
                     double wz=w0*pa.z+w1*pb.z+w2*pc.z;
                     double shade = receive ? sampleShadow({wx,wy,wz}) : 1.0;
+                    if (receive && wy > 0.02) shade *= cloudShadowAt({wx,wy,wz});
                     PVec vdir = pnorm(psub(cam, {wx,wy,wz}));
                     PVec hv = pnorm(padd(light, vdir));
                     double spec = std::pow(std::max(0.0, pdot(n, hv)), 8.0 + 80.0 * rough) * metal;
