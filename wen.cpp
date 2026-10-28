@@ -11840,7 +11840,7 @@ Interpreter::Interpreter() {
                 if (a <= 0.002) continue;
                 cr/=a; cg/=a; cb/=a;
                 // 全分辨率细节扰动，压掉重建后的塑料边
-                a *= 0.90 + 0.20 * hash3(x*1.31, y*1.17, 7.0);
+                a *= 0.97 + 0.06 * hash3(x*1.31, y*1.17, 7.0); a = std::min(1.0, a);
                 size_t i=((size_t)y*w+x)*3;
                 pw.back[i]   = (unsigned char)std::min(255.0, pw.back[i]*(1-a) + cb*255*a);
                 pw.back[i+1] = (unsigned char)std::min(255.0, pw.back[i+1]*(1-a) + cg*255*a);
@@ -11852,76 +11852,83 @@ Interpreter::Interpreter() {
                 double xx=pdot(d,r), yy=pdot(d,u); double fl=(double)h*0.95;
                 sx=w*0.5+xx*fl/zz; sy=h*0.5-yy*fl/zz; z=zz; return true;
             };
-            const int SM = 512;
-            vector<float> shadowMap;
-            PVec lright, lup, lfwd;
+            struct ShadowCascade {
+                int size = 512;
+                double extent = 24.0;
+                vector<float> map;
+                PVec center, right, up, fwd;
+            };
+            ShadowCascade cascades[2];
             auto buildShadowMap = [&]() {
-                shadowMap.assign((size_t)SM * SM, 1e30f);
-                // 阴影框跟随相机并做纹素对齐，避免移动时整片阴影抖动
-                double texel = 30.0 / SM;
-                PVec center{std::floor(cam.x / texel) * texel, 2.0, std::floor(cam.z / texel) * texel};
-                PVec lc = padd(center, pmul(light, 20.0));
-                lfwd = pmul(light, -1.0);
-                lright = pnorm(pcross(lfwd, pv(0,1,0)));
-                lup = pcross(lright, lfwd);
-                auto projL = [&](PVec p, double& x, double& y, double& z) {
-                    PVec d = psub(p, lc);
-                    x = (pdot(d, lright) + 15.0) / 30.0 * SM;
-                    y = (pdot(d, lup) + 15.0) / 30.0 * SM;
-                    z = pdot(d, lfwd);
-                };
-                for (const auto& kv : chunks) {
-                    PVec cd = psub(kv.second.center, lc);
-                    double lx = pdot(cd, lright), ly = pdot(cd, lup);
-                    if (std::fabs(lx) - kv.second.radius > 15.0 || std::fabs(ly) - kv.second.radius > 15.0) continue;
-                    for (int idx : kv.second.idx) {
-                    const auto& t = cubes[(size_t)idx];
-                    if (t.glass) continue;
-                    double x0,y0,z0,x1,y1,z1,x2,y2,z2;
-                    projL(t.a,x0,y0,z0); projL(t.b,x1,y1,z1); projL(t.c,x2,y2,z2);
-                    if (std::max({x0,x1,x2}) < 0 || std::min({x0,x1,x2}) >= SM ||
-                        std::max({y0,y1,y2}) < 0 || std::min({y0,y1,y2}) >= SM) continue;
-                    int minx=std::max(0,(int)std::floor(std::min({x0,x1,x2})));
-                    int maxx=std::min(SM-1,(int)std::ceil(std::max({x0,x1,x2})));
-                    int miny=std::max(0,(int)std::floor(std::min({y0,y1,y2})));
-                    int maxy=std::min(SM-1,(int)std::ceil(std::max({y0,y1,y2})));
-                    double den=(y1-y2)*(x0-x2)+(x2-x1)*(y0-y2);
-                    if (std::fabs(den)<1e-9) continue;
-                    for(int y=miny;y<=maxy;++y) for(int x=minx;x<=maxx;++x) {
-                        double px=x+0.5, py=y+0.5;
-                        double w0=((y1-y2)*(px-x2)+(x2-x1)*(py-y2))/den;
-                        double w1=((y2-y0)*(px-x2)+(x0-x2)*(py-y2))/den;
-                        double w2=1-w0-w1;
-                        if(w0<-1e-6||w1<-1e-6||w2<-1e-6) continue;
-                        float z=(float)(w0*z0+w1*z1+w2*z2);
-                        size_t i=(size_t)y*SM+x;
-                        if(z<shadowMap[i]) shadowMap[i]=z;
-                    }
+                for (int ci=0; ci<2; ++ci) {
+                    auto& cs = cascades[ci];
+                    cs.size = ci == 0 ? 512 : 256;
+                    cs.extent = ci == 0 ? 24.0 : 64.0;
+                    cs.map.assign((size_t)cs.size * cs.size, 1e30f);
+                    double texel = cs.extent / cs.size;
+                    cs.center = {std::floor(cam.x / texel) * texel, 2.0, std::floor(cam.z / texel) * texel};
+                    cs.fwd = pmul(light, -1.0);
+                    cs.right = pnorm(pcross(cs.fwd, pv(0,1,0)));
+                    cs.up = pcross(cs.right, cs.fwd);
+                    PVec lc = padd(cs.center, pmul(light, 40.0));
+                    auto projL = [&](PVec p, double& x, double& y, double& z) {
+                        PVec d = psub(p, lc);
+                        x = (pdot(d, cs.right) + cs.extent*0.5) / cs.extent * cs.size;
+                        y = (pdot(d, cs.up) + cs.extent*0.5) / cs.extent * cs.size;
+                        z = pdot(d, cs.fwd);
+                    };
+                    for (const auto& kv : chunks) {
+                        PVec cd = psub(kv.second.center, lc);
+                        double lx = pdot(cd, cs.right), ly = pdot(cd, cs.up);
+                        if (std::fabs(lx) - kv.second.radius > cs.extent*0.5 ||
+                            std::fabs(ly) - kv.second.radius > cs.extent*0.5) continue;
+                        for (int idx : kv.second.idx) {
+                            const auto& t = cubes[(size_t)idx];
+                            if (t.glass) continue;
+                            double x0,y0,z0,x1,y1,z1,x2,y2,z2;
+                            projL(t.a,x0,y0,z0); projL(t.b,x1,y1,z1); projL(t.c,x2,y2,z2);
+                            if (std::max({x0,x1,x2}) < 0 || std::min({x0,x1,x2}) >= cs.size ||
+                                std::max({y0,y1,y2}) < 0 || std::min({y0,y1,y2}) >= cs.size) continue;
+                            int minx=std::max(0,(int)std::floor(std::min({x0,x1,x2})));
+                            int maxx=std::min(cs.size-1,(int)std::ceil(std::max({x0,x1,x2})));
+                            int miny=std::max(0,(int)std::floor(std::min({y0,y1,y2})));
+                            int maxy=std::min(cs.size-1,(int)std::ceil(std::max({y0,y1,y2})));
+                            double den=(y1-y2)*(x0-x2)+(x2-x1)*(y0-y2);
+                            if (std::fabs(den)<1e-9) continue;
+                            for(int y=miny;y<=maxy;++y) for(int x=minx;x<=maxx;++x) {
+                                double px=x+0.5, py=y+0.5;
+                                double w0=((y1-y2)*(px-x2)+(x2-x1)*(py-y2))/den;
+                                double w1=((y2-y0)*(px-x2)+(x0-x2)*(py-y2))/den;
+                                double w2=1-w0-w1;
+                                if(w0<-1e-6||w1<-1e-6||w2<-1e-6) continue;
+                                float z=(float)(w0*z0+w1*z1+w2*z2);
+                                size_t i=(size_t)y*cs.size+x;
+                                if(z<cs.map[i]) cs.map[i]=z;
+                            }
+                        }
                     }
                 }
             };
             auto sampleShadow = [&](PVec p, PVec n) {
-                if (shadowMap.empty()) return 1.0;
-                // 法线偏移：把采样点推离表面，避免自阴影和阴影脱离物体
+                double dist = std::sqrt((p.x-cam.x)*(p.x-cam.x) + (p.z-cam.z)*(p.z-cam.z));
+                auto& cs = cascades[dist < 10.0 ? 0 : 1];
+                if (cs.map.empty()) return 1.0;
                 PVec sp = padd(p, pmul(n, 0.035));
-                double texel = 30.0 / SM;
-                PVec center{std::floor(cam.x / texel) * texel, 2.0, std::floor(cam.z / texel) * texel};
-                PVec lc = padd(center, pmul(light, 20.0));
+                PVec lc = padd(cs.center, pmul(light, 40.0));
                 PVec d = psub(sp, lc);
-                double sx = (pdot(d, lright) + 15.0) / 30.0 * SM;
-                double sy = (pdot(d, lup) + 15.0) / 30.0 * SM;
+                double sx = (pdot(d, cs.right) + cs.extent*0.5) / cs.extent * cs.size;
+                double sy = (pdot(d, cs.up) + cs.extent*0.5) / cs.extent * cs.size;
                 double slope = 1.0 - std::fabs(pdot(n, light));
                 double bias = 0.025 + 0.10 * slope;
-                double dz = pdot(d, lfwd) - bias;
-                if (sx < 1 || sy < 1 || sx >= SM-1 || sy >= SM-1) return 1.0;
+                double dz = pdot(d, cs.fwd) - bias;
+                if (sx < 1 || sy < 1 || sx >= cs.size-1 || sy >= cs.size-1) return 1.0;
                 int cx=(int)sx, cy=(int)sy, lit=0, total=0;
                 for(int oy=-1;oy<=1;++oy) for(int ox=-1;ox<=1;++ox) {
-                    float sd=shadowMap[(size_t)(cy+oy)*SM+(cx+ox)];
+                    float sd=cs.map[(size_t)(cy+oy)*cs.size+(cx+ox)];
                     ++total; if (dz <= sd) ++lit;
                 }
                 return (double)lit / std::max(1,total);
             };
-            // 云影：把云层密度沿太阳方向投到地面，低分辨率网格 + 双线性
             const int CS = 64;
             vector<float> cloudShadowMap((size_t)CS*CS, 1.0f);
             if (light.y > 0.05) {
@@ -11930,8 +11937,7 @@ Interpreter::Interpreter() {
                     double wz = -24.0 + 48.0 * (gy + 0.5) / CS;
                     double t = (atmo.base - 0.0) / light.y;
                     PVec q{wx + light.x * t, atmo.base, wz + light.z * t};
-                    double d = cloudDensity(q, tsec);
-                    cloudShadowMap[(size_t)gy*CS+gx] = (float)(1.0 - 0.62 * d);
+                    cloudShadowMap[(size_t)gy*CS+gx] = (float)(1.0 - 0.62 * cloudDensity(q, tsec));
                 }
             }
             auto cloudShadowAt = [&](PVec p) {
