@@ -11273,12 +11273,17 @@ Interpreter::Interpreter() {
         d->items["风速"] = vNum(0.25);
         d->items["太阳"] = vNum(1.0);
         d->items["雾"] = vNum(0.0);
+        d->items["高层云量"] = vNum(0.22);
+        d->items["高层云底"] = vNum(22.0);
+        d->items["高层云顶"] = vNum(30.0);
+        d->items["高层云尺度"] = vNum(0.055);
         if (name == "晴天") {
             d->items["云量"] = vNum(0.18);
             d->items["云底"] = vNum(10.0); d->items["云顶"] = vNum(13.0);
         } else if (name == "阴天") {
             d->items["云型"] = vStr("层云");
             d->items["云量"] = vNum(0.98);
+            d->items["高层云量"] = vNum(0.45);
             d->items["云底"] = vNum(3.5); d->items["云顶"] = vNum(9.0);
             d->items["云尺度"] = vNum(0.22);
             d->items["太阳"] = vNum(0.65);
@@ -11314,7 +11319,9 @@ Interpreter::Interpreter() {
             else full = truthy(a[3]);
         }
         if (a.size() >= 5) full = truthy(a[4]);
-        struct Atmo { string type="积云"; double cover=0.55, base=8, top=14, scale=0.13, wind=0.25, sun=1.0, fog=0.0; int steps=8, res=8; } atmo;
+        struct Atmo { string type="积云"; double cover=0.55, base=8, top=14, scale=0.13, wind=0.25, sun=1.0, fog=0.0;
+    double highCover=0.22, highBase=22, highTop=30, highScale=0.055;
+    int steps=6, res=8; } atmo;
         if (a.size() >= 7 && a[6].type == VT::Dict) {
             auto ad = needDict(a[6], "大气", line);
             auto pick = [&](const char* k, double& out) {
@@ -11324,6 +11331,7 @@ Interpreter::Interpreter() {
             if (ti != ad->items.end()) atmo.type = needStr(ti->second, "云型", line);
             pick("云量", atmo.cover); pick("云底", atmo.base); pick("云顶", atmo.top);
             pick("云尺度", atmo.scale); pick("风速", atmo.wind); pick("太阳", atmo.sun); pick("雾", atmo.fog);
+            pick("高层云量", atmo.highCover); pick("高层云底", atmo.highBase); pick("高层云顶", atmo.highTop); pick("高层云尺度", atmo.highScale);
             auto st = ad->items.find("云步数"); if (st != ad->items.end()) atmo.steps = std::max(8, std::min(48, (int)needIndex(st->second, "云步数", line)));
             auto rs = ad->items.find("云分辨率"); if (rs != ad->items.end()) atmo.res = std::max(2, std::min(8, (int)needIndex(rs->second, "云分辨率", line)));
             atmo.cover = std::max(0.0, std::min(1.0, atmo.cover));
@@ -11667,6 +11675,40 @@ Interpreter::Interpreter() {
                 if (atmo.type == "卷云") d *= 0.75;
                 return std::max(0.0, std::min(1.0, d));
             };
+            // 高层卷云：独立高空层，和低层积云分开
+            {
+                double htsec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                auto h2 = [](double x,double z){ double v=std::sin(x*127.1+z*311.7)*43758.5453; return v-std::floor(v); };
+                auto vn = [&](double x,double z){
+                    double ix=std::floor(x), iz=std::floor(z), fx=x-ix, fz=z-iz;
+                    fx=fx*fx*(3-2*fx); fz=fz*fz*(3-2*fz);
+                    double a=h2(ix,iz), b=h2(ix+1,iz), c=h2(ix,iz+1), d=h2(ix+1,iz+1);
+                    return (a*(1-fx)+b*fx)*(1-fz)+(c*(1-fx)+d*fx)*fz;
+                };
+                auto fb = [&](double x,double z){ return vn(x,z)*0.62+vn(x*2.1+3,z*2.3-2)*0.38; };
+                for (int y=0;y<h;y+=2) {
+                    double ny=-((double)y+1-h*0.5)/((double)h*0.95);
+                    for (int x=0;x<w;x+=2) {
+                        double nx=((double)x+1-w*0.5)/((double)h*0.95);
+                        PVec rd=pnorm(padd(f,padd(pmul(r,nx),pmul(u,ny))));
+                        if (rd.y<=0.02 || atmo.highCover<=0.001) continue;
+                        double t=(atmo.highBase-cam.y)/rd.y;
+                        if (t<=0.05) continue;
+                        double qx=cam.x+rd.x*t + htsec*atmo.wind*1.5;
+                        double qz=cam.z+rd.z*t - htsec*atmo.wind*1.2;
+                        double n=fb(qx*atmo.highScale, qz*atmo.highScale*2.6);
+                        double a=std::max(0.0,std::min(1.0,(n-0.52)/0.22))*atmo.highCover;
+                        if (a<=0.002) continue;
+                        for(int yy=0;yy<2&&y+yy<h;++yy) for(int xx=0;xx<2&&x+xx<w;++xx){
+                            size_t i=((size_t)(y+yy)*w+(x+xx))*3;
+                            double cr=215*a, cg=225*a, cb=240*a;
+                            pw.back[i]  =(unsigned char)std::min(255.0,pw.back[i]*(1-a)+cb);
+                            pw.back[i+1]=(unsigned char)std::min(255.0,pw.back[i+1]*(1-a)+cg);
+                            pw.back[i+2]=(unsigned char)std::min(255.0,pw.back[i+2]*(1-a)+cr);
+                        }
+                    }
+                }
+            }
             // 体积云：低分辨率射线步进 + 双线性放大
             int cw = std::max(1, w / atmo.res), ch = std::max(1, h / atmo.res);
             vector<unsigned char> cloudBuf((size_t)cw*ch*4, 0);
