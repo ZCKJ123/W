@@ -10693,7 +10693,7 @@ Interpreter::Interpreter() {
                 dir = norm({d[0]-2*dot*h.n[0] + (rnd()-0.5)*rough,
                             d[1]-2*dot*h.n[1] + (rnd()-0.5)*rough,
                             d[2]-2*dot*h.n[2] + (rnd()-0.5)*rough});
-                auto inc = radiance({h.p[0]+h.n[0]*1e-3, h.p[1]+h.n[1]*1e-3, h.p[2]+h.n[2]*1e-3}, dir, depth-1);
+                auto inc = radiance({h.p[0]+h.n[0]*3e-3, h.p[1]+h.n[1]*3e-3, h.p[2]+h.n[2]*3e-3}, dir, depth-1);
                 out[0] += albedo[0]*inc[0]; out[1] += albedo[1]*inc[1]; out[2] += albedo[2]*inc[2];
             } else if (kind == 2) {
                 double eta = 1.0 / pbr[mi].ior;
@@ -10711,7 +10711,7 @@ Interpreter::Interpreter() {
                                 eta*d[1] + (eta*cosI - cosT)*nn[1],
                                 eta*d[2] + (eta*cosI - cosT)*nn[2]});
                 }
-                auto inc = radiance({h.p[0]+dir[0]*1e-3, h.p[1]+dir[1]*1e-3, h.p[2]+dir[2]*1e-3}, dir, depth-1);
+                auto inc = radiance({h.p[0]+dir[0]*3e-3, h.p[1]+dir[1]*3e-3, h.p[2]+dir[2]*3e-3}, dir, depth-1);
                 out[0] += 0.9*inc[0]; out[1] += 0.95*inc[1]; out[2] += 1.0*inc[2];
             } else {
                 // 水面：Fresnel 混合反射与漫反射
@@ -10723,28 +10723,43 @@ Interpreter::Interpreter() {
                 } else {
                     dir = norm({(rnd()*2-1), std::fabs(rnd())+0.2, (rnd()*2-1)});
                 }
-                auto inc = radiance({h.p[0]+h.n[0]*1e-3, h.p[1]+h.n[1]*1e-3, h.p[2]+h.n[2]*1e-3}, dir, depth-1);
+                auto inc = radiance({h.p[0]+h.n[0]*3e-3, h.p[1]+h.n[1]*3e-3, h.p[2]+h.n[2]*3e-3}, dir, depth-1);
                 out[0] += albedo[0]*inc[0]*(1-fr); out[1] += albedo[1]*inc[1]*(1-fr); out[2] += albedo[2]*inc[2]*(1-fr);
                 if (rnd() < fr) {
                     double dot = d[0]*h.n[0] + d[1]*h.n[1] + d[2]*h.n[2];
                     dir = norm({d[0]-2*dot*h.n[0], d[1]-2*dot*h.n[1], d[2]-2*dot*h.n[2]});
-                    auto refl = radiance({h.p[0]+h.n[0]*1e-3, h.p[1]+h.n[1]*1e-3, h.p[2]+h.n[2]*1e-3}, dir, depth-1);
+                    auto refl = radiance({h.p[0]+h.n[0]*3e-3, h.p[1]+h.n[1]*3e-3, h.p[2]+h.n[2]*3e-3}, dir, depth-1);
                     out[0] += fr*refl[0]; out[1] += fr*refl[1]; out[2] += fr*refl[2];
                 }
             }
             if (pbr[mi].clearcoat > 0.01 && depth > 0) {
                 double dot = d[0]*h.n[0] + d[1]*h.n[1] + d[2]*h.n[2];
                 auto rc = norm({d[0]-2*dot*h.n[0], d[1]-2*dot*h.n[1], d[2]-2*dot*h.n[2]});
-                auto cc = radiance({h.p[0]+h.n[0]*1e-3, h.p[1]+h.n[1]*1e-3, h.p[2]+h.n[2]*1e-3}, rc, depth-1);
+                auto cc = radiance({h.p[0]+h.n[0]*3e-3, h.p[1]+h.n[1]*3e-3, h.p[2]+h.n[2]*3e-3}, rc, depth-1);
                 out[0] = out[0]*(1-pbr[mi].clearcoat) + cc[0]*pbr[mi].clearcoat;
                 out[1] = out[1]*(1-pbr[mi].clearcoat) + cc[1]*pbr[mi].clearcoat;
                 out[2] = out[2]*(1-pbr[mi].clearcoat) + cc[2]*pbr[mi].clearcoat;
+            }
+            if (h.mat == 3) {
+                // 玻璃球聚光近似：从光源穿过玻璃球，投到地面的亮斑。
+                double lx = -1.6 + 1.4 * std::cos(tm * 0.7);
+                double ly = 2.35;
+                double lz = -1.25 + 1.4 * std::sin(tm * 0.7);
+                double gx = 1.10, gy = 0.02, gz = 0.02;
+                double dx = gx - lx, dy = gy - ly, dz = gz - lz;
+                double dl = std::sqrt(dx*dx + dy*dy + dz*dz);
+                dx /= dl; dy /= dl; dz /= dl;
+                double tt = -gy / dy;
+                double cxp = gx + dx * tt, czp = gz + dz * tt;
+                double ddx = h.p[0] - cxp, ddz = h.p[2] - czp;
+                double q = std::exp(-(ddx*ddx + ddz*ddz) / 0.045);
+                out[0] += q * 1.4; out[1] += q * 1.5; out[2] += q * 1.7;
             }
             if (kind == 0) {
                 std::array<double,3> dir2{ (rnd()*2-1), (rnd()*2-1), (rnd()*2-1) };
                 if (dir2[0]*h.n[0]+dir2[1]*h.n[1]+dir2[2]*h.n[2] < 0) dir2 = {-dir2[0],-dir2[1],-dir2[2]};
                 dir2 = norm(dir2);
-                auto inc = radiance({h.p[0]+h.n[0]*1e-3, h.p[1]+h.n[1]*1e-3, h.p[2]+h.n[2]*1e-3}, dir2, depth-1);
+                auto inc = radiance({h.p[0]+h.n[0]*3e-3, h.p[1]+h.n[1]*3e-3, h.p[2]+h.n[2]*3e-3}, dir2, depth-1);
                 out[0] += albedo[0]*inc[0]; out[1] += albedo[1]*inc[1]; out[2] += albedo[2]*inc[2];
             }
             return out;
@@ -10761,7 +10776,11 @@ Interpreter::Interpreter() {
                     double py = (1.0 - 2.0*(y+0.5+jy)/h) * 0.72;
                     auto d = norm({px, py, -1.0});
                     auto c = radiance({0,0,2.6}, d, 5);
-                    col[0]+=c[0]; col[1]+=c[1]; col[2]+=c[2];
+                    auto clampc = [](double v) {
+                        if (!std::isfinite(v)) return 0.0;
+                        return std::max(0.0, std::min(12.0, v));
+                    };
+                    col[0]+=clampc(c[0]); col[1]+=clampc(c[1]); col[2]+=clampc(c[2]);
                 }
                 auto tone = [&](double v){ v /= samples; v = v/(1.0+v); return (unsigned char)(255*std::pow(v, 1.0/2.2)); };
                 size_t i = ((size_t)y*w+x)*3;
@@ -11098,6 +11117,10 @@ Interpreter::Interpreter() {
         auto t0 = std::chrono::steady_clock::now();
         while (!pw.closed && !(GetAsyncKeyState(VK_ESCAPE) & 0x8000) && !pw.keys[VK_ESCAPE]) {
             auto frameStart=std::chrono::steady_clock::now();
+            {
+                double ts = std::chrono::duration<double>(frameStart - t0).count();
+                light = pnorm({0.45 + 0.35 * std::sin(ts * 0.7), 1.0, 0.35 + 0.35 * std::cos(ts * 0.5)});
+            }
             MSG msg;
             while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
             if (pw.capture) {
