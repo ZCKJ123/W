@@ -45,6 +45,20 @@ try {
         }
     }
 
+    $mf = Join-Path $dir 'machine.wen'
+    [IO.File]::WriteAllText($mf, '打印 1 打印 2', (New-Object Text.UTF8Encoding($false)))
+    $mr = Invoke-Wen @('--检查', '--机器', $mf)
+    $mj = $mr.out.Trim() | ConvertFrom-Json
+    $mp = $mj.diagnostics[0].PSObject.Properties.Name
+    if (($mp -contains 'kind') -or ($mp -contains 'reason') -or ($mp -contains 'message') -or ($mp -contains 'detail')) {
+        $fail++
+        Write-Host "失败：--机器 仍输出中文报告字段"
+    }
+    if ($mj.diagnostics[0].rule -ne 'syntax.need_newline' -or -not $mj.diagnostics[0].sourceLine) {
+        $fail++
+        Write-Host "失败：--机器 缺 rule/sourceLine"
+    }
+
     $rf = Join-Path $dir 'runtime.wen'
     $rb = Invoke-Wen @('--简短', $rf)
     if ($rb.err.Contains('说明：')) {
@@ -62,6 +76,6 @@ try {
     Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
 }
 if ($fail -gt 0) { exit 1 }
-Write-Host "错误协议回归：rule / --精简 / --简短 / frames 通过"
+Write-Host "错误协议回归：rule / --精简 / --简短 / frames / --机器 通过"
 
 exit 0

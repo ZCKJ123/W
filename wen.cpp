@@ -1824,6 +1824,7 @@ static std::map<string, std::pair<int,int>> gBuiltinArity;
 static bool gNoNameCheck = false;
 static bool gBriefErrors = false;   // --简短：不打印每条的通用「说明」
 static bool gCompactJson = false;   // --精简：JSON 省略 detail/message
+static bool gMachineOnly = false;   // --机器：只给 AI 路径/规则，不给中文报告
 
 static std::vector<uint32_t> nameCps(const string& s) {
     std::vector<uint32_t> out;
@@ -5209,6 +5210,7 @@ static VpWindowData* gVpWin = nullptr;struct PlayerWin {
     bool closed = false;
     bool capture = false;
     int mdx = 0, mdy = 0;
+    int lastX = -1, lastY = -1;
     HDC glDC = nullptr;
     HGLRC glRC = nullptr;
     unsigned glTex = 0;
@@ -5250,15 +5252,23 @@ static LRESULT CALLBACK playerWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
     if (msg == WM_KEYDOWN && wp < 256) gPlayer->keys[wp] = true;
     if (msg == WM_KEYUP && wp < 256) gPlayer->keys[wp] = false;
-    if (msg == WM_MOUSEMOVE && gPlayer && gPlayer->capture) {
-        POINT p; GetCursorPos(&p);
-        RECT r; GetWindowRect(hwnd, &r);
-        int cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2;
-        gPlayer->mdx += p.x - cx; gPlayer->mdy += p.y - cy;
-        SetCursorPos(cx, cy);
+    if (msg == WM_MOUSEMOVE && gPlayer) {
+        int mx = (int)(short)LOWORD(lp), my = (int)(short)HIWORD(lp);
+        if (gPlayer->capture) {
+            POINT p; GetCursorPos(&p);
+            RECT r; GetWindowRect(hwnd, &r);
+            int cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2;
+            gPlayer->mdx += p.x - cx; gPlayer->mdy += p.y - cy;
+            SetCursorPos(cx, cy);
+        } else if (gPlayer->lastX >= 0) {
+            gPlayer->mdx += mx - gPlayer->lastX;
+            gPlayer->mdy += my - gPlayer->lastY;
+        }
+        gPlayer->lastX = mx; gPlayer->lastY = my;
         return 0;
     }
     if (msg == WM_SIZE && gPlayer) return 0;  // 固定渲染面，避免与显示线程尺寸竞态
+    if (msg == WM_MOUSELEAVE && gPlayer) { gPlayer->lastX = gPlayer->lastY = -1; }
     if (msg == WM_KILLFOCUS && gPlayer && gPlayer->capture) {
         gPlayer->capture = false; ReleaseCapture(); ShowCursor(TRUE);
     }
@@ -11164,7 +11174,7 @@ Interpreter::Interpreter() {
                 double xx=pdot(d,r), yy=pdot(d,u); double fl=(double)h*0.95;
                 sx=w*0.5+xx*fl/zz; sy=h*0.5-yy*fl/zz; z=zz; return true;
             };
-            const int SM = 384;
+            const int SM = 512;
             vector<float> shadowMap;
             PVec lright, lup, lfwd;
             auto buildShadowMap = [&]() {
@@ -16377,6 +16387,26 @@ static void printDiagnostics(const vector<WenError>& errors, const string& filen
         for (size_t i = 0; i < errors.size(); ++i) {
             const WenError& e = errors[i];
             if (i) out += ",";
+            if (gMachineOnly) {
+                out += "{\"line\":" + std::to_string(e.line) +
+                       ",\"column\":" + std::to_string(e.col) +
+                       ",\"code\":" + jsonQuote(errorCode(e.kind)) +
+                       ",\"rule\":" + jsonQuote(errorRule(e)) +
+                       ",\"severity\":\"error\"";
+                if (e.line >= 1 && (size_t)e.line <= lines.size())
+                    out += ",\"sourceLine\":{\"number\":" + std::to_string(e.line) +
+                           ",\"text\":" + jsonQuote(lines[(size_t)e.line - 1]) + "}";
+                if (!e.frames.empty()) {
+                    out += ",\"frames\":[";
+                    for (size_t k = 0; k < e.frames.size(); ++k) {
+                        if (k) out += ",";
+                        out += jsonQuote(e.frames[k]);
+                    }
+                    out += "]";
+                }
+                out += "}";
+                continue;
+            }
             out += "{\"kind\":" + jsonQuote(e.kind) +
                    ",\"line\":" + std::to_string(e.line) +
                    ",\"column\":" + std::to_string(e.col) +
@@ -17336,6 +17366,7 @@ static int runMain(vector<string> args) {
         if (*it == "--不查名字") { gNoNameCheck = true; it = args.erase(it); }
         else if (*it == "--简短") { gBriefErrors = true; it = args.erase(it); }
         else if (*it == "--精简") { gCompactJson = true; gJsonDiagnostics = true; it = args.erase(it); }
+        else if (*it == "--机器" || *it == "--AI") { gMachineOnly = true; gCompactJson = true; gJsonDiagnostics = true; it = args.erase(it); }
         else if (*it == "--json" || *it == "--诊断JSON") { gJsonDiagnostics = true; it = args.erase(it); }
         else ++it;
     }
