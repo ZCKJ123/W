@@ -11320,8 +11320,8 @@ Interpreter::Interpreter() {
         }
         if (a.size() >= 5) full = truthy(a[4]);
         struct Atmo { string type="积云"; double cover=0.55, base=8, top=14, scale=0.13, wind=0.25, sun=1.0, fog=0.0;
-    double highCover=0.22, highBase=22, highTop=30, highScale=0.055;
-    int steps=8, res=6; } atmo;
+    double highCover=0.0, highBase=22, highTop=30, highScale=0.055;
+    int steps=6, res=9; } atmo;
         if (a.size() >= 7 && a[6].type == VT::Dict) {
             auto ad = needDict(a[6], "大气", line);
             auto pick = [&](const char* k, double& out) {
@@ -11688,7 +11688,7 @@ Interpreter::Interpreter() {
                     double d=(f*profile - 0.30)*3.2*atmo.highCover;
                     return std::max(0.0,std::min(1.0,d));
                 };
-                int hcw=std::max(1,w/16), hch=std::max(1,h/16);
+                int hcw=std::max(1,w/24), hch=std::max(1,h/24);
                 vector<unsigned char> hbuf((size_t)hcw*hch*4,0);
                 double htsec=std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();
                 for (int cy=0;cy<hch;++cy) {
@@ -11701,7 +11701,7 @@ Interpreter::Interpreter() {
                         t0r=(atmo.highBase-cam.y)/rd.y; t1r=(atmo.highTop-cam.y)/rd.y;
                         if (t0r>t1r) std::swap(t0r,t1r);
                         t0r=std::max(0.05,t0r); if (t1r<=t0r) continue;
-                        int steps=3; double dt=(t1r-t0r)/steps;
+                        int steps=2; double dt=(t1r-t0r)/steps;
                         double T=1,cr=0,cg=0,cb=0;
                         for (int st=0;st<steps;++st) {
                             PVec p2=padd(cam,pmul(rd,t0r+(st+0.5)*dt));
@@ -11826,6 +11826,7 @@ Interpreter::Interpreter() {
                 pw.back[i+1] = (unsigned char)(pw.back[i+1]*(1-a) + mixc(1)*a);
                 pw.back[i+2] = (unsigned char)(pw.back[i+2]*(1-a) + mixc(0)*a);
             }
+            std::fill(pw.back.begin(), pw.back.end(), 0);
             zbuf.assign((size_t)w*h, 1e30);
             auto project=[&](PVec p, double& sx, double& sy, double& z)->bool{
                 PVec d=psub(p,cam); double zz=pdot(d,f); if(zz<=0.08) return false;
