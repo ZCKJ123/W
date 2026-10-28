@@ -17,6 +17,24 @@ try {
         if ($code -notmatch 'function f\(' -or $code -notmatch 'console\.log') {
             $fail++; Write-Host '失败：TypeScript 内容不完整'
         }
+        $node = Get-Command node.exe -ErrorAction SilentlyContinue
+        if (-not $node) {
+            foreach ($cand in @("$env:ProgramFiles\nodejs\node.exe", "${env:ProgramFiles(x86)}\nodejs\node.exe")) {
+                if (Test-Path $cand) { $node = Get-Item $cand; break }
+            }
+        }
+        if ($node) {
+            $js = Join-Path $dir 'a.js'
+            Copy-Item $out $js -Force
+            $run = (& $node.Source $js 2>&1) -join "`n"
+            if ($LASTEXITCODE -ne 0 -or $run -notmatch '结果 8') {
+                $fail++; Write-Host "失败：TypeScript 产物运行不对：$run"
+            } else {
+                Write-Host "TypeScript 产物运行：$run"
+            }
+        } else {
+            Write-Host 'TypeScript 产物运行跳过：本机没有 node.exe'
+        }
     }
 } catch {
     $fail++; Write-Host "失败：TypeScript 回归异常：$_"
