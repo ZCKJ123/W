@@ -7310,7 +7310,7 @@ static Value compatParse(const string& lang0, const string& code, int line) {
     string ext, cmd;
     if (lang == "python") { ext = ".py"; cmd = "python -m py_compile"; }
     else if (lang == "javascript" || lang == "js") { ext = ".js"; cmd = "node --check"; }
-    else if (lang == "typescript" || lang == "ts") { ext = ".ts"; cmd = "tsc --noEmit"; }
+    else if (lang == "typescript" || lang == "ts") { ext = ".js"; cmd = "node --check"; }
     else if (lang == "java") { ext = ".java"; cmd = "javac -d"; }
     else if (lang == "c") { ext = ".c"; cmd = "gcc -fsyntax-only"; }
     else if (lang == "cpp" || lang == "c++") { ext = ".cpp"; cmd = "g++ -fsyntax-only"; }
@@ -8633,7 +8633,7 @@ Interpreter::Interpreter() {
     });
     registerBuiltin("兼容支持", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
         auto l = std::make_shared<List>();
-        for (const char* s : {"python", "javascript", "json", "java", "字节码", "C++", "汇编"})
+        for (const char* s : {"python", "javascript", "typescript", "json", "java", "字节码", "C++", "汇编"})
             l->items.push_back(vStr(s));
         return vList(l);
     });
@@ -8644,7 +8644,7 @@ Interpreter::Interpreter() {
         string t = lowerAscii(target);
         if (t == "js") t = "javascript";
         if (t == "cpp") t = "C++";
-        bool external = t == "python" || t == "javascript" || t == "json" || t == "java";
+        bool external = t == "python" || t == "javascript" || t == "json" || t == "java" || t == "typescript" || t == "ts";
         bool internal = t == "字节码" || t == "C++" || t == "汇编";
         if (!external && !internal)
             throw WenError("运行时错误", line, 0, "不支持的兼容目标：" + target);
@@ -8991,6 +8991,7 @@ Interpreter::Interpreter() {
         l->items.push_back(vStr("javascript"));
         l->items.push_back(vStr("json"));
         l->items.push_back(vStr("java"));
+        l->items.push_back(vStr("typescript"));
         return vList(l);
     });
     registerBuiltin("外派目标", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
@@ -9015,12 +9016,12 @@ Interpreter::Interpreter() {
         vector<string> diags;
         string target = externalTarget(src);
         bool ok = target == "python" || target == "javascript" || target == "js" ||
-                  target == "json" || target == "gson" || target == "java";
+                  target == "json" || target == "gson" || target == "java" || target == "typescript" || target == "ts";
         if (target.empty())
             diags.push_back("第 1 行：缺少外派目标；第一行写「# 外派: python」");
         else if (!ok)
             diags.push_back("第 1 行：目标「" + target +
-                            "」的适配器未安装；当前支持 python / javascript / json / java");
+                            "」的适配器未安装；当前支持 python / javascript / typescript / json / java");
         if (ok) {
             try {
                 Interpreter sub;
@@ -9068,12 +9069,12 @@ Interpreter::Interpreter() {
         vector<string> diags;
         string target = externalTarget(src);
         bool ok = target == "python" || target == "javascript" || target == "js" ||
-                  target == "json" || target == "gson" || target == "java";
+                  target == "json" || target == "gson" || target == "java" || target == "typescript" || target == "ts";
         if (target.empty())
             diags.push_back("第 1 行：缺少外派目标；第一行写「# 外派: python」");
         else if (!ok)
             diags.push_back("第 1 行：目标「" + target +
-                            "」的适配器未安装；当前支持 python / javascript / json / java");
+                            "」的适配器未安装；当前支持 python / javascript / typescript / json / java");
         string code;
         if (ok) {
             try {

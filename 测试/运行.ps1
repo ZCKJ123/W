@@ -150,4 +150,6 @@ if ($LASTEXITCODE -ne 0) { exit 1 }
 if ($LASTEXITCODE -ne 0) { exit 1 }
 & (Join-Path $PSScriptRoot '..\工具\自述检查.ps1')
 if ($LASTEXITCODE -ne 0) { exit 1 }
+& (Join-Path $PSScriptRoot '..\工具\TypeScript检查.ps1')
+if ($LASTEXITCODE -ne 0) { exit 1 }
 exit 0
