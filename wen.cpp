@@ -10207,6 +10207,32 @@ Interpreter::Interpreter() {
         gMediaAliases.clear();
         return vNum(n);
     });
+    registerBuiltin("重置核心", 0, 0, [this](Interpreter&, vector<Value>&, int line) -> Value {
+        vector<std::pair<string,Value>> keep;
+        int removed = 0;
+        for (const auto& kv : globals->vars) {
+            bool coreFn = false;
+            if (kv.second.type == VT::Func) {
+                auto b = std::dynamic_pointer_cast<Builtin>(kv.second.callable);
+                coreFn = b && b->core;
+            }
+            bool constant = kv.first=="圆周率" || kv.first=="π" || kv.first=="自然常数" || kv.first=="重力加速度";
+            if (coreFn || constant) keep.push_back({kv.first, kv.second});
+            else ++removed;
+        }
+        globals->vars.clear(); globals->idVars.clear(); globals->idSlot.clear();
+        globals->fast.clear(); globals->fastDefined.clear();
+        for (const auto& kv : keep) globals->set(kv.first, kv.second);
+        loadedModules.clear(); symbolOwner.clear(); callCounts.clear();
+        accelCache.clear(); leapCache.clear(); leapHits=leapMisses=0;
+        memoryStore.clear(); memoryTemp.clear(); memoryCompressed.clear(); memoryOrigSize.clear(); decompressCache.clear();
+        renderScene.clear(); lastValue=vNone(); lastWasExpr=false;
+        auto d=std::make_shared<Dict>();
+        d->items["清除变量"]=vNum(removed);
+        d->items["保留核心"]=vNum((double)keep.size());
+        d->items["模块已清"]=vBool(true);
+        return vDict(d);
+    });
     registerBuiltin("申请管理员", 1, 1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
 #ifndef WEN_ADMIN_BUILD
         throw WenError("权限错误", line, 0, "此发行版不包含管理员功能；需要开发者构建");
