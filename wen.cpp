@@ -11321,7 +11321,7 @@ Interpreter::Interpreter() {
         if (a.size() >= 5) full = truthy(a[4]);
         struct Atmo { string type="积云"; double cover=0.55, base=8, top=14, scale=0.13, wind=0.25, sun=1.0, fog=0.0;
     double highCover=0.0, highBase=22, highTop=30, highScale=0.055;
-    int steps=6, res=9; } atmo;
+    int steps=8, res=4; } atmo;
         if (a.size() >= 7 && a[6].type == VT::Dict) {
             auto ad = needDict(a[6], "大气", line);
             auto pick = [&](const char* k, double& out) {
@@ -11744,7 +11744,7 @@ Interpreter::Interpreter() {
             int cw = std::max(1, w / atmo.res), ch = std::max(1, h / atmo.res);
             vector<unsigned char> cloudBuf((size_t)cw*ch*4, 0);
             double tsec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            for (int cy=0; cy<ch; ++cy) {
+            auto lowRows = [&](int cy0, int cy1) { for (int cy=cy0; cy<cy1; ++cy) {
                 double ny = -(((double)cy + 0.5) * atmo.res - h*0.5) / ((double)h*0.95);
                 for (int cx=0; cx<cw; ++cx) {
                     double nx = (((double)cx + 0.5) * atmo.res - w*0.5) / ((double)h*0.95);
@@ -11811,6 +11811,12 @@ Interpreter::Interpreter() {
                         cloudBuf[ci+3]=(unsigned char)std::min(255.0, (1.0-T)*255);
                     }
                 }
+            } };
+            {
+                unsigned nt=std::max(2u,std::min(8u,std::thread::hardware_concurrency()));
+                std::vector<std::thread> th;
+                for(unsigned k=0;k<nt;++k) th.emplace_back(lowRows, ch*(int)k/(int)nt, ch*(int)(k+1)/(int)nt);
+                for(auto& t:th) t.join();
             }
             auto crom = [](double t) {
                 t = std::fabs(t);
@@ -11818,7 +11824,7 @@ Interpreter::Interpreter() {
                 if (t < 2.0) return -0.5*t*t*t + 2.5*t*t - 4.0*t + 2.0;
                 return 0.0;
             };
-            for (int y=0;y<h;++y) for (int x=0;x<w;++x) {
+            auto upRows = [&](int y0, int y1) { for (int y=y0;y<y1;++y) for (int x=0;x<w;++x) {
                 double sx = (x + 0.5) * cw / w - 0.5;
                 double sy = (y + 0.5) * ch / h - 0.5;
                 int ix = (int)std::floor(sx), iy = (int)std::floor(sy);
@@ -11845,6 +11851,12 @@ Interpreter::Interpreter() {
                 pw.back[i]   = (unsigned char)std::min(255.0, pw.back[i]*(1-a) + cb*255*a);
                 pw.back[i+1] = (unsigned char)std::min(255.0, pw.back[i+1]*(1-a) + cg*255*a);
                 pw.back[i+2] = (unsigned char)std::min(255.0, pw.back[i+2]*(1-a) + cr*255*a);
+            } };
+            {
+                unsigned nt=std::max(2u,std::min(8u,std::thread::hardware_concurrency()));
+                std::vector<std::thread> th;
+                for(unsigned k=0;k<nt;++k) th.emplace_back(upRows, h*(int)k/(int)nt, h*(int)(k+1)/(int)nt);
+                for(auto& t:th) t.join();
             }
             zbuf.assign((size_t)w*h, 1e30);
             auto project=[&](PVec p, double& sx, double& sy, double& z)->bool{
