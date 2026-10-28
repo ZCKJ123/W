@@ -5321,9 +5321,10 @@ static PVec pmul(PVec a, double k) { return {a.x*k,a.y*k,a.z*k}; }
 static double pdot(PVec a, PVec b) { return a.x*b.x+a.y*b.y+a.z*b.z; }
 static PVec pcross(PVec a, PVec b) { return {a.y*b.z-a.z*b.y, a.z*b.x-a.x*b.z, a.x*b.y-a.y*b.x}; }
 static PVec pnorm(PVec a) { double l=std::sqrt(pdot(a,a)); return l<1e-9?pv(0,1,0):pmul(a,1/l); }
-struct PTri { PVec a,b,c; unsigned color; double metal = 0.0, rough = 0.8, emit = 0.0; };
+struct PTri { PVec a,b,c; unsigned color; double metal = 0.0, rough = 0.8, emit = 0.0; bool glass = false; };
 static void addSphere(vector<PTri>& out, PVec c, double r, unsigned col,
-                      double metal = 0.0, double rough = 0.8, int seg = 12, int ring = 6) {
+                      double metal = 0.0, double rough = 0.8, int seg = 12, int ring = 6,
+                      bool glass = false) {
     auto at = [&](int i, int j) {
         double th = 3.14159265358979323846 * j / ring;
         double ph = 2.0 * 3.14159265358979323846 * i / seg;
@@ -5333,8 +5334,8 @@ static void addSphere(vector<PTri>& out, PVec c, double r, unsigned col,
     };
     for (int j = 0; j < ring; ++j) for (int i = 0; i < seg; ++i) {
         PVec a=at(i,j), b=at(i+1,j), d=at(i,j+1), e=at(i+1,j+1);
-        out.push_back({a,b,e,col,metal,rough,0});
-        out.push_back({a,e,d,col,metal,rough,0});
+        out.push_back({a,b,e,col,metal,rough,0,glass});
+        out.push_back({a,e,d,col,metal,rough,0,glass});
     }
 }
 static void addCube(vector<PTri>& out, PVec c, double s, unsigned col, double metal = 0.0, double rough = 0.8) {
@@ -11090,6 +11091,7 @@ Interpreter::Interpreter() {
         }
         struct Box { PVec c; double s; };
         vector<Box> boxes;
+        vector<PVec> glassCenters;
         auto addBox = [&](PVec c, double s, unsigned col, double metal = 0.0, double rough = 0.8) { addCube(cubes, c, s, col, metal, rough); boxes.push_back({c, s}); };
         if (sceneArg) {
             auto list = needList(*sceneArg, "玩家视口场景", line);
@@ -11114,12 +11116,14 @@ Interpreter::Interpreter() {
                 if (mi != d->items.end()) metal = std::max(0.0, std::min(1.0, needNum(mi->second, "金属度", line)));
                 auto ri = d->items.find("粗糙度");
                 if (ri != d->items.end()) rough = std::max(0.02, std::min(1.0, needNum(ri->second, "粗糙度", line)));
-                if (kind == "球") {
+                if (kind == "球" || kind == "玻璃球") {
                     double r = s;
                     auto rri = d->items.find("半径");
                     if (rri != d->items.end()) r = std::max(0.05, needNum(rri->second, "半径", line));
-                    addSphere(cubes, c, r, col, metal, rough);
+                    bool glass = kind == "玻璃球";
+                    addSphere(cubes, c, r, col, metal, rough, glass);
                     boxes.push_back({c, r});
+                    if (glass) glassCenters.push_back(c);
                 } else {
                     addBox(c, s, col, metal, rough);
                 }
@@ -11261,6 +11265,7 @@ Interpreter::Interpreter() {
                     z = pdot(d, lfwd);
                 };
                 for (const auto& t : cubes) {
+                    if (t.glass) continue;
                     double x0,y0,z0,x1,y1,z1,x2,y2,z2;
                     projL(t.a,x0,y0,z0); projL(t.b,x1,y1,z1); projL(t.c,x2,y2,z2);
                     int minx=std::max(0,(int)std::floor(std::min({x0,x1,x2})));
@@ -11297,7 +11302,7 @@ Interpreter::Interpreter() {
                 }
                 return (double)lit / std::max(1,total);
             };
-            auto drawTri=[&](PVec pa, PVec pb, PVec pc, unsigned col, double zoff, bool receive, double metal, double rough){
+            auto drawTri=[&](PVec pa, PVec pb, PVec pc, unsigned col, double zoff, bool receive, double metal, double rough, bool glass){
                 double x0,y0,z0,x1,y1,z1,x2,y2,z2;
                 if(!project(pa,x0,y0,z0)||!project(pb,x1,y1,z1)||!project(pc,x2,y2,z2)) return;
                 double minx=std::max(0.0,std::floor(std::min({x0,x1,x2}))), maxx=std::min((double)w-1,std::ceil(std::max({x0,x1,x2})));
@@ -11322,17 +11327,46 @@ Interpreter::Interpreter() {
                     PVec hv = pnorm(padd(light, vdir));
                     double spec = std::pow(std::max(0.0, pdot(n, hv)), 8.0 + 80.0 * rough) * metal;
                     double fog=std::max(0.25,1.0-z/28.0);
+                    if (glass) {
+                        double fres = 0.18 + 0.62 * std::pow(1.0 - std::max(0.0, pdot(n, vdir)), 3.0);
+                        double alpha = 0.18 + 0.45 * fres;
+                        double tr = (col>>16)&255, tg=(col>>8)&255, tb=col&255;
+                        pw.back[i*3]   = (unsigned char)(pw.back[i*3]   * (1-alpha) + tb * alpha);
+                        pw.back[i*3+1] = (unsigned char)(pw.back[i*3+1] * (1-alpha) + tg * alpha);
+                        pw.back[i*3+2] = (unsigned char)(pw.back[i*3+2] * (1-alpha) + tr * alpha);
+                        zbuf[i] = z - 0.001;  // 玻璃不遮挡后面的不透明物，但保留近层
+                        continue;
+                    }
                     pw.back[i*3]=(unsigned char)std::min(255.0,cb*lit*shade*fog + spec*220);
                     pw.back[i*3+1]=(unsigned char)std::min(255.0,cg*lit*shade*fog + spec*220);
                     pw.back[i*3+2]=(unsigned char)std::min(255.0,cr*lit*shade*fog + spec*220);
                 }
             };
             buildShadowMap();
-            for(auto& t:ground) drawTri(t.a,t.b,t.c,t.color,0,true,0,t.rough);
-            for(auto& t:cubes) drawTri(t.a,t.b,t.c,t.color,0,true,t.metal,t.rough);
+            for(auto& t:ground) drawTri(t.a,t.b,t.c,t.color,0,true,0,t.rough,false);
+            for(auto& t:cubes) if(!t.glass) drawTri(t.a,t.b,t.c,t.color,0,true,t.metal,t.rough,false);
+            for(auto& t:cubes) if(t.glass) drawTri(t.a,t.b,t.c,t.color,0,false,t.metal,t.rough,true);
             for(int y=-2;y<=2;++y) for(int x=-2;x<=2;++x){
                 if(std::abs(x)<=1&&std::abs(y)<=1) continue;
                 size_t i=(size_t)(h/2+y)*w+(w/2+x); if(i*3+2<pw.back.size()){pw.back[i*3]=230;pw.back[i*3+1]=240;pw.back[i*3+2]=255;}
+            }
+            // 玻璃球地面焦散光斑 + 光晕
+            for (const auto& gc : glassCenters) {
+                double t = gc.y / std::max(0.05, -light.y);
+                PVec gp{gc.x + light.x * t, 0.02, gc.z + light.z * t};
+                double sx, sy, sz;
+                if (!project(gp, sx, sy, sz)) continue;
+                int cxp=(int)sx, cyp=(int)sy;
+                for (int yy=-36; yy<=36; ++yy) for (int xx=-36; xx<=36; ++xx) {
+                    int px=cxp+xx, py=cyp+yy;
+                    if (px<0||py<0||px>=w||py>=h) continue;
+                    double dist=std::sqrt((double)(xx*xx+yy*yy));
+                    double glow=std::exp(-dist*dist/220.0);
+                    size_t gi=(size_t)py*w+px;
+                    pw.back[gi*3]=(unsigned char)std::min(255.0, pw.back[gi*3] + glow*120);
+                    pw.back[gi*3+1]=(unsigned char)std::min(255.0, pw.back[gi*3+1] + glow*150);
+                    pw.back[gi*3+2]=(unsigned char)std::min(255.0, pw.back[gi*3+2] + glow*180);
+                }
             }
             // 屏幕空间环境光遮蔽：用深度差压暗角落，不做假全屏泛光。
             for (int y = 1; y + 1 < h; ++y) for (int x = 1; x + 1 < w; ++x) {
