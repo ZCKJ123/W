@@ -11368,6 +11368,10 @@ Interpreter::Interpreter() {
         struct Box { PVec c; double s; };
         vector<Box> boxes;
         vector<PVec> glassCenters;
+        bool hasSceneLight = false;
+        PVec sceneLightDir{0.45, 1.0, 0.35};
+        double sceneLightIntensity = 1.0;
+        unsigned sceneLightColor = 0xFFFFFF;
         auto addBox = [&](PVec c, double s, unsigned col, double metal = 0.0, double rough = 0.8) { addCube(cubes, c, s, col, metal, rough); boxes.push_back({c, s}); };
         if (sceneArg) {
             auto list = needList(*sceneArg, "玩家视口场景", line);
@@ -11375,6 +11379,20 @@ Interpreter::Interpreter() {
                 auto d = needDict(it, "玩家视口场景", line);
                 auto ki0 = d->items.find("类型");
                 string kind0 = ki0 != d->items.end() ? needStr(ki0->second, "类型", line) : "方块";
+                if (kind0 == "光") {
+                    auto di = d->items.find("方向");
+                    if (di != d->items.end()) {
+                        auto dl = needList(di->second, "光方向", line);
+                        if (dl->items.size() != 3) throw WenError("运行时错误", line, 0, "光方向必须是 [x,y,z]");
+                        sceneLightDir = pnorm({needNum(dl->items[0],"x",line), needNum(dl->items[1],"y",line), needNum(dl->items[2],"z",line)});
+                    }
+                    auto ii = d->items.find("强度");
+                    if (ii != d->items.end()) sceneLightIntensity = std::max(0.0, needNum(ii->second, "光强度", line));
+                    auto ci = d->items.find("颜色");
+                    if (ci != d->items.end()) sceneLightColor = (unsigned)vpColor(ci->second, line);
+                    hasSceneLight = true;
+                    continue;
+                }
                 if (kind0 == "网格") {
                     auto tl = d->items.find("三角形");
                     if (tl == d->items.end() || tl->second.type != VT::List)
@@ -11503,7 +11521,8 @@ Interpreter::Interpreter() {
             auto frameStart=std::chrono::steady_clock::now();
             {
                 double ts = std::chrono::duration<double>(frameStart - t0).count();
-                light = pnorm({0.45 + 0.35 * std::sin(ts * 0.12), 1.0, 0.35 + 0.35 * std::cos(ts * 0.09)});
+                light = hasSceneLight ? sceneLightDir
+                      : pnorm({0.45 + 0.35 * std::sin(ts * 0.12), 1.0, 0.35 + 0.35 * std::cos(ts * 0.09)});
             }
             MSG msg;
             while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
@@ -11828,8 +11847,9 @@ Interpreter::Interpreter() {
                 if (maxx < 0 || minx >= w || maxy < 0 || miny >= h) return;
                 double den=(y1-y2)*(x0-x2)+(x2-x1)*(y0-y2); if(std::fabs(den)<1e-9) return;
                 PVec n=pnorm(pcross(psub(pb,pa),psub(pc,pa)));
-                double ndl=std::fabs(pdot(n,light)); double lit=0.35+0.65*ndl;
+                double ndl=std::fabs(pdot(n,light)); double lit=0.28 + 0.72*ndl*sceneLightIntensity;
                 int cr=(int)((col>>16)&255), cg=(int)((col>>8)&255), cb=(int)(col&255);
+                double lr=((sceneLightColor>>16)&255)/255.0, lg=((sceneLightColor>>8)&255)/255.0, lb=(sceneLightColor&255)/255.0;
                 for(int y=(int)miny;y<=(int)maxy;++y) for(int x=(int)minx;x<=(int)maxx;++x){
                     double px=x+0.5, py=y+0.5;
                     double w0=((y1-y2)*(px-x2)+(x2-x1)*(py-y2))/den;
@@ -11845,11 +11865,25 @@ Interpreter::Interpreter() {
                     if (receive && wy > 0.02) shade *= cloudShadowAt({wx,wy,wz});
                     PVec vdir = pnorm(psub(cam, {wx,wy,wz}));
                     PVec hv = pnorm(padd(light, vdir));
-                    double spec = std::pow(std::max(0.0, pdot(n, hv)), 8.0 + 80.0 * rough) * metal;
+                    // GGX / Smith / Schlick：光源角度、微表面法线、Fresnel 都由这里的模型定义
+                    double NoL = std::max(0.001, pdot(n, light));
+                    double NoV = std::max(0.001, pdot(n, vdir));
+                    double NoH = std::max(0.0, pdot(n, hv));
+                    double VoH = std::max(0.0, pdot(vdir, hv));
+                    double alpha = std::max(0.03, rough * rough);
+                    double a2 = alpha * alpha;
+                    double denom = NoH * NoH * (a2 - 1.0) + 1.0;
+                    double D = a2 / (3.14159265358979323846 * denom * denom);
+                    double k = alpha * 0.5;
+                    double G = (NoL / (NoL * (1-k) + k)) * (NoV / (NoV * (1-k) + k));
+                    double F0 = metal > 0.5 ? 0.92 : 0.04;
+                    double F = F0 + (1.0 - F0) * std::pow(1.0 - VoH, 5.0);
+                    double spec = D * G * F / (4.0 * NoL * NoV + 1e-4) * NoL * sceneLightIntensity;
+                    double kd = (1.0 - F) * (1.0 - metal);
                     if (fuzzy) {
                         double rim = std::pow(1.0 - std::max(0.0, pdot(n, vdir)), 2.0);
                         lit = lit * (0.72 + 0.28 * rim) + 0.12 * rim;
-                        spec *= 0.15;
+                        spec *= 0.15; kd *= 0.85;
                     }
                     double fog=1.0 - std::exp(-z * 0.045);
                     double fogR=haze[0], fogG=haze[1], fogB=haze[2];
@@ -11863,11 +11897,13 @@ Interpreter::Interpreter() {
                         zbuf[i] = z - 0.001;  // 玻璃不遮挡后面的不透明物，但保留近层
                         continue;
                     }
-                    double rr = cb*lit*shade, gg = cg*lit*shade, bb = cr*lit*shade;
+                    double rr = cb*kd*lit*shade + spec*lb*255.0*shade;
+                    double gg = cg*kd*lit*shade + spec*lg*255.0*shade;
+                    double bb = cr*kd*lit*shade + spec*lr*255.0*shade;
                     rr = rr*(1-fog) + fogR*fog; gg = gg*(1-fog) + fogG*fog; bb = bb*(1-fog) + fogB*fog;
-                    pw.back[i*3]=(unsigned char)std::min(255.0,rr + spec*220);
-                    pw.back[i*3+1]=(unsigned char)std::min(255.0,gg + spec*220);
-                    pw.back[i*3+2]=(unsigned char)std::min(255.0,bb + spec*220);
+                    pw.back[i*3]=(unsigned char)std::min(255.0,std::max(0.0,rr));
+                    pw.back[i*3+1]=(unsigned char)std::min(255.0,std::max(0.0,gg));
+                    pw.back[i*3+2]=(unsigned char)std::min(255.0,std::max(0.0,bb));
                 }
             };
             buildShadowMap();
