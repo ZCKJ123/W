@@ -2386,6 +2386,32 @@ static const char* WEN_SOURCE_SUFFIXES[] = {".脚本", ".程序", ".wen"};
 static bool gNoFast = false;
 static size_t gBigMaxDigits = 50000000;
 static std::set<string> gAdminPerms;
+static string readEnvUtf8(const char* name) {
+#ifdef _WIN32
+    int wn = MultiByteToWideChar(CP_UTF8, 0, name, -1, nullptr, 0);
+    if (wn <= 1) return "";
+    std::wstring w((size_t)wn, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, name, -1, w.data(), wn);
+    DWORD n = GetEnvironmentVariableW(w.c_str(), nullptr, 0);
+    if (!n) return "";
+    std::wstring v((size_t)n, L'\0');
+    DWORD got = GetEnvironmentVariableW(w.c_str(), v.data(), n);
+    if (!got) return "";
+    v.resize(got);
+    int bytes = WideCharToMultiByte(CP_UTF8, 0, v.data(), (int)v.size(), nullptr, 0, nullptr, nullptr);
+    string out((size_t)bytes, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, v.data(), (int)v.size(), out.data(), bytes, nullptr, nullptr);
+    return out;
+#else
+    const char* v = std::getenv(name);
+    return v ? v : "";
+#endif
+}
+static string readEnvToken(const char* cn, const char* en) {
+    string v = readEnvUtf8(cn);
+    if (!v.empty()) return v;
+    return readEnvUtf8(en);
+}
 static int gPiDigits = 50;
 static long long gExecuted = 0;
 static size_t gMemoryMaxBytes = 64 * 1024 * 1024;
@@ -9739,8 +9765,10 @@ Interpreter::Interpreter() {
         return vList(l);
     });
     registerBuiltin("申请管理员", 1, 1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
-        const char* env = std::getenv("WEN_ADMIN_TOKEN");
-        string token = env ? env : "";
+#ifndef WEN_ADMIN_BUILD
+        throw WenError("权限错误", line, 0, "此发行版不包含管理员功能；需要开发者构建");
+#else
+        string token = readEnvToken("文_管理员口令", "WEN_ADMIN_TOKEN");
         if (token.empty())
             throw WenError("权限错误", line, 0,
                            "未配置管理员口令：先设置中文变量「文_管理员口令」");
@@ -9748,6 +9776,7 @@ Interpreter::Interpreter() {
             throw WenError("权限错误", line, 0, "管理员口令不正确");
         adminGranted = true;
         return vBool(true);
+#endif
     });
     registerBuiltin("是否管理员", 0, 0, [this](Interpreter&, vector<Value>&, int) -> Value {
         return vBool(adminGranted);
@@ -9792,9 +9821,14 @@ Interpreter::Interpreter() {
         auto perms = std::make_shared<List>();
         for (const auto& s : gAdminPerms) perms->items.push_back(vStr(s));
         d->items["授权"] = vList(perms);
-        const char* cn = std::getenv("文_管理员口令");
-        const char* en = std::getenv("WEN_ADMIN_TOKEN");
-        d->items["口令来源"] = vStr(cn && *cn ? "文_管理员口令" : (en && *en ? "旧版英文变量" : "未配置"));
+        string cn = readEnvUtf8("文_管理员口令");
+        string en = readEnvUtf8("WEN_ADMIN_TOKEN");
+        d->items["口令来源"] = vStr(!cn.empty() ? "文_管理员口令" : (!en.empty() ? "旧版英文变量" : "未配置"));
+#ifndef WEN_ADMIN_BUILD
+        d->items["发行版"] = vStr("普通版（无管理员）");
+#else
+        d->items["发行版"] = vStr("管理员构建");
+#endif
         return vDict(d);
     });
     registerBuiltin("沙盒状态", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
@@ -10431,8 +10465,8 @@ Interpreter::Interpreter() {
         return vDict(d);
     });
     registerBuiltin("安全管理员", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
-        const char* token = std::getenv("WEN_SECURITY_TOKEN");
-        if (!token || !*token) throw WenError("安全权限", line, 0, "未配置安全口令：先设置中文变量「文_安全口令」");
+        string token = readEnvToken("文_安全口令", "WEN_SECURITY_TOKEN");
+        if (token.empty()) throw WenError("安全权限", line, 0, "未配置安全口令：先设置中文变量「文_安全口令」");
         if (needStr(a[0], "安全管理员", line) != token)
             throw WenError("安全权限", line, 0, "安全管理员口令错误");
         gSecAdmin = true;
@@ -16287,6 +16321,7 @@ static string errorRule(const WenError& e) {
         return "runtime.error";
     }
     if (k == "文件错误") return "io.file";
+    if (k == "权限错误" && r.find("此发行版不包含管理员功能") != string::npos) return "permission.admin";
     if (k == "库冲突") return "lib.conflict";
     if (k == "兼容冲突") return "compat.target";
     return "error.generic";
@@ -16340,6 +16375,7 @@ static string errorSuggestion(const WenError& e) {
     if (rule == "runtime.index") return "检查下标范围；负下标从末尾算。";
     if (rule == "lex.unclosed_text") return "补上结尾引号；文本不能跨行。";
     if (rule == "io.file") return "检查路径、权限和目录是否存在。";
+    if (rule == "permission.admin") return "普通版不含管理员；开发者需用 -DWEN_ADMIN_BUILD 自行编译。";
     string r = e.what();
     if (r.find("运算符不能当名字") != string::npos || r.find("却遇到运算符") != string::npos)
         return "换一个不是运算符的名字，例如「相加」「平方算」。";

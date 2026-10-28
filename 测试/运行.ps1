@@ -90,8 +90,15 @@ if ($exampleFail -eq 0) { Write-Host ("通过：{0} 个示例" -f $examples.Coun
 # ---- 正确用例 ----
 Write-Host "`n== 用例 =="
 $caseDir = Join-Path $PSScriptRoot '用例'
+$skipAdmin = @('48管理员破坏.wen', '90管理员授权.wen')
+$skipped = 0
 foreach ($f in (Get-ChildItem $caseDir -Filter *.wen | Sort-Object Name)) {
     $total++
+    if ($skipAdmin -contains $f.Name) {
+        Write-Host ("跳过：{0}（普通版不含管理员）" -f $f.Name)
+        $skipped++
+        continue
+    }
     $expectedPath = [IO.Path]::ChangeExtension($f.FullName, '.期望')
     if (-not (Test-Path $expectedPath)) {
         Write-Host ("失败：{0} 缺少期望输出文件" -f $f.Name)
@@ -140,7 +147,7 @@ if (Test-Path $errorDir) {
     }
 }
 
-Write-Host ("`n通过 {0}/{1}" -f ($total - $fail), $total)
+Write-Host ("`n通过 {0}/{1}（跳过 {2}）" -f ($total - $fail - $skipped), $total, $skipped)
 if ($fail -gt 0) { exit 1 }
 & (Join-Path $PSScriptRoot '错误协议.ps1')
 if ($LASTEXITCODE -ne 0) { exit 1 }
