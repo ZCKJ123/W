@@ -11942,35 +11942,45 @@ Interpreter::Interpreter() {
                     double xx=pdot(d,r), yy=pdot(d,u); double fl=(double)h*0.95;
                     sx=w*0.5+xx*fl/zz; sy=h*0.5-yy*fl/zz; return true;
                 };
-                // 粒子先累加成屏幕密度场，再统一做体积吸收，避免一颗颗圆点
-                vector<float> den((size_t)w*h, 0.0f), colr((size_t)w*h, 0.0f), colg((size_t)w*h, 0.0f), colb((size_t)w*h, 0.0f);
+                // 半分辨率密度场：粒子累加 → 梯度明暗 → 上采样合成
+                int dw=(w+1)/2, dh=(h+1)/2;
+                vector<float> den((size_t)dw*dh, 0.0f), colr((size_t)dw*dh, 0.0f), colg((size_t)dw*dh, 0.0f), colb((size_t)dw*dh, 0.0f);
                 for (const auto& pt : parts) {
                     double sx,sy,zz;
                     if (!pj(pt.p,sx,sy,zz)) continue;
-                    double rad = std::max(3.0, std::min(120.0, 360.0/zz));
+                    sx *= 0.5; sy *= 0.5;
+                    double rad = std::max(1.0, std::min(60.0, 180.0/zz));
                     double cr = (pt.layer ? 220 : 205) * (0.62 + 0.38*pt.shade);
                     double cg = (pt.layer ? 225 : 210) * (0.62 + 0.38*pt.shade);
                     double cb = (pt.layer ? 240 : 220) * (0.62 + 0.38*pt.shade);
                     double wgt = pt.d * (pt.layer ? 0.55 : 1.0);
                     int x0=(int)(sx-rad), x1=(int)(sx+rad), y0=(int)(sy-rad), y1=(int)(sy+rad);
-                    if (x1<0||y1<0||x0>=w||y0>=h) continue;
-                    for (int y=std::max(0,y0); y<=std::min(h-1,y1); ++y) for (int x=std::max(0,x0); x<=std::min(w-1,x1); ++x) {
+                    if (x1<0||y1<0||x0>=dw||y0>=dh) continue;
+                    for (int y=std::max(0,y0); y<=std::min(dh-1,y1); ++y) for (int x=std::max(0,x0); x<=std::min(dw-1,x1); ++x) {
                         double dx=(x+0.5-sx)/rad, dy=(y+0.5-sy)/rad;
                         double fall=1.0-dx*dx-dy*dy; if (fall<=0) continue;
                         double g=fall*fall*wgt;
-                        size_t i=(size_t)y*w+x;
+                        size_t i=(size_t)y*dw+x;
                         den[i]+=g; colr[i]+=cr*g; colg[i]+=cg*g; colb[i]+=cb*g;
                     }
                 }
-                for (int y=0;y<h;++y) for (int x=0;x<w;++x) {
-                    size_t i=(size_t)y*w+x;
+                for (int y=0;y<dh;++y) for (int x=0;x<dw;++x) {
+                    size_t i=(size_t)y*dw+x;
                     if (den[i] <= 1e-5) continue;
                     double a = 1.0 - std::exp(-den[i] * 0.16);
                     double cr = colr[i]/den[i], cg = colg[i]/den[i], cb = colb[i]/den[i];
-                    size_t o=i*3;
-                    pw.back[o]  =(unsigned char)std::min(255.0,pw.back[o]*(1-a)+cb*a);
-                    pw.back[o+1]=(unsigned char)std::min(255.0,pw.back[o+1]*(1-a)+cg*a);
-                    pw.back[o+2]=(unsigned char)std::min(255.0,pw.back[o+2]*(1-a)+cr*a);
+                    // 密度梯度当作体积法线，给云底/云顶不同明暗
+                    double gx = (x+1<dw ? den[i+1] : den[i]) - (x>0 ? den[i-1] : den[i]);
+                    double gy = (y+1<dh ? den[i+dw] : den[i]) - (y>0 ? den[i-dw] : den[i]);
+                    double shade = 1.0 - 0.45*gy + 0.20*gx;
+                    shade = std::max(0.55, std::min(1.35, shade));
+                    cr*=shade; cg*=shade; cb*=shade;
+                    for (int yy=0; yy<2 && y*2+yy<h; ++yy) for (int xx=0; xx<2 && x*2+xx<w; ++xx) {
+                        size_t o=((size_t)(y*2+yy)*w+(x*2+xx))*3;
+                        pw.back[o]  =(unsigned char)std::min(255.0,pw.back[o]*(1-a)+cb*a);
+                        pw.back[o+1]=(unsigned char)std::min(255.0,pw.back[o+1]*(1-a)+cg*a);
+                        pw.back[o+2]=(unsigned char)std::min(255.0,pw.back[o+2]*(1-a)+cr*a);
+                    }
                 }
             }
             if (!useParticleClouds) {
