@@ -11622,6 +11622,7 @@ Interpreter::Interpreter() {
                 if (atmo.sun < 0.99) { r *= atmo.sun; g *= atmo.sun; b *= atmo.sun; }
                 return std::array<double,3>{r,g,b};
             };
+            std::fill(pw.back.begin(), pw.back.end(), 0);
             for (int y=0;y<h;y+=2) {
                 double ny = -((double)y + 1.0 - h*0.5) / ((double)h*0.95);
                 for (int x=0;x<w;x+=2) {
@@ -11811,29 +11812,40 @@ Interpreter::Interpreter() {
                     }
                 }
             }
+            auto crom = [](double t) {
+                t = std::fabs(t);
+                if (t < 1.0) return 1.5*t*t*t - 2.5*t*t + 1.0;
+                if (t < 2.0) return -0.5*t*t*t + 2.5*t*t - 4.0*t + 2.0;
+                return 0.0;
+            };
             for (int y=0;y<h;++y) for (int x=0;x<w;++x) {
                 double sx = (x + 0.5) * cw / w - 0.5;
                 double sy = (y + 0.5) * ch / h - 0.5;
-                int x0=std::max(0,std::min(cw-1,(int)std::floor(sx))), y0=std::max(0,std::min(ch-1,(int)std::floor(sy)));
-                int x1=std::max(0,std::min(cw-1,x0+1)), y1=std::max(0,std::min(ch-1,y0+1));
-                double fx=sx-x0, fy=sy-y0;
-                auto sample = [&](int xx,int yy) -> size_t { return ((size_t)yy*cw+xx)*4; };
-                size_t i00=sample(x0,y0), i10=sample(x1,y0), i01=sample(x0,y1), i11=sample(x1,y1);
-                double a00=cloudBuf[i00+3], a10=cloudBuf[i10+3], a01=cloudBuf[i01+3], a11=cloudBuf[i11+3];
-                double a = (a00*(1-fx)*(1-fy)+a10*fx*(1-fy)+a01*(1-fx)*fy+a11*fx*fy)/255.0;
-                // 全分辨率细节噪声：打散低分辨率放大的块状边缘
-                a *= 0.88 + 0.24 * hash3(x*1.31, y*1.17, 7.0);
+                int ix = (int)std::floor(sx), iy = (int)std::floor(sy);
+                double fx = sx - ix, fy = sy - iy;
+                double wx[4], wy[4];
+                for (int k=0;k<4;++k) { wx[k]=crom(k-1-fx); wy[k]=crom(k-1-fy); }
+                double a=0, cr=0, cg=0, cb=0;
+                for (int yy=0;yy<4;++yy) for (int xx=0;xx<4;++xx) {
+                    int px = std::max(0,std::min(cw-1, ix+xx-1));
+                    int py = std::max(0,std::min(ch-1, iy+yy-1));
+                    double wgt = wx[xx]*wy[yy];
+                    size_t si=((size_t)py*cw+px)*4;
+                    double aa = cloudBuf[si+3]/255.0;
+                    a += aa*wgt;
+                    cr += cloudBuf[si+2]/255.0*aa*wgt;
+                    cg += cloudBuf[si+1]/255.0*aa*wgt;
+                    cb += cloudBuf[si+0]/255.0*aa*wgt;
+                }
                 if (a <= 0.002) continue;
-                auto mixc = [&](int offset) {
-                    return (cloudBuf[i00+offset]*(1-fx)*(1-fy)+cloudBuf[i10+offset]*fx*(1-fy)+
-                            cloudBuf[i01+offset]*(1-fx)*fy+cloudBuf[i11+offset]*fx*fy);
-                };
+                cr/=a; cg/=a; cb/=a;
+                // 全分辨率细节扰动，压掉重建后的塑料边
+                a *= 0.90 + 0.20 * hash3(x*1.31, y*1.17, 7.0);
                 size_t i=((size_t)y*w+x)*3;
-                pw.back[i]   = (unsigned char)(pw.back[i]*(1-a) + mixc(2)*a);
-                pw.back[i+1] = (unsigned char)(pw.back[i+1]*(1-a) + mixc(1)*a);
-                pw.back[i+2] = (unsigned char)(pw.back[i+2]*(1-a) + mixc(0)*a);
+                pw.back[i]   = (unsigned char)std::min(255.0, pw.back[i]*(1-a) + cb*255*a);
+                pw.back[i+1] = (unsigned char)std::min(255.0, pw.back[i+1]*(1-a) + cg*255*a);
+                pw.back[i+2] = (unsigned char)std::min(255.0, pw.back[i+2]*(1-a) + cr*255*a);
             }
-            std::fill(pw.back.begin(), pw.back.end(), 0);
             zbuf.assign((size_t)w*h, 1e30);
             auto project=[&](PVec p, double& sx, double& sy, double& z)->bool{
                 PVec d=psub(p,cam); double zz=pdot(d,f); if(zz<=0.08) return false;
