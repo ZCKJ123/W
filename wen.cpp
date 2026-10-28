@@ -39,6 +39,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <mmsystem.h>
 #include <imm.h>
 #include <shellapi.h>
 #include <psapi.h>
@@ -3555,7 +3556,7 @@ static const std::map<string, string>& functionModules() {
         {"新建神经层", "神经网络库"}, {"神经链", "神经网络库"}, {"前向", "神经网络库"},
         {"颜色", "视口库"}, {"新建视口", "视口库"}, {"视口清空", "视口库"}, {"视口画点", "视口库"},
         {"视口画线", "视口库"}, {"视口画三角形", "视口库"}, {"视口尺寸", "视口库"}, {"视口保存", "视口库"},
-        {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"}, {"视口显示", "视口库"}, {"玩家视口", "视口库"}, {"大气预设", "视口库"}, {"网格新建", "三维库"}, {"网格三角", "三维库"}, {"网格平移", "三维库"}, {"网格缩放", "三维库"}, {"网格旋转", "三维库"}, {"网格合并", "三维库"}, {"网格三角形数", "三维库"}, {"视口加载模型", "视口库"}, {"光追渲染", "视口库"}, {"体积云渲染", "视口库"}, {"材质检查", "视口库"}, {"材质预设", "视口库"}, {"视口取色", "视口库"},
+        {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"}, {"视口显示", "视口库"}, {"玩家视口", "视口库"}, {"大气预设", "视口库"}, {"媒体信息", "媒体库"}, {"媒体播放", "媒体库"}, {"媒体停止", "媒体库"}, {"音频设备", "媒体库"}, {"音频录制", "媒体库"}, {"音频兼容检查", "媒体库"}, {"媒体格式支持", "媒体库"}, {"网格新建", "三维库"}, {"网格三角", "三维库"}, {"网格平移", "三维库"}, {"网格缩放", "三维库"}, {"网格旋转", "三维库"}, {"网格合并", "三维库"}, {"网格三角形数", "三维库"}, {"视口加载模型", "视口库"}, {"光追渲染", "视口库"}, {"体积云渲染", "视口库"}, {"材质检查", "视口库"}, {"材质预设", "视口库"}, {"视口取色", "视口库"},
         {"硬件信息", "硬件库"}, {"高精度计时", "硬件库"}, {"内存状态", "硬件库"}, {"屏幕尺寸", "硬件库"}, {"磁盘空间", "硬件库"},
         {"大整数幂", "大整数库"}, {"大整数乘", "大整数库"}, {"大整数加", "大整数库"}, {"大整数阶乘", "大整数库"},
         {"阶乘位数", "大整数库"}, {"阶乘末尾零", "大整数库"}, {"阶乘概览", "大整数库"},
@@ -9764,6 +9765,145 @@ Interpreter::Interpreter() {
         auto l = std::make_shared<List>();
         for (const char* suf : WEN_SOURCE_SUFFIXES) l->items.push_back(vStr(suf));
         return vList(l);
+    });
+    // ---------- 媒体库：WAV 录制 / MP3/MP4 探测与 MCI 播放 ----------
+    static std::map<string,string> gMediaAliases;
+    registerBuiltin("音频设备", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+        auto d = std::make_shared<Dict>();
+        UINT n = waveInGetNumDevs();
+        d->items["数量"] = vNum((double)n);
+        auto list = std::make_shared<List>();
+        for (UINT i=0;i<n;++i) {
+            WAVEINCAPSW caps{};
+            if (waveInGetDevCapsW(i,&caps,sizeof(caps)) == MMSYSERR_NOERROR)
+                list->items.push_back(vStr(wideToUtf8(caps.szPname)));
+        }
+        d->items["设备"] = vList(list);
+        return vDict(d);
+    });
+    registerBuiltin("音频录制", 1, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path = needStr(a[0], "音频录制", line);
+        double seconds = a.size() >= 2 ? needNum(a[1], "音频录制", line) : 3.0;
+        int rate = a.size() >= 3 ? (int)needIndex(a[2], "音频录制", line) : 44100;
+        seconds = std::max(0.2, std::min(30.0, seconds));
+        rate = std::max(8000, std::min(48000, rate));
+        if (waveInGetNumDevs() == 0)
+            throw WenError("媒体错误", line, 0, "没有录音设备");
+        WAVEFORMATEX fmt{};
+        fmt.wFormatTag = WAVE_FORMAT_PCM; fmt.nChannels = 1;
+        fmt.nSamplesPerSec = (DWORD)rate; fmt.wBitsPerSample = 16;
+        fmt.nBlockAlign = 2; fmt.nAvgBytesPerSec = (DWORD)rate * 2;
+        HWAVEIN in = nullptr;
+        if (waveInOpen(&in, WAVE_MAPPER, &fmt, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR)
+            throw WenError("媒体错误", line, 0, "打不开录音设备");
+        size_t frames = (size_t)(seconds * rate);
+        vector<short> pcm(frames, 0);
+        WAVEHDR hdr{};
+        hdr.lpData = (LPSTR)pcm.data();
+        hdr.dwBufferLength = (DWORD)(pcm.size()*2);
+        waveInPrepareHeader(in, &hdr, sizeof(hdr));
+        waveInAddBuffer(in, &hdr, sizeof(hdr));
+        waveInStart(in);
+        std::this_thread::sleep_for(std::chrono::milliseconds((int)(seconds*1000)));
+        waveInStop(in);
+        waveInReset(in);
+        waveInUnprepareHeader(in, &hdr, sizeof(hdr));
+        waveInClose(in);
+        size_t dataBytes = (size_t)hdr.dwBytesRecorded;
+        if (dataBytes == 0) dataBytes = pcm.size()*2;
+        vector<unsigned char> wav(44 + dataBytes, 0);
+        auto put32 = [&](size_t off, uint32_t v) { for(int i=0;i<4;++i) wav[off+i]=(unsigned char)((v>>(8*i))&255); };
+        auto put16 = [&](size_t off, uint16_t v) { wav[off]=(unsigned char)(v&255); wav[off+1]=(unsigned char)((v>>8)&255); };
+        memcpy(wav.data(), "RIFF", 4); put32(4, (uint32_t)(36 + dataBytes));
+        memcpy(wav.data()+8, "WAVEfmt ", 8); put32(16, 16); put16(20, 1); put16(22, 1);
+        put32(24, (uint32_t)rate); put32(28, (uint32_t)rate*2); put16(32, 2); put16(34, 16);
+        memcpy(wav.data()+36, "data", 4); put32(40, (uint32_t)dataBytes);
+        memcpy(wav.data()+44, pcm.data(), std::min(dataBytes, pcm.size()*2));
+        try { writeWholeFile(resolveWenPath(path), string((char*)wav.data(), wav.size()), false); }
+        catch (IoError& e) { throw WenError("文件错误", line, 0, e.what()); }
+        auto d = std::make_shared<Dict>();
+        d->items["文件"] = vStr(path); d->items["秒"] = vNum(seconds);
+        d->items["采样率"] = vNum(rate); d->items["字节"] = vNum((double)wav.size());
+        return vDict(d);
+    });
+    auto mediaFormat = [](const string& p) {
+        string e = lowerAscii(fs::u8path(p).extension().u8string());
+        if (!e.empty() && e[0]=='.') e=e.substr(1);
+        return e;
+    };
+    registerBuiltin("音频兼容检查", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string p = needStr(a[0], "音频兼容检查", line);
+        string e = lowerAscii(fs::u8path(p).extension().u8string());
+        if (!e.empty() && e[0]=='.') e=e.substr(1);
+        auto d = std::make_shared<Dict>();
+        d->items["格式"] = vStr(e.empty() ? "未知" : e);
+        bool ok = e=="wav" || e=="mp3" || e=="m4a" || e=="aac" || e=="flac" || e=="ogg";
+        d->items["支持"] = vBool(ok);
+        d->items["方式"] = vStr(e=="wav" ? "PCM/WAV 直读" : "MCI/DirectShow 解码");
+        return vDict(d);
+    });
+    registerBuiltin("媒体格式支持", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+        auto l = std::make_shared<List>();
+        for (const char* s : {"wav","mp3","mp4","m4a","aac","avi","mkv","flac","ogg","webm"})
+            l->items.push_back(vStr(s));
+        return vList(l);
+    });
+    registerBuiltin("媒体信息", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path = needStr(a[0], "媒体信息", line);
+        string full = resolveWenPath(path);
+        std::error_code ec;
+        if (!fs::exists(fs::u8path(full), ec))
+            throw WenError("文件错误", line, 0, "媒体文件不存在：" + path);
+        string ext = lowerAscii(fs::u8path(full).extension().u8string());
+        if (!ext.empty() && ext[0]=='.') ext=ext.substr(1);
+        std::wstring wpath = utf8ToWide(full);
+        std::wstring alias = L"wenprobe" + std::to_wstring((long long)std::chrono::steady_clock::now().time_since_epoch().count());
+        std::wstring cmd = L"open \"" + wpath + L"\" type mpegvideo alias " + alias;
+        wchar_t err[512]{};
+        MCIERROR rc = mciSendStringW(cmd.c_str(), nullptr, 0, nullptr);
+        if (rc) {
+            cmd = L"open \"" + wpath + L"\" alias " + alias;
+            rc = mciSendStringW(cmd.c_str(), nullptr, 0, nullptr);
+        }
+        long long ms = -1;
+        if (!rc) {
+            wchar_t buf[128]{}; std::wstring st = L"status " + alias + L" length";
+            if (mciSendStringW(st.c_str(), buf, 128, nullptr) == 0) ms = _wtoi64(buf);
+            std::wstring close = L"close " + alias;
+            mciSendStringW(close.c_str(), nullptr, 0, nullptr);
+        }
+        auto d = std::make_shared<Dict>();
+        d->items["文件"] = vStr(path); d->items["格式"] = vStr(ext.empty()?"未知":ext);
+        d->items["字节"] = vNum((double)fs::file_size(fs::u8path(full), ec));
+        d->items["毫秒"] = vNum((double)ms); d->items["秒"] = vNum(ms >= 0 ? ms/1000.0 : -1.0);
+        d->items["可播放"] = vBool(ms >= 0);
+        return vDict(d);
+    });
+    registerBuiltin("媒体播放", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path = needStr(a[0], "媒体播放", line);
+        string full = resolveWenPath(path);
+        if (!fs::exists(fs::u8path(full))) throw WenError("文件错误", line, 0, "媒体文件不存在：" + path);
+        string alias = "wenmedia" + std::to_string((long long)std::chrono::steady_clock::now().time_since_epoch().count());
+        std::wstring walias = utf8ToWide(alias);
+        std::wstring cmd = L"open \"" + utf8ToWide(full) + L"\" type mpegvideo alias " + walias;
+        if (mciSendStringW(cmd.c_str(), nullptr, 0, nullptr) != 0) {
+            cmd = L"open \"" + utf8ToWide(full) + L"\" alias " + walias;
+            if (mciSendStringW(cmd.c_str(), nullptr, 0, nullptr) != 0)
+                throw WenError("媒体错误", line, 0, "MCI 打不开媒体：" + path);
+        }
+        std::wstring play = L"play " + walias;
+        mciSendStringW(play.c_str(), nullptr, 0, nullptr);
+        gMediaAliases[alias] = alias;
+        return vStr(alias);
+    });
+    registerBuiltin("媒体停止", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+        int n = 0;
+        for (const auto& kv : gMediaAliases) {
+            std::wstring close = L"close " + utf8ToWide(kv.second);
+            if (mciSendStringW(close.c_str(), nullptr, 0, nullptr) == 0) ++n;
+        }
+        gMediaAliases.clear();
+        return vNum(n);
     });
     registerBuiltin("申请管理员", 1, 1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
 #ifndef WEN_ADMIN_BUILD
