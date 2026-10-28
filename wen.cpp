@@ -3532,7 +3532,7 @@ static const std::map<string, string>& functionModules() {
         {"新建神经层", "神经网络库"}, {"神经链", "神经网络库"}, {"前向", "神经网络库"},
         {"颜色", "视口库"}, {"新建视口", "视口库"}, {"视口清空", "视口库"}, {"视口画点", "视口库"},
         {"视口画线", "视口库"}, {"视口画三角形", "视口库"}, {"视口尺寸", "视口库"}, {"视口保存", "视口库"},
-        {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"}, {"视口显示", "视口库"}, {"玩家视口", "视口库"}, {"视口加载模型", "视口库"}, {"光追渲染", "视口库"}, {"材质检查", "视口库"}, {"材质预设", "视口库"}, {"视口取色", "视口库"},
+        {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"}, {"视口显示", "视口库"}, {"玩家视口", "视口库"}, {"网格新建", "三维库"}, {"网格三角", "三维库"}, {"网格平移", "三维库"}, {"网格缩放", "三维库"}, {"网格旋转", "三维库"}, {"网格合并", "三维库"}, {"网格三角形数", "三维库"}, {"视口加载模型", "视口库"}, {"光追渲染", "视口库"}, {"材质检查", "视口库"}, {"材质预设", "视口库"}, {"视口取色", "视口库"},
         {"硬件信息", "硬件库"}, {"高精度计时", "硬件库"}, {"内存状态", "硬件库"}, {"屏幕尺寸", "硬件库"}, {"磁盘空间", "硬件库"},
         {"大整数幂", "大整数库"}, {"大整数乘", "大整数库"}, {"大整数加", "大整数库"}, {"大整数阶乘", "大整数库"},
         {"阶乘位数", "大整数库"}, {"阶乘末尾零", "大整数库"}, {"阶乘概览", "大整数库"},
@@ -11043,6 +11043,99 @@ Interpreter::Interpreter() {
         }
         return a[0];
     });
+    registerBuiltin("网格新建", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+        auto d = std::make_shared<Dict>();
+        d->items["类型"] = vStr("网格");
+        d->items["三角形"] = vList(std::make_shared<List>());
+        return vDict(d);
+    });
+    registerBuiltin("网格三角", 5, 7, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto d = needDict(a[0], "网格三角", line);
+        auto li = d->items.find("三角形");
+        if (li == d->items.end() || li->second.type != VT::List)
+            throw WenError("运行时错误", line, 0, "不是网格");
+        auto pt = [&](const Value& v, const string& what) {
+            auto l = needList(v, what, line);
+            if (l->items.size() != 3)
+                throw WenError("运行时错误", line, 0, what + " 必须是 [x,y,z]");
+            return v;
+        };
+        long long col = (long long)needNum(a[4], "颜色", line);
+        double metal = a.size() >= 6 ? needNum(a[5], "金属度", line) : 0.0;
+        double rough = a.size() >= 7 ? needNum(a[6], "粗糙度", line) : 0.8;
+        auto tri = std::make_shared<Dict>();
+        auto pts = std::make_shared<List>();
+        pts->items.push_back(pt(a[1], "顶点 A"));
+        pts->items.push_back(pt(a[2], "顶点 B"));
+        pts->items.push_back(pt(a[3], "顶点 C"));
+        tri->items["点"] = vList(pts);
+        tri->items["颜色"] = vNum((double)(col & 0xFFFFFF));
+        tri->items["金属度"] = vNum(std::max(0.0, std::min(1.0, metal)));
+        tri->items["粗糙度"] = vNum(std::max(0.02, std::min(1.0, rough)));
+        li->second.list->items.push_back(vDict(tri));
+        return a[0];
+    });
+    registerBuiltin("网格三角形数", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto d = needDict(a[0], "网格三角形数", line);
+        auto li = d->items.find("三角形");
+        if (li == d->items.end() || li->second.type != VT::List)
+            throw WenError("运行时错误", line, 0, "不是网格");
+        return vNum((double)li->second.list->items.size());
+    });
+    registerBuiltin("网格平移", 4, 4, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto d = needDict(a[0], "网格平移", line);
+        double dx=needNum(a[1],"dx",line), dy=needNum(a[2],"dy",line), dz=needNum(a[3],"dz",line);
+        auto li = d->items.find("三角形");
+        if (li == d->items.end() || li->second.type != VT::List) throw WenError("运行时错误",line,0,"不是网格");
+        for (auto& tv : li->second.list->items) {
+            auto t = needDict(tv,"网格",line);
+            auto& pts = t->items["点"].list->items;
+            for (auto& pv : pts) {
+                auto& q = pv.list->items;
+                q[0].num += dx; q[1].num += dy; q[2].num += dz;
+            }
+        }
+        return a[0];
+    });
+    registerBuiltin("网格缩放", 4, 4, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto d = needDict(a[0], "网格缩放", line);
+        double sx=needNum(a[1],"sx",line), sy=needNum(a[2],"sy",line), sz=needNum(a[3],"sz",line);
+        auto li = d->items.find("三角形");
+        if (li == d->items.end() || li->second.type != VT::List) throw WenError("运行时错误",line,0,"不是网格");
+        for (auto& tv : li->second.list->items) {
+            auto t = needDict(tv,"网格",line);
+            for (auto& pv : t->items["点"].list->items) {
+                auto& q = pv.list->items;
+                q[0].num *= sx; q[1].num *= sy; q[2].num *= sz;
+            }
+        }
+        return a[0];
+    });
+    registerBuiltin("网格旋转", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto d = needDict(a[0], "网格旋转", line);
+        double ang = needNum(a[1], "角度", line);
+        double c=std::cos(ang), s=std::sin(ang);
+        auto li = d->items.find("三角形");
+        if (li == d->items.end() || li->second.type != VT::List) throw WenError("运行时错误",line,0,"不是网格");
+        for (auto& tv : li->second.list->items) {
+            auto t = needDict(tv,"网格",line);
+            for (auto& pv : t->items["点"].list->items) {
+                auto& q = pv.list->items;
+                double x=q[0].num, z=q[2].num;
+                q[0].num = x*c - z*s; q[2].num = x*s + z*c;
+            }
+        }
+        return a[0];
+    });
+    registerBuiltin("网格合并", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto dst = needDict(a[0],"网格合并",line);
+        auto src = needDict(a[1],"网格合并",line);
+        auto dl = dst->items.find("三角形"), sl = src->items.find("三角形");
+        if (dl == dst->items.end() || sl == src->items.end() || dl->second.type != VT::List || sl->second.type != VT::List)
+            throw WenError("运行时错误",line,0,"不是网格");
+        for (auto& v : sl->second.list->items) dl->second.list->items.push_back(v);
+        return a[0];
+    });
     registerBuiltin("玩家视口", 2, 6, [](Interpreter&, vector<Value>& a, int line) -> Value {
 #ifdef _WIN32
         int w = std::max(320, std::min(1280, (int)needNum(a[0], "玩家视口", line)));
@@ -11095,6 +11188,29 @@ Interpreter::Interpreter() {
             auto list = needList(*sceneArg, "玩家视口场景", line);
             for (const auto& it : list->items) {
                 auto d = needDict(it, "玩家视口场景", line);
+                auto ki0 = d->items.find("类型");
+                string kind0 = ki0 != d->items.end() ? needStr(ki0->second, "类型", line) : "方块";
+                if (kind0 == "网格") {
+                    auto tl = d->items.find("三角形");
+                    if (tl == d->items.end() || tl->second.type != VT::List)
+                        throw WenError("运行时错误", line, 0, "网格缺三角形");
+                    for (auto& tv : tl->second.list->items) {
+                        auto td = needDict(tv, "三角形", line);
+                        auto pl = needList(td->items["点"], "点", line);
+                        if (pl->items.size() != 3) throw WenError("运行时错误", line, 0, "三角形必须 3 点");
+                        PVec vv[3];
+                        for (int k=0;k<3;++k) {
+                            auto q = needList(pl->items[k], "点", line);
+                            if (q->items.size()!=3) throw WenError("运行时错误", line, 0, "点必须是 [x,y,z]");
+                            vv[k] = {needNum(q->items[0],"x",line), needNum(q->items[1],"y",line), needNum(q->items[2],"z",line)};
+                        }
+                        unsigned cc = (unsigned)vpColor(td->items["颜色"], line);
+                        double mm = td->items.count("金属度") ? needNum(td->items["金属度"],"金属度",line) : 0.0;
+                        double rr = td->items.count("粗糙度") ? needNum(td->items["粗糙度"],"粗糙度",line) : 0.8;
+                        cubes.push_back({vv[0],vv[1],vv[2],cc,mm,rr,0,false});
+                    }
+                    continue;
+                }
                 PVec c{0, 0.8, -3}; double s = 0.8; unsigned col = 0xd05040;
                 auto pi = d->items.find("位置");
                 if (pi != d->items.end()) {
