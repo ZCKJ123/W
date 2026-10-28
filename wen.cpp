@@ -2392,6 +2392,7 @@ static std::set<string> gAdminPerms;
 static int gPiDigits = 50;
 static long long gExecuted = 0;
 static size_t gMemoryMaxBytes = 64 * 1024 * 1024;
+static int gCpuThreadLimit = 0;  // 0 = 自动
 static long long gTotal = 0;
 static int gLastLine = 0;
 static std::map<string, Value> gPoints;
@@ -3543,7 +3544,7 @@ static const std::map<string, string>& functionModules() {
         {"反二进制", "兼容库"}, {"暴力还原", "兼容库"},
 
         // CPU / GPU
-        {"CPU核心数", "CPU库"}, {"CPU并行求和", "CPU库"}, {"CPU并行最大", "CPU库"},
+        {"CPU核心数", "CPU库"}, {"CPU线程数", "CPU库"}, {"CPU使用率", "CPU库"}, {"CPU让出", "CPU库"}, {"CPU并行求和", "CPU库"}, {"CPU并行最大", "CPU库"},
         {"CPU并行最小", "CPU库"},
 
         // 内存库
@@ -3693,6 +3694,27 @@ public:
     std::map<string, Value> memoryTemp;   // 内存库：临时
     std::map<string, string> memoryCompressed;  // 内存库：压缩区
     std::map<string, size_t> memoryOrigSize;    // 压缩前字节数
+
+    size_t memoryUsageBytes() const {
+        size_t bytes = 0;
+        for (const auto& kv : memoryStore) bytes += toText(kv.second, true).size();
+        for (const auto& kv : memoryTemp) bytes += toText(kv.second, true).size();
+        for (const auto& kv : memoryCompressed) bytes += kv.second.size();
+        return bytes;
+    }
+    void memoryPut(const string& key, bool temp, const Value& v, int line) {
+        size_t need = toText(v, true).size();
+        if (!temp) memoryStore.erase(key); else memoryTemp.erase(key);
+        while (memoryUsageBytes() + need > gMemoryMaxBytes) {
+            if (!memoryTemp.empty()) memoryTemp.erase(memoryTemp.begin());
+            else if (!memoryCompressed.empty()) memoryCompressed.erase(memoryCompressed.begin());
+            else if (!memoryStore.empty()) memoryStore.erase(memoryStore.begin());
+            else break;
+        }
+        if (memoryUsageBytes() + need > gMemoryMaxBytes)
+            throw WenError("运行时错误", line, 0, "内存超过上限；调大「内存上限」或清理键");
+        if (temp) memoryTemp[key] = v; else memoryStore[key] = v;
+    }
     std::vector<string> memoryDict;             // 符号字典
     std::map<string, int> memoryDictIndex;
     bool memoryAuto = false;             // 内存库：用户函数自动缓存
@@ -4781,7 +4803,7 @@ Value Interpreter::callValue(const Value& callee, vector<Value>& args, int line)
                 string raw = decompressMemoryText(cit->second, line);
                 JsonReader reader(raw, line);
                 Value v = reader.parse();
-                memoryStore[key] = v;
+                memoryPut(key, false, v, line);
                 memoryCompressed.erase(cit);
                 memoryOrigSize.erase(key);
                 ++memoryHits;
@@ -4796,7 +4818,7 @@ Value Interpreter::callValue(const Value& callee, vector<Value>& args, int line)
                     memoryOrigSize[key] = raw.size();
                     memoryCompressed[key] = compressMemoryText(raw);
                 } else {
-                    memoryStore[key] = out;
+                    memoryPut(key, false, out, line);
                 }
             }
             return out;
@@ -5209,6 +5231,7 @@ static VpWindowData* gVpWin = nullptr;struct PlayerWin {
     bool keys[256] = {};
     bool closed = false;
     bool capture = false;
+    bool justCaptured = false;
     int mdx = 0, mdy = 0;
     int lastX = -1, lastY = -1;
     HDC glDC = nullptr;
@@ -5240,7 +5263,8 @@ static LRESULT CALLBACK playerWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     if (msg == WM_LBUTTONDOWN) {
         if (gPlayer) {
             playerForceFocus(hwnd);
-            gPlayer->capture = true; SetCapture(hwnd); ShowCursor(FALSE);
+            gPlayer->capture = true; gPlayer->justCaptured = true; gPlayer->mdx = gPlayer->mdy = 0;
+            gPlayer->lastX = gPlayer->lastY = -1; SetCapture(hwnd); ShowCursor(FALSE);
         }
         return 0;
     }
@@ -5258,6 +5282,13 @@ static LRESULT CALLBACK playerWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             POINT p; GetCursorPos(&p);
             RECT r; GetWindowRect(hwnd, &r);
             int cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2;
+            if (gPlayer->justCaptured) {
+                gPlayer->justCaptured = false;
+                gPlayer->mdx = gPlayer->mdy = 0;
+                SetCursorPos(cx, cy);
+                gPlayer->lastX = mx; gPlayer->lastY = my;
+                return 0;
+            }
             gPlayer->mdx += p.x - cx; gPlayer->mdy += p.y - cy;
             SetCursorPos(cx, cy);
         } else if (gPlayer->lastX >= 0) {
@@ -9093,7 +9124,7 @@ Interpreter::Interpreter() {
             memoryOrigSize[key] = raw.size();
             memoryCompressed[key] = compressMemoryText(raw);
         } else {
-            memoryStore[key] = a[1];
+            memoryPut(key, false, a[1], line);
         }
         return a[1];
     });
@@ -9132,7 +9163,7 @@ Interpreter::Interpreter() {
             string raw = decompressMemoryText(cit->second, line);
             JsonReader reader(raw, line);
             Value v = reader.parse();
-            memoryStore[key] = v;
+            memoryPut(key, false, v, line);
             memoryCompressed.erase(cit);
             memoryOrigSize.erase(key);
             ++memoryHits;
@@ -9178,7 +9209,7 @@ Interpreter::Interpreter() {
     });
     registerBuiltin("内存临时存", 2, 2, [this](Interpreter&, vector<Value>& a, int line) -> Value {
         string key = needStr(a[0], "内存临时存", line);
-        memoryTemp[key] = a[1];
+        memoryPut(key, true, a[1], line);
         return a[1];
     });
     registerBuiltin("内存临时取", 1, 2, [this](Interpreter&, vector<Value>& a, int line) -> Value {
@@ -9239,7 +9270,7 @@ Interpreter::Interpreter() {
         if (it == memoryCompressed.end()) return vBool(false);
         string raw = decompressMemoryText(it->second, line);
         JsonReader reader(raw, line);
-        memoryStore[key] = reader.parse();
+        memoryPut(key, false, reader.parse(), line);
         memoryCompressed.erase(it);
         memoryOrigSize.erase(key);
         return vBool(true);
@@ -9428,7 +9459,7 @@ Interpreter::Interpreter() {
             string raw = decompressMemoryText(cit->second, line);
             JsonReader reader(raw, line);
             Value v = reader.parse();
-            memoryStore[key] = v;
+            memoryPut(key, false, v, line);
             memoryCompressed.erase(cit);
             memoryOrigSize.erase(key);
             ++memoryHits;
@@ -9444,7 +9475,7 @@ Interpreter::Interpreter() {
                 memoryOrigSize[key] = raw.size();
                 memoryCompressed[key] = compressMemoryText(raw);
             } else {
-                memoryStore[key] = out;
+                memoryPut(key, false, out, line);
             }
         }
         return out;
@@ -10798,6 +10829,7 @@ Interpreter::Interpreter() {
             }
         };
         unsigned nt = std::max(2u, std::min(8u, std::thread::hardware_concurrency()));
+        if (gCpuThreadLimit > 0) nt = std::min(nt, (unsigned)gCpuThreadLimit);
         std::vector<std::thread> workers;
         for (unsigned k = 0; k < nt; ++k)
             workers.emplace_back(renderRows, h*(int)k/(int)nt, h*(int)(k+1)/(int)nt);
@@ -11124,6 +11156,8 @@ Interpreter::Interpreter() {
         } guard{pw, hwnd, presenter};
         vector<double> zbuf;
         long long frames = 0; double elapsed = 0;
+        double vy = 0; bool onGround = true;
+        auto lastFrame = std::chrono::steady_clock::now();
         auto t0 = std::chrono::steady_clock::now();
         while (!pw.closed && !(GetAsyncKeyState(VK_ESCAPE) & 0x8000) && !pw.keys[VK_ESCAPE]) {
             auto frameStart=std::chrono::steady_clock::now();
@@ -11261,6 +11295,21 @@ Interpreter::Interpreter() {
                 if(std::abs(x)<=1&&std::abs(y)<=1) continue;
                 size_t i=(size_t)(h/2+y)*w+(w/2+x); if(i*3+2<pw.back.size()){pw.back[i*3]=230;pw.back[i*3+1]=240;pw.back[i*3+2]=255;}
             }
+            // 屏幕空间环境光遮蔽：用深度差压暗角落，不做假全屏泛光。
+            for (int y = 1; y + 1 < h; ++y) for (int x = 1; x + 1 < w; ++x) {
+                size_t i = (size_t)y*w+x;
+                if (zbuf[i] > 1e29) continue;
+                double d = zbuf[i], occ = 0;
+                const int offs[4][2] = {{-1,0},{1,0},{0,-1},{0,1}};
+                for (auto& o : offs) {
+                    double nd = zbuf[(size_t)(y+o[1])*w + (x+o[0])];
+                    if (nd < 1e29 && nd > d + 0.08) occ += std::min(0.5, (nd-d)*0.25);
+                }
+                double ao = std::max(0.55, 1.0 - occ*0.35);
+                pw.back[i*3] = (unsigned char)(pw.back[i*3]*ao);
+                pw.back[i*3+1] = (unsigned char)(pw.back[i*3+1]*ao);
+                pw.back[i*3+2] = (unsigned char)(pw.back[i*3+2]*ao);
+            }
             {
                 std::lock_guard<std::mutex> lk(pw.mtx);
                 std::swap(pw.bgr, pw.back);
@@ -11277,8 +11326,9 @@ Interpreter::Interpreter() {
             }
             auto frameEnd=std::chrono::steady_clock::now();
             double frameMs=std::chrono::duration<double,std::milli>(frameEnd-frameStart).count();
-            if (frameMs < 1000.0/240.0)
-                std::this_thread::sleep_for(std::chrono::duration<double,std::milli>(1000.0/240.0-frameMs));
+            double targetMs = 1000.0 / std::max(60, pw.refreshRate.load());
+            if (frameMs < targetMs)
+                std::this_thread::sleep_for(std::chrono::duration<double,std::milli>(targetMs-frameMs));
         }
         pw.stop = true;
         if (GetCapture() == hwnd) ReleaseCapture();
@@ -11708,6 +11758,37 @@ Interpreter::Interpreter() {
     registerBuiltin("CPU核心数", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
         unsigned n = std::thread::hardware_concurrency();
         return vNum(n ? (double)n : 1);
+    });
+    registerBuiltin("CPU线程数", 0, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+        if (!a.empty()) {
+            int n = (int)needIndex(a[0], "CPU线程数", line);
+            gCpuThreadLimit = std::max(1, std::min((int)hw, n));
+        }
+        return vNum(gCpuThreadLimit > 0 ? gCpuThreadLimit : (int)hw);
+    });
+    registerBuiltin("CPU使用率", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
+#ifdef _WIN32
+        static ULONGLONG prevIdle = 0, prevKernel = 0, prevUser = 0;
+        FILETIME idle, kernel, user;
+        if (!GetSystemTimes(&idle, &kernel, &user)) return vNum(-1);
+        auto ft = [](const FILETIME& t) -> ULONGLONG {
+            ULARGE_INTEGER u; u.LowPart = t.dwLowDateTime; u.HighPart = t.dwHighDateTime; return u.QuadPart;
+        };
+        ULONGLONG i = ft(idle), k = ft(kernel), u = ft(user);
+        if (!prevIdle) { prevIdle=i; prevKernel=k; prevUser=u; return vNum(0); }
+        ULONGLONG di=i-prevIdle, dk=k-prevKernel, du=u-prevUser;
+        prevIdle=i; prevKernel=k; prevUser=u;
+        ULONGLONG total=dk+du;
+        return vNum(total ? (1.0 - (double)di/(double)total) * 100.0 : 0);
+#else
+        return vNum(-1);
+#endif
+    });
+    registerBuiltin("CPU让出", 0, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        int ms = a.empty() ? 1 : (int)needIndex(a[0], "CPU让出", line);
+        std::this_thread::sleep_for(std::chrono::milliseconds(std::max(0, std::min(ms, 1000))));
+        return vNone();
     });
     auto rangeLen = [](const Value& v) -> long long {
         double span = (v.rstop - v.rstart) / v.rstep;

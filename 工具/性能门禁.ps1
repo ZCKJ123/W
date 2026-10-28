@@ -113,7 +113,7 @@ $arithUs = $ta * 1000000.0 / 1000000.0
 $fnUs = $tf * 1000000.0 / 1000000.0
 $libUs = $tl * 1000000.0 / 1000000.0
 $bigOk = $tbig -lt 0.5
-$rayTarget = 240
+$rayTarget = if ($32) { 60 } else { 165 }
 $rayOk = $rayFps -ge $rayTarget
 $calcOk = ($arithUs -lt 35) -and ($fnUs -lt 35) -and ($libUs -lt 35) -and ($tp -lt 0.5)
 
