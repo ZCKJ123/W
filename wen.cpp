@@ -11198,7 +11198,7 @@ Interpreter::Interpreter() {
             }
             {
                 std::lock_guard<std::mutex> lk(pw.mtx);
-                std::swap(pw.back, pw.back);
+                std::swap(pw.bgr, pw.back);
             }
             ++frames;
             auto now=std::chrono::steady_clock::now();
