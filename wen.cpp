@@ -11275,6 +11275,13 @@ Interpreter::Interpreter() {
         if (name == "晴天") {
             d->items["云量"] = vNum(0.18);
             d->items["云底"] = vNum(10.0); d->items["云顶"] = vNum(13.0);
+        } else if (name == "阴天") {
+            d->items["云型"] = vStr("层云");
+            d->items["云量"] = vNum(0.98);
+            d->items["云底"] = vNum(3.5); d->items["云顶"] = vNum(9.0);
+            d->items["云尺度"] = vNum(0.22);
+            d->items["太阳"] = vNum(0.65);
+            d->items["雾"] = vNum(0.15);
         } else if (name == "层云") {
             d->items["云型"] = vStr("层云");
             d->items["云量"] = vNum(0.8);
@@ -11306,7 +11313,7 @@ Interpreter::Interpreter() {
             else full = truthy(a[3]);
         }
         if (a.size() >= 5) full = truthy(a[4]);
-        struct Atmo { string type="积云"; double cover=0.55, base=8, top=14, scale=0.13, wind=0.25, sun=1.0, fog=0.0; int steps=14, res=6; } atmo;
+        struct Atmo { string type="积云"; double cover=0.55, base=8, top=14, scale=0.13, wind=0.25, sun=1.0, fog=0.0; int steps=10, res=8; } atmo;
         if (a.size() >= 7 && a[6].type == VT::Dict) {
             auto ad = needDict(a[6], "大气", line);
             auto pick = [&](const char* k, double& out) {
@@ -11559,6 +11566,7 @@ Interpreter::Interpreter() {
                 double er = vnoise3(q.x*3.1+7.3, q.y*3.4, q.z*3.1-4.2) * 0.22;
                 n -= er * (0.35 + 0.65 * (1.0 - h));
                 double profile = 1.0;
+                bool overcast = atmo.type == "层云" || atmo.cover >= 0.86;
                 if (atmo.type == "层云") {
                     profile = std::sin(3.14159265358979323846 * h);
                 } else if (atmo.type == "卷云") {
@@ -11566,9 +11574,19 @@ Interpreter::Interpreter() {
                 } else {
                     profile = std::pow(h, 0.45) * std::pow(std::max(0.0, 1.0 - h), 0.35) * 2.2;
                 }
-                double threshold = 0.58 - atmo.cover * 0.30;
-                double d = (n * profile - threshold) * (atmo.type == "卷云" ? 4.0 : 9.0);
-                if (d < 0.03) return 0.0;
+                if (overcast) {
+                    // 阴天/层云是连续云盖，不允许阈值挖出空洞
+                    double cover = 0.72 + 0.28 * atmo.cover;
+                    double d = profile * cover * (0.75 + 0.25 * n);
+                    if (atmo.type == "层云") d = std::max(d, profile * 0.42 * atmo.cover);
+                    return std::max(0.0, std::min(1.0, d));
+                }
+                // 积云/晴天：软边而不是硬阈值，避免一片云被挖成洞
+                double threshold = 0.62 - atmo.cover * 0.34;
+                double shape = std::max(0.0, std::min(1.0, (n * profile - threshold) / 0.16));
+                shape = shape * shape * (3.0 - 2.0 * shape);
+                double d = shape * (0.45 + 0.55 * n);
+                if (atmo.type == "卷云") d *= 0.75;
                 return std::max(0.0, std::min(1.0, d));
             };
             // 体积云：低分辨率射线步进 + 双线性放大
@@ -11675,6 +11693,8 @@ Interpreter::Interpreter() {
                     if (t.glass) continue;
                     double x0,y0,z0,x1,y1,z1,x2,y2,z2;
                     projL(t.a,x0,y0,z0); projL(t.b,x1,y1,z1); projL(t.c,x2,y2,z2);
+                    if (std::max({x0,x1,x2}) < 0 || std::min({x0,x1,x2}) >= SM ||
+                        std::max({y0,y1,y2}) < 0 || std::min({y0,y1,y2}) >= SM) continue;
                     int minx=std::max(0,(int)std::floor(std::min({x0,x1,x2})));
                     int maxx=std::min(SM-1,(int)std::ceil(std::max({x0,x1,x2})));
                     int miny=std::max(0,(int)std::floor(std::min({y0,y1,y2})));
@@ -11714,6 +11734,7 @@ Interpreter::Interpreter() {
                 if(!project(pa,x0,y0,z0)||!project(pb,x1,y1,z1)||!project(pc,x2,y2,z2)) return;
                 double minx=std::max(0.0,std::floor(std::min({x0,x1,x2}))), maxx=std::min((double)w-1,std::ceil(std::max({x0,x1,x2})));
                 double miny=std::max(0.0,std::floor(std::min({y0,y1,y2}))), maxy=std::min((double)h-1,std::ceil(std::max({y0,y1,y2})));
+                if (maxx < 0 || minx >= w || maxy < 0 || miny >= h) return;
                 double den=(y1-y2)*(x0-x2)+(x2-x1)*(y0-y2); if(std::fabs(den)<1e-9) return;
                 PVec n=pnorm(pcross(psub(pb,pa),psub(pc,pa)));
                 double ndl=std::fabs(pdot(n,light)); double lit=0.35+0.65*ndl;
