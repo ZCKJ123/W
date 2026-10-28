@@ -5215,12 +5215,11 @@ static VpWindowData* gVpWin = nullptr;struct PlayerWin {
 };
 static PlayerWin* gPlayer = nullptr;
 static void playerForceFocus(HWND hwnd) {
-    DWORD fg = GetWindowThreadProcessId(GetForegroundWindow(), nullptr);
-    DWORD me = GetCurrentThreadId();
-    if (fg && fg != me) AttachThreadInput(me, fg, TRUE);
-    BringWindowToTop(hwnd); SetActiveWindow(hwnd); SetForegroundWindow(hwnd); SetFocus(hwnd);
-    SwitchToThisWindow(hwnd, TRUE);
-    if (fg && fg != me) AttachThreadInput(me, fg, FALSE);
+    // 只用普通前台请求；不 AttachThreadInput / 不 SwitchToThisWindow。
+    // 强制切换前台在部分远程桌面/多显示器环境会把桌面短暂切黑。
+    BringWindowToTop(hwnd);
+    SetForegroundWindow(hwnd);
+    SetFocus(hwnd);
 }
 static LRESULT CALLBACK playerWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_ERASEBKGND) return 1;
@@ -10751,6 +10750,9 @@ Interpreter::Interpreter() {
             return out;
         };
         auto renderRows = [&](int y0, int y1) {
+#ifdef _WIN32
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
             for (int y = y0; y < y1; ++y) for (int x = 0; x < w; ++x) {
                 std::array<double,3> col{0,0,0};
                 for (int s = 0; s < samples; ++s) {
@@ -11179,7 +11181,7 @@ Interpreter::Interpreter() {
             auto now=std::chrono::steady_clock::now();
             elapsed=std::chrono::duration<double>(now-t0).count();
             if (frames%20==0) {
-                std::wstring t=title+L"  刷新 " + std::to_wstring(pw.refreshRate.load()) +
+                std::wstring t=title+L"  左键抓鼠标/右键释放  Esc退出  刷新 " + std::to_wstring(pw.refreshRate.load()) +
                     L"  渲染 " + std::to_wstring((int)(frames/std::max(0.001,elapsed))) +
                     L"  显示 " + std::to_wstring((int)(pw.presented.load()/std::max(0.001,elapsed))) +
                     L"  x " + std::to_wstring((int)cam.x) + L" z " + std::to_wstring((int)cam.z);
