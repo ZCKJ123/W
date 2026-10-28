@@ -18040,6 +18040,15 @@ static int runMain(vector<string> args) {
         std::cout << "文语言 0.2.0-snapshot\n";
         return 0;
     }
+    if (cmd == "--自述" || cmd == "--规范") {
+        std::cout << "文语言 0.2.0-snapshot\n";
+        std::cout << "语义根：语法.ebnf\n";
+        std::cout << "用户文档：使用教程.md、使用规范.md、语法总表.md、语言规范.md\n";
+        std::cout << "错误协议：错误协议.md（code/rule/frames）\n";
+        std::cout << "机器索引：--索引；库清单：--库；自检：--检查\n";
+        std::cout << "宿主契约：平台接口.md\n";
+        return 0;
+    }
     if (cmd == "--帮助" || cmd == "-h" || cmd == "帮助") {
         std::cout <<
             "文语言 0.2.0-snapshot\n"
@@ -18050,7 +18059,8 @@ static int runMain(vector<string> args) {
             "  wen.exe --编译 文件.wen         编译成原生 exe\n"
             "  wen.exe --翻译 文件.wen 目标    翻译（python/javascript/json/java/字节码/C++/汇编）\n"
             "  wen.exe --验证                   自检\n"
-            "  wen.exe --帮助                   本页\n\n"
+            "  wen.exe --帮助                   本页\n"
+            "  wen.exe --自述                   只列本语言自己的规范/协议\n\n"
             "先看：使用教程.md、使用规范.md、语法总表.md、破坏性变更.md\n"
             "查错误：wen.exe --查 错误\n"
             "查单位：wen.exe --查 查找\n";
