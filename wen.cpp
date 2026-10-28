@@ -3669,9 +3669,9 @@ static const std::map<string, string>& functionModules() {
         {"取属性", "网页库"}, {"取链接", "网页库"}, {"取标题", "网页库"},
 
         // 集合库
-        {"集合删除", "集合库"},
-        {"并集", "集合库"}, {"交集", "集合库"},
-        {"差集", "集合库"}, {"子集", "集合库"}, {"对称差", "集合库"},
+        
+        
+        
 
         // 点阵库
         {"新建点阵", "点阵库"}, {"点阵添加", "点阵库"},
@@ -16051,80 +16051,12 @@ Interpreter::Interpreter() {
             if (valueEquals(item, a[1])) return vBool(true);
         return vBool(false);
     });
-    registerBuiltin("并集", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
-        auto x = needSet(a[0], "并集", line);
-        auto y = needSet(a[1], "并集", line);
+    registerBuiltin("集合列表", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto s = needSet(a[0], "集合列表", line);
         auto out = std::make_shared<List>();
-        for (const auto& item : x->items) out->items.push_back(item);
-        for (const auto& item : y->items) {
-            bool found = false;
-            for (const auto& old : out->items)
-                if (valueEquals(old, item)) { found = true; break; }
-            if (!found) out->items.push_back(item);
-        }
-        return vSet(out);
+        for (const auto& item : s->items) out->items.push_back(item);
+        return vList(out);
     });
-    registerBuiltin("交集", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
-        auto x = needSet(a[0], "交集", line);
-        auto y = needSet(a[1], "交集", line);
-        auto out = std::make_shared<List>();
-        for (const auto& item : x->items) {
-            for (const auto& other : y->items) {
-                if (valueEquals(item, other)) {
-                    out->items.push_back(item);
-                    break;
-                }
-            }
-        }
-        return vSet(out);
-    });
-    registerBuiltin("差集", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
-        auto x = needSet(a[0], "差集", line);
-        auto y = needSet(a[1], "差集", line);
-        auto out = std::make_shared<List>();
-        for (const auto& item : x->items) {
-            bool found = false;
-            for (const auto& other : y->items)
-                if (valueEquals(item, other)) { found = true; break; }
-            if (!found) out->items.push_back(item);
-        }
-        return vSet(out);
-    });
-    registerBuiltin("子集", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
-        auto x = needSet(a[0], "子集", line);
-        auto y = needSet(a[1], "子集", line);
-        for (const auto& item : x->items) {
-            bool found = false;
-            for (const auto& other : y->items)
-                if (valueEquals(item, other)) { found = true; break; }
-            if (!found) return vBool(false);
-        }
-        return vBool(true);
-    });
-    registerBuiltin("对称差", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
-        auto x = needSet(a[0], "对称差", line);
-        auto y = needSet(a[1], "对称差", line);
-        auto out = std::make_shared<List>();
-        auto addUnique = [&](const Value& item) {
-            for (const auto& old : out->items)
-                if (valueEquals(old, item)) return;
-            out->items.push_back(item);
-        };
-        for (const auto& item : x->items) {
-            bool found = false;
-            for (const auto& other : y->items)
-                if (valueEquals(item, other)) { found = true; break; }
-            if (!found) addUnique(item);
-        }
-        for (const auto& item : y->items) {
-            bool found = false;
-            for (const auto& other : x->items)
-                if (valueEquals(item, other)) { found = true; break; }
-            if (!found) addUnique(item);
-        }
-        return vSet(out);
-    });
-
     // ---------- 点阵库 ----------
     registerBuiltin("新建点阵", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
         return vList();
