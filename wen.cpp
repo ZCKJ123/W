@@ -5342,7 +5342,7 @@ static PVec pmul(PVec a, double k) { return {a.x*k,a.y*k,a.z*k}; }
 static double pdot(PVec a, PVec b) { return a.x*b.x+a.y*b.y+a.z*b.z; }
 static PVec pcross(PVec a, PVec b) { return {a.y*b.z-a.z*b.y, a.z*b.x-a.x*b.z, a.x*b.y-a.y*b.x}; }
 static PVec pnorm(PVec a) { double l=std::sqrt(pdot(a,a)); return l<1e-9?pv(0,1,0):pmul(a,1/l); }
-struct PTri { PVec a,b,c; unsigned color; double metal = 0.0, rough = 0.8, emit = 0.0; bool glass = false; bool fuzzy = false; };
+struct PTri { PVec a,b,c; unsigned color; double metal = 0.0, rough = 0.8, emit = 0.0; bool glass = false; bool fuzzy = false; PVec na,nb,nc; };
 static void addSphere(vector<PTri>& out, PVec c, double r, unsigned col,
                       double metal = 0.0, double rough = 0.8, int seg = 12, int ring = 6,
                       bool glass = false, bool fuzzy = false) {
@@ -5355,8 +5355,9 @@ static void addSphere(vector<PTri>& out, PVec c, double r, unsigned col,
     };
     for (int j = 0; j < ring; ++j) for (int i = 0; i < seg; ++i) {
         PVec a=at(i,j), b=at(i+1,j), d=at(i,j+1), e=at(i+1,j+1);
-        out.push_back({a,b,e,col,metal,rough,0,glass,fuzzy});
-        out.push_back({a,e,d,col,metal,rough,0,glass,fuzzy});
+        PVec na=pnorm(psub(a,c)), nb=pnorm(psub(b,c)), ne=pnorm(psub(e,c)), nd=pnorm(psub(d,c));
+        out.push_back({a,b,e,col,metal,rough,0,glass,fuzzy,na,nb,ne});
+        out.push_back({a,e,d,col,metal,rough,0,glass,fuzzy,na,ne,nd});
     }
 }
 static void addCube(vector<PTri>& out, PVec c, double s, unsigned col, double metal = 0.0, double rough = 0.8) {
@@ -11477,6 +11478,21 @@ Interpreter::Interpreter() {
                 }
             }
         }
+        // 场景按 12 单位空间块分割；渲染时整块做视锥/距离剔除
+        const double CHUNK = 12.0;
+        struct ChunkInfo { PVec center; double radius; vector<int> idx; };
+        std::map<long long, ChunkInfo> chunks;
+        for (size_t i=0;i<cubes.size();++i) {
+            const auto& t=cubes[i];
+            PVec c{(t.a.x+t.b.x+t.c.x)/3.0, (t.a.y+t.b.y+t.c.y)/3.0, (t.a.z+t.b.z+t.c.z)/3.0};
+            int cx=(int)std::floor(c.x/CHUNK), cy=(int)std::floor(c.y/CHUNK), cz=(int)std::floor(c.z/CHUNK);
+            long long key=((long long)(cx+512)<<40) | ((long long)(cy+512)<<20) | (long long)(cz+512);
+            auto& ch=chunks[key];
+            if (ch.idx.empty()) ch.center=c;
+            ch.idx.push_back((int)i);
+            double r=std::sqrt(std::max({pdot(psub(t.a,c),psub(t.a,c)),pdot(psub(t.b,c),psub(t.b,c)),pdot(psub(t.c,c),psub(t.c,c))}));
+            ch.radius=std::max(ch.radius,r);
+        }
         PVec light = pnorm({0.45,1.0,0.35});
         PVec cam{0,1.7,7.5};
         double yaw = 0, pitch = 0.02;
@@ -11839,15 +11855,19 @@ Interpreter::Interpreter() {
                 return a * (1-tz) + b * tz;
             };
             auto haze = skyColor(pv(0, 0.03, -1));
-            auto drawTri=[&](PVec pa, PVec pb, PVec pc, unsigned col, double zoff, bool receive, double metal, double rough, bool glass, bool fuzzy){
+            auto drawTri=[&](PVec pa, PVec pb, PVec pc, PVec na, PVec nb, PVec nc, unsigned col, double zoff, bool receive, double metal, double rough, bool glass, bool fuzzy){
                 double x0,y0,z0,x1,y1,z1,x2,y2,z2;
                 if(!project(pa,x0,y0,z0)||!project(pb,x1,y1,z1)||!project(pc,x2,y2,z2)) return;
                 double minx=std::max(0.0,std::floor(std::min({x0,x1,x2}))), maxx=std::min((double)w-1,std::ceil(std::max({x0,x1,x2})));
                 double miny=std::max(0.0,std::floor(std::min({y0,y1,y2}))), maxy=std::min((double)h-1,std::ceil(std::max({y0,y1,y2})));
                 if (maxx < 0 || minx >= w || maxy < 0 || miny >= h) return;
                 double den=(y1-y2)*(x0-x2)+(x2-x1)*(y0-y2); if(std::fabs(den)<1e-9) return;
-                PVec n=pnorm(pcross(psub(pb,pa),psub(pc,pa)));
-                double ndl=std::fabs(pdot(n,light)); double lit=0.28 + 0.72*ndl*sceneLightIntensity;
+                PVec fn=pnorm(pcross(psub(pb,pa),psub(pc,pa)));
+                bool smooth = (na.x*na.x+na.y*na.y+na.z*na.z) > 1e-8 &&
+                              (nb.x*nb.x+nb.y*nb.y+nb.z*nb.z) > 1e-8 &&
+                              (nc.x*nc.x+nc.y*nc.y+nc.z*nc.z) > 1e-8;
+                if (!smooth) { na=fn; nb=fn; nc=fn; }
+                double ndl=std::fabs(pdot(fn,light)); double lit=0.28 + 0.72*ndl*sceneLightIntensity;
                 int cr=(int)((col>>16)&255), cg=(int)((col>>8)&255), cb=(int)(col&255);
                 double lr=((sceneLightColor>>16)&255)/255.0, lg=((sceneLightColor>>8)&255)/255.0, lb=(sceneLightColor&255)/255.0;
                 for(int y=(int)miny;y<=(int)maxy;++y) for(int x=(int)minx;x<=(int)maxx;++x){
@@ -11861,6 +11881,9 @@ Interpreter::Interpreter() {
                     double wx=w0*pa.x+w1*pb.x+w2*pc.x;
                     double wy=w0*pa.y+w1*pb.y+w2*pc.y;
                     double wz=w0*pa.z+w1*pb.z+w2*pc.z;
+                    PVec n = pnorm({w0*na.x+w1*nb.x+w2*nc.x,
+                                    w0*na.y+w1*nb.y+w2*nc.y,
+                                    w0*na.z+w1*nb.z+w2*nc.z});
                     double shade = receive ? sampleShadow({wx,wy,wz}, n) : 1.0;
                     if (receive && wy > 0.02) shade *= cloudShadowAt({wx,wy,wz});
                     PVec vdir = pnorm(psub(cam, {wx,wy,wz}));
@@ -11907,9 +11930,31 @@ Interpreter::Interpreter() {
                 }
             };
             buildShadowMap();
-            for(auto& t:ground) drawTri(t.a,t.b,t.c,t.color,0,true,0,t.rough,false,false);
-            for(auto& t:cubes) if(!t.glass) drawTri(t.a,t.b,t.c,t.color,0,true,t.metal,t.rough,false,t.fuzzy);
-            for(auto& t:cubes) if(t.glass) drawTri(t.a,t.b,t.c,t.color,0,false,t.metal,t.rough,true,false);
+            auto chunkVisible = [&](const ChunkInfo& ch) {
+                PVec d=psub(ch.center,cam);
+                double z=pdot(d,f);
+                if (z + ch.radius < 0.1 || z - ch.radius > 90.0) return false;
+                double tx=pdot(d,r), ty=pdot(d,u);
+                double halfW=z*0.62, halfH=z*0.62;
+                if (std::fabs(tx) > halfW + ch.radius) return false;
+                if (std::fabs(ty) > halfH + ch.radius) return false;
+                return true;
+            };
+            for(auto& t:ground) drawTri(t.a,t.b,t.c,t.na,t.nb,t.nc,t.color,0,true,0,t.rough,false,false);
+            for (auto& kv : chunks) {
+                if (!chunkVisible(kv.second)) continue;
+                for (int idx : kv.second.idx) {
+                    const auto& t=cubes[(size_t)idx];
+                    if (!t.glass) drawTri(t.a,t.b,t.c,t.na,t.nb,t.nc,t.color,0,true,t.metal,t.rough,false,t.fuzzy);
+                }
+            }
+            for (auto& kv : chunks) {
+                if (!chunkVisible(kv.second)) continue;
+                for (int idx : kv.second.idx) {
+                    const auto& t=cubes[(size_t)idx];
+                    if (t.glass) drawTri(t.a,t.b,t.c,t.na,t.nb,t.nc,t.color,0,false,t.metal,t.rough,true,false);
+                }
+            }
             for(int y=-2;y<=2;++y) for(int x=-2;x<=2;++x){
                 if(std::abs(x)<=1&&std::abs(y)<=1) continue;
                 size_t i=(size_t)(h/2+y)*w+(w/2+x); if(i*3+2<pw.back.size()){pw.back[i*3]=230;pw.back[i*3+1]=240;pw.back[i*3+2]=255;}
