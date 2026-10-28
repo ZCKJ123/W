@@ -11777,23 +11777,33 @@ Interpreter::Interpreter() {
                     double xx=pdot(d,r), yy=pdot(d,u); double fl=(double)h*0.95;
                     sx=w*0.5+xx*fl/zz; sy=h*0.5-yy*fl/zz; return true;
                 };
+                // 粒子先累加成屏幕密度场，再统一做体积吸收，避免一颗颗圆点
+                vector<float> den((size_t)w*h, 0.0f), colr((size_t)w*h, 0.0f), colg((size_t)w*h, 0.0f), colb((size_t)w*h, 0.0f);
                 for (const auto& pt : parts) {
                     double sx,sy,zz;
                     if (!pj(pt.p,sx,sy,zz)) continue;
-                    double rad = std::max(3.0, std::min(90.0, 300.0/zz));
-                    double aa = std::min(0.55, 0.12 + pt.d*0.32) * (pt.layer ? 0.55 : 1.0);
+                    double rad = std::max(3.0, std::min(120.0, 360.0/zz));
                     double cr = pt.layer ? 220 : 205, cg = pt.layer ? 225 : 210, cb = pt.layer ? 240 : 220;
+                    double wgt = pt.d * (pt.layer ? 0.55 : 1.0);
                     int x0=(int)(sx-rad), x1=(int)(sx+rad), y0=(int)(sy-rad), y1=(int)(sy+rad);
                     if (x1<0||y1<0||x0>=w||y0>=h) continue;
                     for (int y=std::max(0,y0); y<=std::min(h-1,y1); ++y) for (int x=std::max(0,x0); x<=std::min(w-1,x1); ++x) {
                         double dx=(x+0.5-sx)/rad, dy=(y+0.5-sy)/rad;
                         double fall=1.0-dx*dx-dy*dy; if (fall<=0) continue;
-                        double a=aa*fall*fall;
-                        size_t i=((size_t)y*w+x)*3;
-                        pw.back[i]  =(unsigned char)std::min(255.0,pw.back[i]*(1-a)+cb*a);
-                        pw.back[i+1]=(unsigned char)std::min(255.0,pw.back[i+1]*(1-a)+cg*a);
-                        pw.back[i+2]=(unsigned char)std::min(255.0,pw.back[i+2]*(1-a)+cr*a);
+                        double g=fall*fall*wgt;
+                        size_t i=(size_t)y*w+x;
+                        den[i]+=g; colr[i]+=cr*g; colg[i]+=cg*g; colb[i]+=cb*g;
                     }
+                }
+                for (int y=0;y<h;++y) for (int x=0;x<w;++x) {
+                    size_t i=(size_t)y*w+x;
+                    if (den[i] <= 1e-5) continue;
+                    double a = 1.0 - std::exp(-den[i] * 0.16);
+                    double cr = colr[i]/den[i], cg = colg[i]/den[i], cb = colb[i]/den[i];
+                    size_t o=i*3;
+                    pw.back[o]  =(unsigned char)std::min(255.0,pw.back[o]*(1-a)+cb*a);
+                    pw.back[o+1]=(unsigned char)std::min(255.0,pw.back[o+1]*(1-a)+cg*a);
+                    pw.back[o+2]=(unsigned char)std::min(255.0,pw.back[o+2]*(1-a)+cr*a);
                 }
             }
             if (!useParticleClouds) {
