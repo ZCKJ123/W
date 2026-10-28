@@ -44,6 +44,8 @@
 #include <mfidl.h>
 #include <mfreadwrite.h>
 #include <mftransform.h>
+#define MINIMP3_IMPLEMENTATION
+#include "minimp3.h"
 #include <imm.h>
 #include <shellapi.h>
 #include <psapi.h>
@@ -9860,6 +9862,28 @@ Interpreter::Interpreter() {
         if (w.samples.empty()) { err = "没有解码出音频采样"; return false; }
         return true;
     };
+    static auto decodeMp3 = [](const string& full, WavInfo& w, string& err) -> bool {
+        string data;
+        try { data=readWholeFile(full); } catch (IoError& e) { err=e.what(); return false; }
+        if (data.size() < 4) { err="MP3 文件为空"; return false; }
+        mp3dec_t dec; mp3dec_init(&dec);
+        int16_t pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
+        size_t pos=0;
+        w.samples.clear();
+        while (pos + 4 < data.size()) {
+            mp3dec_frame_info_t info{};
+            int n = mp3dec_decode_frame(&dec, (const uint8_t*)data.data()+pos, (int)(data.size()-pos), pcm, &info);
+            if (info.frame_bytes <= 0) break;
+            pos += (size_t)info.frame_bytes;
+            if (n > 0 && info.channels > 0) {
+                w.rate=info.hz; w.channels=info.channels; w.bits=16;
+                w.samples.insert(w.samples.end(), pcm, pcm + (size_t)n*info.channels);
+                if (w.samples.size() > 44100u*2u*600u) break;
+            }
+        }
+        if (w.samples.empty()) { err="minimp3 没有解出采样"; return false; }
+        return true;
+    };
     static auto fftPeak = [](const vector<short>& src, int rate, int count) {
         const int N=2048;
         vector<std::complex<double>> a(N);
@@ -9897,7 +9921,8 @@ Interpreter::Interpreter() {
         if (ext != "wav") {
             WavInfo mf;
             string derr;
-            if (decodeAudio(full, mf, derr)) {
+            bool ok = (ext == "mp3") ? decodeMp3(full, mf, derr) : decodeAudio(full, mf, derr);
+            if (ok) {
                 double peak=0,rms=0,zc=0,quiet=0;
                 for(size_t i=0;i<mf.samples.size();++i){
                     double v=mf.samples[i]/32768.0; peak=std::max(peak,std::fabs(v)); rms+=v*v;
@@ -9905,7 +9930,7 @@ Interpreter::Interpreter() {
                     if(std::fabs(v)<0.02) ++quiet;
                 }
                 rms=std::sqrt(rms/std::max<size_t>(1,mf.samples.size()));
-                d->items["可解析"]=vBool(true); d->items["编码"]=vStr("Media Foundation PCM");
+                d->items["可解析"]=vBool(true); d->items["编码"]=vStr(ext=="mp3" ? "minimp3 PCM" : "Media Foundation PCM");
                 d->items["采样率"]=vNum(mf.rate); d->items["声道"]=vNum(mf.channels); d->items["位深"]=vNum(mf.bits);
                 d->items["时长"]=vNum(mf.rate? (double)mf.samples.size()/mf.channels/mf.rate : 0);
                 d->items["峰值"]=vNum(peak); d->items["均方根"]=vNum(rms);
@@ -9967,7 +9992,10 @@ Interpreter::Interpreter() {
         WavInfo w;
         if(!parseWav(b,w)) {
             string derr;
-            if (!decodeAudio(full,w,derr)) throw WenError("音频错误",line,0,"无法解码音频：" + derr);
+            string e2=lowerAscii(fs::u8path(path).extension().u8string());
+            if(!e2.empty()&&e2[0]=='.') e2=e2.substr(1);
+            bool ok=(e2=="mp3") ? decodeMp3(full,w,derr) : decodeAudio(full,w,derr);
+            if (!ok) throw WenError("音频错误",line,0,"无法解码音频：" + derr);
         }
         double peak=0,rms=0; size_t zc=0,quiet=0;
         for(size_t i=0;i<w.samples.size();++i){ double v=w.samples[i]/32768.0; peak=std::max(peak,std::fabs(v)); rms+=v*v; if(i&&((w.samples[i-1]<0)!=(w.samples[i]<0)))++zc; if(std::fabs(v)<0.02)++quiet; }
@@ -9986,7 +10014,7 @@ Interpreter::Interpreter() {
         string path=needStr(a[0],"音频频谱",line); int n=a.size()>1?(int)needIndex(a[1],"音频频谱",line):5;
         string b; try { b=readWholeFile(resolveWenPath(path)); } catch(IoError& e){ throw WenError("文件错误",line,0,e.what()); }
         WavInfo w;
-        if(!parseWav(b,w)) { string derr; if(!decodeAudio(resolveWenPath(path),w,derr)) throw WenError("音频错误",line,0,"无法解码音频：" + derr); }
+        if(!parseWav(b,w)) { string derr; string e2=lowerAscii(fs::u8path(path).extension().u8string()); if(!e2.empty()&&e2[0]=='.') e2=e2.substr(1); bool ok=(e2=="mp3")?decodeMp3(resolveWenPath(path),w,derr):decodeAudio(resolveWenPath(path),w,derr); if(!ok) throw WenError("音频错误",line,0,"无法解码音频：" + derr); }
         auto list=std::make_shared<List>();
         for(auto& p:fftPeak(w.samples,w.rate,std::max(1,std::min(32,n)))){
             auto d=std::make_shared<Dict>(); d->items["频率"]=vNum(p.first); d->items["幅度"]=vNum(p.second); list->items.push_back(vDict(d));
