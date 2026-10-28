@@ -11235,10 +11235,54 @@ Interpreter::Interpreter() {
             PVec f{std::sin(yaw)*std::cos(pitch), std::sin(pitch), -std::cos(yaw)*std::cos(pitch)};
             PVec r{std::cos(yaw), 0, std::sin(yaw)};
             PVec u = pnorm(pcross(r, f));
-            for (int y=0;y<h;++y) {
-                double k=(double)y/h;
-                unsigned char rr=(unsigned char)(30+50*(1-k)), gg=(unsigned char)(45+70*(1-k)), bb=(unsigned char)(70+80*(1-k));
-                for (int x=0;x<w;++x){ size_t i=((size_t)y*w+x)*3; pw.back[i]=bb; pw.back[i+1]=gg; pw.back[i+2]=rr; }
+            auto hash2 = [](double x, double z) {
+                double v = std::sin(x * 127.1 + z * 311.7) * 43758.5453123;
+                return v - std::floor(v);
+            };
+            auto noise2 = [&](double x, double z) {
+                double ix = std::floor(x), iz = std::floor(z);
+                double fx = x - ix, fz = z - iz;
+                fx = fx*fx*(3-2*fx); fz = fz*fz*(3-2*fz);
+                double a=hash2(ix,iz), b=hash2(ix+1,iz), c=hash2(ix,iz+1), d=hash2(ix+1,iz+1);
+                return (a*(1-fx)+b*fx)*(1-fz) + (c*(1-fx)+d*fx)*fz;
+            };
+            auto fbm2 = [&](double x, double z) {
+                double v=0, a=0.5;
+                for(int i=0;i<2;++i){ v += noise2(x,z)*a; x=x*2.03+1.7; z=z*2.01+3.1; a*=0.5; }
+                return v;
+            };
+            for (int y=0;y<h;y+=2) {
+                double ny = -((double)y + 1.0 - h*0.5) / ((double)h*0.95);
+                for (int x=0;x<w;x+=2) {
+                    double nx = ((double)x + 0.5 - w*0.5) / ((double)h*0.95);
+                    PVec rd = pnorm(padd(f, padd(pmul(r, nx), pmul(u, ny))));
+                    double k = std::max(0.0, std::min(1.0, rd.y));
+                    double rr = 35 + 55*(1-k), gg = 50 + 80*(1-k), bb = 80 + 95*(1-k);
+                    if (rd.y > 0.02) {
+                        double t = (8.0 - cam.y) / rd.y;
+                        double cx = cam.x + rd.x*t, cz = cam.z + rd.z*t;
+                        double n = fbm2(cx*0.12 + 3.0, cz*0.12 + 7.0);
+                        double cover = std::max(0.0, std::min(1.0, (n - 0.42) / 0.34));
+                        double sun = std::max(0.0, pdot(rd, light));
+                        double cloud = cover;
+                        rr = rr*(1-cloud) + (205 + 45*sun)*cloud;
+                        gg = gg*(1-cloud) + (210 + 35*sun)*cloud;
+                        bb = bb*(1-cloud) + (220 + 25*sun)*cloud;
+                    }
+                    double sunDot = pdot(rd, light);
+                    if (sunDot > 0.93) {
+                        double glow = std::pow(std::max(0.0, (sunDot-0.93)/0.07), 8.0);
+                        rr = std::min(255.0, rr + glow*180);
+                        gg = std::min(255.0, gg + glow*150);
+                        bb = std::min(255.0, bb + glow*80);
+                    }
+                    for (int yy=0; yy<2 && y+yy<h; ++yy) for (int xx=0; xx<2 && x+xx<w; ++xx) {
+                        size_t i=((size_t)(y+yy)*w+(x+xx))*3;
+                        pw.back[i]=(unsigned char)std::min(255.0,bb);
+                        pw.back[i+1]=(unsigned char)std::min(255.0,gg);
+                        pw.back[i+2]=(unsigned char)std::min(255.0,rr);
+                    }
+                }
             }
             zbuf.assign((size_t)w*h, 1e30);
             auto project=[&](PVec p, double& sx, double& sy, double& z)->bool{
