@@ -11313,7 +11313,7 @@ Interpreter::Interpreter() {
             else full = truthy(a[3]);
         }
         if (a.size() >= 5) full = truthy(a[4]);
-        struct Atmo { string type="积云"; double cover=0.55, base=8, top=14, scale=0.13, wind=0.25, sun=1.0, fog=0.0; int steps=10, res=8; } atmo;
+        struct Atmo { string type="积云"; double cover=0.55, base=8, top=14, scale=0.13, wind=0.25, sun=1.0, fog=0.0; int steps=9, res=9; } atmo;
         if (a.size() >= 7 && a[6].type == VT::Dict) {
             auto ad = needDict(a[6], "大气", line);
             auto pick = [&](const char* k, double& out) {
@@ -11665,7 +11665,12 @@ Interpreter::Interpreter() {
                             PVec lp = padd(p, pmul(light, 0.35*l));
                             od += cloudDensity(lp, tsec) * 0.35;
                         }
-                        double beam = std::exp(-od * 2.0);
+                        // 多阶散射：单次 + 二次 + 三次，按能量衰减叠加
+                        double beam = 0.0, bw = 1.0;
+                        for (int order=0; order<3; ++order) {
+                            beam += bw * std::exp(-od * 2.0 * (order + 1));
+                            bw *= 0.55;
+                        }
                         double a = 1.0 - std::exp(-dens * std::min(dt, 1.6) * 1.8);
                         // 多次散射的粗糙近似：直射 + 环境
                         double powder = 1.0 - std::exp(-dens * 4.0);
