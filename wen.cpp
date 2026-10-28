@@ -11321,7 +11321,7 @@ Interpreter::Interpreter() {
         if (a.size() >= 5) full = truthy(a[4]);
         struct Atmo { string type="积云"; double cover=0.55, base=8, top=14, scale=0.13, wind=0.25, sun=1.0, fog=0.0;
     double highCover=0.22, highBase=22, highTop=30, highScale=0.055;
-    int steps=6, res=8; } atmo;
+    int steps=8, res=6; } atmo;
         if (a.size() >= 7 && a[6].type == VT::Dict) {
             auto ad = needDict(a[6], "大气", line);
             auto pick = [&](const char* k, double& out) {
@@ -11675,38 +11675,63 @@ Interpreter::Interpreter() {
                 if (atmo.type == "卷云") d *= 0.75;
                 return std::max(0.0, std::min(1.0, d));
             };
-            // 高层卷云：独立高空层，和低层积云分开
-            {
-                double htsec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-                auto h2 = [](double x,double z){ double v=std::sin(x*127.1+z*311.7)*43758.5453; return v-std::floor(v); };
-                auto vn = [&](double x,double z){
-                    double ix=std::floor(x), iz=std::floor(z), fx=x-ix, fz=z-iz;
-                    fx=fx*fx*(3-2*fx); fz=fz*fz*(3-2*fz);
-                    double a=h2(ix,iz), b=h2(ix+1,iz), c=h2(ix,iz+1), d=h2(ix+1,iz+1);
-                    return (a*(1-fx)+b*fx)*(1-fz)+(c*(1-fx)+d*fx)*fz;
+            // 高层卷云：独立高度层，真正射线步进
+            if (atmo.highCover > 0.001) {
+                auto highDensity = [&](PVec p, double time) {
+                    double h=(p.y-atmo.highBase)/(atmo.highTop-atmo.highBase);
+                    if (h<0 || h>1) return 0.0;
+                    double qx=p.x*atmo.highScale + time*atmo.wind*1.5;
+                    double qz=p.z*atmo.highScale*2.6 - time*atmo.wind*1.2;
+                    double f=0, amp=0.55, fr=1;
+                    for (int o=0;o<3;++o) { f += vnoise3(qx*fr, p.y*atmo.highScale*1.3, qz*fr)*amp; fr*=2.1; amp*=0.5; }
+                    double profile = std::pow(std::max(0.0,h),0.25)*std::pow(std::max(0.0,1-h),0.25);
+                    double d=(f*profile - 0.30)*3.2*atmo.highCover;
+                    return std::max(0.0,std::min(1.0,d));
                 };
-                auto fb = [&](double x,double z){ return vn(x,z)*0.62+vn(x*2.1+3,z*2.3-2)*0.38; };
-                for (int y=0;y<h;y+=2) {
-                    double ny=-((double)y+1-h*0.5)/((double)h*0.95);
-                    for (int x=0;x<w;x+=2) {
-                        double nx=((double)x+1-w*0.5)/((double)h*0.95);
+                int hcw=std::max(1,w/16), hch=std::max(1,h/16);
+                vector<unsigned char> hbuf((size_t)hcw*hch*4,0);
+                double htsec=std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();
+                for (int cy=0;cy<hch;++cy) {
+                    double ny=-(((double)cy+0.5)*12-h*0.5)/((double)h*0.95);
+                    for (int cx=0;cx<hcw;++cx) {
+                        double nx=(((double)cx+0.5)*12-w*0.5)/((double)h*0.95);
                         PVec rd=pnorm(padd(f,padd(pmul(r,nx),pmul(u,ny))));
-                        if (rd.y<=0.02 || atmo.highCover<=0.001) continue;
-                        double t=(atmo.highBase-cam.y)/rd.y;
-                        if (t<=0.05) continue;
-                        double qx=cam.x+rd.x*t + htsec*atmo.wind*1.5;
-                        double qz=cam.z+rd.z*t - htsec*atmo.wind*1.2;
-                        double n=fb(qx*atmo.highScale, qz*atmo.highScale*2.6);
-                        double a=std::max(0.0,std::min(1.0,(n-0.52)/0.22))*atmo.highCover;
-                        if (a<=0.002) continue;
-                        for(int yy=0;yy<2&&y+yy<h;++yy) for(int xx=0;xx<2&&x+xx<w;++xx){
-                            size_t i=((size_t)(y+yy)*w+(x+xx))*3;
-                            double cr=215*a, cg=225*a, cb=240*a;
-                            pw.back[i]  =(unsigned char)std::min(255.0,pw.back[i]*(1-a)+cb);
-                            pw.back[i+1]=(unsigned char)std::min(255.0,pw.back[i+1]*(1-a)+cg);
-                            pw.back[i+2]=(unsigned char)std::min(255.0,pw.back[i+2]*(1-a)+cr);
+                        double t0r,t1r;
+                        if (std::fabs(rd.y)<1e-4) continue;
+                        t0r=(atmo.highBase-cam.y)/rd.y; t1r=(atmo.highTop-cam.y)/rd.y;
+                        if (t0r>t1r) std::swap(t0r,t1r);
+                        t0r=std::max(0.05,t0r); if (t1r<=t0r) continue;
+                        int steps=3; double dt=(t1r-t0r)/steps;
+                        double T=1,cr=0,cg=0,cb=0;
+                        for (int st=0;st<steps;++st) {
+                            PVec p2=padd(cam,pmul(rd,t0r+(st+0.5)*dt));
+                            double den=highDensity(p2,htsec);
+                            if (den<=0.001) continue;
+                            double od=0;
+                            for(int l=1;l<=2;++l) od += highDensity(padd(p2,pmul(light,0.6*l)),htsec)*0.6;
+                            double beam=std::exp(-od*1.5);
+                            double alpha=1-std::exp(-den*dt*1.2);
+                            double lit=0.55+0.45*beam;
+                            cr += T*alpha*(0.88*lit+0.10); cg += T*alpha*(0.91*lit+0.10); cb += T*alpha*(0.97*lit+0.12);
+                            T *= (1-alpha);
+                            if (T<0.02) break;
+                        }
+                        if (T<0.995) {
+                            size_t i=((size_t)cy*hcw+cx)*4;
+                            hbuf[i]=(unsigned char)std::min(255.0,cr*255);
+                            hbuf[i+1]=(unsigned char)std::min(255.0,cg*255);
+                            hbuf[i+2]=(unsigned char)std::min(255.0,cb*255);
+                            hbuf[i+3]=(unsigned char)std::min(255.0,(1-T)*255);
                         }
                     }
+                }
+                for(int y=0;y<h;++y) for(int x=0;x<w;++x){
+                    int cx=std::min(hcw-1,x*hcw/w), cy=std::min(hch-1,y*hch/h);
+                    size_t ci=((size_t)cy*hcw+cx)*4; int al=hbuf[ci+3]; if(!al) continue;
+                    size_t i=((size_t)y*w+x)*3; double aa=al/255.0;
+                    pw.back[i]  =(unsigned char)(pw.back[i]*(1-aa)+hbuf[ci+2]*aa);
+                    pw.back[i+1]=(unsigned char)(pw.back[i+1]*(1-aa)+hbuf[ci+1]*aa);
+                    pw.back[i+2]=(unsigned char)(pw.back[i+2]*(1-aa)+hbuf[ci]*aa);
                 }
             }
             // 体积云：低分辨率射线步进 + 双线性放大
