@@ -20,7 +20,7 @@ try {
     $bw.Flush(); [IO.File]::WriteAllBytes($wav, $ms.ToArray()); $bw.Dispose(); $ms.Dispose()
 
     $runner = Join-Path $dir 'run.wen'
-    [IO.File]::WriteAllText($runner, "依赖 媒体库`n打印 音频解析(`"$wav`")`n打印 音频判定(`"$wav`")`n打印 音频频谱(`"$wav`", 1)`n", (New-Object Text.UTF8Encoding($false)))
+    [IO.File]::WriteAllText($runner, "依赖 媒体库`n打印 音频解析(`"$wav`")`n打印 音频判定(`"$wav`")`n打印 音频频谱(`"$wav`", 1)`n打印 音频轨道(`"$wav`")`n", (New-Object Text.UTF8Encoding($false)))
     $lines = @(& $exe $runner 2>&1)
     $text = $lines -join "`n"
     if ($text -notmatch '"采样率": 8000' -or $text -notmatch '"声道": 1' -or $text -notmatch '"时长": 0\.25') { $fail++; Write-Host '失败：WAV 元数据不对' }
@@ -33,5 +33,5 @@ try {
     Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
 }
 if ($fail -gt 0) { exit 1 }
-Write-Host '音频回归：WAV 元数据/判定/主频/频谱 通过'
+Write-Host '音频回归：WAV 元数据/判定/主频/频谱/轨道 通过'
 exit 0

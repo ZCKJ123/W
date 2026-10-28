@@ -3562,7 +3562,7 @@ static const std::map<string, string>& functionModules() {
         {"新建神经层", "神经网络库"}, {"神经链", "神经网络库"}, {"前向", "神经网络库"},
         {"颜色", "视口库"}, {"新建视口", "视口库"}, {"视口清空", "视口库"}, {"视口画点", "视口库"},
         {"视口画线", "视口库"}, {"视口画三角形", "视口库"}, {"视口尺寸", "视口库"}, {"视口保存", "视口库"},
-        {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"}, {"视口显示", "视口库"}, {"玩家视口", "视口库"}, {"大气预设", "视口库"}, {"媒体信息", "媒体库"}, {"媒体播放", "媒体库"}, {"媒体停止", "媒体库"}, {"音频设备", "媒体库"}, {"音频录制", "媒体库"}, {"音频兼容检查", "媒体库"}, {"媒体格式支持", "媒体库"}, {"音频解析", "媒体库"}, {"音频判定", "媒体库"}, {"音频频谱", "媒体库"}, {"网格新建", "三维库"}, {"网格三角", "三维库"}, {"网格平移", "三维库"}, {"网格缩放", "三维库"}, {"网格旋转", "三维库"}, {"网格合并", "三维库"}, {"网格三角形数", "三维库"}, {"视口加载模型", "视口库"}, {"光追渲染", "视口库"}, {"体积云渲染", "视口库"}, {"材质检查", "视口库"}, {"材质预设", "视口库"}, {"视口取色", "视口库"},
+        {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"}, {"视口显示", "视口库"}, {"玩家视口", "视口库"}, {"大气预设", "视口库"}, {"媒体信息", "媒体库"}, {"媒体播放", "媒体库"}, {"媒体停止", "媒体库"}, {"音频设备", "媒体库"}, {"音频录制", "媒体库"}, {"音频兼容检查", "媒体库"}, {"媒体格式支持", "媒体库"}, {"音频解析", "媒体库"}, {"音频判定", "媒体库"}, {"音频频谱", "媒体库"}, {"音频轨道", "媒体库"}, {"网格新建", "三维库"}, {"网格三角", "三维库"}, {"网格平移", "三维库"}, {"网格缩放", "三维库"}, {"网格旋转", "三维库"}, {"网格合并", "三维库"}, {"网格三角形数", "三维库"}, {"视口加载模型", "视口库"}, {"光追渲染", "视口库"}, {"体积云渲染", "视口库"}, {"材质检查", "视口库"}, {"材质预设", "视口库"}, {"视口取色", "视口库"},
         {"硬件信息", "硬件库"}, {"高精度计时", "硬件库"}, {"内存状态", "硬件库"}, {"屏幕尺寸", "硬件库"}, {"磁盘空间", "硬件库"},
         {"大整数幂", "大整数库"}, {"大整数乘", "大整数库"}, {"大整数加", "大整数库"}, {"大整数阶乘", "大整数库"},
         {"阶乘位数", "大整数库"}, {"阶乘末尾零", "大整数库"}, {"阶乘概览", "大整数库"},
@@ -9909,6 +9909,53 @@ Interpreter::Interpreter() {
         for(int i=0;i<std::min<int>(count,bins.size());++i) out.push_back(bins[i]);
         return out;
     };
+    static auto rd32be = [](const string& b, size_t p) -> uint32_t {
+        if (p+4>b.size()) return 0;
+        return ((uint32_t)(uint8_t)b[p]<<24) | ((uint32_t)(uint8_t)b[p+1]<<16) |
+               ((uint32_t)(uint8_t)b[p+2]<<8) | (uint8_t)b[p+3];
+    };
+    static auto parseMp4Track = [](const string& b, string& codec, int& rate, int& ch, double& dur) -> bool {
+        size_t ft = b.find("ftyp");
+        (void)ft;
+        const char* codecs[] = {"mp4a", "alac", "ac-3", "ec-3", "Opus"};
+        size_t cp = string::npos; string c;
+        for (const char* cc : codecs) { size_t p=b.find(cc); if(p!=string::npos){cp=p;c=cc;break;} }
+        if (cp == string::npos) return false;
+        codec = c;
+        ch = (int)(((uint8_t)b[cp+20]<<8) | (uint8_t)b[cp+21]);
+        rate = (int)(rd32be(b, cp+28) >> 16);
+        size_t md = b.find("mdhd");
+        dur = -1;
+        if (md != string::npos && md+24 < b.size()) {
+            int ver = (uint8_t)b[md+4];
+            uint32_t ts = rd32be(b, md + (ver==1?24:16));
+            uint64_t d = ver==1 ? ((uint64_t)rd32be(b,md+28)<<32)|rd32be(b,md+32) : rd32be(b,md+20);
+            if (ts) dur = (double)d/ts;
+        }
+        return true;
+    };
+    registerBuiltin("音频轨道", 1, 1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path=needStr(a[0],"音频轨道",line);
+        string full=resolveWenPath(path);
+        string ext=lowerAscii(fs::u8path(path).extension().u8string());
+        if(!ext.empty()&&ext[0]=='.') ext=ext.substr(1);
+        auto list=std::make_shared<List>();
+        auto add=[&](const string& codec,int rate,int ch,double dur){
+            auto d=std::make_shared<Dict>(); d->items["编码"]=vStr(codec); d->items["采样率"]=vNum(rate);
+            d->items["声道"]=vNum(ch); d->items["时长"]=vNum(dur); list->items.push_back(vDict(d));
+        };
+        if (ext=="wav") {
+            string b; try { b=readWholeFile(full); } catch(IoError& e){ throw WenError("文件错误",line,0,e.what()); }
+            WavInfo w; if(parseWav(b,w)) add("PCM",w.rate,w.channels,w.rate?(double)w.samples.size()/w.channels/w.rate:0);
+        } else if (ext=="mp3") {
+            WavInfo w; string err; if(decodeMp3(full,w,err)) add("MP3",w.rate,w.channels,w.rate?(double)w.samples.size()/w.channels/w.rate:0);
+        } else if (ext=="mp4"||ext=="m4a"||ext=="mov") {
+            string b; try { b=readWholeFile(full); } catch(IoError& e){ throw WenError("文件错误",line,0,e.what()); }
+            string codec; int rate=0,ch=0; double dur=-1;
+            if(parseMp4Track(b,codec,rate,ch,dur)) add(codec,rate,ch,dur);
+        }
+        return vList(list);
+    });
     registerBuiltin("音频解析", 1, 1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
         string path=needStr(a[0],"音频解析",line);
         string full=resolveWenPath(path);
