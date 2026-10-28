@@ -11682,10 +11682,15 @@ Interpreter::Interpreter() {
                     if (h<0 || h>1) return 0.0;
                     double qx=p.x*atmo.highScale + time*atmo.wind*1.5;
                     double qz=p.z*atmo.highScale*2.6 - time*atmo.wind*1.2;
+                    double warp = vnoise3(qx*0.45+3.1, p.y*0.2, qz*0.45-1.7)*0.8;
                     double f=0, amp=0.55, fr=1;
-                    for (int o=0;o<3;++o) { f += vnoise3(qx*fr, p.y*atmo.highScale*1.3, qz*fr)*amp; fr*=2.1; amp*=0.5; }
+                    for (int o=0;o<4;++o) {
+                        f += vnoise3(qx*fr + warp, p.y*atmo.highScale*1.3, qz*fr*1.8 - warp)*amp;
+                        fr*=2.1; amp*=0.5;
+                    }
                     double profile = std::pow(std::max(0.0,h),0.25)*std::pow(std::max(0.0,1-h),0.25);
-                    double d=(f*profile - 0.30)*3.2*atmo.highCover;
+                    double streak = 0.65 + 0.35*std::sin(qz*3.0 + warp*4.0);
+                    double d=(f*profile*streak - 0.30)*3.2*atmo.highCover;
                     return std::max(0.0,std::min(1.0,d));
                 };
                 int hcw=std::max(1,w/24), hch=std::max(1,h/24);
@@ -11816,6 +11821,8 @@ Interpreter::Interpreter() {
                 size_t i00=sample(x0,y0), i10=sample(x1,y0), i01=sample(x0,y1), i11=sample(x1,y1);
                 double a00=cloudBuf[i00+3], a10=cloudBuf[i10+3], a01=cloudBuf[i01+3], a11=cloudBuf[i11+3];
                 double a = (a00*(1-fx)*(1-fy)+a10*fx*(1-fy)+a01*(1-fx)*fy+a11*fx*fy)/255.0;
+                // 全分辨率细节噪声：打散低分辨率放大的块状边缘
+                a *= 0.88 + 0.24 * hash3(x*1.31, y*1.17, 7.0);
                 if (a <= 0.002) continue;
                 auto mixc = [&](int offset) {
                     return (cloudBuf[i00+offset]*(1-fx)*(1-fy)+cloudBuf[i10+offset]*fx*(1-fy)+
@@ -11851,7 +11858,12 @@ Interpreter::Interpreter() {
                     y = (pdot(d, lup) + 15.0) / 30.0 * SM;
                     z = pdot(d, lfwd);
                 };
-                for (const auto& t : cubes) {
+                for (const auto& kv : chunks) {
+                    PVec cd = psub(kv.second.center, lc);
+                    double lx = pdot(cd, lright), ly = pdot(cd, lup);
+                    if (std::fabs(lx) - kv.second.radius > 15.0 || std::fabs(ly) - kv.second.radius > 15.0) continue;
+                    for (int idx : kv.second.idx) {
+                    const auto& t = cubes[(size_t)idx];
                     if (t.glass) continue;
                     double x0,y0,z0,x1,y1,z1,x2,y2,z2;
                     projL(t.a,x0,y0,z0); projL(t.b,x1,y1,z1); projL(t.c,x2,y2,z2);
@@ -11872,6 +11884,7 @@ Interpreter::Interpreter() {
                         float z=(float)(w0*z0+w1*z1+w2*z2);
                         size_t i=(size_t)y*SM+x;
                         if(z<shadowMap[i]) shadowMap[i]=z;
+                    }
                     }
                 }
             };
@@ -12076,6 +12089,11 @@ Interpreter::Interpreter() {
             }
             auto frameEnd=std::chrono::steady_clock::now();
             double frameMs=std::chrono::duration<double,std::milli>(frameEnd-frameStart).count();
+            // 自适应云质量：按实际帧时间调整，先保交互，再保细节
+            if (frames % 24 == 0) {
+                if (frameMs > 34.0 && atmo.res < 14) { ++atmo.res; if (atmo.steps > 4) --atmo.steps; }
+                else if (frameMs < 18.0 && atmo.res > 6) { --atmo.res; if (atmo.steps < 10) ++atmo.steps; }
+            }
             double targetMs = 1000.0 / std::max(60, pw.refreshRate.load());
             if (frameMs < targetMs)
                 std::this_thread::sleep_for(std::chrono::duration<double,std::milli>(targetMs-frameMs));
