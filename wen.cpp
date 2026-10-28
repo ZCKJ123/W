@@ -11139,6 +11139,10 @@ Interpreter::Interpreter() {
             if (down('D')) want = padd(want, pmul(right, speed*0.016));
             if (down(VK_SPACE)) want.y += speed*0.016;
             if (down(VK_SHIFT)) want.y = std::max(0.5, want.y-speed*0.016);
+            if (down(VK_UP)) want = padd(want, pmul(fwd, speed*0.016));
+            if (down(VK_DOWN)) want = psub(want, pmul(fwd, speed*0.016));
+            if (down(VK_LEFT)) yaw -= 0.035;
+            if (down(VK_RIGHT)) yaw += 0.035;
             auto blocked = [&](PVec p) {
                 for (const auto& b : boxes)
                     if (std::fabs(p.x-b.c.x) < b.s+0.35 && std::fabs(p.z-b.c.z) < b.s+0.35 &&
@@ -11152,7 +11156,7 @@ Interpreter::Interpreter() {
             for (int y=0;y<h;++y) {
                 double k=(double)y/h;
                 unsigned char rr=(unsigned char)(30+50*(1-k)), gg=(unsigned char)(45+70*(1-k)), bb=(unsigned char)(70+80*(1-k));
-                for (int x=0;x<w;++x){ size_t i=((size_t)y*w+x)*3; pw.back[i]=rr; pw.back[i+1]=gg; pw.back[i+2]=bb; }
+                for (int x=0;x<w;++x){ size_t i=((size_t)y*w+x)*3; pw.back[i]=bb; pw.back[i+1]=gg; pw.back[i+2]=rr; }
             }
             zbuf.assign((size_t)w*h, 1e30);
             auto project=[&](PVec p, double& sx, double& sy, double& z)->bool{
@@ -11160,7 +11164,60 @@ Interpreter::Interpreter() {
                 double xx=pdot(d,r), yy=pdot(d,u); double fl=(double)h*0.95;
                 sx=w*0.5+xx*fl/zz; sy=h*0.5-yy*fl/zz; z=zz; return true;
             };
-            auto drawTri=[&](PVec pa, PVec pb, PVec pc, unsigned col, double zoff){
+            const int SM = 384;
+            vector<float> shadowMap;
+            PVec lright, lup, lfwd;
+            auto buildShadowMap = [&]() {
+                shadowMap.assign((size_t)SM * SM, 1e30f);
+                PVec center{0, 2.0, -2.0};
+                PVec lc = padd(center, pmul(light, 20.0));
+                lfwd = pmul(light, -1.0);
+                lright = pnorm(pcross(lfwd, pv(0,1,0)));
+                lup = pcross(lright, lfwd);
+                auto projL = [&](PVec p, double& x, double& y, double& z) {
+                    PVec d = psub(p, lc);
+                    x = (pdot(d, lright) + 15.0) / 30.0 * SM;
+                    y = (pdot(d, lup) + 15.0) / 30.0 * SM;
+                    z = pdot(d, lfwd);
+                };
+                for (const auto& t : cubes) {
+                    double x0,y0,z0,x1,y1,z1,x2,y2,z2;
+                    projL(t.a,x0,y0,z0); projL(t.b,x1,y1,z1); projL(t.c,x2,y2,z2);
+                    int minx=std::max(0,(int)std::floor(std::min({x0,x1,x2})));
+                    int maxx=std::min(SM-1,(int)std::ceil(std::max({x0,x1,x2})));
+                    int miny=std::max(0,(int)std::floor(std::min({y0,y1,y2})));
+                    int maxy=std::min(SM-1,(int)std::ceil(std::max({y0,y1,y2})));
+                    double den=(y1-y2)*(x0-x2)+(x2-x1)*(y0-y2);
+                    if (std::fabs(den)<1e-9) continue;
+                    for(int y=miny;y<=maxy;++y) for(int x=minx;x<=maxx;++x) {
+                        double px=x+0.5, py=y+0.5;
+                        double w0=((y1-y2)*(px-x2)+(x2-x1)*(py-y2))/den;
+                        double w1=((y2-y0)*(px-x2)+(x0-x2)*(py-y2))/den;
+                        double w2=1-w0-w1;
+                        if(w0<-1e-6||w1<-1e-6||w2<-1e-6) continue;
+                        float z=(float)(w0*z0+w1*z1+w2*z2);
+                        size_t i=(size_t)y*SM+x;
+                        if(z<shadowMap[i]) shadowMap[i]=z;
+                    }
+                }
+            };
+            auto sampleShadow = [&](PVec p) {
+                if (shadowMap.empty()) return 1.0;
+                PVec center{0, 2.0, -2.0};
+                PVec lc = padd(center, pmul(light, 20.0));
+                PVec d = psub(p, lc);
+                double sx = (pdot(d, lright) + 15.0) / 30.0 * SM;
+                double sy = (pdot(d, lup) + 15.0) / 30.0 * SM;
+                double dz = pdot(d, lfwd) - 0.04;
+                if (sx < 1 || sy < 1 || sx >= SM-1 || sy >= SM-1) return 1.0;
+                int cx=(int)sx, cy=(int)sy, lit=0, total=0;
+                for(int oy=-1;oy<=1;++oy) for(int ox=-1;ox<=1;++ox) {
+                    float sd=shadowMap[(size_t)(cy+oy)*SM+(cx+ox)];
+                    ++total; if (dz <= sd) ++lit;
+                }
+                return (double)lit / std::max(1,total);
+            };
+            auto drawTri=[&](PVec pa, PVec pb, PVec pc, unsigned col, double zoff, bool receive){
                 double x0,y0,z0,x1,y1,z1,x2,y2,z2;
                 if(!project(pa,x0,y0,z0)||!project(pb,x1,y1,z1)||!project(pc,x2,y2,z2)) return;
                 double minx=std::max(0.0,std::floor(std::min({x0,x1,x2}))), maxx=std::min((double)w-1,std::ceil(std::max({x0,x1,x2})));
@@ -11177,21 +11234,19 @@ Interpreter::Interpreter() {
                     if(w0<-1e-6||w1<-1e-6||w2<-1e-6) continue;
                     double z=w0*z0+w1*z1+w2*z2-zoff; if(z<=0) continue;
                     size_t i=(size_t)y*w+x; if(z>=zbuf[i]) continue; zbuf[i]=z;
+                    double wx=w0*pa.x+w1*pb.x+w2*pc.x;
+                    double wy=w0*pa.y+w1*pb.y+w2*pc.y;
+                    double wz=w0*pa.z+w1*pb.z+w2*pc.z;
+                    double shade = receive ? sampleShadow({wx,wy,wz}) : 1.0;
                     double fog=std::max(0.25,1.0-z/28.0);
-                    pw.back[i*3]=(unsigned char)std::min(255.0,cr*lit*fog);
-                    pw.back[i*3+1]=(unsigned char)std::min(255.0,cg*lit*fog);
-                    pw.back[i*3+2]=(unsigned char)std::min(255.0,cb*lit*fog);
+                    pw.back[i*3]=(unsigned char)std::min(255.0,cb*lit*shade*fog);
+                    pw.back[i*3+1]=(unsigned char)std::min(255.0,cg*lit*shade*fog);
+                    pw.back[i*3+2]=(unsigned char)std::min(255.0,cr*lit*shade*fog);
                 }
             };
-            for(auto& t:ground) drawTri(t.a,t.b,t.c,t.color,0);
-            for(auto& t:cubes){
-                PVec sa,sb,sc; double tt;
-                tt=t.a.y/light.y; sa={t.a.x-light.x*tt,0,t.a.z-light.z*tt};
-                tt=t.b.y/light.y; sb={t.b.x-light.x*tt,0,t.b.z-light.z*tt};
-                tt=t.c.y/light.y; sc={t.c.x-light.x*tt,0,t.c.z-light.z*tt};
-                drawTri(sa,sb,sc,0x1a2226,0.01);
-            }
-            for(auto& t:cubes) drawTri(t.a,t.b,t.c,t.color,0);
+            buildShadowMap();
+            for(auto& t:ground) drawTri(t.a,t.b,t.c,t.color,0,true);
+            for(auto& t:cubes) drawTri(t.a,t.b,t.c,t.color,0,true);
             for(int y=-2;y<=2;++y) for(int x=-2;x<=2;++x){
                 if(std::abs(x)<=1&&std::abs(y)<=1) continue;
                 size_t i=(size_t)(h/2+y)*w+(w/2+x); if(i*3+2<pw.back.size()){pw.back[i*3]=230;pw.back[i*3+1]=240;pw.back[i*3+2]=255;}
