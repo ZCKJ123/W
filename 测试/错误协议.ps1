@@ -66,6 +66,9 @@ try {
     if (-not $ej.diagnostics[0].frames -or $ej.diagnostics[0].frames.Count -lt 3) {
         $fail++
         Write-Host "失败：表达式内调用缺 frames"
+    } elseif ($ej.diagnostics[0].frames[0] -notmatch '甲') {
+        $fail++
+        Write-Host "失败：frames 顺序不是外层在前"
     }
 
     $rf = Join-Path $dir 'runtime.wen'

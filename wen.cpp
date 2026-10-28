@@ -16607,9 +16607,9 @@ static void printDiagnostics(const vector<WenError>& errors, const string& filen
                            ",\"text\":" + jsonQuote(lines[(size_t)e.line - 1]) + "}";
                 if (!e.frames.empty()) {
                     out += ",\"frames\":[";
-                    for (size_t k = 0; k < e.frames.size(); ++k) {
-                        if (k) out += ",";
-                        out += jsonQuote(e.frames[k]);
+                    for (auto it = e.frames.rbegin(); it != e.frames.rend(); ++it) {
+                        if (it != e.frames.rbegin()) out += ",";
+                        out += jsonQuote(*it);
                     }
                     out += "]";
                 }
@@ -16631,9 +16631,9 @@ static void printDiagnostics(const vector<WenError>& errors, const string& filen
                 out += ",\"hint\":" + jsonQuote(hint);
             if (!e.frames.empty()) {
                 out += ",\"frames\":[";
-                for (size_t k = 0; k < e.frames.size(); ++k) {
-                    if (k) out += ",";
-                    out += jsonQuote(e.frames[k]);
+                for (auto it = e.frames.rbegin(); it != e.frames.rend(); ++it) {
+                    if (it != e.frames.rbegin()) out += ",";
+                    out += jsonQuote(*it);
                 }
                 out += "]";
             }
