@@ -3529,7 +3529,7 @@ static const std::map<string, string>& functionModules() {
         {"新建神经层", "神经网络库"}, {"神经链", "神经网络库"}, {"前向", "神经网络库"},
         {"颜色", "视口库"}, {"新建视口", "视口库"}, {"视口清空", "视口库"}, {"视口画点", "视口库"},
         {"视口画线", "视口库"}, {"视口画三角形", "视口库"}, {"视口尺寸", "视口库"}, {"视口保存", "视口库"},
-        {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"}, {"视口显示", "视口库"}, {"玩家视口", "视口库"}, {"大气预设", "视口库"}, {"网格新建", "三维库"}, {"网格三角", "三维库"}, {"网格平移", "三维库"}, {"网格缩放", "三维库"}, {"网格旋转", "三维库"}, {"网格合并", "三维库"}, {"网格三角形数", "三维库"}, {"视口加载模型", "视口库"}, {"光追渲染", "视口库"}, {"材质检查", "视口库"}, {"材质预设", "视口库"}, {"视口取色", "视口库"},
+        {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"}, {"视口显示", "视口库"}, {"玩家视口", "视口库"}, {"大气预设", "视口库"}, {"网格新建", "三维库"}, {"网格三角", "三维库"}, {"网格平移", "三维库"}, {"网格缩放", "三维库"}, {"网格旋转", "三维库"}, {"网格合并", "三维库"}, {"网格三角形数", "三维库"}, {"视口加载模型", "视口库"}, {"光追渲染", "视口库"}, {"体积云渲染", "视口库"}, {"材质检查", "视口库"}, {"材质预设", "视口库"}, {"视口取色", "视口库"},
         {"硬件信息", "硬件库"}, {"高精度计时", "硬件库"}, {"内存状态", "硬件库"}, {"屏幕尺寸", "硬件库"}, {"磁盘空间", "硬件库"},
         {"大整数幂", "大整数库"}, {"大整数乘", "大整数库"}, {"大整数加", "大整数库"}, {"大整数阶乘", "大整数库"},
         {"阶乘位数", "大整数库"}, {"阶乘末尾零", "大整数库"}, {"阶乘概览", "大整数库"},
@@ -10554,6 +10554,99 @@ Interpreter::Interpreter() {
             throw WenError("运行时错误", line, 0,
                            "未知材质预设「" + name + "」；可用：金 银 铜 玻璃 水 陶瓷 橡胶 自发光");
         }
+        return vDict(d);
+    });
+    registerBuiltin("体积云渲染", 2, 4, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        int w = std::max(1, std::min(2048, (int)needIndex(a[0], "体积云渲染", line)));
+        int h = std::max(1, std::min(2048, (int)needIndex(a[1], "体积云渲染", line)));
+        double tm = a.size() >= 3 ? needNum(a[2], "体积云渲染", line) : 0;
+        int steps = a.size() >= 4 ? (int)needIndex(a[3], "体积云渲染", line) : 48;
+        steps = std::max(8, std::min(96, steps));
+        auto buf = std::make_shared<std::vector<unsigned char>>((size_t)w*h*3);
+        auto hash3 = [](double x, double y, double z) {
+            double v = std::sin(x*127.1 + y*311.7 + z*74.7) * 43758.5453123;
+            return v - std::floor(v);
+        };
+        auto noise3 = [&](double x, double y, double z) {
+            double ix=std::floor(x), iy=std::floor(y), iz=std::floor(z);
+            double fx=x-ix, fy=y-iy, fz=z-iz;
+            fx=fx*fx*(3-2*fx); fy=fy*fy*(3-2*fy); fz=fz*fz*(3-2*fz);
+            double n000=hash3(ix,iy,iz), n100=hash3(ix+1,iy,iz);
+            double n010=hash3(ix,iy+1,iz), n110=hash3(ix+1,iy+1,iz);
+            double n001=hash3(ix,iy,iz+1), n101=hash3(ix+1,iy,iz+1);
+            double n011=hash3(ix,iy+1,iz+1), n111=hash3(ix+1,iy+1,iz+1);
+            double nx00=n000*(1-fx)+n100*fx, nx10=n010*(1-fx)+n110*fx;
+            double nx01=n001*(1-fx)+n101*fx, nx11=n011*(1-fx)+n111*fx;
+            return (nx00*(1-fy)+nx10*fy)*(1-fz) + (nx01*(1-fy)+nx11*fy)*fz;
+        };
+        auto density = [&](double x, double y, double z, double t) {
+            double hh = (y - 6.0) / 12.0;
+            if (hh < 0 || hh > 1) return 0.0;
+            double f=0, amp=0.55, fr=1;
+            for (int o=0;o<4;++o) { f += noise3(x*0.16*fr + t*0.2, y*0.22*fr, z*0.16*fr - t*0.2)*amp; fr*=2.07; amp*=0.5; }
+            double billow = 1.0 - std::fabs(2.0*f - 1.0);
+            double n = f*0.62 + billow*0.38;
+            n -= noise3(x*0.5+7, y*0.55, z*0.5-4)*0.18;
+            double prof = std::pow(hh,0.45)*std::pow(std::max(0.0,1-hh),0.35)*2.2;
+            return std::max(0.0, std::min(1.0, (n*prof - 0.40)*9.0));
+        };
+        auto renderRows = [&](int y0, int y1) {
+#ifdef _WIN32
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+            for (int y=y0;y<y1;++y) for (int x=0;x<w;++x) {
+                double px=(2.0*(x+0.5)/w-1.0)*(double)w/h*0.75;
+                double py=(1.0-2.0*(y+0.5)/h)*0.75;
+                double len=std::sqrt(px*px+py*py+1.0);
+                double dx=px/len, dy=py/len, dz=-1.0/len;
+                // 相机在云下，稍微抬头
+                dy += 0.18;
+                double dl=std::sqrt(dx*dx+dy*dy+dz*dz); dx/=dl; dy/=dl; dz/=dl;
+                double rr=30+50*std::max(0.0,dy), gg=45+70*std::max(0.0,dy), bb=80+90*std::max(0.0,dy);
+                double lx=-1.6+1.4*std::cos(tm*0.5), ly=2.35, lz=-1.25+1.4*std::sin(tm*0.5);
+                double ll=std::sqrt(lx*lx+ly*ly+lz*lz); lx/=ll; ly/=ll; lz/=ll;
+                double sun=std::max(0.0, dx*lx+dy*ly+dz*lz);
+                rr += std::pow(sun,64)*80; gg += std::pow(sun,64)*60; bb += std::pow(sun,64)*30;
+                if (dy > 0.02) {
+                    double t0=(6.0-1.8)/dy, t1=(18.0-1.8)/dy;
+                    if (t1>t0) {
+                        double T=1, cr=0, cg=0, cb=0;
+                        double jitter=hash3(x*1.7,y*2.3,0.5);
+                        for (int st=0;st<steps;++st) {
+                            double tt=t0+(t1-t0)*(st+jitter)/steps;
+                            double cx=0+dx*tt, cy=1.8+dy*tt, cz=6.0+dz*tt;
+                            double den=density(cx,cy,cz,tm);
+                            if (den<=0.001) continue;
+                            double od=0;
+                            for (int l=1;l<=6;++l) od += density(cx+lx*0.5*l, cy+ly*0.5*l, cz+lz*0.5*l, tm)*0.5;
+                            double beam=std::exp(-od*2.0);
+                            double a=1-std::exp(-den*(t1-t0)/steps*1.8);
+                            double mu=dx*lx+dy*ly+dz*lz;
+                            double g=0.62;
+                            double phase=(1-g*g)/(4*3.14159265358979323846*std::pow(std::max(0.02,1+g*g-2*g*mu),1.5));
+                            double powder=1-std::exp(-den*4);
+                            double lit=(0.48+0.52*beam)*(0.5+0.5*phase*8)*(0.55+0.45*powder);
+                            cr += T*a*(0.92*lit+0.08);
+                            cg += T*a*(0.95*lit+0.08);
+                            cb += T*a*(1.0*lit+0.12);
+                            T *= (1-a);
+                            if (T<0.01) break;
+                        }
+                        rr=rr*T+cr*255; gg=gg*T+cg*255; bb=bb*T+cb*255;
+                    }
+                }
+                size_t i=((size_t)y*w+x)*3;
+                (*buf)[i]=(unsigned char)std::min(255.0,std::max(0.0,rr));
+                (*buf)[i+1]=(unsigned char)std::min(255.0,std::max(0.0,gg));
+                (*buf)[i+2]=(unsigned char)std::min(255.0,std::max(0.0,bb));
+            }
+        };
+        unsigned nt=std::max(2u,std::min(8u,std::thread::hardware_concurrency()));
+        std::vector<std::thread> th;
+        for(unsigned k=0;k<nt;++k) th.emplace_back(renderRows,h*(int)k/(int)nt,h*(int)(k+1)/(int)nt);
+        for(auto& t:th) t.join();
+        auto d=std::make_shared<Dict>();
+        d->items["宽"]=vNum(w); d->items["高"]=vNum(h); d->items["像素"]=vBytes(buf);
         return vDict(d);
     });
     registerBuiltin("材质检查", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
