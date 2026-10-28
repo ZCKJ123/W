@@ -11756,38 +11756,47 @@ Interpreter::Interpreter() {
                 }
                 auto addLayer = [&](double base, double top, double cover, double scale, double wind, int layer) {
                     double t = tsec;
-                    for (double gx=-42; gx<=42; gx+=particleStep)
-                    for (double gz=-42; gz<=42; gz+=particleStep)
-                    for (double gy=base+0.4; gy<top; gy+=0.9) {
-                        double h=(gy-base)/(top-base);
-                        double qx=(gx+t*wind)*scale, qy=gy*scale*1.7, qz=(gz-t*wind)*scale;
-                        double f=0, amp=0.55, fr=1;
-                        for(int o=0;o<3;++o){ f += vnoise3(qx*fr,qy*fr,qz*fr)*amp; fr*=2.1; amp*=0.5; }
-                        double billow=1.0-std::fabs(2.0*f-1.0);
-                        double n=f*0.62+billow*0.38;
-                        double prof=std::pow(std::max(0.0,h),0.40)*std::pow(std::max(0.0,1-h),0.20);
-                        double d=(n*prof - (0.52-cover*0.32))*4.0;
-                        if (d <= 0.03) continue;
-                        if (layer == 0) {
-                            double env=0;
-                            for (const auto& sd : seeds) {
-                                double dx=gx-(sd.x+t*wind), dz=gz-(sd.z-t*wind);
-                                env=std::max(env, std::exp(-(dx*dx+dz*dz)/(sd.r*sd.r)));
+                    if (layer == 0) {
+                        for (int i=0;i<12;++i) {
+                            double sx = -34.0 + 68.0 * hash3(i*3.1, 1.7, 2.3);
+                            double sz = -34.0 + 68.0 * hash3(i*5.7, 4.1, 8.9);
+                            double sr = 3.0 + 6.0 * hash3(i*2.3, 9.1, 3.7);
+                            int n = 620;
+                            for (int k=0;k<n;++k) {
+                                double u = hash3(i*7.1, k*1.31, 1.2);
+                                double ang = 6.28318530718 * hash3(i*2.7, k*3.1, 7.4);
+                                double rr = std::sqrt(u) * sr;
+                                double hh = hash3(k*2.1, i*5.3, 9.7);
+                                double gx = sx + std::cos(ang)*rr + t*wind;
+                                double gz = sz + std::sin(ang)*rr - t*wind;
+                                double gy = base + (0.08 + 0.92*hh) * (top-base);
+                                double env = 1.0 - rr/std::max(0.1,sr);
+                                double vprof = std::pow(std::max(0.0, 1.0-hh), 0.25);
+                                double d = cover * env * vprof * (0.55+0.45*hash3(i*1.9, k*4.7, 2.2));
+                                if (d <= 0.025) continue;
+                                double beam = 0.45 + 0.55*std::exp(-vnoise3((gx+light.x*4)*scale,(gy+2.5)*scale*1.4,(gz+light.z*4)*scale)*2.2);
+                                parts.push_back({{gx,gy,gz}, std::min(1.0,d), beam, 0});
+                                if (parts.size() > 24000) return;
                             }
-                            if (env < 0.18) continue;
-                            d *= (0.55 + 0.45*env);
                         }
-                        double beam = 0.45 + 0.55*std::exp(-vnoise3((gx+light.x*4.0)*scale, (gy+2.5)*scale*1.4, (gz+light.z*4.0)*scale)*2.2);
-                        if (d <= 0.03) continue;
-                        double jx=(hash3(gx*1.3,gz*1.7,gy)-0.5)*1.8;
-                        double jz=(hash3(gz*1.1,gx*1.9,gy+7)-0.5)*1.8;
-                        parts.push_back({{gx+jx, gy, gz+jz}, std::min(1.0,d), beam, layer});
-                        if (parts.size() > 26000) return;
+                    } else {
+                        for (double gx=-36; gx<=36; gx+=1.7)
+                        for (double gz=-36; gz<=36; gz+=1.7) {
+                            double h = hash3(gx*0.7, gz*1.3, 5.0);
+                            double gy = base + h*(top-base);
+                            double qx=(gx+t*wind)*scale, qy=gy*scale*1.7, qz=(gz-t*wind)*scale;
+                            double f=0, amp=0.55, fr=1;
+                            for(int o=0;o<3;++o){ f += vnoise3(qx*fr,qy*fr,qz*fr)*amp; fr*=2.1; amp*=0.5; }
+                            double d=(f - (0.55-cover*0.25))*2.2;
+                            if (d<=0.02) continue;
+                            double beam=0.55+0.45*std::exp(-f*2.0);
+                            parts.push_back({{gx,gy,gz}, std::min(1.0,d), beam, 1});
+                            if (parts.size() > 26000) return;
+                        }
                     }
                 };
                 addLayer(atmo.base, atmo.top, atmo.cover, atmo.scale, atmo.wind, 0);
                 if (atmo.highCover > 0.01) addLayer(atmo.highBase, atmo.highTop, atmo.highCover, atmo.highScale, atmo.wind*0.6, 1);
-                std::cerr << "PARTS " << parts.size() << " cover=" << atmo.cover << "\n";
                 auto pj = [&](PVec q, double& sx, double& sy, double& zz)->bool {
                     PVec d=psub(q,cam); zz=pdot(d,f); if(zz<=0.2) return false;
                     double xx=pdot(d,r), yy=pdot(d,u); double fl=(double)h*0.95;
