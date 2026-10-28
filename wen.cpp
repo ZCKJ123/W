@@ -12754,6 +12754,54 @@ Interpreter::Interpreter() {
                 pw.back[i*3+1] = (unsigned char)(pw.back[i*3+1]*ao);
                 pw.back[i*3+2] = (unsigned char)(pw.back[i*3+2]*ao);
             }
+            // 后处理：亮部 → Bloom → ACES → 暗角
+            {
+                const int bw=std::max(1,w/4), bh=std::max(1,h/4);
+                vector<float> bloom((size_t)bw*bh*3, 0.0f);
+                for (int y=0;y<bh;++y) for (int x=0;x<bw;++x) {
+                    size_t si=((size_t)(y*4)*w + x*4)*3;
+                    double r=pw.back[si+2], g=pw.back[si+1], b=pw.back[si];
+                    double lum=0.2126*r+0.7152*g+0.0722*b;
+                    double k=std::max(0.0, (lum-155.0)/100.0);
+                    if (k<=0) continue;
+                    size_t di=((size_t)y*bw+x)*3;
+                    bloom[di]=(float)(b*k); bloom[di+1]=(float)(g*k); bloom[di+2]=(float)(r*k);
+                }
+                vector<float> tmp;
+                for (int pass=0; pass<2; ++pass) {
+                    tmp=bloom;
+                    for (int y=0;y<bh;++y) for (int x=0;x<bw;++x) {
+                        double sr=0,sg=0,sb=0,sw=0;
+                        for(int oy=-2;oy<=2;++oy) for(int ox=-2;ox<=2;++ox){
+                            int xx=std::max(0,std::min(bw-1,x+ox)), yy=std::max(0,std::min(bh-1,y+oy));
+                            double wgt=1.0/(1.0+std::abs(ox)+std::abs(oy));
+                            size_t qi=((size_t)yy*bw+xx)*3;
+                            sr+=tmp[qi]*wgt; sg+=tmp[qi+1]*wgt; sb+=tmp[qi+2]*wgt; sw+=wgt;
+                        }
+                        size_t di=((size_t)y*bw+x)*3;
+                        bloom[di]=(float)(sr/sw); bloom[di+1]=(float)(sg/sw); bloom[di+2]=(float)(sb/sw);
+                    }
+                }
+                auto aces=[](double x){ return (x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14); };
+                for (int y=0;y<h;++y) for (int x=0;x<w;++x) {
+                    size_t i=((size_t)y*w+x)*3;
+                    size_t bi=((size_t)(y*bh/h)*bw + (x*bw/w))*3;
+                    double r=pw.back[i+2] + bloom[bi+2]*0.22;
+                    double g=pw.back[i+1] + bloom[bi+1]*0.22;
+                    double b=pw.back[i]   + bloom[bi]  *0.22;
+                    double nx=(x+0.5)/w*2-1, ny=(y+0.5)/h*2-1;
+                    double vig=1.0-0.18*(nx*nx+ny*ny);
+                    double tr=r/255.0, tg=g/255.0, tb=b/255.0;
+                    if (tr>0.55) tr=aces(tr); if (tg>0.55) tg=aces(tg); if (tb>0.55) tb=aces(tb);
+                    r=tr*255.0*vig; g=tg*255.0*vig; b=tb*255.0*vig;
+                    double lum=0.2126*r+0.7152*g+0.0722*b;
+                    r=lum+(r-lum)*1.12; g=lum+(g-lum)*1.12; b=lum+(b-lum)*1.12;
+                    r=(r-128.0)*1.10+128.0; g=(g-128.0)*1.10+128.0; b=(b-128.0)*1.10+128.0;
+                    pw.back[i]  =(unsigned char)std::min(255.0,std::max(0.0,b));
+                    pw.back[i+1]=(unsigned char)std::min(255.0,std::max(0.0,g));
+                    pw.back[i+2]=(unsigned char)std::min(255.0,std::max(0.0,r));
+                }
+            }
             {
                 std::lock_guard<std::mutex> lk(pw.mtx);
                 std::swap(pw.bgr, pw.back);
