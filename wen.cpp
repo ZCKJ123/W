@@ -11181,7 +11181,7 @@ Interpreter::Interpreter() {
             else full = truthy(a[3]);
         }
         if (a.size() >= 5) full = truthy(a[4]);
-        struct Atmo { string type="积云"; double cover=0.55, base=8, top=14, scale=0.13, wind=0.25, sun=1.0, fog=0.0; int steps=16, res=5; } atmo;
+        struct Atmo { string type="积云"; double cover=0.55, base=8, top=14, scale=0.13, wind=0.25, sun=1.0, fog=0.0; int steps=14, res=6; } atmo;
         if (a.size() >= 7 && a[6].type == VT::Dict) {
             auto ad = needDict(a[6], "大气", line);
             auto pick = [&](const char* k, double& out) {
@@ -11325,7 +11325,7 @@ Interpreter::Interpreter() {
         }
         PVec light = pnorm({0.45,1.0,0.35});
         PVec cam{0,1.7,4.5};
-        double yaw = 0, pitch = -0.05;
+        double yaw = 0, pitch = 0.10;
         pw.capture = true; SetCapture(hwnd); ShowCursor(FALSE);
         std::thread presenter([&]() {
             HDC pdc = GetDC(hwnd);
@@ -11429,7 +11429,10 @@ Interpreter::Interpreter() {
                     fr *= 2.07; amp *= 0.5;
                 }
                 double billow = 1.0 - std::fabs(2.0*f - 1.0);
-                double n = f * 0.72 + billow * 0.28;
+                double n = f * 0.62 + billow * 0.38;
+                // 细节侵蚀：大尺度云团上挖出小空洞
+                double er = vnoise3(q.x*3.1+7.3, q.y*3.4, q.z*3.1-4.2) * 0.22;
+                n -= er * (0.35 + 0.65 * (1.0 - h));
                 double profile = 1.0;
                 if (atmo.type == "层云") {
                     profile = std::sin(3.14159265358979323846 * h);
@@ -11438,8 +11441,9 @@ Interpreter::Interpreter() {
                 } else {
                     profile = std::pow(h, 0.45) * std::pow(std::max(0.0, 1.0 - h), 0.35) * 2.2;
                 }
-                double threshold = (1.0 - atmo.cover) * 0.78;
-                double d = (n * profile - threshold) * (atmo.type == "卷云" ? 2.2 : 4.0);
+                double threshold = 0.58 - atmo.cover * 0.30;
+                double d = (n * profile - threshold) * (atmo.type == "卷云" ? 4.0 : 9.0);
+                if (d < 0.03) return 0.0;
                 return std::max(0.0, std::min(1.0, d));
             };
             // 体积云：低分辨率射线步进 + 双线性放大
@@ -11463,8 +11467,11 @@ Interpreter::Interpreter() {
                     double T = 1.0, cr = 0, cg = 0, cb = 0;
                     double mu = pdot(rd, light);
                     double g = atmo.type == "卷云" ? 0.35 : 0.62;
-                    double phase = (1.0-g*g) / (4.0*3.14159265358979323846 *
-                                   std::pow(std::max(0.02, 1.0 + g*g - 2.0*g*mu), 1.5));
+                    auto hg = [&](double gg) {
+                        return (1.0-gg*gg) / (4.0*3.14159265358979323846 *
+                               std::pow(std::max(0.02, 1.0 + gg*gg - 2.0*gg*mu), 1.5));
+                    };
+                    double phase = hg(g) * 0.7 + hg(-0.18) * 0.3;
                     for (int st=0; st<steps; ++st) {
                         double tt = t0r + (st + jitter) * dt;
                         PVec p = padd(cam, pmul(rd, tt));
@@ -11478,10 +11485,13 @@ Interpreter::Interpreter() {
                         double beam = std::exp(-od * 2.0);
                         double a = 1.0 - std::exp(-dens * dt * 1.8);
                         // 多次散射的粗糙近似：直射 + 环境
-                        double lit = 0.58 + 0.42 * std::max(0.0, beam * atmo.sun);
-                        cr += T * a * (0.88 * lit + 0.12);
-                        cg += T * a * (0.91 * lit + 0.12);
-                        cb += T * a * (0.97 * lit + 0.14);
+                        double powder = 1.0 - std::exp(-dens * 4.0);
+                        double ms = 1.0 / (1.0 + 0.22 * od);
+                        double lit = (0.50 + 0.50 * std::max(0.0, beam * atmo.sun)) *
+                                     (0.65 + 0.35 * phase * 8.0) * (0.55 + 0.45 * powder) * (0.75 + 0.25 * ms);
+                        cr += T * a * (0.90 * lit + 0.10);
+                        cg += T * a * (0.93 * lit + 0.10);
+                        cb += T * a * (1.00 * lit + 0.12);
                         T *= (1.0 - a);
                         if (T < 0.015) break;
                     }
