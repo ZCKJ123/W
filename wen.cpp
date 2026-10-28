@@ -3556,7 +3556,7 @@ static const std::map<string, string>& functionModules() {
         {"新建神经层", "神经网络库"}, {"神经链", "神经网络库"}, {"前向", "神经网络库"},
         {"颜色", "视口库"}, {"新建视口", "视口库"}, {"视口清空", "视口库"}, {"视口画点", "视口库"},
         {"视口画线", "视口库"}, {"视口画三角形", "视口库"}, {"视口尺寸", "视口库"}, {"视口保存", "视口库"},
-        {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"}, {"视口显示", "视口库"}, {"玩家视口", "视口库"}, {"大气预设", "视口库"}, {"媒体信息", "媒体库"}, {"媒体播放", "媒体库"}, {"媒体停止", "媒体库"}, {"音频设备", "媒体库"}, {"音频录制", "媒体库"}, {"音频兼容检查", "媒体库"}, {"媒体格式支持", "媒体库"}, {"网格新建", "三维库"}, {"网格三角", "三维库"}, {"网格平移", "三维库"}, {"网格缩放", "三维库"}, {"网格旋转", "三维库"}, {"网格合并", "三维库"}, {"网格三角形数", "三维库"}, {"视口加载模型", "视口库"}, {"光追渲染", "视口库"}, {"体积云渲染", "视口库"}, {"材质检查", "视口库"}, {"材质预设", "视口库"}, {"视口取色", "视口库"},
+        {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"}, {"视口显示", "视口库"}, {"玩家视口", "视口库"}, {"大气预设", "视口库"}, {"媒体信息", "媒体库"}, {"媒体播放", "媒体库"}, {"媒体停止", "媒体库"}, {"音频设备", "媒体库"}, {"音频录制", "媒体库"}, {"音频兼容检查", "媒体库"}, {"媒体格式支持", "媒体库"}, {"音频解析", "媒体库"}, {"音频判定", "媒体库"}, {"音频频谱", "媒体库"}, {"网格新建", "三维库"}, {"网格三角", "三维库"}, {"网格平移", "三维库"}, {"网格缩放", "三维库"}, {"网格旋转", "三维库"}, {"网格合并", "三维库"}, {"网格三角形数", "三维库"}, {"视口加载模型", "视口库"}, {"光追渲染", "视口库"}, {"体积云渲染", "视口库"}, {"材质检查", "视口库"}, {"材质预设", "视口库"}, {"视口取色", "视口库"},
         {"硬件信息", "硬件库"}, {"高精度计时", "硬件库"}, {"内存状态", "硬件库"}, {"屏幕尺寸", "硬件库"}, {"磁盘空间", "硬件库"},
         {"大整数幂", "大整数库"}, {"大整数乘", "大整数库"}, {"大整数加", "大整数库"}, {"大整数阶乘", "大整数库"},
         {"阶乘位数", "大整数库"}, {"阶乘末尾零", "大整数库"}, {"阶乘概览", "大整数库"},
@@ -9766,6 +9766,154 @@ Interpreter::Interpreter() {
         for (const char* suf : WEN_SOURCE_SUFFIXES) l->items.push_back(vStr(suf));
         return vList(l);
     });
+    // ---------- 音频解析器：WAV PCM / MP3 帧头 / MP4 mvhd / FFT ----------
+    struct WavInfo {
+        int rate=0, channels=0, bits=0;
+        vector<short> samples;
+    };
+    static auto rd32le = [](const string& b, size_t p) -> uint32_t {
+        if (p+4>b.size()) return 0;
+        return (uint8_t)b[p] | ((uint32_t)(uint8_t)b[p+1]<<8) |
+               ((uint32_t)(uint8_t)b[p+2]<<16) | ((uint32_t)(uint8_t)b[p+3]<<24);
+    };
+    static auto rd16le = [](const string& b, size_t p) -> uint16_t {
+        if (p+2>b.size()) return 0;
+        return (uint8_t)b[p] | ((uint16_t)(uint8_t)b[p+1]<<8);
+    };
+    static auto parseWav = [](const string& b, WavInfo& w) -> bool {
+        if (b.size()<12 || b.compare(0,4,"RIFF")!=0 || b.compare(8,4,"WAVE")!=0) return false;
+        size_t pos=12; bool haveFmt=false;
+        while (pos+8<=b.size()) {
+            string id=b.substr(pos,4); uint32_t sz=rd32le(b,pos+4); pos+=8;
+            if (id=="fmt ") {
+                if (sz<16 || pos+16>b.size()) return false;
+                w.channels=rd16le(b,pos+2); w.rate=(int)rd32le(b,pos+4); w.bits=rd16le(b,pos+14);
+                haveFmt=true;
+            } else if (id=="data") {
+                if (!haveFmt) return false;
+                size_t n=std::min((size_t)sz,b.size()-pos);
+                if (w.bits==16) {
+                    w.samples.resize(n/2);
+                    memcpy(w.samples.data(),b.data()+pos,(n/2)*2);
+                } else if (w.bits==8) {
+                    w.samples.resize(n);
+                    for(size_t i=0;i<n;++i) w.samples[i]=(short)(((int)(uint8_t)b[pos+i]-128)*256);
+                } else return false;
+                return true;
+            }
+            pos += sz + (sz&1);
+        }
+        return false;
+    };
+    static auto fftPeak = [](const vector<short>& src, int rate, int count) {
+        const int N=2048;
+        vector<std::complex<double>> a(N);
+        size_t off=src.size()>N ? (src.size()-N)/2 : 0;
+        for(int i=0;i<N;++i){
+            double win=0.5-0.5*std::cos(2*3.14159265358979323846*i/(N-1));
+            double v=(off+(size_t)i<src.size()?src[off+i]:0)/32768.0;
+            a[i]=v*win;
+        }
+        for(int i=1,j=0;i<N;++i){ int bit=N>>1; for(;j&bit;bit>>=1) j^=bit; j^=bit; if(i<j) std::swap(a[i],a[j]); }
+        for(int len=2;len<=N;len<<=1){
+            double ang=-2*3.14159265358979323846/len;
+            std::complex<double> wl(std::cos(ang),std::sin(ang));
+            for(int i=0;i<N;i+=len){
+                std::complex<double> w(1);
+                for(int j=0;j<len/2;++j){ auto u=a[i+j], v=a[i+j+len/2]*w; a[i+j]=u+v; a[i+j+len/2]=u-v; w*=wl; }
+            }
+        }
+        vector<std::pair<double,double>> bins;
+        for(int i=2;i<N/2;++i) bins.push_back({(double)i*rate/N, std::abs(a[i])});
+        std::sort(bins.begin(),bins.end(),[](auto& x,auto& y){return x.second>y.second;});
+        vector<std::pair<double,double>> out;
+        for(int i=0;i<std::min<int>(count,bins.size());++i) out.push_back(bins[i]);
+        return out;
+    };
+    registerBuiltin("音频解析", 1, 1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path=needStr(a[0],"音频解析",line);
+        string full=resolveWenPath(path);
+        string ext=lowerAscii(fs::u8path(path).extension().u8string());
+        if(!ext.empty()&&ext[0]=='.') ext=ext.substr(1);
+        string b;
+        try { b=readWholeFile(full); } catch(IoError& e){ throw WenError("文件错误",line,0,e.what()); }
+        auto d=std::make_shared<Dict>();
+        d->items["文件"]=vStr(path); d->items["格式"]=vStr(ext.empty()?"未知":ext);
+        if (ext=="wav") {
+            WavInfo w;
+            if(!parseWav(b,w)) throw WenError("音频错误",line,0,"WAV 解析失败");
+            double peak=0,rms=0,zc=0,quiet=0;
+            for(size_t i=0;i<w.samples.size();++i){
+                double v=w.samples[i]/32768.0; peak=std::max(peak,std::fabs(v)); rms+=v*v;
+                if(i && ((w.samples[i-1]<0)!=(w.samples[i]<0))) ++zc;
+                if(std::fabs(v)<0.02) ++quiet;
+            }
+            rms=std::sqrt(rms/std::max<size_t>(1,w.samples.size()));
+            d->items["可解析"]=vBool(true); d->items["编码"]=vStr("PCM");
+            d->items["采样率"]=vNum(w.rate); d->items["声道"]=vNum(w.channels); d->items["位深"]=vNum(w.bits);
+            d->items["时长"]=vNum(w.rate? (double)w.samples.size()/w.channels/w.rate : 0);
+            d->items["峰值"]=vNum(peak); d->items["均方根"]=vNum(rms);
+            d->items["过零率"]=vNum(zc/std::max<size_t>(1,w.samples.size()-1));
+            d->items["静音比"]=vNum(quiet/std::max<size_t>(1,w.samples.size()));
+        } else if (ext=="mp3") {
+            size_t pos=0;
+            if (b.size()>10 && b.compare(0,3,"ID3")==0) {
+                pos=10 + ((uint8_t)b[6]<<21) + ((uint8_t)b[7]<<14) + ((uint8_t)b[8]<<7) + (uint8_t)b[9];
+            }
+            int br=0,sr=0,ch=0; bool found=false;
+            while (pos+4<b.size()) {
+                unsigned char h1=(unsigned char)b[pos],h2=(unsigned char)b[pos+1],h3=(unsigned char)b[pos+2];
+                if(h1==0xFF && (h2&0xE0)==0xE0){ int ver=(h2>>3)&3, layer=(h2>>1)&3, bri=(h3>>4)&15, sri=(h3>>2)&3;
+                    static const int br1[16]={0,32,40,48,56,64,80,96,112,128,160,192,224,256,320,0};
+                    static const int sr1[4]={44100,48000,32000,0};
+                    if(ver==3&&layer==1&&bri>0&&sri<3){ br=br1[bri]; sr=sr1[sri]; ch=((h3>>6)&3)==3?1:2; found=true; break; }
+                }
+                ++pos;
+            }
+            d->items["可解析"]=vBool(found);
+            if(found){ d->items["编码"]=vStr("MPEG-1 Layer III"); d->items["比特率"]=vNum(br); d->items["采样率"]=vNum(sr); d->items["声道"]=vNum(ch);
+                d->items["时长"]=vNum((double)(b.size()-pos)*8/(br*1000.0)); }
+        } else if (ext=="mp4" || ext=="m4a" || ext=="mov") {
+            size_t pos=b.find("mvhd");
+            bool found=pos!=string::npos && pos+32<b.size();
+            d->items["可解析"]=vBool(found);
+            if(found){ unsigned char ver=(unsigned char)b[pos+4]; uint32_t ts=rd32le(b,pos+ (ver==1?20:12)); uint64_t dur=ver==1? ((uint64_t)rd32le(b,pos+24)<<32)|rd32le(b,pos+28) : rd32le(b,pos+16);
+                d->items["编码"]=vStr("MP4/M4A"); d->items["时基"]=vNum(ts); d->items["时长"]=vNum(ts? (double)dur/ts : 0); }
+        } else {
+            d->items["可解析"]=vBool(false);
+        }
+        return vDict(d);
+    });
+    registerBuiltin("音频判定", 1, 1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path=needStr(a[0],"音频判定",line);
+        string full=resolveWenPath(path);
+        string b;
+        try { b=readWholeFile(full); } catch(IoError& e){ throw WenError("文件错误",line,0,e.what()); }
+        WavInfo w;
+        if(!parseWav(b,w)) throw WenError("音频错误",line,0,"音频判定只支持 PCM WAV");
+        double peak=0,rms=0; size_t zc=0,quiet=0;
+        for(size_t i=0;i<w.samples.size();++i){ double v=w.samples[i]/32768.0; peak=std::max(peak,std::fabs(v)); rms+=v*v; if(i&&((w.samples[i-1]<0)!=(w.samples[i]<0)))++zc; if(std::fabs(v)<0.02)++quiet; }
+        rms=std::sqrt(rms/std::max<size_t>(1,w.samples.size()));
+        auto d=std::make_shared<Dict>();
+        d->items["有声音"]=vBool(peak>0.03 && rms>0.005);
+        d->items["静音"]=vBool(peak<=0.03 || quiet*2>w.samples.size());
+        d->items["峰值"]=vNum(peak); d->items["均方根"]=vNum(rms);
+        d->items["过零率"]=vNum((double)zc/std::max<size_t>(1,w.samples.size()-1));
+        d->items["时长"]=vNum(w.rate?(double)w.samples.size()/w.channels/w.rate:0);
+        auto pk=fftPeak(w.samples,w.rate,1);
+        if(!pk.empty()){ d->items["主频"]=vNum(pk[0].first); d->items["主频幅度"]=vNum(pk[0].second); }
+        return vDict(d);
+    });
+    registerBuiltin("音频频谱", 1, 2, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path=needStr(a[0],"音频频谱",line); int n=a.size()>1?(int)needIndex(a[1],"音频频谱",line):5;
+        string b; try { b=readWholeFile(resolveWenPath(path)); } catch(IoError& e){ throw WenError("文件错误",line,0,e.what()); }
+        WavInfo w; if(!parseWav(b,w)) throw WenError("音频错误",line,0,"频谱只支持 PCM WAV");
+        auto list=std::make_shared<List>();
+        for(auto& p:fftPeak(w.samples,w.rate,std::max(1,std::min(32,n)))){
+            auto d=std::make_shared<Dict>(); d->items["频率"]=vNum(p.first); d->items["幅度"]=vNum(p.second); list->items.push_back(vDict(d));
+        }
+        return vList(list);
+    });
     // ---------- 媒体库：WAV 录制 / MP3/MP4 探测与 MCI 播放 ----------
     static std::map<string,string> gMediaAliases;
     registerBuiltin("音频设备", 0, 0, [](Interpreter&, vector<Value>&, int) -> Value {
@@ -12180,23 +12328,29 @@ Interpreter::Interpreter() {
             };
             auto sampleShadow = [&](PVec p, PVec n) {
                 double dist = std::sqrt((p.x-cam.x)*(p.x-cam.x) + (p.z-cam.z)*(p.z-cam.z));
-                auto& cs = cascades[dist < 10.0 ? 0 : 1];
-                if (cs.map.empty()) return 1.0;
-                PVec sp = padd(p, pmul(n, 0.035));
-                PVec lc = padd(cs.center, pmul(light, 40.0));
-                PVec d = psub(sp, lc);
-                double sx = (pdot(d, cs.right) + cs.extent*0.5) / cs.extent * cs.size;
-                double sy = (pdot(d, cs.up) + cs.extent*0.5) / cs.extent * cs.size;
-                double slope = 1.0 - std::fabs(pdot(n, light));
-                double bias = 0.025 + 0.10 * slope;
-                double dz = pdot(d, cs.fwd) - bias;
-                if (sx < 1 || sy < 1 || sx >= cs.size-1 || sy >= cs.size-1) return 1.0;
-                int cx=(int)sx, cy=(int)sy, lit=0, total=0;
-                for(int oy=-1;oy<=1;++oy) for(int ox=-1;ox<=1;++ox) {
-                    float sd=cs.map[(size_t)(cy+oy)*cs.size+(cx+ox)];
-                    ++total; if (dz <= sd) ++lit;
-                }
-                return (double)lit / std::max(1,total);
+                auto sampleCascade = [&](int ci) {
+                    auto& cs = cascades[ci];
+                    if (cs.map.empty()) return 1.0;
+                    PVec sp = padd(p, pmul(n, 0.035));
+                    PVec lc = padd(cs.center, pmul(light, 40.0));
+                    PVec d = psub(sp, lc);
+                    double sx = (pdot(d, cs.right) + cs.extent*0.5) / cs.extent * cs.size;
+                    double sy = (pdot(d, cs.up) + cs.extent*0.5) / cs.extent * cs.size;
+                    double slope = 1.0 - std::fabs(pdot(n, light));
+                    double bias = 0.025 + 0.10 * slope;
+                    double dz = pdot(d, cs.fwd) - bias;
+                    if (sx < 1 || sy < 1 || sx >= cs.size-1 || sy >= cs.size-1) return 1.0;
+                    int cx=(int)sx, cy=(int)sy, lit=0, total=0;
+                    for(int oy=-1;oy<=1;++oy) for(int ox=-1;ox<=1;++ox) {
+                        float sd=cs.map[(size_t)(cy+oy)*cs.size+(cx+ox)];
+                        ++total; if (dz <= sd) ++lit;
+                    }
+                    return (double)lit / std::max(1,total);
+                };
+                if (dist < 8.0) return sampleCascade(0);
+                if (dist > 14.0) return sampleCascade(1);
+                double t = (dist - 8.0) / 6.0;
+                return sampleCascade(0) * (1.0-t) + sampleCascade(1) * t;
             };
             const int CS = 64;
             vector<float> cloudShadowMap((size_t)CS*CS, 1.0f);

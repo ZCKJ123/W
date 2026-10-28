@@ -159,10 +159,11 @@ $protocol = '✓'; & (Join-Path $PSScriptRoot '错误协议.ps1'); if ($LASTEXIT
 $crash = '✓'; & (Join-Path $PSScriptRoot '防崩溃.ps1'); if ($LASTEXITCODE -ne 0) { exit 1 }
 $index = '✓'; & (Join-Path $PSScriptRoot '..\工具\索引检查.ps1'); if ($LASTEXITCODE -ne 0) { exit 1 }
 $self = '✓'; & (Join-Path $PSScriptRoot '..\工具\自述检查.ps1'); if ($LASTEXITCODE -ne 0) { exit 1 }
+$audio = '✓'; & (Join-Path $PSScriptRoot '..\工具\音频检查.ps1'); if ($LASTEXITCODE -ne 0) { exit 1 }
 $ts = '✓'; & (Join-Path $PSScriptRoot '..\工具\TypeScript检查.ps1')
 if ($LASTEXITCODE -eq 2) { $ts = '⚠️未验证' }
 elseif ($LASTEXITCODE -ne 0) { exit 1 }
 
-Write-Host ("总账：主用例 {0}/{1}、错误 {2}/{3}、协议 {4}、防崩溃 {5}、索引 {6}、自述 {7}、TS {8}" -f `
-    $casePass, $caseTotal, $errorPass, $errorTotal, $protocol, $crash, $index, $self, $ts)
+Write-Host ("总账：主用例 {0}/{1}、错误 {2}/{3}、协议 {4}、防崩溃 {5}、索引 {6}、自述 {7}、TS {8}、音频 {9}" -f `
+    $casePass, $caseTotal, $errorPass, $errorTotal, $protocol, $crash, $index, $self, $ts, $audio)
 exit 0
