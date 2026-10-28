@@ -3532,7 +3532,7 @@ static const std::map<string, string>& functionModules() {
         {"新建神经层", "神经网络库"}, {"神经链", "神经网络库"}, {"前向", "神经网络库"},
         {"颜色", "视口库"}, {"新建视口", "视口库"}, {"视口清空", "视口库"}, {"视口画点", "视口库"},
         {"视口画线", "视口库"}, {"视口画三角形", "视口库"}, {"视口尺寸", "视口库"}, {"视口保存", "视口库"},
-        {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"}, {"视口显示", "视口库"}, {"玩家视口", "视口库"}, {"网格新建", "三维库"}, {"网格三角", "三维库"}, {"网格平移", "三维库"}, {"网格缩放", "三维库"}, {"网格旋转", "三维库"}, {"网格合并", "三维库"}, {"网格三角形数", "三维库"}, {"视口加载模型", "视口库"}, {"光追渲染", "视口库"}, {"材质检查", "视口库"}, {"材质预设", "视口库"}, {"视口取色", "视口库"},
+        {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"}, {"视口显示", "视口库"}, {"玩家视口", "视口库"}, {"大气预设", "视口库"}, {"网格新建", "三维库"}, {"网格三角", "三维库"}, {"网格平移", "三维库"}, {"网格缩放", "三维库"}, {"网格旋转", "三维库"}, {"网格合并", "三维库"}, {"网格三角形数", "三维库"}, {"视口加载模型", "视口库"}, {"光追渲染", "视口库"}, {"材质检查", "视口库"}, {"材质预设", "视口库"}, {"视口取色", "视口库"},
         {"硬件信息", "硬件库"}, {"高精度计时", "硬件库"}, {"内存状态", "硬件库"}, {"屏幕尺寸", "硬件库"}, {"磁盘空间", "硬件库"},
         {"大整数幂", "大整数库"}, {"大整数乘", "大整数库"}, {"大整数加", "大整数库"}, {"大整数阶乘", "大整数库"},
         {"阶乘位数", "大整数库"}, {"阶乘末尾零", "大整数库"}, {"阶乘概览", "大整数库"},
@@ -11136,7 +11136,41 @@ Interpreter::Interpreter() {
         for (auto& v : sl->second.list->items) dl->second.list->items.push_back(v);
         return a[0];
     });
-    registerBuiltin("玩家视口", 2, 6, [](Interpreter&, vector<Value>& a, int line) -> Value {
+    registerBuiltin("大气预设", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string name = needStr(a[0], "大气预设", line);
+        auto d = std::make_shared<Dict>();
+        d->items["云型"] = vStr("积云");
+        d->items["云量"] = vNum(0.55);
+        d->items["云底"] = vNum(8.0);
+        d->items["云顶"] = vNum(14.0);
+        d->items["云尺度"] = vNum(0.13);
+        d->items["风速"] = vNum(0.25);
+        d->items["太阳"] = vNum(1.0);
+        d->items["雾"] = vNum(0.0);
+        if (name == "晴天") {
+            d->items["云量"] = vNum(0.18);
+            d->items["云底"] = vNum(10.0); d->items["云顶"] = vNum(13.0);
+        } else if (name == "层云") {
+            d->items["云型"] = vStr("层云");
+            d->items["云量"] = vNum(0.8);
+            d->items["云底"] = vNum(6.0); d->items["云顶"] = vNum(8.0);
+            d->items["云尺度"] = vNum(0.2);
+        } else if (name == "卷云") {
+            d->items["云型"] = vStr("卷云");
+            d->items["云量"] = vNum(0.45);
+            d->items["云底"] = vNum(14.0); d->items["云顶"] = vNum(18.0);
+            d->items["云尺度"] = vNum(0.08);
+        } else if (name == "黄昏") {
+            d->items["云量"] = vNum(0.65);
+            d->items["太阳"] = vNum(0.6);
+            d->items["雾"] = vNum(0.35);
+        } else if (name != "积云") {
+            throw WenError("运行时错误", line, 0,
+                           "未知大气预设「" + name + "」；可用：晴天 积云 层云 卷云 黄昏");
+        }
+        return vDict(d);
+    });
+    registerBuiltin("玩家视口", 2, 7, [](Interpreter&, vector<Value>& a, int line) -> Value {
 #ifdef _WIN32
         int w = std::max(320, std::min(1280, (int)needNum(a[0], "玩家视口", line)));
         int h = std::max(180, std::min(720, (int)needNum(a[1], "玩家视口", line)));
@@ -11147,6 +11181,20 @@ Interpreter::Interpreter() {
             else full = truthy(a[3]);
         }
         if (a.size() >= 5) full = truthy(a[4]);
+        struct Atmo { string type="积云"; double cover=0.55, base=8, top=14, scale=0.13, wind=0.25, sun=1.0, fog=0.0; } atmo;
+        if (a.size() >= 7 && a[6].type == VT::Dict) {
+            auto ad = needDict(a[6], "大气", line);
+            auto pick = [&](const char* k, double& out) {
+                auto it = ad->items.find(k); if (it != ad->items.end()) out = needNum(it->second, k, line);
+            };
+            auto ti = ad->items.find("云型");
+            if (ti != ad->items.end()) atmo.type = needStr(ti->second, "云型", line);
+            pick("云量", atmo.cover); pick("云底", atmo.base); pick("云顶", atmo.top);
+            pick("云尺度", atmo.scale); pick("风速", atmo.wind); pick("太阳", atmo.sun); pick("雾", atmo.fog);
+            atmo.cover = std::max(0.0, std::min(1.0, atmo.cover));
+            atmo.base = std::max(1.0, std::min(30.0, atmo.base));
+            atmo.top = std::max(atmo.base + 0.5, std::min(35.0, atmo.top));
+        }
         std::wstring title = utf8ToWide(a.size() >= 3 ? needStr(a[2], "玩家视口", line) : "玩家视角");
         static bool reg = false;
         HINSTANCE inst = GetModuleHandleW(nullptr);
@@ -11248,7 +11296,7 @@ Interpreter::Interpreter() {
             addBox({2.0,0.6,-5}, 0.6, 0x4070c0);
             addBox({0.2,0.5,-9}, 0.5, 0xd0b040);
         }
-        if (a.size() >= 6 && a[5].type == VT::Str) {
+        if (a.size() >= 6 && a[5].type == VT::Str && !a[5].str.empty()) {
             std::ifstream mf(fs::u8path(a[5].str));
             if (!mf) throw WenError("文件错误", line, 0, "打不开模型：" + a[5].str);
             vector<PVec> vs; string ln;
@@ -11351,54 +11399,110 @@ Interpreter::Interpreter() {
             PVec f{std::sin(yaw)*std::cos(pitch), std::sin(pitch), -std::cos(yaw)*std::cos(pitch)};
             PVec r{std::cos(yaw), 0, std::sin(yaw)};
             PVec u = pnorm(pcross(r, f));
-            auto hash2 = [](double x, double z) {
-                double v = std::sin(x * 127.1 + z * 311.7) * 43758.5453123;
+            auto hash3 = [](double x, double y, double z) {
+                double v = std::sin(x*127.1 + y*311.7 + z*74.7) * 43758.5453123;
                 return v - std::floor(v);
             };
-            auto noise2 = [&](double x, double z) {
-                double ix = std::floor(x), iz = std::floor(z);
-                double fx = x - ix, fz = z - iz;
-                fx = fx*fx*(3-2*fx); fz = fz*fz*(3-2*fz);
-                double a=hash2(ix,iz), b=hash2(ix+1,iz), c=hash2(ix,iz+1), d=hash2(ix+1,iz+1);
-                return (a*(1-fx)+b*fx)*(1-fz) + (c*(1-fx)+d*fx)*fz;
+            auto vnoise3 = [&](double x, double y, double z) {
+                double ix=std::floor(x), iy=std::floor(y), iz=std::floor(z);
+                double fx=x-ix, fy=y-iy, fz=z-iz;
+                fx=fx*fx*(3-2*fx); fy=fy*fy*(3-2*fy); fz=fz*fz*(3-2*fz);
+                double n000=hash3(ix,iy,iz), n100=hash3(ix+1,iy,iz);
+                double n010=hash3(ix,iy+1,iz), n110=hash3(ix+1,iy+1,iz);
+                double n001=hash3(ix,iy,iz+1), n101=hash3(ix+1,iy,iz+1);
+                double n011=hash3(ix,iy+1,iz+1), n111=hash3(ix+1,iy+1,iz+1);
+                double nx00=n000*(1-fx)+n100*fx, nx10=n010*(1-fx)+n110*fx;
+                double nx01=n001*(1-fx)+n101*fx, nx11=n011*(1-fx)+n111*fx;
+                double ny0=nx00*(1-fy)+nx10*fy, ny1=nx01*(1-fy)+nx11*fy;
+                return ny0*(1-fz)+ny1*fz;
             };
-            auto fbm2 = [&](double x, double z) {
-                double v=0, a=0.5;
-                for(int i=0;i<2;++i){ v += noise2(x,z)*a; x=x*2.03+1.7; z=z*2.01+3.1; a*=0.5; }
-                return v;
+            auto cloudDensity = [&](PVec p, double time) {
+                double h = (p.y - atmo.base) / (atmo.top - atmo.base);
+                if (h < 0 || h > 1) return 0.0;
+                double sc = atmo.scale;
+                double n = vnoise3(p.x*sc + time*atmo.wind, p.y*sc*1.7, p.z*sc - time*atmo.wind) * 0.65 +
+                           vnoise3(p.x*sc*2.1 + 9.1, p.y*sc*2.3, p.z*sc*2.1) * 0.35;
+                double d = (n - (1.0 - atmo.cover)*0.72) * 3.2;
+                if (atmo.type == "层云") d *= (0.35 + 0.65 * (1.0 - h));
+                else if (atmo.type == "卷云") d *= (0.2 + 0.8 * h);
+                else d *= (0.55 + 0.45 * (1.0 - std::fabs(h - 0.35)*2.0));
+                return std::max(0.0, std::min(1.0, d));
             };
-            for (int y=0;y<h;y+=2) {
-                double ny = -((double)y + 1.0 - h*0.5) / ((double)h*0.95);
-                for (int x=0;x<w;x+=2) {
+            for (int y=0;y<h;++y) {
+                double ny = -((double)y + 0.5 - h*0.5) / ((double)h*0.95);
+                for (int x=0;x<w;++x) {
                     double nx = ((double)x + 0.5 - w*0.5) / ((double)h*0.95);
                     PVec rd = pnorm(padd(f, padd(pmul(r, nx), pmul(u, ny))));
                     double k = std::max(0.0, std::min(1.0, rd.y));
                     double rr = 35 + 55*(1-k), gg = 50 + 80*(1-k), bb = 80 + 95*(1-k);
-                    if (rd.y > 0.02) {
-                        double t = (8.0 - cam.y) / rd.y;
-                        double cx = cam.x + rd.x*t, cz = cam.z + rd.z*t;
-                        double n = fbm2(cx*0.12 + 3.0, cz*0.12 + 7.0);
-                        double cover = std::max(0.0, std::min(1.0, (n - 0.42) / 0.34));
-                        double sun = std::max(0.0, pdot(rd, light));
-                        double cloud = cover;
-                        rr = rr*(1-cloud) + (205 + 45*sun)*cloud;
-                        gg = gg*(1-cloud) + (210 + 35*sun)*cloud;
-                        bb = bb*(1-cloud) + (220 + 25*sun)*cloud;
-                    }
                     double sunDot = pdot(rd, light);
                     if (sunDot > 0.93) {
                         double glow = std::pow(std::max(0.0, (sunDot-0.93)/0.07), 8.0);
-                        rr = std::min(255.0, rr + glow*180);
-                        gg = std::min(255.0, gg + glow*150);
-                        bb = std::min(255.0, bb + glow*80);
+                        rr = std::min(255.0, rr + glow*180*atmo.sun);
+                        gg = std::min(255.0, gg + glow*150*atmo.sun);
+                        bb = std::min(255.0, bb + glow*80*atmo.sun);
                     }
-                    for (int yy=0; yy<2 && y+yy<h; ++yy) for (int xx=0; xx<2 && x+xx<w; ++xx) {
-                        size_t i=((size_t)(y+yy)*w+(x+xx))*3;
-                        pw.back[i]=(unsigned char)std::min(255.0,bb);
-                        pw.back[i+1]=(unsigned char)std::min(255.0,gg);
-                        pw.back[i+2]=(unsigned char)std::min(255.0,rr);
+                    size_t i=((size_t)y*w+x)*3;
+                    pw.back[i]=(unsigned char)std::min(255.0,bb);
+                    pw.back[i+1]=(unsigned char)std::min(255.0,gg);
+                    pw.back[i+2]=(unsigned char)std::min(255.0,rr);
+                }
+            }
+            // 体积云：1/6 分辨率射线步进，穿过云底到云顶
+            int cw = std::max(1, w/5), ch = std::max(1, h/5);
+            vector<unsigned char> cloudBuf((size_t)cw*ch*4, 0);
+            double tsec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            for (int cy=0; cy<ch; ++cy) {
+                double ny = -((double)cy*5 + 2.5 - h*0.5) / ((double)h*0.95);
+                for (int cx=0; cx<cw; ++cx) {
+                    double nx = ((double)cx*5 + 2.5 - w*0.5) / ((double)h*0.95);
+                    PVec rd = pnorm(padd(f, padd(pmul(r, nx), pmul(u, ny))));
+                    if (rd.y <= 0.02) continue;
+                    double t0r = (atmo.base - cam.y) / rd.y;
+                    double t1r = (atmo.top - cam.y) / rd.y;
+                    if (t1r <= 0.05) continue;
+                    t0r = std::max(0.05, t0r);
+                    if (t1r <= t0r) continue;
+                    int steps = 12;
+                    double dt = (t1r - t0r) / steps;
+                    double T = 1.0, cr = 0, cg = 0, cb = 0;
+                    for (int st=0; st<steps; ++st) {
+                        PVec p = padd(cam, pmul(rd, t0r + (st+0.5)*dt));
+                        double dens = cloudDensity(p, tsec);
+                        if (dens <= 0.001) continue;
+                        double od = 0;
+                        for (int l=1; l<=4; ++l) {
+                            PVec lp = padd(p, pmul(light, 0.45*l));
+                            od += cloudDensity(lp, tsec) * 0.45;
+                        }
+                        double beam = std::exp(-od * 2.2);
+                        double a = 1.0 - std::exp(-dens * dt * 1.6);
+                        double sunTint = 0.55 + 0.45 * std::max(0.0, beam * atmo.sun);
+                        cr += T * a * (0.86 * sunTint + 0.14);
+                        cg += T * a * (0.89 * sunTint + 0.14);
+                        cb += T * a * (0.94 * sunTint + 0.16);
+                        T *= (1.0 - a);
+                        if (T < 0.02) break;
+                    }
+                    if (T < 0.995) {
+                        size_t ci=((size_t)cy*cw+cx)*4;
+                        cloudBuf[ci]=(unsigned char)std::min(255.0, cr*255);
+                        cloudBuf[ci+1]=(unsigned char)std::min(255.0, cg*255);
+                        cloudBuf[ci+2]=(unsigned char)std::min(255.0, cb*255);
+                        cloudBuf[ci+3]=(unsigned char)std::min(255.0, (1.0-T)*255);
                     }
                 }
+            }
+            for (int y=0;y<h;++y) for (int x=0;x<w;++x) {
+                int cx = std::min(cw-1, x*cw/w), cy = std::min(ch-1, y*ch/h);
+                size_t ci=((size_t)cy*cw+cx)*4;
+                int alpha = cloudBuf[ci+3];
+                if (!alpha) continue;
+                size_t i=((size_t)y*w+x)*3;
+                double a = alpha / 255.0;
+                pw.back[i]   = (unsigned char)(pw.back[i]*(1-a) + cloudBuf[ci+2]*a);
+                pw.back[i+1] = (unsigned char)(pw.back[i+1]*(1-a) + cloudBuf[ci+1]*a);
+                pw.back[i+2] = (unsigned char)(pw.back[i+2]*(1-a) + cloudBuf[ci]*a);
             }
             zbuf.assign((size_t)w*h, 1e30);
             auto project=[&](PVec p, double& sx, double& sy, double& z)->bool{
