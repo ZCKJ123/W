@@ -5321,12 +5321,27 @@ static PVec pmul(PVec a, double k) { return {a.x*k,a.y*k,a.z*k}; }
 static double pdot(PVec a, PVec b) { return a.x*b.x+a.y*b.y+a.z*b.z; }
 static PVec pcross(PVec a, PVec b) { return {a.y*b.z-a.z*b.y, a.z*b.x-a.x*b.z, a.x*b.y-a.y*b.x}; }
 static PVec pnorm(PVec a) { double l=std::sqrt(pdot(a,a)); return l<1e-9?pv(0,1,0):pmul(a,1/l); }
-struct PTri { PVec a,b,c; unsigned color; };
-static void addCube(vector<PTri>& out, PVec c, double s, unsigned col) {
+struct PTri { PVec a,b,c; unsigned color; double metal = 0.0, rough = 0.8, emit = 0.0; };
+static void addSphere(vector<PTri>& out, PVec c, double r, unsigned col,
+                      double metal = 0.0, double rough = 0.8, int seg = 12, int ring = 6) {
+    auto at = [&](int i, int j) {
+        double th = 3.14159265358979323846 * j / ring;
+        double ph = 2.0 * 3.14159265358979323846 * i / seg;
+        return PVec{c.x + r*std::sin(th)*std::cos(ph),
+                    c.y + r*std::cos(th),
+                    c.z + r*std::sin(th)*std::sin(ph)};
+    };
+    for (int j = 0; j < ring; ++j) for (int i = 0; i < seg; ++i) {
+        PVec a=at(i,j), b=at(i+1,j), d=at(i,j+1), e=at(i+1,j+1);
+        out.push_back({a,b,e,col,metal,rough,0});
+        out.push_back({a,e,d,col,metal,rough,0});
+    }
+}
+static void addCube(vector<PTri>& out, PVec c, double s, unsigned col, double metal = 0.0, double rough = 0.8) {
     auto v=[&](double x,double y,double z){return pv(c.x+x*s,c.y+y*s,c.z+z*s);};
     PVec p[8]={v(-1,-1,-1),v(1,-1,-1),v(1,1,-1),v(-1,1,-1),v(-1,-1,1),v(1,-1,1),v(1,1,1),v(-1,1,1)};
     int f[6][4]={{0,1,2,3},{4,5,6,7},{0,1,5,4},{2,3,7,6},{0,3,7,4},{1,2,6,5}};
-    for(auto& q:f){ out.push_back({p[q[0]],p[q[1]],p[q[2]],col}); out.push_back({p[q[0]],p[q[2]],p[q[3]],col}); }
+    for(auto& q:f){ out.push_back({p[q[0]],p[q[1]],p[q[2]],col,metal,rough,0}); out.push_back({p[q[0]],p[q[2]],p[q[3]],col,metal,rough,0}); }
 }
 
 static LRESULT CALLBACK vpWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -11075,7 +11090,7 @@ Interpreter::Interpreter() {
         }
         struct Box { PVec c; double s; };
         vector<Box> boxes;
-        auto addBox = [&](PVec c, double s, unsigned col) { addCube(cubes, c, s, col); boxes.push_back({c, s}); };
+        auto addBox = [&](PVec c, double s, unsigned col, double metal = 0.0, double rough = 0.8) { addCube(cubes, c, s, col, metal, rough); boxes.push_back({c, s}); };
         if (sceneArg) {
             auto list = needList(*sceneArg, "玩家视口场景", line);
             for (const auto& it : list->items) {
@@ -11091,7 +11106,23 @@ Interpreter::Interpreter() {
                 if (si != d->items.end()) s = std::max(0.05, needNum(si->second, "大小", line));
                 auto ci = d->items.find("颜色");
                 if (ci != d->items.end()) col = (unsigned)vpColor(ci->second, line);
-                addBox(c, s, col);
+                string kind = "方块";
+                auto ki = d->items.find("类型");
+                if (ki != d->items.end()) kind = needStr(ki->second, "类型", line);
+                double metal = 0.0, rough = 0.8;
+                auto mi = d->items.find("金属度");
+                if (mi != d->items.end()) metal = std::max(0.0, std::min(1.0, needNum(mi->second, "金属度", line)));
+                auto ri = d->items.find("粗糙度");
+                if (ri != d->items.end()) rough = std::max(0.02, std::min(1.0, needNum(ri->second, "粗糙度", line)));
+                if (kind == "球") {
+                    double r = s;
+                    auto rri = d->items.find("半径");
+                    if (rri != d->items.end()) r = std::max(0.05, needNum(rri->second, "半径", line));
+                    addSphere(cubes, c, r, col, metal, rough);
+                    boxes.push_back({c, r});
+                } else {
+                    addBox(c, s, col, metal, rough);
+                }
             }
         } else {
             addBox({0,0.8,-3}, 0.8, 0xd05040);
@@ -11257,7 +11288,7 @@ Interpreter::Interpreter() {
                 PVec d = psub(p, lc);
                 double sx = (pdot(d, lright) + 15.0) / 30.0 * SM;
                 double sy = (pdot(d, lup) + 15.0) / 30.0 * SM;
-                double dz = pdot(d, lfwd) - 0.04;
+                double dz = pdot(d, lfwd) - 0.25;
                 if (sx < 1 || sy < 1 || sx >= SM-1 || sy >= SM-1) return 1.0;
                 int cx=(int)sx, cy=(int)sy, lit=0, total=0;
                 for(int oy=-1;oy<=1;++oy) for(int ox=-1;ox<=1;++ox) {
@@ -11266,7 +11297,7 @@ Interpreter::Interpreter() {
                 }
                 return (double)lit / std::max(1,total);
             };
-            auto drawTri=[&](PVec pa, PVec pb, PVec pc, unsigned col, double zoff, bool receive){
+            auto drawTri=[&](PVec pa, PVec pb, PVec pc, unsigned col, double zoff, bool receive, double metal, double rough){
                 double x0,y0,z0,x1,y1,z1,x2,y2,z2;
                 if(!project(pa,x0,y0,z0)||!project(pb,x1,y1,z1)||!project(pc,x2,y2,z2)) return;
                 double minx=std::max(0.0,std::floor(std::min({x0,x1,x2}))), maxx=std::min((double)w-1,std::ceil(std::max({x0,x1,x2})));
@@ -11287,15 +11318,18 @@ Interpreter::Interpreter() {
                     double wy=w0*pa.y+w1*pb.y+w2*pc.y;
                     double wz=w0*pa.z+w1*pb.z+w2*pc.z;
                     double shade = receive ? sampleShadow({wx,wy,wz}) : 1.0;
+                    PVec vdir = pnorm(psub(cam, {wx,wy,wz}));
+                    PVec hv = pnorm(padd(light, vdir));
+                    double spec = std::pow(std::max(0.0, pdot(n, hv)), 8.0 + 80.0 * rough) * metal;
                     double fog=std::max(0.25,1.0-z/28.0);
-                    pw.back[i*3]=(unsigned char)std::min(255.0,cb*lit*shade*fog);
-                    pw.back[i*3+1]=(unsigned char)std::min(255.0,cg*lit*shade*fog);
-                    pw.back[i*3+2]=(unsigned char)std::min(255.0,cr*lit*shade*fog);
+                    pw.back[i*3]=(unsigned char)std::min(255.0,cb*lit*shade*fog + spec*220);
+                    pw.back[i*3+1]=(unsigned char)std::min(255.0,cg*lit*shade*fog + spec*220);
+                    pw.back[i*3+2]=(unsigned char)std::min(255.0,cr*lit*shade*fog + spec*220);
                 }
             };
             buildShadowMap();
-            for(auto& t:ground) drawTri(t.a,t.b,t.c,t.color,0,true);
-            for(auto& t:cubes) drawTri(t.a,t.b,t.c,t.color,0,true);
+            for(auto& t:ground) drawTri(t.a,t.b,t.c,t.color,0,true,0,t.rough);
+            for(auto& t:cubes) drawTri(t.a,t.b,t.c,t.color,0,true,t.metal,t.rough);
             for(int y=-2;y<=2;++y) for(int x=-2;x<=2;++x){
                 if(std::abs(x)<=1&&std::abs(y)<=1) continue;
                 size_t i=(size_t)(h/2+y)*w+(w/2+x); if(i*3+2<pw.back.size()){pw.back[i*3]=230;pw.back[i*3+1]=240;pw.back[i*3+2]=255;}
