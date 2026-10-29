@@ -10445,6 +10445,32 @@ Interpreter::Interpreter() {
         return vFunc(fn);
 #endif
     });
+    registerBuiltin("机器函数", 1, 2, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+#if !defined(_WIN32) || !defined(_M_X64)
+        throw WenError("运行时错误", line, 0, "机器函数只支持 Windows x64");
+#else
+        string hex = needStr(a[0], "机器函数", line);
+        int arity = a.size()>1 ? (int)needIndex(a[1], "机器函数", line) : 0;
+        if (arity < 0 || arity > 4) throw WenError("运行时错误", line, 0, "机器函数参数数 0..4");
+        vector<unsigned char> bytes;
+        auto val=[](char c)->int{ if(c>='0'&&c<='9')return c-'0'; if(c>='a'&&c<='f')return c-'a'+10; if(c>='A'&&c<='F')return c-'A'+10; return -1; };
+        int hi=-1;
+        for (char c : hex) {
+            if (c==' '||c=='\t'||c=='\n'||c=='\r'||c=='_') continue;
+            int v=val(c); if(v<0) throw WenError("运行时错误", line, 0, "机器码不是十六进制");
+            if (hi<0) hi=v; else { bytes.push_back((unsigned char)((hi<<4)|v)); hi=-1; }
+        }
+        if (hi>=0) throw WenError("运行时错误", line, 0, "机器码十六进制位数必须是偶数");
+        if (bytes.empty()) throw WenError("运行时错误", line, 0, "机器码为空");
+        void* mem=VirtualAlloc(nullptr, bytes.size(), MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if(!mem) throw WenError("运行时错误", line, 0, "机器码分配失败");
+        memcpy(mem,bytes.data(),bytes.size());
+        FlushInstructionCache(GetCurrentProcess(),mem,bytes.size());
+        auto fn=std::make_shared<NativeFunction>();
+        fn->name="机器函数"; fn->code=mem; fn->codeSize=bytes.size(); fn->arity=arity;
+        return vFunc(fn);
+#endif
+    });
     registerBuiltin("重置核心", 0, 0, [this](Interpreter&, vector<Value>&, int line) -> Value {
         vector<std::pair<string,Value>> keep;
         int removed = 0;
