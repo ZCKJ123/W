@@ -18885,6 +18885,51 @@ static void put16(vector<unsigned char>& b, size_t off, uint16_t v){ b[off]=(uns
 static void put32(vector<unsigned char>& b, size_t off, uint32_t v){ for(int i=0;i<4;++i) b[off+(size_t)i]=(unsigned char)((v>>(8*i))&255); }
 static void put64(vector<unsigned char>& b, size_t off, uint64_t v){ for(int i=0;i<8;++i) b[off+(size_t)i]=(unsigned char)((v>>(8*i))&255); }
 
+static bool writeNativeExe32(int exitCode, const string& outPath, string& err) {
+    vector<unsigned char> code;
+    if (exitCode >= 0 && exitCode <= 127) { code.push_back(0x6A); code.push_back((unsigned char)exitCode); }
+    else { code.push_back(0x68); for(int i=0;i<4;++i) code.push_back((unsigned char)((exitCode>>(8*i))&255)); }
+    code.push_back(0xFF); code.push_back(0x15);
+    for(int i=0;i<4;++i) code.push_back((unsigned char)((0x402010>>(8*i))&255));
+    code.push_back(0xCC);
+    const size_t textRaw=0x400, idataRaw=0x600, fileSize=0x800;
+    vector<unsigned char> f(fileSize,0);
+    f[0]='M'; f[1]='Z'; put32(f,0x3C,0x40);
+    f[0x40]='P'; f[0x41]='E'; f[0x42]=0; f[0x43]=0;
+    put16(f,0x44,0x14C); put16(f,0x46,2); put16(f,0x54,0xE0); put16(f,0x56,0x22);
+    size_t o=0x58;
+    put16(f,o,0x10B);
+    put32(f,o+4,0x200); put32(f,o+8,0x200); put32(f,o+12,0);
+    put32(f,o+16,0x1000); put32(f,o+20,0x1000); put32(f,o+24,0x2000);
+    put32(f,o+28,0x400000);
+    put32(f,o+32,0x1000); put32(f,o+36,0x200);
+    put16(f,o+40,6); put16(f,o+42,0); put16(f,o+44,0); put16(f,o+46,0); put16(f,o+48,6); put16(f,o+50,0);
+    put32(f,o+52,0); put32(f,o+56,0x3000); put32(f,o+60,0x400); put32(f,o+64,0);
+    put16(f,o+68,3); put16(f,o+70,0);
+    put32(f,o+72,0x100000); put32(f,o+76,0x1000); put32(f,o+80,0x100000); put32(f,o+84,0x1000);
+    put32(f,o+88,0); put32(f,o+92,16);
+    size_t dd=o+96;
+    put32(f,dd+8,0x2060); put32(f,dd+12,0x28);
+    size_t sh=o+0xE0;
+    auto section=[&](size_t at,const char* name,uint32_t vs,uint32_t va,uint32_t rawSize,uint32_t rawPtr,uint32_t ch){
+        memcpy(&f[at],name,strlen(name)); put32(f,at+8,vs); put32(f,at+12,va); put32(f,at+16,rawSize); put32(f,at+20,rawPtr); put32(f,at+36,ch);
+    };
+    section(sh,".text",(uint32_t)code.size(),0x1000,0x200,textRaw,0x60000020);
+    section(sh+40,".idata",0x100,0x2000,0x200,idataRaw,0x40000040);
+    memcpy(&f[textRaw],code.data(),code.size());
+    size_t id=idataRaw;
+    put32(f,id+0,0x2020); put32(f,id+4,0);
+    put32(f,id+0x10,0x2020); put32(f,id+0x14,0);
+    put16(f,id+0x20,0); memcpy(&f[id+0x22],"ExitProcess",11);
+    memcpy(&f[id+0x40],"KERNEL32.dll",12);
+    put32(f,id+0x60,0x2000); put32(f,id+0x64,0); put32(f,id+0x68,0); put32(f,id+0x6C,0x2040); put32(f,id+0x70,0x2010);
+    std::ofstream out(fs::u8path(outPath), std::ios::binary);
+    if(!out){ err="无法写文件："+outPath; return false; }
+    out.write((const char*)f.data(), (std::streamsize)f.size());
+    if(!out){ err="写入失败："+outPath; return false; }
+    return true;
+}
+
 static bool writeNativeExe(int exitCode, const string& outPath, string& err) {
     vector<unsigned char> code;
     auto emit=[&](std::initializer_list<unsigned char> x){ code.insert(code.end(),x); };
@@ -19833,6 +19878,25 @@ static int runMain(vector<string> args) {
             return 1;
         }
         return indexFile(target, asJson || gJsonDiagnostics);
+    }
+    if (cmd == "--原生EXE32") {
+        if (args.size() < 4) { std::cerr << "用法：wen.exe --原生EXE32 源.wen 输出.exe\n"; return 1; }
+        string src;
+        try { src=readWholeFile(resolveWenPath(args[2])); }
+        catch (IoError& e) { std::cerr << e.what() << "\n"; return 1; }
+        Interpreter sub;
+        sub.filename=args[2]; sub.sourceLines=splitLines(src);
+        int value=0; bool found=false;
+        try {
+            auto program=sub.parseSource(src);
+            for (const auto& st : program) if (st && st->k==Stmt::K::Return && st->expr && st->expr->k==Expr::K::Num) { value=(int)st->expr->num; found=true; }
+            if (!found) { std::cerr << "原生EXE32 目前只支持顶层「返回 常量」\n"; return 2; }
+        } catch (WenError& e) { std::cerr << e.what() << "\n"; return 1; }
+        catch (IncompleteError& e) { std::cerr << e.what() << "\n"; return 1; }
+        string err;
+        if (!writeNativeExe32(value, resolveWenPath(args[3]), err)) { std::cerr << err << "\n"; return 1; }
+        std::cout << args[3] << "\n";
+        return 0;
     }
     if (cmd == "--原生EXE") {
         if (args.size() < 4) { std::cerr << "用法：wen.exe --原生EXE 源.wen 输出.exe\n"; return 1; }
