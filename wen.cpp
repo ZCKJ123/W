@@ -11999,8 +11999,8 @@ Interpreter::Interpreter() {
         auto d = std::make_shared<Dict>();
         d->items["云型"] = vStr("积云");
         d->items["云量"] = vNum(0.55);
-        d->items["云底"] = vNum(8.0);
-        d->items["云顶"] = vNum(14.0);
+        d->items["云底"] = vNum(6.0);
+        d->items["云顶"] = vNum(26.0);
         d->items["云尺度"] = vNum(0.13);
         d->items["风速"] = vNum(0.25);
         d->items["太阳"] = vNum(1.0);
@@ -12482,7 +12482,7 @@ Interpreter::Interpreter() {
                 vector<PC> parts;
                 struct Seed { double x,z,r; };
                 vector<Seed> seeds;
-                for (int i=0;i<14;++i) {
+                for (int i=0;i<8;++i) {
                     double sx = -38.0 + 76.0 * hash3(i*3.1, 1.7, 2.3);
                     double sz = -38.0 + 76.0 * hash3(i*5.7, 4.1, 8.9);
                     double sr = 7.0 + 8.0 * hash3(i*2.3, 9.1, 3.7);
@@ -12591,7 +12591,7 @@ Interpreter::Interpreter() {
             }
             if (!useParticleClouds && !useOldClouds) {
                 struct VoxelGrid {
-                    int nx=64, ny=20, nz=64;
+                    int nx=72, ny=42, nz=72;
                     double x0=-42, x1=42, y0=0, y1=1, z0=-42, z1=42;
                     vector<float> d;
                 };
@@ -12599,18 +12599,41 @@ Interpreter::Interpreter() {
                 if (vg.d.empty()) {
                     vg.y0=atmo.base; vg.y1=atmo.top;
                     vg.d.assign((size_t)vg.nx*vg.ny*vg.nz, 0.0f);
+                    struct Seed { double x,z,r,top; };
+                    vector<Seed> seeds;
+                    for (int i=0;i<14;++i) {
+                        Seed sd;
+                        sd.x = -42.0 + 84.0 * hash3(i*3.1, 1.7, 2.3);
+                        sd.z = -42.0 + 84.0 * hash3(i*5.7, 4.1, 8.9);
+                        sd.r = 3.0 + 5.0 * hash3(i*2.3, 9.1, 3.7);
+                        sd.top = 0.45 + 0.55 * hash3(i*7.7, 2.2, 6.1);
+                        seeds.push_back(sd);
+                    }
                     for (int iz=0; iz<vg.nz; ++iz) for (int iy=0; iy<vg.ny; ++iy) for (int ix=0; ix<vg.nx; ++ix) {
                         double x=vg.x0 + (vg.x1-vg.x0)*(ix+0.5)/vg.nx;
                         double y=vg.y0 + (vg.y1-vg.y0)*(iy+0.5)/vg.ny;
                         double z=vg.z0 + (vg.z1-vg.z0)*(iz+0.5)/vg.nz;
                         double h=(y-vg.y0)/(vg.y1-vg.y0);
-                        double qx=x*atmo.scale, qy=y*atmo.scale*1.7, qz=z*atmo.scale;
+                        double env=0;
+                        for (const auto& sd : seeds) {
+                            double dx=x-sd.x, dz=z-sd.z;
+                            if (h > sd.top) continue;
+                            double e=std::exp(-(dx*dx+dz*dz)/(sd.r*sd.r));
+                            double hv=std::max(0.0, 1.0 - h/std::max(0.1,sd.top));
+                            env=std::max(env, e*(0.35+0.65*hv));
+                        }
+                        if (env < 0.12) {
+                            vg.d[(size_t)(iz*vg.ny+iy)*vg.nx+ix]=0.0f;
+                            continue;
+                        }
+                        double qx=x*atmo.scale, qy=y*atmo.scale*0.95, qz=z*atmo.scale;
                         double f=0, amp=0.55, fr=1;
-                        for (int o=0;o<3;++o) { f += vnoise3(qx*fr,qy*fr,qz*fr)*amp; fr*=2.1; amp*=0.5; }
+                        for (int o=0;o<4;++o) { f += vnoise3(qx*fr,qy*fr,qz*fr)*amp; fr*=2.1; amp*=0.5; }
                         double billow=1.0-std::fabs(2.0*f-1.0);
-                        double n=f*0.62+billow*0.38;
-                        double prof=std::pow(std::max(0.0,h),0.40)*std::pow(std::max(0.0,1-h),0.20);
-                        double d=(n*prof - (0.43 - atmo.cover*0.22))*3.2;
+                        double n=f*0.58+billow*0.42;
+                        double baseProf=std::max(0.0,std::min(1.0,h/0.08));
+                        double topProf=std::pow(std::max(0.0,1.0-h),0.35);
+                        double d=(n*baseProf*topProf*env - (0.38 - atmo.cover*0.18))*3.6;
                         vg.d[(size_t)(iz*vg.ny+iy)*vg.nx+ix]=(float)std::max(0.0,std::min(1.0,d));
                     }
                 }
@@ -12642,7 +12665,7 @@ Interpreter::Interpreter() {
                         if (std::fabs(rd.y)<1e-4) continue;
                         if (t0r>t1r) std::swap(t0r,t1r);
                         t0r=std::max(0.05,t0r); if (t1r<=t0r) continue;
-                        int steps=12; double dt=(t1r-t0r)/steps;
+                        int steps=18; double dt=(t1r-t0r)/steps;
                         double T=1,cr=0,cg=0,cb=0;
                         for (int st=0;st<steps;++st) {
                             PVec p2=padd(cam,pmul(rd,t0r+(st+0.5)*dt));
