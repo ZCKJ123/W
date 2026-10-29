@@ -12070,7 +12070,8 @@ Interpreter::Interpreter() {
             atmo.base = std::max(1.0, std::min(30.0, atmo.base));
             atmo.top = std::max(atmo.base + 0.5, std::min(35.0, atmo.top));
         }
-        bool useParticleClouds = true;
+        bool useParticleClouds = false;
+        bool useOldClouds = false;
         std::wstring title = utf8ToWide(a.size() >= 3 ? needStr(a[2], "玩家视口", line) : "玩家视角");
         static bool reg = false;
         HINSTANCE inst = GetModuleHandleW(nullptr);
@@ -12412,7 +12413,7 @@ Interpreter::Interpreter() {
                 return std::max(0.0, std::min(1.0, d));
             };
             // 高层卷云：独立高度层，真正射线步进
-            if (!useParticleClouds && atmo.highCover > 0.001) {
+            if (useOldClouds && atmo.highCover > 0.001) {
                 auto highDensity = [&](PVec p, double time) {
                     double h=(p.y-atmo.highBase)/(atmo.highTop-atmo.highBase);
                     if (h<0 || h>1) return 0.0;
@@ -12588,7 +12589,92 @@ Interpreter::Interpreter() {
                     pw.back[o+2]=(unsigned char)std::min(255.0,pw.back[o+2]*(1-a)+cr*a);
                 }
             }
-            if (!useParticleClouds) {
+            if (!useParticleClouds && !useOldClouds) {
+                struct VoxelGrid {
+                    int nx=64, ny=20, nz=64;
+                    double x0=-42, x1=42, y0=0, y1=1, z0=-42, z1=42;
+                    vector<float> d;
+                };
+                static VoxelGrid vg;
+                if (vg.d.empty()) {
+                    vg.y0=atmo.base; vg.y1=atmo.top;
+                    vg.d.assign((size_t)vg.nx*vg.ny*vg.nz, 0.0f);
+                    for (int iz=0; iz<vg.nz; ++iz) for (int iy=0; iy<vg.ny; ++iy) for (int ix=0; ix<vg.nx; ++ix) {
+                        double x=vg.x0 + (vg.x1-vg.x0)*(ix+0.5)/vg.nx;
+                        double y=vg.y0 + (vg.y1-vg.y0)*(iy+0.5)/vg.ny;
+                        double z=vg.z0 + (vg.z1-vg.z0)*(iz+0.5)/vg.nz;
+                        double h=(y-vg.y0)/(vg.y1-vg.y0);
+                        double qx=x*atmo.scale, qy=y*atmo.scale*1.7, qz=z*atmo.scale;
+                        double f=0, amp=0.55, fr=1;
+                        for (int o=0;o<3;++o) { f += vnoise3(qx*fr,qy*fr,qz*fr)*amp; fr*=2.1; amp*=0.5; }
+                        double billow=1.0-std::fabs(2.0*f-1.0);
+                        double n=f*0.62+billow*0.38;
+                        double prof=std::pow(std::max(0.0,h),0.40)*std::pow(std::max(0.0,1-h),0.20);
+                        double d=(n*prof - (0.43 - atmo.cover*0.22))*3.2;
+                        vg.d[(size_t)(iz*vg.ny+iy)*vg.nx+ix]=(float)std::max(0.0,std::min(1.0,d));
+                    }
+                }
+                auto sampleVox = [&](PVec p, double time) -> double {
+                    p.x += time*atmo.wind; p.z -= time*atmo.wind;
+                    if (p.x<vg.x0||p.x>vg.x1||p.y<vg.y0||p.y>vg.y1||p.z<vg.z0||p.z>vg.z1) return 0.0;
+                    double fx=(p.x-vg.x0)/(vg.x1-vg.x0)*vg.nx - 0.5;
+                    double fy=(p.y-vg.y0)/(vg.y1-vg.y0)*vg.ny - 0.5;
+                    double fz=(p.z-vg.z0)/(vg.z1-vg.z0)*vg.nz - 0.5;
+                    int ix=std::max(0,std::min(vg.nx-2,(int)std::floor(fx)));
+                    int iy=std::max(0,std::min(vg.ny-2,(int)std::floor(fy)));
+                    int iz=std::max(0,std::min(vg.nz-2,(int)std::floor(fz)));
+                    double tx=std::max(0.0,std::min(1.0,fx-ix)), ty=std::max(0.0,std::min(1.0,fy-iy)), tz=std::max(0.0,std::min(1.0,fz-iz));
+                    auto at=[&](int a,int b,int c){ return (double)vg.d[(size_t)(c*vg.ny+b)*vg.nx+a]; };
+                    double c00=at(ix,iy,iz)*(1-tx)+at(ix+1,iy,iz)*tx;
+                    double c10=at(ix,iy+1,iz)*(1-tx)+at(ix+1,iy+1,iz)*tx;
+                    double c01=at(ix,iy,iz+1)*(1-tx)+at(ix+1,iy,iz+1)*tx;
+                    double c11=at(ix,iy+1,iz+1)*(1-tx)+at(ix+1,iy+1,iz+1)*tx;
+                    return (c00*(1-ty)+c10*ty)*(1-tz) + (c01*(1-ty)+c11*ty)*tz;
+                };
+                int cw=std::max(1,w/2), ch=std::max(1,h/2);
+                vector<unsigned char> vbuf((size_t)cw*ch*4,0);
+                for (int cy=0;cy<ch;++cy) {
+                    double ny=-(((double)cy+0.5)*2-h*0.5)/((double)h*0.95);
+                    for (int cx=0;cx<cw;++cx) {
+                        double nx=(((double)cx+0.5)*2-w*0.5)/((double)h*0.95);
+                        PVec rd=pnorm(padd(f,padd(pmul(r,nx),pmul(u,ny))));
+                        double t0r=(atmo.base-cam.y)/rd.y, t1r=(atmo.top-cam.y)/rd.y;
+                        if (std::fabs(rd.y)<1e-4) continue;
+                        if (t0r>t1r) std::swap(t0r,t1r);
+                        t0r=std::max(0.05,t0r); if (t1r<=t0r) continue;
+                        int steps=12; double dt=(t1r-t0r)/steps;
+                        double T=1,cr=0,cg=0,cb=0;
+                        for (int st=0;st<steps;++st) {
+                            PVec p2=padd(cam,pmul(rd,t0r+(st+0.5)*dt));
+                            double den=sampleVox(p2,tsec);
+                            if (den<=0.002) continue;
+                            double od=0;
+                            for (int l=1;l<=2;++l) od += sampleVox(padd(p2,pmul(light,0.65*l)),tsec)*0.65;
+                            double beam=std::exp(-od*2.2);
+                            double a=1-std::exp(-den*dt*1.7);
+                            double lit=0.55+0.45*beam;
+                            cr += T*a*(0.86*lit+0.10); cg += T*a*(0.89*lit+0.10); cb += T*a*(0.95*lit+0.12);
+                            T*= (1-a); if (T<0.02) break;
+                        }
+                        if (T<0.995) {
+                            size_t ci=((size_t)cy*cw+cx)*4;
+                            vbuf[ci]=(unsigned char)std::min(255.0,cr*255);
+                            vbuf[ci+1]=(unsigned char)std::min(255.0,cg*255);
+                            vbuf[ci+2]=(unsigned char)std::min(255.0,cb*255);
+                            vbuf[ci+3]=(unsigned char)std::min(255.0,(1-T)*255);
+                        }
+                    }
+                }
+                for (int y=0;y<h;++y) for (int x=0;x<w;++x) {
+                    int cx=std::min(cw-1,x*cw/w), cy=std::min(ch-1,y*ch/h);
+                    size_t ci=((size_t)cy*cw+cx)*4; int al=vbuf[ci+3]; if(!al) continue;
+                    size_t i=((size_t)y*w+x)*3; double aa=al/255.0;
+                    pw.back[i]  =(unsigned char)(pw.back[i]*(1-aa)+vbuf[ci+2]*aa);
+                    pw.back[i+1]=(unsigned char)(pw.back[i+1]*(1-aa)+vbuf[ci+1]*aa);
+                    pw.back[i+2]=(unsigned char)(pw.back[i+2]*(1-aa)+vbuf[ci]*aa);
+                }
+            }
+            if (useOldClouds) {
             // 体积云：低分辨率射线步进 + 双线性放大
             int cw = std::max(1, w / atmo.res), ch = std::max(1, h / atmo.res);
             vector<unsigned char> cloudBuf((size_t)cw*ch*4, 0);
