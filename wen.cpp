@@ -2036,6 +2036,35 @@ struct Function : Callable {
     string memoKey() const override { return name; }
 };
 
+struct NativeFunction : Callable {
+    void* code = nullptr;
+    size_t codeSize = 0;
+    int arity = 0;
+    ~NativeFunction() override {
+#if defined(_WIN32) && defined(_M_X64)
+        if (code) VirtualFree(code, 0, MEM_RELEASE);
+#endif
+    }
+    Value call(Interpreter&, vector<Value>& args, int line) override {
+        if ((int)args.size() != arity)
+            throw WenError("运行时错误", line, 0, "原生函数需要 " + std::to_string(arity) + " 个参数");
+#if defined(_WIN32) && defined(_M_X64)
+        double x[4] = {0,0,0,0};
+        for (int i=0;i<arity;++i) {
+            if (args[(size_t)i].type != VT::Num)
+                throw WenError("运行时错误", line, 0, "原生函数参数必须是数字");
+            x[i] = args[(size_t)i].num;
+        }
+        using Fn = double(*)(double,double,double,double);
+        Value out; out.type = VT::Num; out.num = ((Fn)code)(x[0],x[1],x[2],x[3]);
+        return out;
+#else
+        throw WenError("运行时错误", line, 0, "原生函数只支持 Windows x64");
+#endif
+    }
+    string display() const override { return "<原生函数>"; }
+};
+
 struct Builtin : Callable {
     int minArgs = 0;
     int maxArgs = -1;
@@ -10313,6 +10342,76 @@ Interpreter::Interpreter() {
         }
         gMediaAliases.clear();
         return vNum(n);
+    });
+    registerBuiltin("原生函数", 2, 2, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+#if !defined(_WIN32) || !defined(_M_X64)
+        throw WenError("运行时错误", line, 0, "原生函数只支持 Windows x64");
+#else
+        string exprText = needStr(a[0], "原生函数", line);
+        auto params = needList(a[1], "原生函数参数表", line);
+        if (params->items.size() > 4)
+            throw WenError("运行时错误", line, 0, "原生函数最多 4 个参数");
+        std::map<string,int> index;
+        for (size_t i=0;i<params->items.size();++i)
+            index[needStr(params->items[i], "原生函数参数", line)] = (int)i;
+        Interpreter tmp;
+        tmp.filename = "<原生>";
+        string src;
+        for (size_t i=0;i<params->items.size();++i)
+            src += "将 " + needStr(params->items[i], "原生函数参数", line) + " 变成 0\n";
+        src += "将 原生结果 变成 " + exprText + "\n";
+        auto prog = tmp.parseSource(src);
+        if (prog.empty() || !prog.back() || prog.back()->k != Stmt::K::Assign || !prog.back()->expr)
+            throw WenError("语法错误", line, 0, "原生表达式解析失败");
+        vector<unsigned char> code;
+        auto emit = [&](std::initializer_list<unsigned char> bytes) { code.insert(code.end(), bytes); };
+        auto imm64 = [&](uint64_t v) {
+            emit({0x48,0xB8});
+            for (int i=0;i<8;++i) code.push_back((unsigned char)((v>>(8*i))&255));
+            emit({0x66,0x48,0x0F,0x6E,0xC0});
+        };
+        std::function<void(ExprPtr)> gen = [&](ExprPtr e) {
+            if (!e) throw WenError("语法错误", line, 0, "原生表达式为空");
+            if (e->k == Expr::K::Num) { uint64_t bits; double v=e->num; memcpy(&bits,&v,8); imm64(bits); return; }
+            if (e->k == Expr::K::Var) {
+                auto it = index.find(e->text);
+                if (it == index.end()) throw WenError("运行时错误", line, 0, "原生表达式用了未声明参数「" + e->text + "」");
+                int i = it->second;
+                emit({0x66,0x0F,0x28,(unsigned char)(0xC0 + (4 + i))});
+                return;
+            }
+            if (e->k == Expr::K::Unary && e->op == "-") {
+                gen(e->args[0]);
+                imm64(0x8000000000000000ULL);
+                emit({0x66,0x0F,0x57,0xC1});
+                return;
+            }
+            if (e->k == Expr::K::Binary && (e->op=="+"||e->op=="-"||e->op=="*"||e->op=="/")) {
+                gen(e->args[0]);
+                emit({0x48,0x83,0xEC,0x08});
+                emit({0xF2,0x0F,0x11,0x04,0x24});
+                gen(e->args[1]);
+                emit({0xF2,0x0F,0x10,0x0C,0x24});
+                emit({0x48,0x83,0xC4,0x08});
+                unsigned char op = e->op=="+"?0x58:(e->op=="-"?0x5C:(e->op=="*"?0x59:0x5E));
+                emit({0xF2,0x0F,op,0xC8});
+                emit({0x66,0x0F,0x28,0xC1});
+                return;
+            }
+            throw WenError("语法错误", line, 0, "原生函数只支持数字、参数和 + - * /");
+        };
+        for (size_t i=0;i<params->items.size();++i)
+            emit({0x66,0x0F,0x28,(unsigned char)(0xC0 | ((4+i)<<3) | (int)i)});
+        gen(prog.back()->expr);
+        emit({0xC3});
+        void* mem = VirtualAlloc(nullptr, code.size(), MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (!mem) throw WenError("运行时错误", line, 0, "原生代码分配失败");
+        memcpy(mem, code.data(), code.size());
+        FlushInstructionCache(GetCurrentProcess(), mem, code.size());
+        auto fn = std::make_shared<NativeFunction>();
+        fn->name = "原生函数"; fn->code = mem; fn->codeSize = code.size(); fn->arity = (int)params->items.size();
+        return vFunc(fn);
+#endif
     });
     registerBuiltin("重置核心", 0, 0, [this](Interpreter&, vector<Value>&, int line) -> Value {
         vector<std::pair<string,Value>> keep;
