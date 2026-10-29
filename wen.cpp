@@ -18930,6 +18930,71 @@ static bool writeNativeExe32(int exitCode, const string& outPath, string& err) {
     return true;
 }
 
+static bool writeNativeExeText(int exitCode, const string& text, const string& outPath, string& err) {
+    vector<unsigned char> code;
+    auto emit=[&](std::initializer_list<unsigned char> x){ code.insert(code.end(),x); };
+    auto callIat=[&](uint32_t iatRVA){
+        emit({0xFF,0x15,0,0,0,0}); size_t off=code.size()-4;
+        int32_t d=(int32_t)(iatRVA - (0x1000 + (uint32_t)code.size()));
+        for(int i=0;i<4;++i) code[off+(size_t)i]=(unsigned char)((d>>(8*i))&255);
+    };
+    emit({0x48,0x83,0xEC,0x48});
+    emit({0xB9,0xF5,0xFF,0xFF,0xFF});
+    callIat(0x3020);
+    emit({0x48,0x89,0xC1});
+    emit({0x48,0x8D,0x15,0,0,0,0}); size_t leaOff=code.size()-4;
+    int32_t md=(int32_t)(0x2000 - (0x1000 + (uint32_t)code.size()));
+    for(int i=0;i<4;++i) code[leaOff+(size_t)i]=(unsigned char)((md>>(8*i))&255);
+    uint32_t len=(uint32_t)text.size()+2;
+    emit({0x41,0xB8}); for(int i=0;i<4;++i) code.push_back((unsigned char)((len>>(8*i))&255));
+    emit({0x4C,0x8D,0x4C,0x24,0x28});
+    emit({0x48,0xC7,0x44,0x24,0x20,0,0,0,0});
+    emit({0x48,0xC7,0x44,0x24,0x28,0,0,0,0});
+    callIat(0x3028);
+    emit({0xB9}); for(int i=0;i<4;++i) code.push_back((unsigned char)((exitCode>>(8*i))&255));
+    callIat(0x3030);
+    emit({0xCC});
+    const size_t textRaw=0x400, rdataRaw=0x600, idataRaw=0x800, fileSize=0xA00;
+    vector<unsigned char> f(fileSize,0);
+    f[0]='M'; f[1]='Z'; put32(f,0x3C,0x40);
+    f[0x40]='P'; f[0x41]='E'; f[0x42]=0; f[0x43]=0;
+    put16(f,0x44,0x8664); put16(f,0x46,3); put32(f,0x48,0); put32(f,0x4C,0); put32(f,0x50,0);
+    put16(f,0x54,0xF0); put16(f,0x56,0x22);
+    size_t o=0x58;
+    put16(f,o,0x20B);
+    put32(f,o+4,0x200); put32(f,o+8,0x600); put32(f,o+12,0); put32(f,o+16,0x1000); put32(f,o+20,0x1000);
+    put64(f,o+24,0x140000000ULL); put32(f,o+32,0x1000); put32(f,o+36,0x200);
+    put16(f,o+40,6); put16(f,o+42,0); put16(f,o+44,0); put16(f,o+46,0); put16(f,o+48,6); put16(f,o+50,0);
+    put32(f,o+52,0); put32(f,o+56,0x4000); put32(f,o+60,0x400); put32(f,o+64,0); put16(f,o+68,3); put16(f,o+70,0);
+    put64(f,o+72,0x100000); put64(f,o+80,0x1000); put64(f,o+88,0x100000); put64(f,o+96,0x1000);
+    put32(f,o+104,0); put32(f,o+108,16);
+    size_t dd=o+112;
+    put32(f,dd+8,0x30A0); put32(f,dd+12,0x28);
+    size_t sh=o+0xF0;
+    auto section=[&](size_t at,const char* name,uint32_t vs,uint32_t va,uint32_t rawSize,uint32_t rawPtr,uint32_t ch){
+        memcpy(&f[at],name,strlen(name)); put32(f,at+8,vs); put32(f,at+12,va); put32(f,at+16,rawSize); put32(f,at+20,rawPtr); put32(f,at+36,ch);
+    };
+    section(sh,".text",(uint32_t)code.size(),0x1000,0x200,textRaw,0x60000020);
+    section(sh+40,".rdata",len,0x2000,0x200,rdataRaw,0x40000040);
+    section(sh+80,".idata",0x100,0x3000,0x200,idataRaw,0x40000040);
+    memcpy(&f[textRaw],code.data(),code.size());
+    memcpy(&f[rdataRaw],text.data(),text.size());
+    f[rdataRaw+text.size()]='\r'; f[rdataRaw+text.size()+1]='\n';
+    size_t id=idataRaw;
+    put64(f,id+0,0x3050); put64(f,id+8,0x3060); put64(f,id+0x10,0x3070); put64(f,id+0x18,0);
+    put64(f,id+0x20,0x3050); put64(f,id+0x28,0x3060); put64(f,id+0x30,0x3070); put64(f,id+0x38,0);
+    put16(f,id+0x50,0); memcpy(&f[id+0x52],"GetStdHandle",12);
+    put16(f,id+0x60,0); memcpy(&f[id+0x62],"WriteFile",9);
+    put16(f,id+0x70,0); memcpy(&f[id+0x72],"ExitProcess",11);
+    memcpy(&f[id+0x90],"KERNEL32.dll",12);
+    put32(f,id+0xA0,0x3000); put32(f,id+0xA4,0); put32(f,id+0xA8,0); put32(f,id+0xAC,0x3090); put32(f,id+0xB0,0x3020);
+    std::ofstream out(fs::u8path(outPath), std::ios::binary);
+    if(!out){ err="无法写文件："+outPath; return false; }
+    out.write((const char*)f.data(), (std::streamsize)f.size());
+    if(!out){ err="写入失败："+outPath; return false; }
+    return true;
+}
+
 static bool writeNativeExe(int exitCode, const string& outPath, string& err) {
     vector<unsigned char> code;
     auto emit=[&](std::initializer_list<unsigned char> x){ code.insert(code.end(),x); };
@@ -19905,15 +19970,20 @@ static int runMain(vector<string> args) {
         catch (IoError& e) { std::cerr << e.what() << "\n"; return 1; }
         Interpreter sub;
         sub.filename=args[2]; sub.sourceLines=splitLines(src);
-        int value=0; bool found=false;
+        int value=0; bool found=false; string printText;
         try {
             auto program=sub.parseSource(src);
-            for (const auto& st : program) if (st && st->k==Stmt::K::Return && st->expr && st->expr->k==Expr::K::Num) { value=(int)st->expr->num; found=true; }
+            for (const auto& st : program) {
+                if (st && st->k==Stmt::K::Return && st->expr && st->expr->k==Expr::K::Num) { value=(int)st->expr->num; found=true; }
+                if (st && st->k==Stmt::K::Print && st->args.size()==1 && st->args[0] && st->args[0]->k==Expr::K::Str) printText=st->args[0]->text;
+            }
             if (!found) { std::cerr << "原生EXE 目前只支持顶层「返回 常量」\n"; return 2; }
         } catch (WenError& e) { std::cerr << e.what() << "\n"; return 1; }
         catch (IncompleteError& e) { std::cerr << e.what() << "\n"; return 1; }
         string err;
-        if (!writeNativeExe(value, resolveWenPath(args[3]), err)) { std::cerr << err << "\n"; return 1; }
+        bool ok=printText.empty() ? writeNativeExe(value, resolveWenPath(args[3]), err)
+                                  : writeNativeExeText(value, printText, resolveWenPath(args[3]), err);
+        if (!ok) { std::cerr << err << "\n"; return 1; }
         std::cout << args[3] << "\n";
         return 0;
     }
