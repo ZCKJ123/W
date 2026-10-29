@@ -205,7 +205,7 @@ static const std::set<string>& keywords() {
         "将", "变成", "打印", "如果", "则", "否则如果", "否则", "结束",
         "当", "对于", "在", "中", "函数", "返回", "依赖",
         "中断", "继续", "真", "假", "空", "且", "或", "非", "导出",
-        "尝试", "捕获", "最终"
+        "尝试", "捕获", "最终", "匹配", "情形"
     };
     return kw;
 }
@@ -802,7 +802,7 @@ using StmtPtr = shared_ptr<Stmt>;
 struct Stmt {
     enum class K {
         Assign, Print, If, While, For, Func, Return,
-        Break, Continue, ExprStmt, Import, Export, Try
+        Break, Continue, ExprStmt, Import, Export, Try, Match
     };
     K k = K::ExprStmt;
     string name;
@@ -1165,6 +1165,7 @@ private:
         if (atKw("依赖")) return parseImport();
         if (atKw("导出")) return parseExport();
         if (atKw("尝试")) return parseTry();
+        if (atKw("匹配")) return parseMatch();
         return parseExprStatement();
     }
 
@@ -1318,6 +1319,35 @@ private:
         s->expr = iter;
         s->body = body;
         s->line = line;
+        return s;
+    }
+
+    StmtPtr parseMatch() {
+        int line = peek().line;
+        ++idx_;
+        auto subject = parseExpr();
+        expectKw("则");
+        endStmt();
+        auto s = std::make_shared<Stmt>();
+        s->k = Stmt::K::Match;
+        s->expr = subject;
+        s->line = line;
+        while (atKw("情形")) {
+            ++idx_;
+            auto pat = parseExpr();
+            expectKw("则");
+            endStmt();
+            auto body = parseBlock({"情形", "否则", "结束"});
+            s->branches.emplace_back(pat, body);
+        }
+        if (matchKw("否则")) {
+            endStmt();
+            s->elseBody = parseBlock({"结束"});
+        }
+        expectKw("结束");
+        endStmt();
+        if (s->branches.empty() && s->elseBody.empty())
+            err(peek(), "「匹配」至少要有一个「情形」或「否则」");
         return s;
     }
 
@@ -4529,7 +4559,24 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
                                      typeName(iter));
             }
             break;
-        }        case Stmt::K::Try: {
+        }
+        case Stmt::K::Match: {
+            Value subject = eval(s->expr, scope);
+            bool matched = false;
+            for (const auto& br : s->branches) {
+                Value pat = eval(br.first, scope);
+                if (valueEquals(subject, pat)) {
+                    for (const auto& st : br.second) exec(st, scope);
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) {
+                for (const auto& st : s->elseBody) exec(st, scope);
+            }
+            break;
+        }
+        case Stmt::K::Try: {
             auto runFinally = [&]() {
                 for (const auto& st : s->finallyBody) exec(st, scope);
             };
@@ -5973,6 +6020,9 @@ struct PyEmitter {
                 break;
             case Stmt::K::Export:
                 break;
+            case Stmt::K::Match:
+                diag(s->line, "匹配暂不翻译");
+                break;
             case Stmt::K::Try:
                 line("try:");
                 block(s->body);
@@ -6202,6 +6252,9 @@ struct JsEmitter {
                 diag(s->line, "「依赖」不翻译；请在外派目标里手动补库");
                 break;
             case Stmt::K::Export: break;
+            case Stmt::K::Match:
+                diag(s->line, "匹配暂不翻译");
+                break;
             case Stmt::K::Try:
                 line("try");
                 block(s->body);
@@ -6525,6 +6578,10 @@ struct JavaEmitter {
                 for (const auto& x : s->elseBody) collect(x);
                 for (const auto& x : s->finallyBody) collect(x);
                 break;
+            case Stmt::K::Match:
+                for (const auto& br : s->branches) for (const auto& x : br.second) collect(x);
+                for (const auto& x : s->elseBody) collect(x);
+                break;
             default: break;
         }
     }
@@ -6618,6 +6675,9 @@ struct JavaEmitter {
                 diag(s->line, "「依赖」不翻译；请在外派目标里手动补库");
                 break;
             case Stmt::K::Export: break;
+            case Stmt::K::Match:
+                diag(s->line, "匹配暂不翻译");
+                break;
             case Stmt::K::Try:
                 line("try");
                 block(s->body);
@@ -7124,6 +7184,9 @@ struct StackEmitter {
             }
             case Stmt::K::Try:
                 diag(s->line, "字节码/汇编暂不支持尝试/捕获");
+                break;
+            case Stmt::K::Match:
+                diag(s->line, "字节码/汇编暂不支持匹配");
                 break;
             case Stmt::K::Import:
                 diag(s->line, "「依赖」不翻译");
@@ -17156,6 +17219,8 @@ private:
                 err(s->line, "「导出」只能写在库里");
             case Stmt::K::Try:
                 err(s->line, "编译模式暂不支持「尝试/捕获」");
+            case Stmt::K::Match:
+                err(s->line, "编译模式暂不支持「匹配」");
             case Stmt::K::ExprStmt:
                 return ind + "(void)(" + expr(s->expr) + ");\n";
         }

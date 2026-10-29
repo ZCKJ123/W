@@ -55,4 +55,4 @@ foreach ($name in @('时间库', '编码库', '正则库', 'CPU库', '路径库'
 }
 if ($libs -match 'GPU库') { 失败 "V0.2 不应带 GPU 库" }
 
-Write-Host "发货检查通过：155/157（跳过 2），版本、签名、标记、库都正常。" -ForegroundColor Green
+Write-Host "发货检查通过：156/158（跳过 2），版本、签名、标记、库都正常。" -ForegroundColor Green
