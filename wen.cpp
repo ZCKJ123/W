@@ -20100,9 +20100,15 @@ static int runMain(vector<string> args) {
                 }
                 if (st && st->k==Stmt::K::Print && st->args.size()==1 && st->args[0]) {
                     string pt; string pe;
-                    if (!constStrEnv(st->args[0], senv, pt, pe)) { std::cerr << "原生EXE32 打印文本错误：" << pe << "\n"; return 2; }
-                    if (!printText.empty()) printText += "\n";
-                    printText += pt;
+                    if (constStrEnv(st->args[0], senv, pt, pe)) {
+                        if (!printText.empty()) printText += "\n";
+                        printText += pt;
+                    } else {
+                        long long pv=0; string ie;
+                        if (!constIntEnv(st->args[0], env, pv, ie)) { std::cerr << "原生EXE32 打印表达式错误：" << ie << "\n"; return 2; }
+                        if (!printText.empty()) printText += "\n";
+                        printText += std::to_string(pv);
+                    }
                 }
             }
             if (!found) { std::cerr << "原生EXE32 目前只支持顶层「返回 常量」\n"; return 2; }
@@ -20144,9 +20150,15 @@ static int runMain(vector<string> args) {
                 }
                 if (st && st->k==Stmt::K::Print && st->args.size()==1 && st->args[0]) {
                     string pt; string pe;
-                    if (!constStrEnv(st->args[0], senv, pt, pe)) { std::cerr << "原生EXE 打印文本错误：" << pe << "\n"; return 2; }
-                    if (!printText.empty()) printText += "\n";
-                    printText += pt;
+                    if (constStrEnv(st->args[0], senv, pt, pe)) {
+                        if (!printText.empty()) printText += "\n";
+                        printText += pt;
+                    } else {
+                        long long pv=0; string ie;
+                        if (!constIntEnv(st->args[0], env, pv, ie)) { std::cerr << "原生EXE 打印表达式错误：" << ie << "\n"; return 2; }
+                        if (!printText.empty()) printText += "\n";
+                        printText += std::to_string(pv);
+                    }
                 }
             }
             if (!found) { std::cerr << "原生EXE 目前只支持顶层「返回 常量」\n"; return 2; }
