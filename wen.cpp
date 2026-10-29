@@ -18991,6 +18991,28 @@ static bool writeNativeExe32(int exitCode, const string& outPath, string& err) {
     return true;
 }
 
+static bool constIntExpr(const ExprPtr& e, long long& out, string& err) {
+    if (!e) { err="空表达式"; return false; }
+    if (e->k==Expr::K::Num) { out=(long long)e->num; return true; }
+    if (e->k==Expr::K::Bool) { out=e->b?1:0; return true; }
+    if (e->k==Expr::K::Unary && e->op=="-") {
+        long long v=0; if(!constIntExpr(e->args[0],v,err)) return false; out=-v; return true;
+    }
+    if (e->k==Expr::K::Binary) {
+        long long a=0,b=0;
+        if(!constIntExpr(e->args[0],a,err) || !constIntExpr(e->args[1],b,err)) return false;
+        if(e->op=="+") out=a+b;
+        else if(e->op=="-") out=a-b;
+        else if(e->op=="*") out=a*b;
+        else if(e->op=="/") { if(b==0){err="除数不能为 0"; return false;} out=a/b; }
+        else if(e->op=="%") { if(b==0){err="除数不能为 0"; return false;} out=a%b; }
+        else { err="常量表达式只支持 + - * / %"; return false; }
+        return true;
+    }
+    err="常量表达式只支持数字、括号、+ - * / %、一元负号";
+    return false;
+}
+
 static bool writeNativeExeText(int exitCode, const string& text, const string& outPath, string& err) {
     vector<unsigned char> code;
     auto emit=[&](std::initializer_list<unsigned char> x){ code.insert(code.end(),x); };
@@ -20016,7 +20038,11 @@ static int runMain(vector<string> args) {
         try {
             auto program=sub.parseSource(src);
             for (const auto& st : program) {
-                if (st && st->k==Stmt::K::Return && st->expr && st->expr->k==Expr::K::Num) { value=(int)st->expr->num; found=true; }
+                if (st && st->k==Stmt::K::Return && st->expr) {
+                    long long cv=0; string ce;
+                    if (!constIntExpr(st->expr, cv, ce)) { std::cerr << "原生EXE 常量表达式错误：" << ce << "\n"; return 2; }
+                    value=(int)cv; found=true;
+                }
                 if (st && st->k==Stmt::K::Print && st->args.size()==1 && st->args[0] && st->args[0]->k==Expr::K::Str) printText=st->args[0]->text;
             }
             if (!found) { std::cerr << "原生EXE32 目前只支持顶层「返回 常量」\n"; return 2; }
@@ -20040,7 +20066,11 @@ static int runMain(vector<string> args) {
         try {
             auto program=sub.parseSource(src);
             for (const auto& st : program) {
-                if (st && st->k==Stmt::K::Return && st->expr && st->expr->k==Expr::K::Num) { value=(int)st->expr->num; found=true; }
+                if (st && st->k==Stmt::K::Return && st->expr) {
+                    long long cv=0; string ce;
+                    if (!constIntExpr(st->expr, cv, ce)) { std::cerr << "原生EXE32 常量表达式错误：" << ce << "\n"; return 2; }
+                    value=(int)cv; found=true;
+                }
                 if (st && st->k==Stmt::K::Print && st->args.size()==1 && st->args[0] && st->args[0]->k==Expr::K::Str) printText=st->args[0]->text;
             }
             if (!found) { std::cerr << "原生EXE 目前只支持顶层「返回 常量」\n"; return 2; }
