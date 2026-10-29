@@ -19013,6 +19013,33 @@ static bool constIntExpr(const ExprPtr& e, long long& out, string& err) {
     return false;
 }
 
+static bool constIntEnv(const ExprPtr& e, const std::map<string,long long>& env, long long& out, string& err) {
+    if (!e) { err="空表达式"; return false; }
+    if (e->k==Expr::K::Num) { out=(long long)e->num; return true; }
+    if (e->k==Expr::K::Bool) { out=e->b?1:0; return true; }
+    if (e->k==Expr::K::Var) {
+        auto it=env.find(e->text);
+        if(it==env.end()){ err="PE 常量变量未定义："+e->text; return false; }
+        out=it->second; return true;
+    }
+    if (e->k==Expr::K::Unary && e->op=="-") {
+        long long v=0; if(!constIntEnv(e->args[0],env,v,err)) return false; out=-v; return true;
+    }
+    if (e->k==Expr::K::Binary) {
+        long long a=0,b=0;
+        if(!constIntEnv(e->args[0],env,a,err) || !constIntEnv(e->args[1],env,b,err)) return false;
+        if(e->op=="+") out=a+b;
+        else if(e->op=="-") out=a-b;
+        else if(e->op=="*") out=a*b;
+        else if(e->op=="/") { if(b==0){err="除数不能为 0"; return false;} out=a/b; }
+        else if(e->op=="%") { if(b==0){err="除数不能为 0"; return false;} out=a%b; }
+        else { err="PE 常量表达式只支持 + - * / %"; return false; }
+        return true;
+    }
+    err="PE 常量表达式只支持数字、变量、括号、+ - * / %、一元负号";
+    return false;
+}
+
 static bool writeNativeExeText(int exitCode, const string& text, const string& outPath, string& err) {
     vector<unsigned char> code;
     auto emit=[&](std::initializer_list<unsigned char> x){ code.insert(code.end(),x); };
@@ -20037,10 +20064,16 @@ static int runMain(vector<string> args) {
         int value=0; bool found=false; string printText;
         try {
             auto program=sub.parseSource(src);
+            std::map<string,long long> env;
             for (const auto& st : program) {
+                if (st && st->k==Stmt::K::Assign && st->target && st->target->k==Expr::K::Var && st->expr) {
+                    long long av=0; string ae;
+                    if (!constIntEnv(st->expr, env, av, ae)) { std::cerr << "原生EXE 常量赋值错误：" << ae << "\n"; return 2; }
+                    env[st->target->text]=av;
+                }
                 if (st && st->k==Stmt::K::Return && st->expr) {
                     long long cv=0; string ce;
-                    if (!constIntExpr(st->expr, cv, ce)) { std::cerr << "原生EXE 常量表达式错误：" << ce << "\n"; return 2; }
+                    if (!constIntEnv(st->expr, env, cv, ce)) { std::cerr << "原生EXE 常量表达式错误：" << ce << "\n"; return 2; }
                     value=(int)cv; found=true;
                 }
                 if (st && st->k==Stmt::K::Print && st->args.size()==1 && st->args[0] && st->args[0]->k==Expr::K::Str) printText=st->args[0]->text;
@@ -20065,10 +20098,16 @@ static int runMain(vector<string> args) {
         int value=0; bool found=false; string printText;
         try {
             auto program=sub.parseSource(src);
+            std::map<string,long long> env;
             for (const auto& st : program) {
+                if (st && st->k==Stmt::K::Assign && st->target && st->target->k==Expr::K::Var && st->expr) {
+                    long long av=0; string ae;
+                    if (!constIntEnv(st->expr, env, av, ae)) { std::cerr << "原生EXE32 常量赋值错误：" << ae << "\n"; return 2; }
+                    env[st->target->text]=av;
+                }
                 if (st && st->k==Stmt::K::Return && st->expr) {
                     long long cv=0; string ce;
-                    if (!constIntExpr(st->expr, cv, ce)) { std::cerr << "原生EXE32 常量表达式错误：" << ce << "\n"; return 2; }
+                    if (!constIntEnv(st->expr, env, cv, ce)) { std::cerr << "原生EXE32 常量表达式错误：" << ce << "\n"; return 2; }
                     value=(int)cv; found=true;
                 }
                 if (st && st->k==Stmt::K::Print && st->args.size()==1 && st->args[0] && st->args[0]->k==Expr::K::Str) printText=st->args[0]->text;
