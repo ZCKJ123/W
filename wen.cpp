@@ -11351,7 +11351,7 @@ Interpreter::Interpreter() {
             double hh = (y - 6.0) / 12.0;
             if (hh < 0 || hh > 1) return 0.0;
             double f=0, amp=0.55, fr=1;
-            for (int o=0;o<4;++o) { f += noise3(x*0.16*fr + t*0.2, y*0.22*fr, z*0.16*fr - t*0.2)*amp; fr*=2.07; amp*=0.5; }
+            for (int o=0;o<4;++o) { f += noise3(x*0.16*fr + t*0.2, y*0.06*fr, z*0.16*fr - t*0.2)*amp; fr*=2.07; amp*=0.5; }
             double billow = 1.0 - std::fabs(2.0*f - 1.0);
             double n = f*0.62 + billow*0.38;
             n -= noise3(x*0.5+7, y*0.55, z*0.5-4)*0.18;
@@ -12591,7 +12591,7 @@ Interpreter::Interpreter() {
             }
             if (!useParticleClouds && !useOldClouds) {
                 struct VoxelGrid {
-                    int nx=72, ny=42, nz=72;
+                    int nx=96, ny=48, nz=96;
                     double x0=-42, x1=42, y0=0, y1=1, z0=-42, z1=42;
                     vector<float> d;
                 };
@@ -12654,18 +12654,18 @@ Interpreter::Interpreter() {
                     double c11=at(ix,iy+1,iz+1)*(1-tx)+at(ix+1,iy+1,iz+1)*tx;
                     return (c00*(1-ty)+c10*ty)*(1-tz) + (c01*(1-ty)+c11*ty)*tz;
                 };
-                int cw=std::max(1,w/2), ch=std::max(1,h/2);
+                int cw=w, ch=h;
                 vector<unsigned char> vbuf((size_t)cw*ch*4,0);
                 for (int cy=0;cy<ch;++cy) {
-                    double ny=-(((double)cy+0.5)*2-h*0.5)/((double)h*0.95);
+                    double ny=-((double)cy+0.5-h*0.5)/((double)h*0.95);
                     for (int cx=0;cx<cw;++cx) {
-                        double nx=(((double)cx+0.5)*2-w*0.5)/((double)h*0.95);
+                        double nx=((double)cx+0.5-w*0.5)/((double)h*0.95);
                         PVec rd=pnorm(padd(f,padd(pmul(r,nx),pmul(u,ny))));
                         double t0r=(atmo.base-cam.y)/rd.y, t1r=(atmo.top-cam.y)/rd.y;
                         if (std::fabs(rd.y)<1e-4) continue;
                         if (t0r>t1r) std::swap(t0r,t1r);
                         t0r=std::max(0.05,t0r); if (t1r<=t0r) continue;
-                        int steps=18; double dt=(t1r-t0r)/steps;
+                        int steps=14; double dt=(t1r-t0r)/steps;
                         double T=1,cr=0,cg=0,cb=0;
                         for (int st=0;st<steps;++st) {
                             PVec p2=padd(cam,pmul(rd,t0r+(st+0.5)*dt));
@@ -13109,7 +13109,7 @@ Interpreter::Interpreter() {
                         size_t i=((size_t)y*w+x)*3;
                         pw.back[i]  =(unsigned char)std::min(255.0,pw.back[i]  + beam*0.55);
                         pw.back[i+1]=(unsigned char)std::min(255.0,pw.back[i+1]+ beam*0.40);
-                        pw.back[i+2]=(unsigned char)std::min(255.0,pw.back[i+2]+ beam*0.22);
+                        pw.back[i+2]=(unsigned char)std::min(255.0,pw.back[i+2]+ beam*0.06);
                     }
                 }
             }
@@ -13159,6 +13159,18 @@ Interpreter::Interpreter() {
                     pw.back[i]  =(unsigned char)std::min(255.0,std::max(0.0,b));
                     pw.back[i+1]=(unsigned char)std::min(255.0,std::max(0.0,g));
                     pw.back[i+2]=(unsigned char)std::min(255.0,std::max(0.0,r));
+                }
+            }
+            {
+                vector<unsigned char> src = pw.back;
+                for (int y=1;y<h-1;++y) for (int x=1;x<w-1;++x) {
+                    size_t i=((size_t)y*w+x)*3;
+                    for (int ch=0; ch<3; ++ch) {
+                        double c=src[i+ch];
+                        double n=(src[i-3+ch]+src[i+3+ch]+src[i-(size_t)w*3+ch]+src[i+(size_t)w*3+ch])*0.25;
+                        double v=c + (c-n)*0.45;
+                        pw.back[i+ch]=(unsigned char)std::max(0.0,std::min(255.0,v));
+                    }
                 }
             }
             {
