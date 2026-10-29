@@ -12235,6 +12235,7 @@ Interpreter::Interpreter() {
             ch.radius=std::max(ch.radius,r);
         }
         PVec light = pnorm({0.45,1.0,0.35});
+        PVec sunDir = pnorm({0.35,0.55,-0.78});
         PVec cam{0,1.7,7.5};
         double yaw = 0, pitch = 0.14;
         pw.capture = false; ShowCursor(TRUE);
@@ -12280,7 +12281,7 @@ Interpreter::Interpreter() {
             {
                 double ts = std::chrono::duration<double>(frameStart - t0).count();
                 light = hasSceneLight ? sceneLightDir
-                      : pnorm({0.45 + 0.35 * std::sin(ts * 0.12), 1.0, 0.35 + 0.35 * std::cos(ts * 0.09)});
+                      : pnorm({0.45 + 0.35 * std::sin(ts * 0.12), 1.0, -0.45 - 0.25 * std::cos(ts * 0.09)});
             }
             MSG msg;
             while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
@@ -12334,8 +12335,8 @@ Interpreter::Interpreter() {
             // 物理天空：Rayleigh/Mie 近似 + 太阳盘
             auto skyColor = [&](PVec rd) {
                 double y = rd.y;
-                double mu = std::max(0.0, pdot(rd, light));
-                double sunAlt = std::max(0.0, light.y);
+                double mu = std::max(0.0, pdot(rd, sunDir));
+                double sunAlt = std::max(0.0, sunDir.y);
                 double rayleigh = 0.75 * (1.0 + mu * mu);
                 double mie = std::pow(mu, 32.0) * 0.8;
                 double horizon = std::exp(-std::max(0.0, y) * 5.0);
@@ -12783,6 +12784,7 @@ Interpreter::Interpreter() {
                     double slope = 1.0 - std::fabs(pdot(n, light));
                     double bias = 0.025 + 0.10 * slope;
                     double dz = pdot(d, cs.fwd) - bias;
+                    if (!std::isfinite(sx) || !std::isfinite(sy) || !std::isfinite(dz)) return 1.0;
                     if (sx < 1 || sy < 1 || sx >= cs.size-1 || sy >= cs.size-1) return 1.0;
                     int cx=(int)sx, cy=(int)sy, lit=0, total=0;
                     for(int oy=-2;oy<=2;++oy) for(int ox=-2;ox<=2;++ox) {
@@ -12974,11 +12976,12 @@ Interpreter::Interpreter() {
                 pw.back[i*3+1] = (unsigned char)(pw.back[i*3+1]*ao);
                 pw.back[i*3+2] = (unsigned char)(pw.back[i*3+2]*ao);
             }
-            // 太阳体积光：从太阳屏幕位置向四周做屏幕空间光束积分
+            // 可见太阳体积光：独立太阳方向，避免改阴影光源
             {
                 double ssx=0, ssy=0, ssz=0;
-                if (project(padd(cam, pmul(light, 80.0)), ssx, ssy, ssz) &&
-                    ssx > -w*0.5 && ssx < w*1.5 && ssy > -h*0.5 && ssy < h*1.5) {
+                if (project(padd(cam, pmul(sunDir, 80.0)), ssx, ssy, ssz) &&
+                    std::isfinite(ssx) && std::isfinite(ssy) &&
+                    ssx > 0 && ssx < w && ssy > 0 && ssy < h) {
                     for (int y=0;y<h;++y) for (int x=0;x<w;++x) {
                         double sum=0, ws=0;
                         for (int st=1; st<=10; ++st) {
@@ -12993,7 +12996,7 @@ Interpreter::Interpreter() {
                             sum += lum*wgt; ws += wgt;
                         }
                         if (ws <= 1e-6) continue;
-                        double beam=(sum/ws)*0.10;
+                        double beam=(sum/ws)*0.055;
                         size_t i=((size_t)y*w+x)*3;
                         pw.back[i]  =(unsigned char)std::min(255.0,pw.back[i]  + beam*0.55);
                         pw.back[i+1]=(unsigned char)std::min(255.0,pw.back[i+1]+ beam*0.40);
