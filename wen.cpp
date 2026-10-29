@@ -10471,6 +10471,104 @@ Interpreter::Interpreter() {
         return vFunc(fn);
 #endif
     });
+    registerBuiltin("原生程序", 1, 1, [this](Interpreter&, vector<Value>& a, int line) -> Value {
+#if !defined(_WIN32) || !defined(_M_X64)
+        throw WenError("运行时错误", line, 0, "原生程序暂只支持 Windows x64");
+#else
+        string src = needStr(a[0], "原生程序", line);
+        Interpreter tmp;
+        tmp.filename = "<原生程序>";
+        string wrapped = "函数 原生入口 则\n" + src + "\n结束\n";
+        auto prog = tmp.parseSource(wrapped);
+        if (prog.empty() || !prog[0] || prog[0]->k != Stmt::K::Func)
+            throw WenError("语法错误", line, 0, "原生程序解析失败");
+        vector<unsigned char> code;
+        auto emit = [&](std::initializer_list<unsigned char> b){ code.insert(code.end(), b); };
+        auto imm64 = [&](uint64_t v){ emit({0x48,0xB8}); for(int i=0;i<8;++i) code.push_back((unsigned char)((v>>(8*i))&255)); emit({0x66,0x48,0x0F,0x6E,0xC0}); };
+        std::map<string,int> slots;
+        auto slotOf = [&](const string& n)->int {
+            auto it=slots.find(n); if(it!=slots.end()) return it->second;
+            int v=(int)slots.size(); if(v>=63) throw WenError("运行时错误", line, 0, "原生程序最多 63 个变量");
+            slots[n]=v; return v;
+        };
+        vector<int> labelAt; vector<std::pair<size_t,int>> fix;
+        auto newLabel=[&](){ labelAt.push_back(-1); return (int)labelAt.size()-1; };
+        auto place=[&](int id){ labelAt[(size_t)id]=(int)code.size(); };
+        auto jmp=[&](int id){ emit({0xE9,0,0,0,0}); fix.push_back({code.size()-4,id}); };
+        auto jcc=[&](int id){ emit({0x0F,0x84,0,0,0,0}); fix.push_back({code.size()-4,id}); };
+        std::function<void(ExprPtr)> gen = [&](ExprPtr e) {
+            if(!e) throw WenError("语法错误", line, 0, "原生程序表达式为空");
+            if(e->k==Expr::K::Num){ uint64_t b; double v=e->num; memcpy(&b,&v,8); imm64(b); return; }
+            if(e->k==Expr::K::Bool){ imm64(e->b?1:0); return; }
+            if(e->k==Expr::K::Var){
+                int sl=slotOf(e->text); uint32_t off=(uint32_t)(-(int)(8*(sl+1)));
+                emit({0xF2,0x0F,0x10,0x85}); for(int i=0;i<4;++i) code.push_back((unsigned char)((off>>(8*i))&255));
+                return;
+            }
+            if(e->k==Expr::K::Unary && e->op=="-"){
+                gen(e->args[0]); imm64(0x8000000000000000ULL); emit({0x66,0x0F,0x57,0xC1}); return;
+            }
+            if(e->k==Expr::K::Binary){
+                string op=e->op;
+                if(op=="+"||op=="-"||op=="*"||op=="/"||op=="<"||op=="<="||op==">"||op==">="||op=="=="||op=="!="){
+                    gen(e->args[0]); emit({0x48,0x83,0xEC,0x08}); emit({0xF2,0x0F,0x11,0x04,0x24});
+                    gen(e->args[1]); emit({0xF2,0x0F,0x10,0x0C,0x24}); emit({0x48,0x83,0xC4,0x08});
+                    if(op=="+"||op=="-"||op=="*"||op=="/"){
+                        unsigned char o=op=="+"?0x58:(op=="-"?0x5C:(op=="*"?0x59:0x5E));
+                        emit({0xF2,0x0F,o,0xC8}); emit({0x66,0x0F,0x28,0xC1});
+                    } else {
+                        emit({0x66,0x0F,0x2E,0xC8}); // ucomisd xmm1, xmm0
+                        unsigned char cc = op=="<"?0x92:(op=="<="?0x96:(op==">"?0x97:(op==">="?0x93:(op=="=="?0x94:0x95))));
+                        emit({0x0F,cc,0xC0}); emit({0x0F,0xB6,0xC0}); emit({0xF2,0x0F,0x2A,0xC0});
+                    }
+                    return;
+                }
+                throw WenError("语法错误", line, 0, "原生程序不支持运算符「"+op+"」");
+            }
+            throw WenError("语法错误", line, 0, "原生程序只支持数字、变量、算术/比较");
+        };
+        std::function<void(const StmtPtr&)> stmt = [&](const StmtPtr& st) {
+            if(!st) return;
+            if(st->k==Stmt::K::Assign){
+                if(!st->target || st->target->k!=Expr::K::Var) throw WenError("语法错误", line, 0, "原生程序只支持变量赋值");
+                int sl=slotOf(st->target->text); uint32_t off=(uint32_t)(-(int)(8*(sl+1)));
+                gen(st->expr); emit({0xF2,0x0F,0x11,0x85}); for(int i=0;i<4;++i) code.push_back((unsigned char)((off>>(8*i))&255));
+                return;
+            }
+            if(st->k==Stmt::K::Return){ gen(st->expr); emit({0xC9,0xC3}); return; }
+            if(st->k==Stmt::K::If){
+                vector<int> ends;
+                for(size_t i=0;i<st->branches.size();++i){
+                    int next=newLabel();
+                    gen(st->branches[i].first); emit({0x66,0x0F,0x57,0xC9}); emit({0x66,0x0F,0x2E,0xC1}); jcc(next);
+                    for(const auto& b: st->branches[i].second) stmt(b);
+                    int end=newLabel(); jmp(end); ends.push_back(end); place(next);
+                }
+                for(const auto& b: st->elseBody) stmt(b);
+                for(int e:ends) place(e);
+                return;
+            }
+            if(st->k==Stmt::K::While){
+                int start=newLabel(), end=newLabel(); place(start);
+                gen(st->expr); emit({0x66,0x0F,0x57,0xC9}); emit({0x66,0x0F,0x2E,0xC1}); jcc(end);
+                for(const auto& b: st->body) stmt(b); jmp(start); place(end); return;
+            }
+            throw WenError("语法错误", line, 0, "原生程序暂不支持这条语句");
+        };
+        emit({0x55,0x48,0x89,0xE5,0x48,0x81,0xEC,0x00,0x02,0x00,0x00});
+        for(const auto& st: prog[0]->body) stmt(st);
+        emit({0x66,0x0F,0x57,0xC0,0xC9,0xC3});
+        for(auto& fx: fix){
+            int dest=labelAt[(size_t)fx.second]; int rel=dest-(int)(fx.first+4);
+            for(int i=0;i<4;++i) code[fx.first+(size_t)i]=(unsigned char)((rel>>(8*i))&255);
+        }
+        void* mem=VirtualAlloc(nullptr,code.size(),MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
+        if(!mem) throw WenError("运行时错误",line,0,"原生程序分配失败");
+        memcpy(mem,code.data(),code.size()); FlushInstructionCache(GetCurrentProcess(),mem,code.size());
+        auto fn=std::make_shared<NativeFunction>(); fn->name="原生程序"; fn->code=mem; fn->codeSize=code.size(); fn->arity=0;
+        return vFunc(fn);
+#endif
+    });
     registerBuiltin("重置核心", 0, 0, [this](Interpreter&, vector<Value>&, int line) -> Value {
         vector<std::pair<string,Value>> keep;
         int removed = 0;
