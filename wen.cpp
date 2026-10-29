@@ -2041,14 +2041,14 @@ struct NativeFunction : Callable {
     size_t codeSize = 0;
     int arity = 0;
     ~NativeFunction() override {
-#if defined(_WIN32) && defined(_M_X64)
+#if defined(_WIN32) && (defined(_M_X64) || defined(_M_IX86))
         if (code) VirtualFree(code, 0, MEM_RELEASE);
 #endif
     }
     Value call(Interpreter&, vector<Value>& args, int line) override {
         if ((int)args.size() != arity)
             throw WenError("运行时错误", line, 0, "原生函数需要 " + std::to_string(arity) + " 个参数");
-#if defined(_WIN32) && defined(_M_X64)
+#if defined(_WIN32) && (defined(_M_X64) || defined(_M_IX86))
         double x[4] = {0,0,0,0};
         for (int i=0;i<arity;++i) {
             if (args[(size_t)i].type != VT::Num)
@@ -10344,8 +10344,8 @@ Interpreter::Interpreter() {
         return vNum(n);
     });
     registerBuiltin("原生函数", 2, 2, [this](Interpreter&, vector<Value>& a, int line) -> Value {
-#if !defined(_WIN32) || !defined(_M_X64)
-        throw WenError("运行时错误", line, 0, "原生函数只支持 Windows x64");
+#if !defined(_WIN32) || (!defined(_M_X64) && !defined(_M_IX86))
+        throw WenError("运行时错误", line, 0, "原生函数只支持 Windows x64/x86");
 #else
         string exprText = needStr(a[0], "原生函数", line);
         auto params = needList(a[1], "原生函数参数表", line);
@@ -10365,6 +10365,7 @@ Interpreter::Interpreter() {
             throw WenError("语法错误", line, 0, "原生表达式解析失败");
         vector<unsigned char> code;
         auto emit = [&](std::initializer_list<unsigned char> bytes) { code.insert(code.end(), bytes); };
+#if defined(_M_X64)
         auto imm64 = [&](uint64_t v) {
             emit({0x48,0xB8});
             for (int i=0;i<8;++i) code.push_back((unsigned char)((v>>(8*i))&255));
@@ -10404,6 +10405,37 @@ Interpreter::Interpreter() {
             emit({0x66,0x0F,0x28,(unsigned char)(0xC0 | ((4+i)<<3) | (int)i)});
         gen(prog.back()->expr);
         emit({0xC3});
+#else
+        auto push32 = [&](uint32_t v) { emit({0x68}); for(int i=0;i<4;++i) code.push_back((unsigned char)((v>>(8*i))&255)); };
+        std::function<void(ExprPtr)> gen86 = [&](ExprPtr e) {
+            if (!e) throw WenError("语法错误", line, 0, "原生表达式为空");
+            if (e->k == Expr::K::Num) {
+                uint64_t bits; double v=e->num; memcpy(&bits,&v,8);
+                push32((uint32_t)(bits>>32)); push32((uint32_t)bits);
+                emit({0xDD,0x04,0x24}); emit({0x83,0xC4,0x08});
+                return;
+            }
+            if (e->k == Expr::K::Var) {
+                auto it = index.find(e->text);
+                if (it == index.end()) throw WenError("运行时错误", line, 0, "原生表达式用了未声明参数「" + e->text + "」");
+                int disp = 4 + 8*it->second;
+                emit({0xDD,0x44,0x24,(unsigned char)disp});
+                return;
+            }
+            if (e->k == Expr::K::Unary && e->op == "-") { gen86(e->args[0]); emit({0xD9,0xE0}); return; }
+            if (e->k == Expr::K::Binary && (e->op=="+"||e->op=="-"||e->op=="*"||e->op=="/")) {
+                gen86(e->args[0]); gen86(e->args[1]);
+                if (e->op=="+") emit({0xDE,0xC1});
+                else if (e->op=="-") emit({0xDE,0xE9});
+                else if (e->op=="*") emit({0xDE,0xC9});
+                else emit({0xDE,0xF9});
+                return;
+            }
+            throw WenError("语法错误", line, 0, "原生函数只支持数字、参数和 + - * /");
+        };
+        gen86(prog.back()->expr);
+        emit({0xC3});
+#endif
         void* mem = VirtualAlloc(nullptr, code.size(), MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE);
         if (!mem) throw WenError("运行时错误", line, 0, "原生代码分配失败");
         memcpy(mem, code.data(), code.size());

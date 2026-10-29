@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="620" viewBox="0 0 1000 620">
+  <rect width="1000" height="620" fill="#0f172a"/>
+  <text x="40" y="52" fill="#e2e8f0" font-size="28" font-family="Microsoft YaHei, sans-serif">文语言编译路径</text>
+  <text x="40" y="82" fill="#94a3b8" font-size="15" font-family="Microsoft YaHei, sans-serif">源文件是唯一输入；解释、字节码、JIT、外派是不同出口，不是同一件事</text>
+
+  <rect x="40" y="120" width="180" height="76" rx="10" fill="#1e293b" stroke="#38bdf8"/>
+  <text x="130" y="152" fill="#e2e8f0" font-size="20" text-anchor="middle" font-family="Microsoft YaHei, sans-serif">源 .wen</text>
+  <text x="130" y="178" fill="#94a3b8" font-size="13" text-anchor="middle" font-family="Microsoft YaHei, sans-serif">中文词法 / 语法</text>
+
+  <rect x="280" y="120" width="180" height="76" rx="10" fill="#1e293b" stroke="#38bdf8"/>
+  <text x="370" y="152" fill="#e2e8f0" font-size="20" text-anchor="middle" font-family="Microsoft YaHei, sans-serif">AST</text>
+  <text x="370" y="178" fill="#94a3b8" font-size="13" text-anchor="middle" font-family="Microsoft YaHei, sans-serif">语句 / 表达式 / 匹配</text>
+
+  <line x1="220" y1="158" x2="280" y2="158" stroke="#38bdf8" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="460" y1="158" x2="520" y2="158" stroke="#38bdf8" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <rect x="520" y="110" width="190" height="96" rx="10" fill="#1e293b" stroke="#22c55e"/>
+  <text x="615" y="142" fill="#e2e8f0" font-size="19" text-anchor="middle" font-family="Microsoft YaHei, sans-serif">解释器</text>
+  <text x="615" y="168" fill="#94a3b8" font-size="13" text-anchor="middle" font-family="Microsoft YaHei, sans-serif">当前默认路径</text>
+  <text x="615" y="190" fill="#94a3b8" font-size="13" text-anchor="middle" font-family="Microsoft YaHei, sans-serif">作用域 / 闭包 / 库</text>
+
+  <rect x="520" y="245" width="190" height="96" rx="10" fill="#1e293b" stroke="#f59e0b"/>
+  <text x="615" y="277" fill="#e2e8f0" font-size="19" text-anchor="middle" font-family="Microsoft YaHei, sans-serif">字节码</text>
+  <text x="615" y="303" fill="#94a3b8" font-size="13" text-anchor="middle" font-family="Microsoft YaHei, sans-serif">数值 / 列表 / 字典子集</text>
+  <text x="615" y="325" fill="#94a3b8" font-size="13" text-anchor="middle" font-family="Microsoft YaHei, sans-serif">匹配/尝试暂不支持</text>
+
+  <rect x="520" y="380" width="190" height="96" rx="10" fill="#1e293b" stroke="#ef4444"/>
+  <text x="615" y="412" fill="#e2e8f0" font-size="19" text-anchor="middle" font-family="Microsoft YaHei, sans-serif">原生函数 JIT</text>
+  <text x="615" y="438" fill="#94a3b8" font-size="13" text-anchor="middle" font-family="Microsoft YaHei, sans-serif">数字 / 参数 / + - * /</text>
+  <text x="615" y="460" fill="#94a3b8" font-size="13" text-anchor="middle" font-family="Microsoft YaHei, sans-serif">x64: SSE  ·  x86: x87</text>
+
+  <rect x="770" y="110" width="190" height="96" rx="10" fill="#1e293b" stroke="#a78bfa"/>
+  <text x="865" y="142" fill="#e2e8f0" font-size="19" text-anchor="middle" font-family="Microsoft YaHei, sans-serif">编译 / 外派</text>
+  <text x="865" y="168" fill="#94a3b8" font-size="13" text-anchor="middle" font-family="Microsoft YaHei, sans-serif">C++ / Python / JS / TS</text>
+  <text x="865" y="190" fill="#94a3b8" font-size="13" text-anchor="middle" font-family="Microsoft YaHei, sans-serif">Java / JSON / 字节码</text>
+
+  <rect x="770" y="245" width="190" height="96" rx="10" fill="#1e293b" stroke="#06b6d4"/>
+  <text x="865" y="277" fill="#e2e8f0" font-size="19" text-anchor="middle" font-family="Microsoft YaHei, sans-serif">库层</text>
+  <text x="865" y="303" fill="#94a3b8" font-size="13" text-anchor="middle" font-family="Microsoft YaHei, sans-serif">库/*.wen</text>
+  <text x="865" y="325" fill="#94a3b8" font-size="13" text-anchor="middle" font-family="Microsoft YaHei, sans-serif">演算 / 集合 / 几何</text>
+
+  <line x1="710" y1="158" x2="770" y2="158" stroke="#a78bfa" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="710" y1="290" x2="770" y2="290" stroke="#06b6d4" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L7,3 z" fill="#38bdf8"/>
+    </marker>
+  </defs>
+
+  <text x="40" y="540" fill="#94a3b8" font-size="15" font-family="Microsoft YaHei, sans-serif">核心仍是 C++；库层可以是文语言；JIT 只覆盖数值表达式子集。</text>
+  <text x="40" y="570" fill="#64748b" font-size="13" font-family="Microsoft YaHei, sans-serif">“语言构造”不等于“库”，也不等于“编译目标”。</text>
+</svg>
