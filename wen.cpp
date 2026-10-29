@@ -20076,7 +20076,10 @@ static int runMain(vector<string> args) {
                     if (!constIntEnv(st->expr, env, cv, ce)) { std::cerr << "原生EXE 常量表达式错误：" << ce << "\n"; return 2; }
                     value=(int)cv; found=true;
                 }
-                if (st && st->k==Stmt::K::Print && st->args.size()==1 && st->args[0] && st->args[0]->k==Expr::K::Str) printText=st->args[0]->text;
+                if (st && st->k==Stmt::K::Print && st->args.size()==1 && st->args[0] && st->args[0]->k==Expr::K::Str) {
+                    if (!printText.empty()) printText += "\n";
+                    printText += st->args[0]->text;
+                }
             }
             if (!found) { std::cerr << "原生EXE32 目前只支持顶层「返回 常量」\n"; return 2; }
         } catch (WenError& e) { std::cerr << e.what() << "\n"; return 1; }
@@ -20110,7 +20113,10 @@ static int runMain(vector<string> args) {
                     if (!constIntEnv(st->expr, env, cv, ce)) { std::cerr << "原生EXE32 常量表达式错误：" << ce << "\n"; return 2; }
                     value=(int)cv; found=true;
                 }
-                if (st && st->k==Stmt::K::Print && st->args.size()==1 && st->args[0] && st->args[0]->k==Expr::K::Str) printText=st->args[0]->text;
+                if (st && st->k==Stmt::K::Print && st->args.size()==1 && st->args[0] && st->args[0]->k==Expr::K::Str) {
+                    if (!printText.empty()) printText += "\n";
+                    printText += st->args[0]->text;
+                }
             }
             if (!found) { std::cerr << "原生EXE 目前只支持顶层「返回 常量」\n"; return 2; }
         } catch (WenError& e) { std::cerr << e.what() << "\n"; return 1; }
