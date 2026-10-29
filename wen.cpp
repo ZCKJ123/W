@@ -12079,7 +12079,7 @@ Interpreter::Interpreter() {
         }
         PVec light = pnorm({0.45,1.0,0.35});
         PVec cam{0,1.7,7.5};
-        double yaw = 0, pitch = 0.02;
+        double yaw = 0, pitch = 0.14;
         pw.capture = false; ShowCursor(TRUE);
         std::thread presenter([&]() {
             HDC pdc = GetDC(hwnd);
@@ -12334,7 +12334,7 @@ Interpreter::Interpreter() {
                     if (layer == 0) {
                         for (int i=0;i<12;++i) {
                             double sx = -34.0 + 68.0 * hash3(i*3.1, 1.7, 2.3);
-                            double sz = -34.0 + 68.0 * hash3(i*5.7, 4.1, 8.9);
+                            double sz = -8.0 - 30.0 * hash3(i*5.7, 4.1, 8.9);
                             double sr = 3.0 + 6.0 * hash3(i*2.3, 9.1, 3.7);
                             int n = 620;
                             for (int k=0;k<n;++k) {
@@ -12378,13 +12378,12 @@ Interpreter::Interpreter() {
                     sx=w*0.5+xx*fl/zz; sy=h*0.5-yy*fl/zz; return true;
                 };
                 // 半分辨率密度场：粒子累加 → 梯度明暗 → 上采样合成
-                int dw=(w+1)/2, dh=(h+1)/2;
+                int dw=w, dh=h;
                 vector<float> den((size_t)dw*dh, 0.0f), colr((size_t)dw*dh, 0.0f), colg((size_t)dw*dh, 0.0f), colb((size_t)dw*dh, 0.0f);
                 for (const auto& pt : parts) {
                     double sx,sy,zz;
                     if (!pj(pt.p,sx,sy,zz)) continue;
-                    sx *= 0.5; sy *= 0.5;
-                    double rad = std::max(1.0, std::min(60.0, 180.0/zz));
+                    double rad = std::max(1.0, std::min(42.0, 105.0/zz));
                     double cr = (pt.layer ? 220 : 205) * (0.62 + 0.38*pt.shade);
                     double cg = (pt.layer ? 225 : 210) * (0.62 + 0.38*pt.shade);
                     double cb = (pt.layer ? 240 : 220) * (0.62 + 0.38*pt.shade);
@@ -12402,7 +12401,10 @@ Interpreter::Interpreter() {
                 for (int y=0;y<dh;++y) for (int x=0;x<dw;++x) {
                     size_t i=(size_t)y*dw+x;
                     if (den[i] <= 1e-5) continue;
-                    double a = 1.0 - std::exp(-den[i] * 0.16);
+                    double a = 1.0 - std::exp(-den[i] * 0.34);
+                    a = std::pow(std::min(1.0, a), 0.82);
+                    // 全分辨率高频边缘，避免整片像模糊贴图
+                    a *= 0.90 + 0.20 * hash3(x*0.83, y*0.91, 3.7);
                     double cr = colr[i]/den[i], cg = colg[i]/den[i], cb = colb[i]/den[i];
                     // 密度梯度当作体积法线，给云底/云顶不同明暗
                     double gx = (x+1<dw ? den[i+1] : den[i]) - (x>0 ? den[i-1] : den[i]);
@@ -12422,12 +12424,10 @@ Interpreter::Interpreter() {
                     double beam = std::exp(-od * 0.020);
                     shade *= (0.58 + 0.42*beam);
                     cr*=shade; cg*=shade; cb*=shade;
-                    for (int yy=0; yy<2 && y*2+yy<h; ++yy) for (int xx=0; xx<2 && x*2+xx<w; ++xx) {
-                        size_t o=((size_t)(y*2+yy)*w+(x*2+xx))*3;
-                        pw.back[o]  =(unsigned char)std::min(255.0,pw.back[o]*(1-a)+cb*a);
-                        pw.back[o+1]=(unsigned char)std::min(255.0,pw.back[o+1]*(1-a)+cg*a);
-                        pw.back[o+2]=(unsigned char)std::min(255.0,pw.back[o+2]*(1-a)+cr*a);
-                    }
+                    size_t o=((size_t)y*w+x)*3;
+                    pw.back[o]  =(unsigned char)std::min(255.0,pw.back[o]*(1-a)+cb*a);
+                    pw.back[o+1]=(unsigned char)std::min(255.0,pw.back[o+1]*(1-a)+cg*a);
+                    pw.back[o+2]=(unsigned char)std::min(255.0,pw.back[o+2]*(1-a)+cr*a);
                 }
             }
             if (!useParticleClouds) {
@@ -12849,9 +12849,9 @@ Interpreter::Interpreter() {
                 for (int y=0;y<h;++y) for (int x=0;x<w;++x) {
                     size_t i=((size_t)y*w+x)*3;
                     size_t bi=((size_t)(y*bh/h)*bw + (x*bw/w))*3;
-                    double r=pw.back[i+2] + bloom[bi+2]*0.22;
-                    double g=pw.back[i+1] + bloom[bi+1]*0.22;
-                    double b=pw.back[i]   + bloom[bi]  *0.22;
+                    double r=pw.back[i+2] + bloom[bi+2]*0.10;
+                    double g=pw.back[i+1] + bloom[bi+1]*0.10;
+                    double b=pw.back[i]   + bloom[bi]  *0.10;
                     double nx=(x+0.5)/w*2-1, ny=(y+0.5)/h*2-1;
                     double vig=1.0-0.18*(nx*nx+ny*ny);
                     double tr=r/255.0, tg=g/255.0, tb=b/255.0;
