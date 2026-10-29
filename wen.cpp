@@ -2036,6 +2036,8 @@ struct Function : Callable {
     string memoKey() const override { return name; }
 };
 
+static thread_local int gNativeError = 0;
+
 struct NativeFunction : Callable {
     void* code = nullptr;
     size_t codeSize = 0;
@@ -2056,7 +2058,10 @@ struct NativeFunction : Callable {
             x[i] = args[(size_t)i].num;
         }
         using Fn = double(*)(double,double,double,double);
-        Value out; out.type = VT::Num; out.num = ((Fn)code)(x[0],x[1],x[2],x[3]);
+        gNativeError = 0;
+        double result = ((Fn)code)(x[0],x[1],x[2],x[3]);
+        if (gNativeError) throw WenError("运行时错误", line, 0, "除数不能为 0");
+        Value out; out.type = VT::Num; out.num = result;
         return out;
 #else
         throw WenError("运行时错误", line, 0, "原生函数只支持 Windows x64");
@@ -10347,6 +10352,7 @@ Interpreter::Interpreter() {
 #if !defined(_WIN32) || (!defined(_M_X64) && !defined(_M_IX86))
         throw WenError("运行时错误", line, 0, "原生函数只支持 Windows x64/x86");
 #else
+        if (gSandbox) throw WenError("权限错误", line, 0, "沙盒开启时不能使用原生函数");
         string exprText = needStr(a[0], "原生函数", line);
         auto params = needList(a[1], "原生函数参数表", line);
         if (params->items.size() > 4)
@@ -10362,7 +10368,7 @@ Interpreter::Interpreter() {
         src += "将 原生结果 变成 " + exprText + "\n";
         auto prog = tmp.parseSource(src);
         if (prog.empty() || !prog.back() || prog.back()->k != Stmt::K::Assign || !prog.back()->expr)
-            throw WenError("语法错误", line, 0, "原生表达式解析失败");
+            throw WenError("编译错误", line, 0, "原生表达式解析失败");
         vector<unsigned char> code;
         auto emit = [&](std::initializer_list<unsigned char> bytes) { code.insert(code.end(), bytes); };
 #if defined(_M_X64)
@@ -10372,7 +10378,7 @@ Interpreter::Interpreter() {
             emit({0x66,0x48,0x0F,0x6E,0xC0});
         };
         std::function<void(ExprPtr)> gen = [&](ExprPtr e) {
-            if (!e) throw WenError("语法错误", line, 0, "原生表达式为空");
+            if (!e) throw WenError("编译错误", line, 0, "原生表达式为空");
             if (e->k == Expr::K::Num) { uint64_t bits; double v=e->num; memcpy(&bits,&v,8); imm64(bits); return; }
             if (e->k == Expr::K::Var) {
                 auto it = index.find(e->text);
@@ -10388,6 +10394,8 @@ Interpreter::Interpreter() {
                 return;
             }
             if (e->k == Expr::K::Binary && (e->op=="+"||e->op=="-"||e->op=="*"||e->op=="/")) {
+                if (e->op=="/" && e->args[1]->k==Expr::K::Num && e->args[1]->num==0.0)
+                    throw WenError("编译错误", line, 0, "原生函数：除数不能为 0");
                 gen(e->args[0]);
                 emit({0x48,0x83,0xEC,0x08});
                 emit({0xF2,0x0F,0x11,0x04,0x24});
@@ -10399,7 +10407,7 @@ Interpreter::Interpreter() {
                 emit({0x66,0x0F,0x28,0xC1});
                 return;
             }
-            throw WenError("语法错误", line, 0, "原生函数只支持数字、参数和 + - * /");
+            throw WenError("编译错误", line, 0, "原生函数只支持数字、参数和 + - * /");
         };
         for (size_t i=0;i<params->items.size();++i)
             emit({0x66,0x0F,0x28,(unsigned char)(0xC0 | ((4+i)<<3) | (int)i)});
@@ -10408,7 +10416,7 @@ Interpreter::Interpreter() {
 #else
         auto push32 = [&](uint32_t v) { emit({0x68}); for(int i=0;i<4;++i) code.push_back((unsigned char)((v>>(8*i))&255)); };
         std::function<void(ExprPtr)> gen86 = [&](ExprPtr e) {
-            if (!e) throw WenError("语法错误", line, 0, "原生表达式为空");
+            if (!e) throw WenError("编译错误", line, 0, "原生表达式为空");
             if (e->k == Expr::K::Num) {
                 uint64_t bits; double v=e->num; memcpy(&bits,&v,8);
                 push32((uint32_t)(bits>>32)); push32((uint32_t)bits);
@@ -10431,7 +10439,7 @@ Interpreter::Interpreter() {
                 else emit({0xDE,0xF9});
                 return;
             }
-            throw WenError("语法错误", line, 0, "原生函数只支持数字、参数和 + - * /");
+            throw WenError("编译错误", line, 0, "原生函数只支持数字、参数和 + - * /");
         };
         gen86(prog.back()->expr);
         emit({0xC3});
@@ -10449,6 +10457,7 @@ Interpreter::Interpreter() {
 #if !defined(_WIN32) || !defined(_M_X64)
         throw WenError("运行时错误", line, 0, "机器函数只支持 Windows x64");
 #else
+        if (gSandbox) throw WenError("权限错误", line, 0, "沙盒开启时不能使用机器函数");
         string hex = needStr(a[0], "机器函数", line);
         int arity = a.size()>1 ? (int)needIndex(a[1], "机器函数", line) : 0;
         if (arity < 0 || arity > 4) throw WenError("运行时错误", line, 0, "机器函数参数数 0..4");
@@ -10475,15 +10484,18 @@ Interpreter::Interpreter() {
 #if !defined(_WIN32) || !defined(_M_X64)
         throw WenError("运行时错误", line, 0, "原生程序暂只支持 Windows x64");
 #else
+        if (gSandbox) throw WenError("权限错误", line, 0, "沙盒开启时不能使用原生程序");
         string src = needStr(a[0], "原生程序", line);
         Interpreter tmp;
         tmp.filename = "<原生程序>";
         string wrapped = "函数 原生入口 则\n" + src + "\n结束\n";
         auto prog = tmp.parseSource(wrapped);
         if (prog.empty() || !prog[0] || prog[0]->k != Stmt::K::Func)
-            throw WenError("语法错误", line, 0, "原生程序解析失败");
+            throw WenError("编译错误", line, 0, "原生程序解析失败");
         vector<unsigned char> code;
+        vector<size_t> errPtrs;
         auto emit = [&](std::initializer_list<unsigned char> b){ code.insert(code.end(), b); };
+        auto patchRel = [&](size_t pos){ int rel=(int)code.size()-(int)(pos+4); for(int i=0;i<4;++i) code[pos+(size_t)i]=(unsigned char)((rel>>(8*i))&255); };
         auto imm64 = [&](uint64_t v){ emit({0x48,0xB8}); for(int i=0;i<8;++i) code.push_back((unsigned char)((v>>(8*i))&255)); emit({0x66,0x48,0x0F,0x6E,0xC0}); };
         std::map<string,int> slots;
         auto slotOf = [&](const string& n)->int {
@@ -10497,7 +10509,7 @@ Interpreter::Interpreter() {
         auto jmp=[&](int id){ emit({0xE9,0,0,0,0}); fix.push_back({code.size()-4,id}); };
         auto jcc=[&](int id){ emit({0x0F,0x84,0,0,0,0}); fix.push_back({code.size()-4,id}); };
         std::function<void(ExprPtr)> gen = [&](ExprPtr e) {
-            if(!e) throw WenError("语法错误", line, 0, "原生程序表达式为空");
+            if(!e) throw WenError("编译错误", line, 0, "原生程序表达式为空");
             if(e->k==Expr::K::Num){ uint64_t b; double v=e->num; memcpy(&b,&v,8); imm64(b); return; }
             if(e->k==Expr::K::Bool){ imm64(e->b?1:0); return; }
             if(e->k==Expr::K::Var){
@@ -10511,10 +10523,23 @@ Interpreter::Interpreter() {
             if(e->k==Expr::K::Binary){
                 string op=e->op;
                 if(op=="+"||op=="-"||op=="*"||op=="/"||op=="<"||op=="<="||op==">"||op==">="||op=="=="||op=="!="){
+                    if(op=="/" && e->args[1]->k==Expr::K::Num && e->args[1]->num==0.0)
+                        throw WenError("编译错误", line, 0, "原生程序：除数不能为 0");
                     gen(e->args[0]); emit({0x48,0x83,0xEC,0x08}); emit({0xF2,0x0F,0x11,0x04,0x24});
                     gen(e->args[1]); emit({0xF2,0x0F,0x10,0x0C,0x24}); emit({0x48,0x83,0xC4,0x08});
-                    if(op=="+"||op=="-"||op=="*"||op=="/"){
-                        unsigned char o=op=="+"?0x58:(op=="-"?0x5C:(op=="*"?0x59:0x5E));
+                    if(op=="/"){
+                        emit({0x66,0x0F,0x57,0xD2});
+                        emit({0x66,0x0F,0x2E,0xC2});
+                        emit({0x0F,0x85,0,0,0,0}); size_t jn=code.size()-4;
+                        emit({0x48,0xB9,0,0,0,0,0,0,0,0}); errPtrs.push_back(code.size()-8);
+                        emit({0xC7,0x01,0x01,0x00,0x00,0x00});
+                        emit({0x66,0x0F,0x57,0xC0});
+                        emit({0xE9,0,0,0,0}); size_t jd=code.size()-4;
+                        patchRel(jn);
+                        emit({0xF2,0x0F,0x5E,0xC8}); emit({0x66,0x0F,0x28,0xC1});
+                        patchRel(jd);
+                    } else if(op=="+"||op=="-"||op=="*"){
+                        unsigned char o=op=="+"?0x58:(op=="-"?0x5C:0x59);
                         emit({0xF2,0x0F,o,0xC8}); emit({0x66,0x0F,0x28,0xC1});
                     } else {
                         emit({0x66,0x0F,0x2E,0xC8}); // ucomisd xmm1, xmm0
@@ -10523,14 +10548,14 @@ Interpreter::Interpreter() {
                     }
                     return;
                 }
-                throw WenError("语法错误", line, 0, "原生程序不支持运算符「"+op+"」");
+                throw WenError("编译错误", line, 0, "原生程序不支持运算符「"+op+"」");
             }
-            throw WenError("语法错误", line, 0, "原生程序只支持数字、变量、算术/比较");
+            throw WenError("编译错误", line, 0, "原生程序只支持数字、变量、算术/比较");
         };
         std::function<void(const StmtPtr&)> stmt = [&](const StmtPtr& st) {
             if(!st) return;
             if(st->k==Stmt::K::Assign){
-                if(!st->target || st->target->k!=Expr::K::Var) throw WenError("语法错误", line, 0, "原生程序只支持变量赋值");
+                if(!st->target || st->target->k!=Expr::K::Var) throw WenError("编译错误", line, 0, "原生程序只支持变量赋值");
                 int sl=slotOf(st->target->text); uint32_t off=(uint32_t)(-(int)(8*(sl+1)));
                 gen(st->expr); emit({0xF2,0x0F,0x11,0x85}); for(int i=0;i<4;++i) code.push_back((unsigned char)((off>>(8*i))&255));
                 return;
@@ -10553,7 +10578,7 @@ Interpreter::Interpreter() {
                 gen(st->expr); emit({0x66,0x0F,0x57,0xC9}); emit({0x66,0x0F,0x2E,0xC1}); jcc(end);
                 for(const auto& b: st->body) stmt(b); jmp(start); place(end); return;
             }
-            throw WenError("语法错误", line, 0, "原生程序暂不支持这条语句");
+            throw WenError("编译错误", line, 0, "原生程序暂不支持这条语句");
         };
         emit({0x55,0x48,0x89,0xE5,0x48,0x81,0xEC,0x00,0x02,0x00,0x00});
         for(const auto& st: prog[0]->body) stmt(st);
@@ -10564,7 +10589,9 @@ Interpreter::Interpreter() {
         }
         void* mem=VirtualAlloc(nullptr,code.size(),MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
         if(!mem) throw WenError("运行时错误",line,0,"原生程序分配失败");
-        memcpy(mem,code.data(),code.size()); FlushInstructionCache(GetCurrentProcess(),mem,code.size());
+        memcpy(mem,code.data(),code.size());
+        for (size_t ep : errPtrs) { uint64_t addr=(uint64_t)&gNativeError; memcpy((char*)mem+ep,&addr,8); }
+        FlushInstructionCache(GetCurrentProcess(),mem,code.size());
         auto fn=std::make_shared<NativeFunction>(); fn->name="原生程序"; fn->code=mem; fn->codeSize=code.size(); fn->arity=0;
         return vFunc(fn);
 #endif
