@@ -12974,6 +12974,33 @@ Interpreter::Interpreter() {
                 pw.back[i*3+1] = (unsigned char)(pw.back[i*3+1]*ao);
                 pw.back[i*3+2] = (unsigned char)(pw.back[i*3+2]*ao);
             }
+            // 太阳体积光：从太阳屏幕位置向四周做屏幕空间光束积分
+            {
+                double ssx=0, ssy=0, ssz=0;
+                if (project(padd(cam, pmul(light, 80.0)), ssx, ssy, ssz) &&
+                    ssx > -w*0.5 && ssx < w*1.5 && ssy > -h*0.5 && ssy < h*1.5) {
+                    for (int y=0;y<h;++y) for (int x=0;x<w;++x) {
+                        double sum=0, ws=0;
+                        for (int st=1; st<=10; ++st) {
+                            double t=(double)st/10.0;
+                            int xx=(int)(x + (ssx-x)*t), yy=(int)(y + (ssy-y)*t);
+                            if (xx<0||xx>=w||yy<0||yy>=h) continue;
+                            size_t zi=(size_t)yy*w+xx;
+                            if (zbuf[zi] < 1e29) continue;
+                            size_t si=zi*3;
+                            double lum=0.2126*pw.back[si+2]+0.7152*pw.back[si+1]+0.0722*pw.back[si];
+                            double wgt=1.0-t*0.65;
+                            sum += lum*wgt; ws += wgt;
+                        }
+                        if (ws <= 1e-6) continue;
+                        double beam=(sum/ws)*0.10;
+                        size_t i=((size_t)y*w+x)*3;
+                        pw.back[i]  =(unsigned char)std::min(255.0,pw.back[i]  + beam*0.55);
+                        pw.back[i+1]=(unsigned char)std::min(255.0,pw.back[i+1]+ beam*0.40);
+                        pw.back[i+2]=(unsigned char)std::min(255.0,pw.back[i+2]+ beam*0.22);
+                    }
+                }
+            }
             // 后处理：亮部 → Bloom → ACES → 暗角
             {
                 const int bw=std::max(1,w/4), bh=std::max(1,h/4);
