@@ -19097,12 +19097,13 @@ static LRESULT CALLBACK uiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
             }
             return 0;
-        case WM_LBUTTONDOWN:
-            /* 用户点画面时把键盘焦点拿回来。某些远程桌面/多显示器环境下
-               CreateWindow 后的 SetFocus 会被前台窗口抢走。 */
+        case WM_LBUTTONDOWN: {
             SetForegroundWindow(hwnd);
             SetFocus(hwnd);
+            int mx=(short)LOWORD(lp), my=(short)HIWORD(lp);
+            gUi.events.push_back({"鼠标", std::to_string(mx)+","+std::to_string(my)});
             return 0;
+        }
         case WM_CLOSE:
             gUi.events.push_back({"关闭", ""});
             gUi.closed = true;
