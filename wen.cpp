@@ -19013,6 +19013,23 @@ static bool constIntExpr(const ExprPtr& e, long long& out, string& err) {
     return false;
 }
 
+static bool constStrEnv(const ExprPtr& e, const std::map<string,string>& env, string& out, string& err) {
+    if (!e) { err="空字符串表达式"; return false; }
+    if (e->k==Expr::K::Str) { out=e->text; return true; }
+    if (e->k==Expr::K::Var) {
+        auto it=env.find(e->text);
+        if(it==env.end()){ err="PE 字符串变量未定义："+e->text; return false; }
+        out=it->second; return true;
+    }
+    if (e->k==Expr::K::Binary && e->op=="+") {
+        string a,b;
+        if(!constStrEnv(e->args[0],env,a,err) || !constStrEnv(e->args[1],env,b,err)) return false;
+        out=a+b; return true;
+    }
+    err="PE 字符串表达式只支持文本、变量和 +";
+    return false;
+}
+
 static bool constIntEnv(const ExprPtr& e, const std::map<string,long long>& env, long long& out, string& err) {
     if (!e) { err="空表达式"; return false; }
     if (e->k==Expr::K::Num) { out=(long long)e->num; return true; }
@@ -20065,20 +20082,27 @@ static int runMain(vector<string> args) {
         try {
             auto program=sub.parseSource(src);
             std::map<string,long long> env;
+            std::map<string,string> senv;
             for (const auto& st : program) {
                 if (st && st->k==Stmt::K::Assign && st->target && st->target->k==Expr::K::Var && st->expr) {
-                    long long av=0; string ae;
-                    if (!constIntEnv(st->expr, env, av, ae)) { std::cerr << "原生EXE 常量赋值错误：" << ae << "\n"; return 2; }
-                    env[st->target->text]=av;
+                    string sv; string se;
+                    if (constStrEnv(st->expr, senv, sv, se)) { senv[st->target->text]=sv; }
+                    else {
+                        long long av=0; string ae;
+                        if (!constIntEnv(st->expr, env, av, ae)) { std::cerr << "原生EXE32 常量赋值错误：" << ae << "\n"; return 2; }
+                        env[st->target->text]=av;
+                    }
                 }
                 if (st && st->k==Stmt::K::Return && st->expr) {
                     long long cv=0; string ce;
-                    if (!constIntEnv(st->expr, env, cv, ce)) { std::cerr << "原生EXE 常量表达式错误：" << ce << "\n"; return 2; }
+                    if (!constIntEnv(st->expr, env, cv, ce)) { std::cerr << "原生EXE32 常量表达式错误：" << ce << "\n"; return 2; }
                     value=(int)cv; found=true;
                 }
-                if (st && st->k==Stmt::K::Print && st->args.size()==1 && st->args[0] && st->args[0]->k==Expr::K::Str) {
+                if (st && st->k==Stmt::K::Print && st->args.size()==1 && st->args[0]) {
+                    string pt; string pe;
+                    if (!constStrEnv(st->args[0], senv, pt, pe)) { std::cerr << "原生EXE32 打印文本错误：" << pe << "\n"; return 2; }
                     if (!printText.empty()) printText += "\n";
-                    printText += st->args[0]->text;
+                    printText += pt;
                 }
             }
             if (!found) { std::cerr << "原生EXE32 目前只支持顶层「返回 常量」\n"; return 2; }
@@ -20102,20 +20126,27 @@ static int runMain(vector<string> args) {
         try {
             auto program=sub.parseSource(src);
             std::map<string,long long> env;
+            std::map<string,string> senv;
             for (const auto& st : program) {
                 if (st && st->k==Stmt::K::Assign && st->target && st->target->k==Expr::K::Var && st->expr) {
-                    long long av=0; string ae;
-                    if (!constIntEnv(st->expr, env, av, ae)) { std::cerr << "原生EXE32 常量赋值错误：" << ae << "\n"; return 2; }
-                    env[st->target->text]=av;
+                    string sv; string se;
+                    if (constStrEnv(st->expr, senv, sv, se)) { senv[st->target->text]=sv; }
+                    else {
+                        long long av=0; string ae;
+                        if (!constIntEnv(st->expr, env, av, ae)) { std::cerr << "原生EXE 常量赋值错误：" << ae << "\n"; return 2; }
+                        env[st->target->text]=av;
+                    }
                 }
                 if (st && st->k==Stmt::K::Return && st->expr) {
                     long long cv=0; string ce;
-                    if (!constIntEnv(st->expr, env, cv, ce)) { std::cerr << "原生EXE32 常量表达式错误：" << ce << "\n"; return 2; }
+                    if (!constIntEnv(st->expr, env, cv, ce)) { std::cerr << "原生EXE 常量表达式错误：" << ce << "\n"; return 2; }
                     value=(int)cv; found=true;
                 }
-                if (st && st->k==Stmt::K::Print && st->args.size()==1 && st->args[0] && st->args[0]->k==Expr::K::Str) {
+                if (st && st->k==Stmt::K::Print && st->args.size()==1 && st->args[0]) {
+                    string pt; string pe;
+                    if (!constStrEnv(st->args[0], senv, pt, pe)) { std::cerr << "原生EXE 打印文本错误：" << pe << "\n"; return 2; }
                     if (!printText.empty()) printText += "\n";
-                    printText += st->args[0]->text;
+                    printText += pt;
                 }
             }
             if (!found) { std::cerr << "原生EXE 目前只支持顶层「返回 常量」\n"; return 2; }
