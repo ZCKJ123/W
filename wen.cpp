@@ -820,6 +820,7 @@ struct Stmt {
     vector<std::pair<ExprPtr, vector<StmtPtr>>> branches;
     vector<string> params;
     vector<SymId> paramSyms;
+    vector<ExprPtr> paramDefaults;
     vector<string> imports;
     int line = 0;
 };
@@ -1382,13 +1383,16 @@ private:
         ++idx_;
         Token nm = expectName();
         vector<string> params;
+        vector<ExprPtr> paramDefaults;
         if (matchOp("(")) {
             // 旧写法：函数 f(x) 则
             if (!atOp(")")) {
                 params.push_back(expectName().text);
+                if (matchOp("=")) paramDefaults.push_back(parseExpr()); else paramDefaults.push_back(nullptr);
                 while (matchOp(",")) {
                     if (atOp(")")) break;
                     params.push_back(expectName().text);
+                    if (matchOp("=")) paramDefaults.push_back(parseExpr()); else paramDefaults.push_back(nullptr);
                 }
             }
             expectOp(")");
@@ -1396,6 +1400,7 @@ private:
             // 新写法：函数 f x, y 则
             while (!atKw("则")) {
                 params.push_back(expectName().text);
+                if (matchOp("=")) paramDefaults.push_back(parseExpr()); else paramDefaults.push_back(nullptr);
                 matchOp(",");
             }
         }
@@ -1418,6 +1423,7 @@ private:
         s->name = nm.text;
         s->nameSym = internSymbol(s->name);
         s->params = std::move(params);
+        s->paramDefaults = std::move(paramDefaults);
         for (const auto& p : s->params) s->paramSyms.push_back(internSymbol(p));
         s->body = body;
         s->line = line;
@@ -2023,6 +2029,7 @@ struct Callable {
 struct Function : Callable {
     vector<string> params;
     vector<SymId> paramSyms;
+    vector<ExprPtr> paramDefaults;
     int simpleOp = 0;
     double simpleConst = 0;
     SymId simpleParam = 0;
@@ -4651,6 +4658,7 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
             fn->name = s->name;
             fn->params = s->params;
             fn->paramSyms = s->paramSyms;
+            fn->paramDefaults = s->paramDefaults;
             fn->body = s->body;
             fn->closure = scope;
             fn->line = s->line;
@@ -5036,15 +5044,18 @@ Value Function::call(Interpreter& vm, vector<Value>& args, int callLine) {
         ~DepthGuard() { --vm.callDepth; }
     } depthGuard(vm);
     if (vm.callStats && !name.empty()) ++vm.callCounts[name];
-    if (args.size() != params.size()) {
+    if (args.size() > params.size()) {
         throw WenError("运行时错误", callLine, 0,
-                       "函数「" + name + "」需要 " + std::to_string(params.size()) +
+                       "函数「" + name + "」最多需要 " + std::to_string(params.size()) +
                        " 个参数，收到 " + std::to_string(args.size()) + " 个");
     }
     auto scope = std::make_shared<Scope>(closure);
-    for (size_t i = 0; i < params.size(); ++i) {
-        SymId id = paramSyms[i];
-        scope->set(id, args[i]);
+    for (size_t i = 0; i < args.size(); ++i) scope->set(paramSyms[i], args[i]);
+    for (size_t i = args.size(); i < params.size(); ++i) {
+        if (i >= paramDefaults.size() || !paramDefaults[i])
+            throw WenError("运行时错误", callLine, 0,
+                           "函数「" + name + "」缺少参数「" + params[i] + "」");
+        scope->set(paramSyms[i], vm.eval(paramDefaults[i], scope));
     }
     try {
         for (const auto& st : body) vm.exec(st, scope);
@@ -18349,7 +18360,10 @@ static void collectStaticDefs(const vector<StmtPtr>& ps, std::set<string>& vars,
         if (s->k == Stmt::K::Assign && s->target && s->target->k == Expr::K::Var)
             vars.insert(s->target->text);
         if (s->k == Stmt::K::Func) {
-            funcs[s->name] = (int)s->params.size();
+            int required = 0;
+            for (size_t pi=0; pi<s->params.size(); ++pi)
+                if (pi >= s->paramDefaults.size() || !s->paramDefaults[pi]) ++required;
+            funcs[s->name] = required * 1000 + (int)s->params.size();
             vars.insert(s->name);
             for (const auto& p : s->params) vars.insert(p);
         }
@@ -18389,10 +18403,18 @@ static void checkExprNames(const ExprPtr& e, const std::set<string>& vars,
         int n = (int)e->args.size() - 1;
         auto uf = funcs.find(callee);
         auto bi = gBuiltinArity.find(callee);
-        if (uf != funcs.end() && n != uf->second) {
-            errors.push_back(WenError("静态错误", e->line, 0,
-                "函数「" + callee + "」需要 " + std::to_string(uf->second) +
-                " 个参数，收到 " + std::to_string(n) + " 个"));
+        if (uf != funcs.end()) {
+            int req = uf->second / 1000;
+            int maxArgs = uf->second % 1000;
+            if (n < req) {
+                errors.push_back(WenError("静态错误", e->line, 0,
+                    "函数「" + callee + "」至少需要 " + std::to_string(req) +
+                    " 个参数，收到 " + std::to_string(n) + " 个"));
+            } else if (n > maxArgs) {
+                errors.push_back(WenError("静态错误", e->line, 0,
+                    "函数「" + callee + "」需要 " + std::to_string(maxArgs) +
+                    " 个参数，收到 " + std::to_string(n) + " 个"));
+            }
         } else if (uf == funcs.end() && bi != gBuiltinArity.end() &&
                    (n < bi->second.first || (bi->second.second >= 0 && n > bi->second.second))) {
             errors.push_back(WenError("静态错误", e->line, 0,
