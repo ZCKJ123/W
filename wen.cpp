@@ -19485,6 +19485,41 @@ static int runMain(vector<string> args) {
         }
         return indexFile(target, asJson || gJsonDiagnostics);
     }
+    if (cmd == "--平台") {
+        std::cout << "宿主：Windows x64\n";
+        std::cout << "核心：词法/语法/AST/求值（C++ 引导）\n";
+        std::cout << "可移植出口：--字节码（JSON 栈字节码，需要目标平台实现 VM）\n";
+        std::cout << "宿主依赖：文件/窗口/网络/音频/渲染\n";
+        std::cout << "不可移植：当前解释器本体仍是 C++\n";
+        return 0;
+    }
+    if (cmd == "--字节码") {
+        string target, outPath;
+        for (size_t i=2;i<args.size();++i) {
+            if (args[i].rfind("--",0)!=0) {
+                if (target.empty()) target=args[i]; else outPath=args[i];
+            }
+        }
+        if (target.empty()) { std::cerr << "用法：wen.exe --字节码 文件.wen [输出.json]\n"; return 1; }
+        string src;
+        try { src=readWholeFile(resolveWenPath(target)); }
+        catch (IoError& e) { std::cerr << e.what() << "\n"; return 1; }
+        Interpreter sub;
+        sub.filename=target; sub.sourceLines=splitLines(src);
+        try {
+            auto program=sub.parseSource(src);
+            StackEmitter em(program);
+            string code=em.bytecode();
+            if (!em.diags.empty()) {
+                for (const auto& d : em.diags) std::cerr << d << "\n";
+                return 1;
+            }
+            if (outPath.empty()) std::cout << code << "\n";
+            else { writeWholeFile(resolveWenPath(outPath), code, false); std::cout << outPath << "\n"; }
+            return 0;
+        } catch (WenError& e) { std::cerr << e.what() << "\n"; return 1; }
+        catch (IncompleteError& e) { std::cerr << e.what() << "\n"; return 1; }
+    }
     if (cmd == "--词法") {
         if (args.size() < 3) {
             std::cerr << "用法：wen.exe --词法 文件.wen\n";
