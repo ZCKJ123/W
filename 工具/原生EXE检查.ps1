@@ -27,5 +27,12 @@ if ($LASTEXITCODE -ne 0) { throw '原生EXE32 生成失败' }
 $p32 = Start-Process -FilePath $exe32 -PassThru -Wait
 if ($p32.ExitCode -ne 42) { throw "原生EXE32 退出码错误：$($p32.ExitCode)" }
 
+& $wen --原生EXE32 $txt $exe32 | Out-Null
+if ($LASTEXITCODE -ne 0) { throw '原生EXE32 文本生成失败' }
+$pt32 = Start-Process -FilePath $exe32 -PassThru -Wait -RedirectStandardOutput $txtOut
+if ($pt32.ExitCode -ne 7) { throw "原生EXE32 文本退出码错误：$($pt32.ExitCode)" }
+$got32 = Get-Content $txtOut -Raw -Encoding UTF8
+if ($got32 -notmatch '文语言') { throw '原生EXE32 打印文本失败' }
+
 Remove-Item $src, $exe, $exe32, $txt, $txtOut -Force -ErrorAction SilentlyContinue
-Write-Output '原生EXE：x64 文本/退出码、x86 退出码 通过'
+Write-Output '原生EXE：x64/x86 文本与退出码 通过'
