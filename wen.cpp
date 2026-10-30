@@ -176,6 +176,22 @@ struct WenError : std::runtime_error {
           col(col_) {}
 };
 
+static string wenErrorCodeOf(const string& kind) {
+    if (kind=="词法错误") return "WEN-LEX-001";
+    if (kind=="语法错误") return "WEN-SYN-001";
+    if (kind=="静态错误") return "WEN-STA-001";
+    if (kind=="运行时错误") return "WEN-RUN-001";
+    if (kind=="编译错误") return "WEN-CMP-001";
+    if (kind=="文件错误") return "WEN-IO-001";
+    if (kind=="库冲突") return "WEN-LIB-001";
+    if (kind=="兼容冲突") return "WEN-CMP-002";
+    if (kind=="翻译错误") return "WEN-TRA-001";
+    if (kind=="外派错误") return "WEN-EXP-001";
+    if (kind=="权限错误") return "WEN-PERM-001";
+    if (kind=="引擎错误") return "WEN-ENG-001";
+    return "WEN-UNKNOWN-001";
+}
+
 struct IncompleteError : std::runtime_error {
     int line;
     explicit IncompleteError(int line_, string msg)
@@ -4630,6 +4646,7 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
                 }
                 auto d = std::make_shared<Dict>();
                 d->items["类型"] = vStr(e.kind);
+                d->items["代码"] = vStr(wenErrorCodeOf(e.kind));
                 d->items["原因"] = vStr(e.what());
                 d->items["行"] = vNum(e.line);
                 d->items["列"] = vNum(e.col);
