@@ -1420,11 +1420,10 @@ private:
                 matchOp(",");
             }
         }
-        bool seenDefault = false;
+        bool seenDefault = false, badDefaultOrder = false;
         for (size_t di=0; di<paramDefaults.size(); ++di) {
             if (paramDefaults[di]) seenDefault = true;
-            else if (seenDefault)
-                throw WenError("静态错误", line, 0, "默认参数后面不能再出现无默认参数；请把默认参数移到末尾");
+            else if (seenDefault) badDefaultOrder = true;
         }
         expectKw("则");
         // 函数体里不能再把变量绑成全局快槽：否则函数里的每个变量都会变成全局变量。
@@ -1440,6 +1439,8 @@ private:
         --funcDepth_;
         expectKw("结束");
         endStmt();
+        if (badDefaultOrder)
+            throw WenError("静态错误", line, 0, "默认参数后面不能再出现无默认参数；请把默认参数移到末尾");
         auto s = std::make_shared<Stmt>();
         s->k = Stmt::K::Func;
         s->name = nm.text;
@@ -10990,7 +10991,7 @@ Interpreter::Interpreter() {
         JsonReader reader(text, line);
         return reader.parse();
     });
-    registerBuiltin("沙盒", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+    registerBuiltin("沙盒", 1, 2, [](Interpreter& vm, vector<Value>& a, int line) -> Value {
         string root = needStr(a[0], "沙盒", line);
         std::error_code ec;
         fs::path rp = fs::absolute(fs::u8path(root), ec);
@@ -10998,7 +10999,11 @@ Interpreter::Interpreter() {
         gSandbox = true;
         gSandboxAllow.clear();
         gSandboxAllow.push_back(gSandboxRoot);
-        gSandboxAllow.push_back(fs::current_path().u8string());
+        if (!vm.filename.empty()) {
+            std::error_code ec2;
+            fs::path sp = fs::absolute(fs::u8path(vm.filename), ec2);
+            if (!ec2) gSandboxAllow.push_back(sp.parent_path().u8string());
+        }
         if (a.size() > 1) {
             auto extra = needList(a[1], "沙盒允许", line);
             for (const auto& v : extra->items)
@@ -17802,6 +17807,7 @@ static string errorRule(const WenError& e) {
     if (k == "静态错误") {
         if (r.find("没有定义名字") != string::npos) return "static.undefined_name";
         if (r.find("不能调用") != string::npos) return "static.call_non_function";
+        if (r.find("默认参数") != string::npos) return "static.default_param_order";
         if (r.find("参数") != string::npos) return "static.arity";
         if (r.find("负数参数") != string::npos) return "static.negative_arg";
         return "static.invalid";
@@ -17864,6 +17870,7 @@ static string errorSuggestion(const WenError& e) {
     if (rule == "syntax.missing_end") return "在「如果/函数/对于/尝试」块末尾补「结束」。";
     if (rule == "syntax.missing_then") return "条件后补「则」。";
     if (rule == "static.undefined_name") return "先赋值或定义，再引用；检查名字有没有写错。";
+    if (rule == "static.default_param_order") return "把默认参数移到参数表末尾。";
     if (rule == "static.arity") return "按函数定义的参数个数传参。";
     if (rule == "static.call_non_function") return "只有函数能调用；检查括号前的名字。";
     if (rule == "static.negative_arg") return "负数参数加括号，例如「绝对值(-5)」。";
@@ -19898,7 +19905,11 @@ static int runMain(vector<string> args) {
         gSandbox = true;
         gSandboxAllow.clear();
         gSandboxAllow.push_back(gSandboxRoot);
-        gSandboxAllow.push_back(fs::current_path().u8string());
+        if (args.size() > 1) {
+            std::error_code ec;
+            fs::path sp = fs::absolute(fs::u8path(args[1]), ec);
+            if (!ec) gSandboxAllow.push_back(sp.parent_path().u8string());
+        }
         args.erase(args.begin() + 1, args.begin() + 3);
         if (args.size() > 1 && fs::exists(fs::u8path(args[1]))) gSandboxAllow.push_back(fs::absolute(fs::u8path(args[1])).u8string());
     }
@@ -20230,7 +20241,7 @@ static int runMain(vector<string> args) {
         catch (IoError& e) { std::cerr << e.what() << "\n"; return 1; }
         Interpreter sub;
         sub.filename=args[2]; sub.sourceLines=splitLines(src);
-        int value=0; bool found=false; string printText; string writePath; string writeText;
+        int value=0; bool found=false; string printText; string writePath; string writeText; int writeCount=0;
         try {
             auto program=sub.parseSource(src);
             std::map<string,long long> env;
@@ -20254,7 +20265,7 @@ static int runMain(vector<string> args) {
                     string wp,wt,we;
                     if(!constStrEnv(st->expr->args[1],senv,wp,we)||!constStrEnv(st->expr->args[2],senv,wt,we)){std::cerr<<"原生EXE 写入参数错误："<<we<<"\n";return 2;}
                     if(st->expr->args.size()>=4){ std::cerr << "原生EXE 暂不支持追加写入\n"; return 2; }
-                    writePath=wp;writeText=wt;
+                    ++writeCount; writePath=wp;writeText=wt;
                 }
                 if (st && st->k==Stmt::K::Print && st->args.size()==1 && st->args[0]) {
                     string pt; string pe;
@@ -20270,6 +20281,7 @@ static int runMain(vector<string> args) {
                 }
             }
             if (!found) { std::cerr << "原生EXE 目前只支持顶层「返回 常量」\n"; return 2; }
+            if (writeCount > 1) { std::cerr << "原生EXE 暂不支持多次写入\n"; return 2; }
             if (!writePath.empty() && !printText.empty()) { std::cerr << "原生EXE 暂不支持打印+写入组合\n"; return 2; }
         } catch (WenError& e) { std::cerr << e.what() << "\n"; return 1; }
         catch (IncompleteError& e) { std::cerr << e.what() << "\n"; return 1; }

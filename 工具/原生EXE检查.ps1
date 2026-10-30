@@ -126,6 +126,17 @@ $comboCode = $LASTEXITCODE
 $ErrorActionPreference = $oldEap
 if ($comboCode -eq 0) { throw '原生EXE 打印+写入组合应显式报错' }
 
-Remove-Item $src, $exe, $exe32, $txt, $txtOut, $coll, $readFile, $readSrc, $readOut, $writeTarget, $writeSrc, $badSrc, $cnSrc, $appendSrc, $comboSrc -Force -ErrorAction SilentlyContinue
-Write-Output '原生EXE：x64/x86 文本、退出码、列表/字典常量、编译期读取、x64 运行时写入/失败/中文路径/追加拒绝/组合拒绝 通过'
+$multiSrc = Join-Path $env:TEMP 'wen_native_exe_multi.wen'
+Set-Content -Path $multiSrc -Value ('写入("' + $cnPath + '", "A")') -Encoding UTF8
+Add-Content -Path $multiSrc -Value ('写入("' + $cnPath + '2", "B")') -Encoding UTF8
+Add-Content -Path $multiSrc -Value '返回 1' -Encoding UTF8
+$oldEap = $ErrorActionPreference
+$ErrorActionPreference = 'SilentlyContinue'
+& $wen --原生EXE $multiSrc $exe 2>$null | Out-Null
+$multiCode = $LASTEXITCODE
+$ErrorActionPreference = $oldEap
+if ($multiCode -eq 0) { throw '原生EXE 多次写入应显式报错' }
+
+Remove-Item $src, $exe, $exe32, $txt, $txtOut, $coll, $readFile, $readSrc, $readOut, $writeTarget, $writeSrc, $badSrc, $cnSrc, $appendSrc, $comboSrc, $multiSrc -Force -ErrorAction SilentlyContinue
+Write-Output '原生EXE：x64/x86 文本、退出码、列表/字典常量、编译期读取、x64 运行时写入/失败/中文路径/追加拒绝/组合拒绝/多次写入拒绝 通过'
 exit 0
