@@ -19021,6 +19021,15 @@ static bool constStrEnv(const ExprPtr& e, const std::map<string,string>& env, st
         if(it==env.end()){ err="PE 字符串变量未定义："+e->text; return false; }
         out=it->second; return true;
     }
+    if (e->k==Expr::K::Call && e->args.size()>=2 && e->args[0] && e->args[0]->k==Expr::K::Var && e->args[0]->text=="读取") {
+        if(e->args[1]->k!=Expr::K::Str){ err="PE 编译期读取只支持文本路径"; return false; }
+        try {
+            out=readWholeFile(resolveWenPath(e->args[1]->text));
+            if(!out.empty() && out.back()=='\n') out.pop_back();
+            if(!out.empty() && out.back()=='\r') out.pop_back();
+            return true;
+        } catch(IoError& ex){ err=std::string("PE 编译期读取失败：")+ex.what(); return false; }
+    }
     if (e->k==Expr::K::Binary && e->op=="+") {
         string a,b;
         if(!constStrEnv(e->args[0],env,a,err) || !constStrEnv(e->args[1],env,b,err)) return false;
