@@ -19042,6 +19042,25 @@ static bool constIntEnv(const ExprPtr& e, const std::map<string,long long>& env,
     if (e->k==Expr::K::Unary && e->op=="-") {
         long long v=0; if(!constIntEnv(e->args[0],env,v,err)) return false; out=-v; return true;
     }
+    if (e->k==Expr::K::Index && e->args.size()>=2) {
+        long long idx=0;
+        if(!constIntEnv(e->args[1],env,idx,err)) return false;
+        if(e->args[0]->k==Expr::K::List) {
+            auto& items=e->args[0]->args;
+            if(idx<0) idx += (long long)items.size();
+            if(idx<0 || idx>=(long long)items.size()){ err="PE 列表下标越界"; return false; }
+            return constIntEnv(items[(size_t)idx],env,out,err);
+        }
+        if(e->args[0]->k==Expr::K::Dict) {
+            if(e->args[1]->k!=Expr::K::Str){ err="PE 字典键必须是文本"; return false; }
+            for(const auto& kv : e->args[0]->pairs) {
+                if(kv.first && kv.first->k==Expr::K::Str && kv.first->text==e->args[1]->text)
+                    return constIntEnv(kv.second,env,out,err);
+            }
+            err="PE 字典键不存在："+e->args[1]->text; return false;
+        }
+        err="PE 下标只支持列表/字典字面量"; return false;
+    }
     if (e->k==Expr::K::Binary) {
         long long a=0,b=0;
         if(!constIntEnv(e->args[0],env,a,err) || !constIntEnv(e->args[1],env,b,err)) return false;
@@ -19054,6 +19073,7 @@ static bool constIntEnv(const ExprPtr& e, const std::map<string,long long>& env,
         return true;
     }
     err="PE 常量表达式只支持数字、变量、括号、+ - * / %、一元负号";
+    std::cerr << "[pe-kind=" << (int)e->k << "]\n";
     return false;
 }
 
