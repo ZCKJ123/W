@@ -19073,7 +19073,6 @@ static bool constIntEnv(const ExprPtr& e, const std::map<string,long long>& env,
         return true;
     }
     err="PE 常量表达式只支持数字、变量、括号、+ - * / %、一元负号";
-    std::cerr << "[pe-kind=" << (int)e->k << " text=" << e->text << "]\n";
     return false;
 }
 
