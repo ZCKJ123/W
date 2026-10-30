@@ -90,5 +90,42 @@ Add-Content -Path $badSrc -Value '返回 0' -Encoding UTF8
 $pb = Start-Process -FilePath $exe -PassThru -Wait
 if ($pb.ExitCode -ne 1) { throw "原生EXE 写入失败路径退出码错误：$($pb.ExitCode)" }
 
-Remove-Item $src, $exe, $exe32, $txt, $txtOut, $coll, $readFile, $readSrc, $readOut, $writeTarget, $writeSrc, $badSrc -Force -ErrorAction SilentlyContinue
-Write-Output '原生EXE：x64/x86 文本、退出码、列表/字典常量、编译期读取、x64 运行时写入/失败路径 通过'
+$cnDir = Join-Path $env:TEMP '文语言测试目录'
+New-Item -ItemType Directory -Path $cnDir -Force | Out-Null
+$cnTarget = Join-Path $cnDir '中文文件.txt'
+Remove-Item $cnTarget -Force -ErrorAction SilentlyContinue
+$cnSrc = Join-Path $env:TEMP 'wen_native_exe_cn.wen'
+$cnPath = $cnTarget.Replace('\', '/')
+Set-Content -Path $cnSrc -Value ('写入("' + $cnPath + '", "中文路径内容")') -Encoding UTF8
+Add-Content -Path $cnSrc -Value '返回 7' -Encoding UTF8
+& $wen --原生EXE $cnSrc $exe | Out-Null
+if ($LASTEXITCODE -ne 0) { throw '原生EXE 中文路径生成失败' }
+$pcn = Start-Process -FilePath $exe -PassThru -Wait
+if ($pcn.ExitCode -ne 7) { throw "原生EXE 中文路径退出码错误：$($pcn.ExitCode)" }
+$cnGot = Get-Content $cnTarget -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+if ($cnGot -notmatch '中文路径内容') { throw '原生EXE 中文路径写入失败' }
+
+$appendSrc = Join-Path $env:TEMP 'wen_native_exe_append.wen'
+Set-Content -Path $appendSrc -Value ('写入("' + $cnPath + '", "x", 真)') -Encoding UTF8
+Add-Content -Path $appendSrc -Value '返回 1' -Encoding UTF8
+$oldEap = $ErrorActionPreference
+$ErrorActionPreference = 'SilentlyContinue'
+& $wen --原生EXE $appendSrc $exe 2>$null | Out-Null
+$appendCode = $LASTEXITCODE
+$ErrorActionPreference = $oldEap
+if ($appendCode -eq 0) { throw '原生EXE 追加写入应显式报错' }
+
+$comboSrc = Join-Path $env:TEMP 'wen_native_exe_combo.wen'
+Set-Content -Path $comboSrc -Value '打印 "A"' -Encoding UTF8
+Add-Content -Path $comboSrc -Value ('写入("' + $cnPath + '", "B")') -Encoding UTF8
+Add-Content -Path $comboSrc -Value '返回 1' -Encoding UTF8
+$oldEap = $ErrorActionPreference
+$ErrorActionPreference = 'SilentlyContinue'
+& $wen --原生EXE $comboSrc $exe 2>$null | Out-Null
+$comboCode = $LASTEXITCODE
+$ErrorActionPreference = $oldEap
+if ($comboCode -eq 0) { throw '原生EXE 打印+写入组合应显式报错' }
+
+Remove-Item $src, $exe, $exe32, $txt, $txtOut, $coll, $readFile, $readSrc, $readOut, $writeTarget, $writeSrc, $badSrc, $cnSrc, $appendSrc, $comboSrc -Force -ErrorAction SilentlyContinue
+Write-Output '原生EXE：x64/x86 文本、退出码、列表/字典常量、编译期读取、x64 运行时写入/失败/中文路径/追加拒绝/组合拒绝 通过'
+exit 0

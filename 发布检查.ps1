@@ -3,8 +3,12 @@ Set-Location $PSScriptRoot
 function 失败($msg) { Write-Host "发货检查失败：$msg" -ForegroundColor Red; exit 1 }
 
 Write-Host "1/11 测试"
-powershell -NoProfile -ExecutionPolicy Bypass -File 测试\运行.ps1
+$testOutput = & powershell -NoProfile -ExecutionPolicy Bypass -File 测试\运行.ps1 2>&1
+$testOutput | Out-Host
 if ($LASTEXITCODE -ne 0) { 失败 "测试不通过" }
+$testSummary = ($testOutput | Select-String '通过 \d+/\d+').Line
+if (-not $testSummary) { $testSummary = '未读取到测试总数' }
+$testSummary = $testSummary -replace '^通过\s*', ''
 
 Write-Host "2/11 构建"
 cmd /c 完整构建.bat | Out-Null
@@ -55,4 +59,4 @@ foreach ($name in @('时间库', '编码库', '正则库', 'CPU库', '路径库'
 }
 if ($libs -match 'GPU库') { 失败 "V0.2 不应带 GPU 库" }
 
-Write-Host "发货检查通过：181/183（跳过 2），版本、签名、标记、库都正常。" -ForegroundColor Green
+Write-Host "发货检查通过：$testSummary，版本、签名、标记、库都正常。" -ForegroundColor Green

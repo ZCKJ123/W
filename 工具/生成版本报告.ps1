@@ -5,6 +5,8 @@ $exe = Join-Path (Get-Location) 'wen.exe'
 $verify = & $exe --验证
 $plugin = & $exe --验证插件 '插件\wen-check'
 $version = & $exe --版本
+$verText = ($version -join ' ')
+$ver = if ($verText -match '(\d+\.\d+\.\d+[^\s]*)') { $matches[1] } else { 'unknown' }
 $hash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLower()
 $size = (Get-Item $exe).Length
 $test = $Tests
@@ -12,7 +14,7 @@ $lines = @(
     '# 版本验证报告',
     '',
     "- 生成时间：$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')",
-    "- 版本：``0.1.0-snapshot``",
+    "- 版本：``$ver``",
     "- 测试：$test",
     '',
     '## wen.exe',

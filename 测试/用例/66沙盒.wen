@@ -3,7 +3,7 @@
 打印 是否沙盒()
 写文件("_sandbox.txt", "ok")
 打印 读取("_sandbox.txt")
-删除文件 "例子/_sandbox.txt"
+删除文件 "_sandbox.txt"
 尝试
     读取("C:/Windows/win.ini")
 捕获 错
