@@ -12186,6 +12186,9 @@ Interpreter::Interpreter() {
         d->items["高层云底"] = vNum(22.0);
         d->items["高层云顶"] = vNum(30.0);
         d->items["高层云尺度"] = vNum(0.055);
+        d->items["雨"] = vNum(0.0);
+        d->items["雪"] = vNum(0.0);
+        d->items["雷"] = vNum(0.0);
         if (name == "晴天") {
             d->items["云量"] = vNum(0.18);
             d->items["云底"] = vNum(10.0); d->items["云顶"] = vNum(13.0);
@@ -12211,9 +12214,27 @@ Interpreter::Interpreter() {
             d->items["云量"] = vNum(0.65);
             d->items["太阳"] = vNum(0.6);
             d->items["雾"] = vNum(0.35);
+        } else if (name == "雨") {
+            d->items["云型"] = vStr("雨云"); d->items["云量"] = vNum(0.95);
+            d->items["云底"] = vNum(3.0); d->items["云顶"] = vNum(14.0);
+            d->items["云尺度"] = vNum(0.20); d->items["太阳"] = vNum(0.45);
+            d->items["雾"] = vNum(0.22); d->items["雨"] = vNum(0.8);
+        } else if (name == "雪") {
+            d->items["云型"] = vStr("雪云"); d->items["云量"] = vNum(0.85);
+            d->items["云底"] = vNum(4.0); d->items["云顶"] = vNum(16.0);
+            d->items["云尺度"] = vNum(0.18); d->items["太阳"] = vNum(0.55);
+            d->items["雾"] = vNum(0.18); d->items["雪"] = vNum(0.8);
+        } else if (name == "雷雨") {
+            d->items["云型"] = vStr("雷雨云"); d->items["云量"] = vNum(1.0);
+            d->items["云底"] = vNum(2.5); d->items["云顶"] = vNum(18.0);
+            d->items["云尺度"] = vNum(0.24); d->items["太阳"] = vNum(0.30);
+            d->items["雾"] = vNum(0.30); d->items["雨"] = vNum(1.0); d->items["雷"] = vNum(1.0);
+        } else if (name == "雾") {
+            d->items["云型"] = vStr("雾"); d->items["云量"] = vNum(0.65);
+            d->items["太阳"] = vNum(0.55); d->items["雾"] = vNum(0.75);
         } else if (name != "积云") {
             throw WenError("运行时错误", line, 0,
-                           "未知大气预设「" + name + "」；可用：晴天 积云 层云 卷云 黄昏");
+                           "未知大气预设「" + name + "」；可用：晴天 积云 阴天 层云 卷云 黄昏 雨 雪 雷雨 雾");
         }
         return vDict(d);
     });
@@ -12230,6 +12251,7 @@ Interpreter::Interpreter() {
         if (a.size() >= 5) full = truthy(a[4]);
         struct Atmo { string type="积云"; double cover=0.55, base=8, top=14, scale=0.13, wind=0.25, sun=1.0, fog=0.0;
     double highCover=0.0, highBase=22, highTop=30, highScale=0.055;
+    double rain=0.0, snow=0.0, storm=0.0;
     int steps=8, res=4; } atmo;
         if (a.size() >= 7 && a[6].type == VT::Dict) {
             auto ad = needDict(a[6], "大气", line);
@@ -12241,6 +12263,10 @@ Interpreter::Interpreter() {
             pick("云量", atmo.cover); pick("云底", atmo.base); pick("云顶", atmo.top);
             pick("云尺度", atmo.scale); pick("风速", atmo.wind); pick("太阳", atmo.sun); pick("雾", atmo.fog);
             pick("高层云量", atmo.highCover); pick("高层云底", atmo.highBase); pick("高层云顶", atmo.highTop); pick("高层云尺度", atmo.highScale);
+            pick("雨", atmo.rain); pick("雪", atmo.snow); pick("雷", atmo.storm);
+            atmo.rain = std::max(0.0, std::min(1.0, atmo.rain));
+            atmo.snow = std::max(0.0, std::min(1.0, atmo.snow));
+            atmo.storm = std::max(0.0, std::min(1.0, atmo.storm));
             auto st = ad->items.find("云步数"); if (st != ad->items.end()) atmo.steps = std::max(8, std::min(48, (int)needIndex(st->second, "云步数", line)));
             auto rs = ad->items.find("云分辨率"); if (rs != ad->items.end()) atmo.res = std::max(2, std::min(8, (int)needIndex(rs->second, "云分辨率", line)));
             atmo.cover = std::max(0.0, std::min(1.0, atmo.cover));
@@ -13307,6 +13333,21 @@ Interpreter::Interpreter() {
                         pw.back[i+1]=(unsigned char)std::min(255.0,pw.back[i+1]+ beam*0.40);
                         pw.back[i+2]=(unsigned char)std::min(255.0,pw.back[i+2]+ beam*0.06);
                     }
+                }
+            }
+            // 气象层：雨线/雪点/雷闪
+            {
+                if (atmo.rain > 0.01) {
+                    int n=(int)(atmo.rain*1400);
+                    for(int i=0;i<n;++i){ int x=(int)(hash3(i*1.7,3.1,7.7)*w); double y=std::fmod(hash3(i*2.3,5.9,1.1)*h + tsec*520.0, (double)h); int len=5+(int)(hash3(i*3.7,1.3,9.9)*7); for(int k=0;k<len;++k){ int yy=(int)y-k; if(x<0||x>=w||yy<0||yy>=h) continue; size_t q=((size_t)yy*w+x)*3; pw.back[q]=(unsigned char)std::min(255,(int)pw.back[q]+18); pw.back[q+1]=(unsigned char)std::min(255,(int)pw.back[q+1]+28); pw.back[q+2]=(unsigned char)std::min(255,(int)pw.back[q+2]+38); } }
+                }
+                if (atmo.snow > 0.01) {
+                    int n=(int)(atmo.snow*900);
+                    for(int i=0;i<n;++i){ int x=(int)(std::fmod(hash3(i*1.1,7.3,2.9)*w + std::sin(tsec*0.7+i)*8.0, (double)w)); double y=std::fmod(hash3(i*4.1,2.7,6.3)*h + tsec*55.0, (double)h); int r=1+(int)(hash3(i*5.3,3.9,8.1)*2); for(int yy=y-r;yy<=y+r;++yy) for(int xx=x-r;xx<=x+r;++xx){ if(xx<0||xx>=w||yy<0||yy>=h) continue; size_t q=((size_t)yy*w+xx)*3; pw.back[q]=255; pw.back[q+1]=255; pw.back[q+2]=255; } }
+                }
+                if (atmo.storm > 0.01) {
+                    double flash=std::pow(std::max(0.0,std::sin(tsec*1.7)),18.0)*atmo.storm;
+                    if(flash>0.02) for(int y=0;y<h;++y) for(int x=0;x<w;++x){ size_t q=((size_t)y*w+x)*3; int add=(int)(flash*110); pw.back[q]=(unsigned char)std::min(255,pw.back[q]+add); pw.back[q+1]=(unsigned char)std::min(255,pw.back[q+1]+add); pw.back[q+2]=(unsigned char)std::min(255,pw.back[q+2]+add); }
                 }
             }
             // 后处理：亮部 → Bloom → ACES → 暗角
