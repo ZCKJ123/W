@@ -69,5 +69,19 @@ if ($pr32.ExitCode -ne 6) { throw "原生EXE32 读取退出码错误：$($pr32.E
 $gotRead32 = Get-Content $readOut -Raw -Encoding UTF8
 if ($gotRead32 -notmatch '文件内容') { throw '原生EXE32 读取输出失败' }
 
-Remove-Item $src, $exe, $exe32, $txt, $txtOut, $coll, $readFile, $readSrc, $readOut -Force -ErrorAction SilentlyContinue
-Write-Output '原生EXE：x64/x86 文本、退出码、列表/字典常量、编译期读取 通过'
+$writeTarget = Join-Path $env:TEMP 'wen_native_exe_written.txt'
+$writeSrc = Join-Path $env:TEMP 'wen_native_exe_write.wen'
+Remove-Item $writeTarget -Force -ErrorAction SilentlyContinue
+$writePath = $writeTarget.Replace('\', '/')
+Set-Content -Path $writeSrc -Value ('写入("' + $writePath + '", "PE运行时写入")') -Encoding UTF8
+Add-Content -Path $writeSrc -Value '返回 8' -Encoding UTF8
+
+& $wen --原生EXE $writeSrc $exe | Out-Null
+if ($LASTEXITCODE -ne 0) { throw '原生EXE 运行时写入生成失败' }
+$pw = Start-Process -FilePath $exe -PassThru -Wait
+if ($pw.ExitCode -ne 8) { throw "原生EXE 运行时写入退出码错误：$($pw.ExitCode)" }
+$wrote = Get-Content $writeTarget -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+if ($wrote -notmatch 'PE运行时写入') { throw '原生EXE 运行时写入内容失败' }
+
+Remove-Item $src, $exe, $exe32, $txt, $txtOut, $coll, $readFile, $readSrc, $readOut, $writeTarget, $writeSrc -Force -ErrorAction SilentlyContinue
+Write-Output '原生EXE：x64/x86 文本、退出码、列表/字典常量、编译期读取、x64 运行时写入 通过'
