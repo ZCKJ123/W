@@ -41,6 +41,15 @@ CreateFileA / WriteFile / CloseHandle
 PE 能加载，进程挂起，文件未创建
 ```
 
+## 探针进度
+```text
+1. ExitProcess 立即退出      ✓ 已有 x64 PE
+2. CreateFileA 创建文件        ✓ 2026-10-30 探针通过，exit=0，文件存在
+3. WriteFile 写入固定字符串   ← 下一步
+4. CloseHandle               ✗
+5. 接入 写入(路径,文本)       ✗
+```
+本轮修复：生成 `lea` 时只发出了 3 字节指令，没有先预留 4 字节位移占位，后续写位移把前面的指令覆盖，导致 PE 入口执行到乱码。
 ## 下一步
 
 不要直接接语言 `写入`。先做独立的 PE 探针：
