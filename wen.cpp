@@ -20124,6 +20124,7 @@ static int runMain(vector<string> args) {
             std::map<string,long long> env;
             std::map<string,string> senv;
             for (const auto& st : program) {
+                if (st && st->k==Stmt::K::ExprStmt && st->expr && st->expr->k==Expr::K::Call && st->expr->args.size()>=1 && st->expr->args[0] && st->expr->args[0]->k==Expr::K::Var && st->expr->args[0]->text=="写入") { std::cerr << "原生EXE 暂不支持运行时写入\n"; return 2; }
                 if (st && st->k==Stmt::K::Assign && st->target && st->target->k==Expr::K::Var && st->expr) {
                     string sv; string se;
                     if (constStrEnv(st->expr, senv, sv, se)) { senv[st->target->text]=sv; }
@@ -20174,6 +20175,7 @@ static int runMain(vector<string> args) {
             std::map<string,long long> env;
             std::map<string,string> senv;
             for (const auto& st : program) {
+                if (st && st->k==Stmt::K::ExprStmt && st->expr && st->expr->k==Expr::K::Call && st->expr->args.size()>=1 && st->expr->args[0] && st->expr->args[0]->k==Expr::K::Var && st->expr->args[0]->text=="写入") { std::cerr << "原生EXE32 暂不支持运行时写入\n"; return 2; }
                 if (st && st->k==Stmt::K::Assign && st->target && st->target->k==Expr::K::Var && st->expr) {
                     string sv; string se;
                     if (constStrEnv(st->expr, senv, sv, se)) { senv[st->target->text]=sv; }
