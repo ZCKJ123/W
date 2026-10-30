@@ -83,5 +83,12 @@ if ($pw.ExitCode -ne 8) { throw "原生EXE 运行时写入退出码错误：$($p
 $wrote = Get-Content $writeTarget -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
 if ($wrote -notmatch 'PE运行时写入') { throw '原生EXE 运行时写入内容失败' }
 
-Remove-Item $src, $exe, $exe32, $txt, $txtOut, $coll, $readFile, $readSrc, $readOut, $writeTarget, $writeSrc -Force -ErrorAction SilentlyContinue
-Write-Output '原生EXE：x64/x86 文本、退出码、列表/字典常量、编译期读取、x64 运行时写入 通过'
+$badSrc = Join-Path $env:TEMP 'wen_native_exe_badwrite.wen'
+Set-Content -Path $badSrc -Value '写入("C:/不存在目录_xyz/bad.txt", "x")' -Encoding UTF8
+Add-Content -Path $badSrc -Value '返回 0' -Encoding UTF8
+& $wen --原生EXE $badSrc $exe | Out-Null
+$pb = Start-Process -FilePath $exe -PassThru -Wait
+if ($pb.ExitCode -ne 1) { throw "原生EXE 写入失败路径退出码错误：$($pb.ExitCode)" }
+
+Remove-Item $src, $exe, $exe32, $txt, $txtOut, $coll, $readFile, $readSrc, $readOut, $writeTarget, $writeSrc, $badSrc -Force -ErrorAction SilentlyContinue
+Write-Output '原生EXE：x64/x86 文本、退出码、列表/字典常量、编译期读取、x64 运行时写入/失败路径 通过'
