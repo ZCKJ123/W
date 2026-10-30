@@ -19132,22 +19132,22 @@ static bool writeProbeWriteFile(const string& target, const string& content, int
     auto call=[&](uint32_t ia){E({0xFF,0x15});size_t o=c.size();E({0,0,0,0});int32_t d=(int32_t)(ia-(0x1000+(uint32_t)c.size()));for(int i=0;i<4;++i)c[o+i]=(unsigned char)((d>>(8*i))&255);};
     E({0x48,0x83,0xEC,0x48}); E({0xBA,0,0,0,0x40}); E({0x45,0x31,0xC0}); E({0x45,0x31,0xC9});
     E({0x48,0xC7,0x44,0x24,0x20,2,0,0,0}); E({0x48,0xC7,0x44,0x24,0x28,0x80,0,0,0}); E({0x48,0xC7,0x44,0x24,0x30,0,0,0,0});
-    lea(1,0x2000); call(0x3020); E({0x48,0x83,0xF8,0xFF}); E({0x0F,0x84,0,0,0,0}); size_t f=c.size()-4;
+    lea(1,0x2000); call(0x3028); E({0x48,0x83,0xF8,0xFF}); E({0x0F,0x84,0,0,0,0}); size_t f=c.size()-4;
     E({0x48,0x89,0xC3}); E({0x48,0x89,0xD9}); lea(2,0x2080);
     E({0x41,0xB8}); uint32_t n=(uint32_t)content.size(); for(int i=0;i<4;++i)c.push_back((unsigned char)((n>>(8*i))&255));
     E({0x4C,0x8D,0x4C,0x24,0x38}); E({0x48,0xC7,0x44,0x24,0x38,0,0,0,0}); E({0x48,0xC7,0x44,0x24,0x20,0,0,0,0});
-    call(0x3028); E({0xB9}); for(int i=0;i<4;++i)c.push_back((unsigned char)((exitCode>>(8*i))&255)); call(0x3030); E({0xCC});
+    call(0x3030); E({0x48,0x89,0xD9}); call(0x3038); E({0xB9}); for(int i=0;i<4;++i)c.push_back((unsigned char)((exitCode>>(8*i))&255)); call(0x3040); E({0xCC});
     int32_t r=(int32_t)(c.size()-(f+4));for(int i=0;i<4;++i)c[f+i]=(unsigned char)((r>>(8*i))&255);
-    E({0xB9,1,0,0,0}); call(0x3030); E({0xCC});
+    E({0xB9,1,0,0,0}); call(0x3040); E({0xCC});
     const size_t tr=0x400,rr=0x600,ir=0x800,fs=0xA00; vector<unsigned char> b(fs,0);
     b[0]='M';b[1]='Z';put32(b,0x3C,0x40);b[0x40]='P';b[0x41]='E';put16(b,0x44,0x8664);put16(b,0x46,3);put16(b,0x54,0xF0);put16(b,0x56,0x22);size_t o=0x58;
-    put16(b,o,0x20B);put32(b,o+4,0x200);put32(b,o+8,0x600);put32(b,o+16,0x1000);put32(b,o+20,0x1000);put64(b,o+24,0x140000000ULL);put32(b,o+32,0x1000);put32(b,o+36,0x200);put16(b,o+48,6);put32(b,o+56,0x4000);put32(b,o+60,0x400);put16(b,o+68,3);put64(b,o+72,0x100000);put64(b,o+80,0x1000);put64(b,o+88,0x100000);put64(b,o+96,0x1000);put32(b,o+108,16);put32(b,o+120,0x30A0);put32(b,o+124,0x28);
+    put16(b,o,0x20B);put32(b,o+4,0x200);put32(b,o+8,0x600);put32(b,o+16,0x1000);put32(b,o+20,0x1000);put64(b,o+24,0x140000000ULL);put32(b,o+32,0x1000);put32(b,o+36,0x200);put16(b,o+48,6);put32(b,o+56,0x4000);put32(b,o+60,0x400);put16(b,o+68,3);put64(b,o+72,0x100000);put64(b,o+80,0x1000);put64(b,o+88,0x100000);put64(b,o+96,0x1000);put32(b,o+108,16);put32(b,o+120,0x30B0);put32(b,o+124,0x28);
     size_t sh=o+0xF0;auto sec=[&](size_t a,const char* n,uint32_t vs,uint32_t va,uint32_t rs,uint32_t rp,uint32_t ch){memcpy(&b[a],n,strlen(n));put32(b,a+8,vs);put32(b,a+12,va);put32(b,a+16,rs);put32(b,a+20,rp);put32(b,a+36,ch);};
     sec(sh,".text",(uint32_t)c.size(),0x1000,0x200,tr,0x60000020);sec(sh+40,".rdata",0x100,0x2000,0x200,rr,0x40000040);sec(sh+80,".idata",0x100,0x3000,0x200,ir,0x40000040);
     memcpy(&b[tr],c.data(),c.size());memcpy(&b[rr],target.data(),target.size());memcpy(&b[rr+0x80],content.data(),content.size());
-    size_t i=ir;put64(b,i,0x3060);put64(b,i+8,0x3070);put64(b,i+16,0x3080);put64(b,i+24,0);put64(b,i+0x20,0x3060);put64(b,i+0x28,0x3070);put64(b,i+0x30,0x3080);put64(b,i+0x38,0);
-    put16(b,i+0x60,0);memcpy(&b[i+0x62],"CreateFileA",11);put16(b,i+0x70,0);memcpy(&b[i+0x72],"WriteFile",9);put16(b,i+0x80,0);memcpy(&b[i+0x82],"ExitProcess",11);memcpy(&b[i+0x90],"KERNEL32.dll",12);
-    put32(b,i+0xA0,0x3000);put32(b,i+0xAC,0x3090);put32(b,i+0xB0,0x3020);
+    size_t i=ir;put64(b,i,0x3060);put64(b,i+8,0x3070);put64(b,i+16,0x3080);put64(b,i+24,0x3090);put64(b,i+32,0);put64(b,i+0x28,0x3060);put64(b,i+0x30,0x3070);put64(b,i+0x38,0x3080);put64(b,i+0x40,0x3090);put64(b,i+0x48,0);
+    put16(b,i+0x60,0);memcpy(&b[i+0x62],"CreateFileA",11);put16(b,i+0x70,0);memcpy(&b[i+0x72],"WriteFile",9);put16(b,i+0x80,0);memcpy(&b[i+0x82],"CloseHandle",11);put16(b,i+0x90,0);memcpy(&b[i+0x92],"ExitProcess",11);memcpy(&b[i+0xA0],"KERNEL32.dll",12);
+    put32(b,i+0xB0,0x3000);put32(b,i+0xBC,0x30A0);put32(b,i+0xC0,0x3028);
     std::ofstream out(fs::u8path(outPath),std::ios::binary);if(!out){err="无法写文件："+outPath;return false;}out.write((const char*)b.data(),(std::streamsize)b.size());return true;
 }
 
