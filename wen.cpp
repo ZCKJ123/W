@@ -19099,6 +19099,12 @@ static bool constIntEnv(const ExprPtr& e, const std::map<string,long long>& env,
         }
         err="PE 下标只支持列表/字典字面量"; return false;
     }
+    if (e->k==Expr::K::Call && e->args.size()>=2 && e->args[0] && e->args[0]->k==Expr::K::Var && e->args[0]->text=="长度") {
+        if(e->args[1]->k==Expr::K::Str){ out=(long long)e->args[1]->text.size(); return true; }
+        if(e->args[1]->k==Expr::K::List){ out=(long long)e->args[1]->args.size(); return true; }
+        if(e->args[1]->k==Expr::K::Dict){ out=(long long)e->args[1]->pairs.size(); return true; }
+        err="PE 长度只支持文本/列表/字典字面量"; return false;
+    }
     if (e->k==Expr::K::Binary) {
         long long a=0,b=0;
         if(!constIntEnv(e->args[0],env,a,err) || !constIntEnv(e->args[1],env,b,err)) return false;
