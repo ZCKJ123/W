@@ -8535,6 +8535,18 @@ Interpreter::Interpreter() {
         throw WenError("运行时错误", line, 0, toText(a[0]));
     });
 
+    registerBuiltin("写入", 2, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path = needStr(a[0], "写入", line);
+        string text = needStr(a[1], "写入", line);
+        bool append = a.size() > 2 ? truthy(a[2]) : false;
+        string full = resolveWenPath(path);
+        sandboxRequire(full);
+        std::ofstream out(fs::u8path(full), std::ios::binary | (append ? std::ios::app : std::ios::trunc));
+        if (!out) throw WenError("文件错误", line, 0, "无法写入文件：" + path);
+        out.write(text.data(), (std::streamsize)text.size());
+        if (!out) throw WenError("文件错误", line, 0, "写入失败：" + path);
+        return vNum((double)text.size());
+    });
     registerBuiltin("读取", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
         string path = needStr(a[0], "读取", line);
         try {
