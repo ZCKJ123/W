@@ -19043,14 +19043,6 @@ static bool constIntEnv(const ExprPtr& e, const std::map<string,long long>& env,
         long long v=0; if(!constIntEnv(e->args[0],env,v,err)) return false; out=-v; return true;
     }
     if (e->k==Expr::K::Index && e->args.size()>=2) {
-        long long idx=0;
-        if(!constIntEnv(e->args[1],env,idx,err)) return false;
-        if(e->args[0]->k==Expr::K::List) {
-            auto& items=e->args[0]->args;
-            if(idx<0) idx += (long long)items.size();
-            if(idx<0 || idx>=(long long)items.size()){ err="PE 列表下标越界"; return false; }
-            return constIntEnv(items[(size_t)idx],env,out,err);
-        }
         if(e->args[0]->k==Expr::K::Dict) {
             if(e->args[1]->k!=Expr::K::Str){ err="PE 字典键必须是文本"; return false; }
             for(const auto& kv : e->args[0]->pairs) {
@@ -19058,6 +19050,14 @@ static bool constIntEnv(const ExprPtr& e, const std::map<string,long long>& env,
                     return constIntEnv(kv.second,env,out,err);
             }
             err="PE 字典键不存在："+e->args[1]->text; return false;
+        }
+        long long idx=0;
+        if(!constIntEnv(e->args[1],env,idx,err)) return false;
+        if(e->args[0]->k==Expr::K::List) {
+            auto& items=e->args[0]->args;
+            if(idx<0) idx += (long long)items.size();
+            if(idx<0 || idx>=(long long)items.size()){ err="PE 列表下标越界"; return false; }
+            return constIntEnv(items[(size_t)idx],env,out,err);
         }
         err="PE 下标只支持列表/字典字面量"; return false;
     }
