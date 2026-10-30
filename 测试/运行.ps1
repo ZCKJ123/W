@@ -164,7 +164,9 @@ $ts = '✓'; & (Join-Path $PSScriptRoot '..\工具\TypeScript检查.ps1')
 if ($LASTEXITCODE -eq 2) { $ts = '⚠️未验证' }
 elseif ($LASTEXITCODE -ne 0) { exit 1 }
 $native = '✓'; & (Join-Path $PSScriptRoot '..\工具\原生EXE检查.ps1'); if ($LASTEXITCODE -ne 0) { exit 1 }
+$selfhost = '✓'; & (Join-Path $PSScriptRoot '..\工具\自举PE检查.ps1'); if ($LASTEXITCODE -ne 0) { exit 1 }
+$selfdisplay = '✓'; & (Join-Path $PSScriptRoot '..\工具\自举显示检查.ps1'); if ($LASTEXITCODE -ne 0) { exit 1 }
 
-Write-Host ("总账：主用例 {0}/{1}、错误 {2}/{3}、协议 {4}、防崩溃 {5}、索引 {6}、自述 {7}、TS {8}、音频 {9}、原生 {10}" -f `
-    $casePass, $caseTotal, $errorPass, $errorTotal, $protocol, $crash, $index, $self, $ts, $audio, $native)
+Write-Host ("总账：主用例 {0}/{1}、错误 {2}/{3}、协议 {4}、防崩溃 {5}、索引 {6}、自述 {7}、TS {8}、音频 {9}、原生 {10}、自举 {11}、自举显示 {12}" -f `
+    $casePass, $caseTotal, $errorPass, $errorTotal, $protocol, $crash, $index, $self, $ts, $audio, $native, $selfhost, $selfdisplay)
 exit 0

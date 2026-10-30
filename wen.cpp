@@ -8584,6 +8584,13 @@ Interpreter::Interpreter() {
         string s = needStr(a[0], "文本解码", line);
         return vStr(normalizeWenSource(s));
     });
+    registerBuiltin("启动程序", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path = needStr(a[0], "启动程序", line);
+        std::wstring wp = fs::absolute(fs::u8path(path)).wstring();
+        HINSTANCE h = ShellExecuteW(nullptr, L"open", wp.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        if ((INT_PTR)h <= 32) throw WenError("运行时错误", line, 0, "启动程序失败：" + path);
+        return vBool(true);
+    });
     registerBuiltin("运行", 1, 1, [](Interpreter& vm, vector<Value>& a, int line) -> Value {
         string path = needStr(a[0], "运行", line);
         string src;

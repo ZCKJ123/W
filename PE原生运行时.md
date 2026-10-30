@@ -41,6 +41,12 @@ CreateFileA / WriteFile / CloseHandle
 PE 能加载，进程挂起，文件未创建
 ```
 
+## 文言自举 PE 探针
+```text
+文言 PE 打包库：库/PE库.wen
+生成 PE：工具/PE退出探针.wen
+只导入 ExitProcess，退出码 7：通过
+```
 ## 探针进度
 ```text
 1. ExitProcess 立即退出      ✓ 已有 x64 PE
