@@ -12771,6 +12771,8 @@ Interpreter::Interpreter() {
                     int nx=96, ny=48, nz=96;
                     double x0=-42, x1=42, y0=0, y1=1, z0=-42, z1=42;
                     vector<float> d;
+                    vector<unsigned char> occ;
+                    int ox=0, oy=0, oz=0;
                 };
                 static VoxelGrid vg;
                 if (vg.d.empty()) {
@@ -12813,7 +12815,19 @@ Interpreter::Interpreter() {
                         double d=(n*baseProf*topProf*env - (0.38 - atmo.cover*0.18))*3.6;
                         vg.d[(size_t)(iz*vg.ny+iy)*vg.nx+ix]=(float)std::max(0.0,std::min(1.0,d));
                     }
+                    vg.ox=(vg.nx+7)/8; vg.oy=(vg.ny+7)/8; vg.oz=(vg.nz+7)/8;
+                    vg.occ.assign((size_t)vg.ox*vg.oy*vg.oz, 0);
+                    for(int iz=0;iz<vg.nz;++iz) for(int iy=0;iy<vg.ny;++iy) for(int ix=0;ix<vg.nx;++ix)
+                        if(vg.d[(size_t)(iz*vg.ny+iy)*vg.nx+ix] > 0.03f)
+                            vg.occ[(size_t)((iz/8)*vg.oy+(iy/8))*vg.ox+(ix/8)]=1;
                 }
+                auto occAt=[&](PVec p,double time)->bool {
+                    p.x += time*atmo.wind; p.z -= time*atmo.wind;
+                    if(p.x<vg.x0||p.x>vg.x1||p.y<vg.y0||p.y>vg.y1||p.z<vg.z0||p.z>vg.z1) return false;
+                    int ix=(int)((p.x-vg.x0)/(vg.x1-vg.x0)*vg.ox), iy=(int)((p.y-vg.y0)/(vg.y1-vg.y0)*vg.oy), iz=(int)((p.z-vg.z0)/(vg.z1-vg.z0)*vg.oz);
+                    ix=std::max(0,std::min(vg.ox-1,ix)); iy=std::max(0,std::min(vg.oy-1,iy)); iz=std::max(0,std::min(vg.oz-1,iz));
+                    return vg.occ[(size_t)(iz*vg.oy+iy)*vg.ox+ix]!=0;
+                };
                 auto sampleVox = [&](PVec p, double time) -> double {
                     p.x += time*atmo.wind; p.z -= time*atmo.wind;
                     if (p.x<vg.x0||p.x>vg.x1||p.y<vg.y0||p.y>vg.y1||p.z<vg.z0||p.z>vg.z1) return 0.0;
@@ -12842,19 +12856,24 @@ Interpreter::Interpreter() {
                         if (std::fabs(rd.y)<1e-4) continue;
                         if (t0r>t1r) std::swap(t0r,t1r);
                         t0r=std::max(0.05,t0r); if (t1r<=t0r) continue;
-                        int steps=14; double dt=(t1r-t0r)/steps;
+                        int steps=24; double dt=(t1r-t0r)/steps;
                         double T=1,cr=0,cg=0,cb=0;
-                        for (int st=0;st<steps;++st) {
-                            PVec p2=padd(cam,pmul(rd,t0r+(st+0.5)*dt));
+                        double t=t0r + hash3(cx*1.7,cy*2.3,5.1)*dt;
+                        int st=0;
+                        while(t<t1r && st<steps*2) {
+                            PVec p2=padd(cam,pmul(rd,t));
+                            if(!occAt(p2,tsec)) { t += dt*1.8; ++st; continue; }
                             double den=sampleVox(p2,tsec);
-                            if (den<=0.002) continue;
-                            double od=0;
-                            for (int l=1;l<=2;++l) od += sampleVox(padd(p2,pmul(light,0.65*l)),tsec)*0.65;
-                            double beam=std::exp(-od*2.2);
-                            double a=1-std::exp(-den*dt*1.7);
-                            double lit=0.55+0.45*beam;
-                            cr += T*a*(0.86*lit+0.10); cg += T*a*(0.89*lit+0.10); cb += T*a*(0.95*lit+0.12);
-                            T*= (1-a); if (T<0.02) break;
+                            if (den>0.002) {
+                                double od=0;
+                                for (int l=1;l<=2;++l) od += sampleVox(padd(p2,pmul(light,0.65*l)),tsec)*0.65;
+                                double beam=std::exp(-od*2.2);
+                                double a=1-std::exp(-den*dt*1.7);
+                                double lit=0.55+0.45*beam;
+                                cr += T*a*(0.86*lit+0.10); cg += T*a*(0.89*lit+0.10); cb += T*a*(0.95*lit+0.12);
+                                T*= (1-a); if (T<0.02) break;
+                            }
+                            t += dt; ++st;
                         }
                         if (T<0.995) {
                             size_t ci=((size_t)cy*cw+cx)*4;
