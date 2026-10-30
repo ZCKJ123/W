@@ -47,5 +47,27 @@ if ($LASTEXITCODE -ne 0) { throw '原生EXE32 容器常量生成失败' }
 $pc32 = Start-Process -FilePath $exe32 -PassThru -Wait
 if ($pc32.ExitCode -ne 25) { throw "原生EXE32 容器常量退出码错误：$($pc32.ExitCode)" }
 
-Remove-Item $src, $exe, $exe32, $txt, $txtOut, $coll -Force -ErrorAction SilentlyContinue
-Write-Output '原生EXE：x64/x86 文本、退出码、列表/字典常量 通过'
+$readFile = Join-Path $env:TEMP 'wen_native_exe_read.txt'
+$readSrc = Join-Path $env:TEMP 'wen_native_exe_read.wen'
+$readOut = Join-Path $env:TEMP 'wen_native_exe_read.out'
+Set-Content -Path $readFile -Value '文件内容' -Encoding UTF8
+$readPath = $readFile.Replace('\', '/')
+Set-Content -Path $readSrc -Value ('打印 读取("' + $readPath + '")') -Encoding UTF8
+Add-Content -Path $readSrc -Value '返回 6' -Encoding UTF8
+
+& $wen --原生EXE $readSrc $exe | Out-Null
+if ($LASTEXITCODE -ne 0) { throw '原生EXE 读取生成失败' }
+$pr = Start-Process -FilePath $exe -PassThru -Wait -RedirectStandardOutput $readOut
+if ($pr.ExitCode -ne 6) { throw "原生EXE 读取退出码错误：$($pr.ExitCode)" }
+$gotRead = Get-Content $readOut -Raw -Encoding UTF8
+if ($gotRead -notmatch '文件内容') { throw '原生EXE 读取输出失败' }
+
+& $wen --原生EXE32 $readSrc $exe32 | Out-Null
+if ($LASTEXITCODE -ne 0) { throw '原生EXE32 读取生成失败' }
+$pr32 = Start-Process -FilePath $exe32 -PassThru -Wait -RedirectStandardOutput $readOut
+if ($pr32.ExitCode -ne 6) { throw "原生EXE32 读取退出码错误：$($pr32.ExitCode)" }
+$gotRead32 = Get-Content $readOut -Raw -Encoding UTF8
+if ($gotRead32 -notmatch '文件内容') { throw '原生EXE32 读取输出失败' }
+
+Remove-Item $src, $exe, $exe32, $txt, $txtOut, $coll, $readFile, $readSrc, $readOut -Force -ErrorAction SilentlyContinue
+Write-Output '原生EXE：x64/x86 文本、退出码、列表/字典常量、编译期读取 通过'
