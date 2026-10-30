@@ -12804,41 +12804,39 @@ Interpreter::Interpreter() {
                 if (vg.d.empty()) {
                     vg.y0=atmo.base; vg.y1=atmo.top;
                     vg.d.assign((size_t)vg.nx*vg.ny*vg.nz, 0.0f);
-                    struct Seed { double x,z,r,top; };
+                    struct Seed { double x,y,z,rx,ry,rz; };
                     vector<Seed> seeds;
-                    for (int i=0;i<14;++i) {
+                    for (int i=0;i<42;++i) {
                         Seed sd;
-                        sd.x = -42.0 + 84.0 * hash3(i*3.1, 1.7, 2.3);
-                        sd.z = -42.0 + 84.0 * hash3(i*5.7, 4.1, 8.9);
-                        sd.r = 3.0 + 5.0 * hash3(i*2.3, 9.1, 3.7);
-                        sd.top = 0.45 + 0.55 * hash3(i*7.7, 2.2, 6.1);
+                        sd.x = -55.0 + 110.0 * hash3(i*3.1, 1.7, 2.3);
+                        sd.z = -52.0 + 74.0 * hash3(i*5.7, 4.1, 8.9);
+                        double size = 1.4 + 22.0 * std::pow(hash3(i*2.3,9.1,3.7), 3.0);
+                        sd.rx = size * (0.75 + 0.55*hash3(i*6.1,2.2,7.7));
+                        sd.rz = size * (0.75 + 0.55*hash3(i*4.9,8.3,1.3));
+                        sd.ry = 1.0 + size * (0.30 + 0.45*hash3(i*7.1,5.5,3.3));
+                        double maxY = std::max(0.2, (vg.y1-vg.y0) - 2.0*sd.ry);
+                        sd.y = vg.y0 + sd.ry + maxY * hash3(i*8.3,1.1,6.7);
                         seeds.push_back(sd);
                     }
                     for (int iz=0; iz<vg.nz; ++iz) for (int iy=0; iy<vg.ny; ++iy) for (int ix=0; ix<vg.nx; ++ix) {
                         double x=vg.x0 + (vg.x1-vg.x0)*(ix+0.5)/vg.nx;
                         double y=vg.y0 + (vg.y1-vg.y0)*(iy+0.5)/vg.ny;
                         double z=vg.z0 + (vg.z1-vg.z0)*(iz+0.5)/vg.nz;
-                        double h=(y-vg.y0)/(vg.y1-vg.y0);
                         double env=0;
                         for (const auto& sd : seeds) {
-                            double dx=x-sd.x, dz=z-sd.z;
-                            if (h > sd.top) continue;
-                            double e=std::exp(-(dx*dx+dz*dz)/(sd.r*sd.r));
-                            double hv=std::max(0.0, 1.0 - h/std::max(0.1,sd.top));
-                            env=std::max(env, e*(0.35+0.65*hv));
+                            double dx=(x-sd.x)/sd.rx, dy=(y-sd.y)/sd.ry, dz=(z-sd.z)/sd.rz;
+                            double q=dx*dx+dy*dy+dz*dz;
+                            if(q<1.0){ double e=(1.0-q); e*=e; env=std::max(env,e); }
                         }
-                        if (env < 0.12) {
-                            vg.d[(size_t)(iz*vg.ny+iy)*vg.nx+ix]=0.0f;
-                            continue;
-                        }
-                        double qx=x*atmo.scale, qy=y*atmo.scale*0.95, qz=z*atmo.scale;
-                        double f=0, amp=0.55, fr=1;
-                        for (int o=0;o<4;++o) { f += vnoise3(qx*fr,qy*fr,qz*fr)*amp; fr*=2.1; amp*=0.5; }
+                        if (env < 0.04) { vg.d[(size_t)(iz*vg.ny+iy)*vg.nx+ix]=0.0f; continue; }
+                        double h=(y-vg.y0)/std::max(0.1,vg.y1-vg.y0);
+                        double qx=x*atmo.scale, qy=y*atmo.scale*0.85, qz=z*atmo.scale;
+                        double f=0, amp=0.55, fr=0.65;
+                        for (int o=0;o<5;++o) { f += vnoise3(qx*fr,qy*fr,qz*fr)*amp; fr*=1.95; amp*=0.52; }
                         double billow=1.0-std::fabs(2.0*f-1.0);
-                        double n=f*0.58+billow*0.42;
-                        double baseProf=std::max(0.0,std::min(1.0,h/0.08));
-                        double topProf=std::pow(std::max(0.0,1.0-h),0.35);
-                        double d=(n*baseProf*topProf*env - (0.38 - atmo.cover*0.18))*3.6;
+                        double n=f*0.55+billow*0.45;
+                        double baseProf=std::max(0.0,std::min(1.0,h/0.055));
+                        double d=(env*(0.55+0.45*n) - (0.30-atmo.cover*0.16))*4.2*baseProf;
                         vg.d[(size_t)(iz*vg.ny+iy)*vg.nx+ix]=(float)std::max(0.0,std::min(1.0,d));
                     }
                     vg.ox=(vg.nx+7)/8; vg.oy=1; vg.oz=(vg.nz+7)/8;
