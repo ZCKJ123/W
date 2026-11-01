@@ -218,7 +218,7 @@ struct Token {
 
 static const std::set<string>& keywords() {
     static const std::set<string> kw = {
-        "将", "变成", "打印", "如果", "则", "否则如果", "否则", "结束",
+        "将", "变成", "局部", "打印", "如果", "则", "否则如果", "否则", "结束",
         "当", "对于", "在", "中", "函数", "返回", "依赖",
         "中断", "继续", "真", "假", "空", "且", "或", "非", "导出",
         "尝试", "捕获", "最终", "匹配", "情形"
@@ -821,6 +821,7 @@ struct Stmt {
         Break, Continue, ExprStmt, Import, Export, Try, Match
     };
     K k = K::ExprStmt;
+    bool declareLocal = false;   // 「局部 名 变成 …」：强制写当前函数帧
     string name;
     SymId nameSym = 0;
     int nameSlot = -1;
@@ -1171,6 +1172,7 @@ private:
 
     StmtPtr parseStatement() {
         if (atKw("将")) return parseAssign();
+        if (atKw("局部")) return parseLocal();
         if (atKw("打印")) return parsePrint();
         if (atKw("如果")) return parseIf();
         if (atKw("当")) return parseWhile();
@@ -1211,6 +1213,25 @@ private:
         s->target = target;
         s->expr = val;
         s->line = line;
+        return s;
+    }
+
+    // 局部 名 变成 表达式：强制在当前函数帧里建变量，即使外层有同名全局也不改它
+    StmtPtr parseLocal() {
+        int line = peek().line;
+        ++idx_;
+        Token nm = expectName();
+        ExprPtr target = mkVar(nm.text, nm.line);
+        while (matchOp("[")) target = parseIndexPart(target, nm.line);
+        expectKw("变成");
+        ExprPtr val = parseExpr();
+        endStmt();
+        auto s = std::make_shared<Stmt>();
+        s->k = Stmt::K::Assign;
+        s->target = target;
+        s->expr = val;
+        s->line = line;
+        s->declareLocal = true;
         return s;
     }
 
@@ -4539,6 +4560,10 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
     switch (s->k) {
         case Stmt::K::Assign: {
             Value v = eval(s->expr, scope);
+            if (s->declareLocal && s->target && s->target->k == Expr::K::Var) {
+                scope->set(s->target->sym, std::move(v));
+                break;
+            }
             assignTarget(s->target, std::move(v), scope);
             break;
         }
@@ -17507,6 +17532,8 @@ private:
             case Stmt::K::Assign:
                 if (s->target->k != Expr::K::Var)
                     err(s->line, "编译模式只支持给变量赋值");
+                if (s->declareLocal)
+                    err(s->line, "「局部」声明暂不支持编译到其他目标，请用普通变量名区分");
                 addLocal(fi, s->target->text);
                 break;
             case Stmt::K::If:
@@ -17760,6 +17787,8 @@ private:
             case Stmt::K::Assign: {
                 if (s->target->k != Expr::K::Var)
                     err(s->line, "编译模式只支持给变量赋值");
+                if (s->declareLocal)
+                    err(s->line, "「局部」声明暂不支持编译到其他目标，请用普通变量名区分");
                 return ind + varRef(s->target->text, s->line) + " = " + expr(s->expr) + ";\n";
             }
             case Stmt::K::Print: {
