@@ -14531,6 +14531,129 @@ Interpreter::Interpreter() {
         volStore[nid] = out;
         return vNum((double)nid);
     });
+    // 图像存 PNG：8 位灰度，zlib 用 stored 块（不压缩但合法），自带 CRC32 / Adler32
+    registerBuiltin("图像存PNG", 4, 4, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path = needStr(a[0], "图像存PNG", line);
+        long long W = needIndex(a[1], "图像存PNG", line);
+        long long H = needIndex(a[2], "图像存PNG", line);
+        auto px = needBytes(a[3], "图像存PNG", line);
+        if (W <= 0 || H <= 0 || (long long)px->size() < W * H)
+            throw WenError("运行时错误", line, 0, "图像存PNG：尺寸与像素数据不匹配");
+        auto crc32Of = [](const unsigned char* p, size_t n) -> unsigned int {
+            static unsigned int tab[256];
+            static bool init = false;
+            if (!init) {
+                for (unsigned int i = 0; i < 256; ++i) {
+                    unsigned int c = i;
+                    for (int k = 0; k < 8; ++k) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+                    tab[i] = c;
+                }
+                init = true;
+            }
+            unsigned int c = 0xFFFFFFFFu;
+            for (size_t i = 0; i < n; ++i) c = tab[(c ^ p[i]) & 0xFF] ^ (c >> 8);
+            return c ^ 0xFFFFFFFFu;
+        };
+        auto adler32Of = [](const unsigned char* p, size_t n) -> unsigned int {
+            unsigned int s1 = 1, s2 = 0;
+            for (size_t i = 0; i < n; ++i) { s1 = (s1 + p[i]) % 65521; s2 = (s2 + s1) % 65521; }
+            return (s2 << 16) | s1;
+        };
+        std::string raw;                       // 每行前面加一个 filter 字节 0
+        raw.reserve((size_t)(H * (W + 1)));
+        for (long long y = 0; y < H; ++y) {
+            raw.push_back('\0');
+            raw.append(reinterpret_cast<const char*>(px->data()) + (size_t)(y * W), (size_t)W);
+        }
+        std::string z;
+        z.push_back('\x78'); z.push_back('\x01');
+        size_t off = 0;
+        while (off < raw.size()) {
+            size_t n = std::min<size_t>(65535, raw.size() - off);
+            z.push_back((off + n >= raw.size()) ? '\x01' : '\x00');
+            z.push_back((char)(n & 0xFF)); z.push_back((char)((n >> 8) & 0xFF));
+            z.push_back((char)(~n & 0xFF)); z.push_back((char)((~n >> 8) & 0xFF));
+            z.append(raw.data() + off, n);
+            off += n;
+        }
+        unsigned int ad = adler32Of(reinterpret_cast<const unsigned char*>(raw.data()), raw.size());
+        z.push_back((char)(ad >> 24)); z.push_back((char)(ad >> 16)); z.push_back((char)(ad >> 8)); z.push_back((char)ad);
+        std::string out("\x89PNG\r\n\x1A\n", 8);
+        auto put32 = [](std::string& s, unsigned int v) {
+            s.push_back((char)((v >> 24) & 0xFF)); s.push_back((char)((v >> 16) & 0xFF));
+            s.push_back((char)((v >> 8) & 0xFF)); s.push_back((char)(v & 0xFF));
+        };
+        auto chunk = [&](const char* type, const std::string& data) {
+            put32(out, (unsigned int)data.size());
+            std::string body(type, 4);
+            body += data;
+            out += body;
+            put32(out, crc32Of(reinterpret_cast<const unsigned char*>(body.data()), body.size()));
+        };
+        std::string ihdr;
+        put32(ihdr, (unsigned int)W); put32(ihdr, (unsigned int)H);
+        ihdr.push_back(8); ihdr.push_back(0); ihdr.push_back(0); ihdr.push_back(0); ihdr.push_back(0);
+        chunk("IHDR", ihdr);
+        chunk("IDAT", z);
+        chunk("IEND", std::string());
+        try {
+            writeWholeFile(path, out, false);
+        } catch (IoError& e) {
+            throw WenError("文件错误", line, 0, e.what());
+        }
+        return vStr(path);
+    });
+    registerBuiltin("图像存PGM", 4, 4, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path = needStr(a[0], "图像存PGM", line);
+        long long W = needIndex(a[1], "图像存PGM", line);
+        long long H = needIndex(a[2], "图像存PGM", line);
+        auto px = needBytes(a[3], "图像存PGM", line);
+        if (W <= 0 || H <= 0 || (long long)px->size() < W * H)
+            throw WenError("运行时错误", line, 0, "图像存PGM：尺寸与像素数据不匹配");
+        std::string out = "P5\n" + std::to_string(W) + " " + std::to_string(H) + "\n255\n";
+        out.append(reinterpret_cast<const char*>(px->data()), (size_t)(W * H));
+        try { writeWholeFile(path, out, false); }
+        catch (IoError& e) { throw WenError("文件错误", line, 0, e.what()); }
+        return vStr(path);
+    });
+    registerBuiltin("图像存BMP", 4, 4, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path = needStr(a[0], "图像存BMP", line);
+        long long W = needIndex(a[1], "图像存BMP", line);
+        long long H = needIndex(a[2], "图像存BMP", line);
+        auto px = needBytes(a[3], "图像存BMP", line);
+        if (W <= 0 || H <= 0 || (long long)px->size() < W * H)
+            throw WenError("运行时错误", line, 0, "图像存BMP：尺寸与像素数据不匹配");
+        long long row = (W * 3 + 3) / 4 * 4;
+        long long dataLen = row * H;
+        std::string out;
+        auto put16 = [&](unsigned int v) { out.push_back((char)(v & 0xFF)); out.push_back((char)((v >> 8) & 0xFF)); };
+        auto put32 = [&](unsigned int v) {
+            out.push_back((char)(v & 0xFF)); out.push_back((char)((v >> 8) & 0xFF));
+            out.push_back((char)((v >> 16) & 0xFF)); out.push_back((char)((v >> 24) & 0xFF));
+        };
+        out += "BM";
+        put32((unsigned int)(54 + dataLen));
+        put16(0); put16(0);
+        put32(54);
+        put32(40);
+        put32((unsigned int)W); put32((unsigned int)H);
+        put16(1); put16(24);
+        put32(0); put32((unsigned int)dataLen);
+        put32(2835); put32(2835);
+        put32(0); put32(0);
+        for (long long y = H - 1; y >= 0; --y) {
+            long long wrote = 0;
+            for (long long x = 0; x < W; ++x) {
+                unsigned char g = (*px)[(size_t)(y * W + x)];
+                out.push_back((char)g); out.push_back((char)g); out.push_back((char)g);
+                wrote += 3;
+            }
+            while (wrote < row) { out.push_back('\0'); ++wrote; }
+        }
+        try { writeWholeFile(path, out, false); }
+        catch (IoError& e) { throw WenError("文件错误", line, 0, e.what()); }
+        return vStr(path);
+    });
     // 体梯度：把梯度的模长写成一个新的稠密体（用来做边缘/法线可视化）
     registerBuiltin("体梯度", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         auto rd2 = [&](shared_ptr<VolData>& v, int l, int r, int c) -> int {
