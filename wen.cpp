@@ -14531,6 +14531,94 @@ Interpreter::Interpreter() {
         volStore[nid] = out;
         return vNum((double)nid);
     });
+    // 体梯度：把梯度的模长写成一个新的稠密体（用来做边缘/法线可视化）
+    registerBuiltin("体梯度", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto rd2 = [&](shared_ptr<VolData>& v, int l, int r, int c) -> int {
+            if (l < 0 || r < 0 || c < 0 || l >= v->L || r >= v->R || c >= v->C) return 0;
+            if (v->dense) return v->data[(size_t)((l * v->R + r) * v->C + c)];
+            auto key = std::make_tuple(l / v->brick, r / v->brick, c / v->brick);
+            auto bit = v->bricks.find(key);
+            if (bit == v->bricks.end()) return 0;
+            VolBrick& b = bit->second;
+            if (b.constant) return b.v;
+            return b.buf[(size_t)(((l % v->brick) * v->brick + (r % v->brick)) * v->brick + (c % v->brick))];
+        };
+        long long id = needIndex(a[0], "体梯度", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体梯度：体句柄无效");
+        auto v = it->second;
+        auto out = std::make_shared<VolData>();
+        out->L = v->L; out->R = v->R; out->C = v->C; out->dense = true;
+        out->data.assign((size_t)(v->L * v->R * v->C), 0);
+        for (int l = 0; l < v->L; ++l)
+            for (int r = 0; r < v->R; ++r)
+                for (int c = 0; c < v->C; ++c) {
+                    int gx = rd2(v, l, r, c + 1) - rd2(v, l, r, c - 1);
+                    int gy = rd2(v, l, r + 1, c) - rd2(v, l, r - 1, c);
+                    int gz = rd2(v, l + 1, r, c) - rd2(v, l - 1, r, c);
+                    int mag = (int)std::sqrt((double)(gx * gx + gy * gy + gz * gz));
+                    if (mag > 255) mag = 255;
+                    out->data[(size_t)((l * v->R + r) * v->C + c)] = (unsigned char)mag;
+                }
+        long long nid = volNext++;
+        volStore[nid] = out;
+        return vNum((double)nid);
+    });
+    // 体渲染：正交相机沿层方向推进，命中表面后按梯度算法线做 Lambert 光照
+    registerBuiltin("体渲染", 3, 6, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto rd = [&](shared_ptr<VolData>& v, int l, int r, int c) -> int {
+            if (l < 0 || r < 0 || c < 0 || l >= v->L || r >= v->R || c >= v->C) return 0;
+            if (v->dense) return v->data[(size_t)((l * v->R + r) * v->C + c)];
+            auto key = std::make_tuple(l / v->brick, r / v->brick, c / v->brick);
+            auto bit = v->bricks.find(key);
+            if (bit == v->bricks.end()) return 0;
+            VolBrick& b = bit->second;
+            if (b.constant) return b.v;
+            return b.buf[(size_t)(((l % v->brick) * v->brick + (r % v->brick)) * v->brick + (c % v->brick))];
+        };
+        long long id = needIndex(a[0], "体渲染", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体渲染：体句柄无效");
+        auto v = it->second;
+        long long W = needIndex(a[1], "体渲染", line);
+        long long H = needIndex(a[2], "体渲染", line);
+        if (W <= 0 || H <= 0 || W > 2048 || H > 2048)
+            throw WenError("运行时错误", line, 0, "体渲染：宽高必须在 1..2048");
+        auto img = std::make_shared<vector<unsigned char>>((size_t)(W * H), 0);
+        double lx = 0.5, ly = 0.5, lz = -0.7071;
+        if (a.size() >= 6) {
+            lx = needNum(a[3], "体渲染", line);
+            ly = needNum(a[4], "体渲染", line);
+            lz = needNum(a[5], "体渲染", line);
+        }
+        double ln = std::sqrt(lx * lx + ly * ly + lz * lz);
+        lx /= ln; ly /= ln; lz /= ln;
+        for (long long py = 0; py < H; ++py) {
+            int r = (int)((py * v->R) / H);
+            for (long long px = 0; px < W; ++px) {
+                int c = (int)((px * v->C) / W);
+                int hit = -1;
+                for (int l = 0; l < v->L; ++l) {
+                    if (rd(v, l, r, c) > 0) { hit = l; break; }
+                }
+                if (hit < 0) continue;
+                double gx = (double)rd(v, hit, r, c + 1) - (double)rd(v, hit, r, c - 1);
+                double gy = (double)rd(v, hit, r + 1, c) - (double)rd(v, hit, r - 1, c);
+                double gz = (double)rd(v, hit + 1, r, c) - (double)rd(v, hit - 1, r, c);
+                double gn = std::sqrt(gx * gx + gy * gy + gz * gz);
+                double sh = 0.15;
+                if (gn > 1e-9) {
+                    double d = (-gx * lx + -gy * ly + -gz * lz) / gn;
+                    if (d > 0) sh += 0.85 * d;
+                }
+                int val = (int)(sh * (double)rd(v, hit, r, c));
+                if (val > 255) val = 255;
+                if (val < 0) val = 0;
+                (*img)[(size_t)(py * W + px)] = (unsigned char)val;
+            }
+        }
+        return vBytes(img);
+    });
     registerBuiltin("体指纹", 1, 1, [sha256Hex](Interpreter&, vector<Value>& a, int line) -> Value {
         long long id = needIndex(a[0], "体指纹", line);
         auto it = volStore.find(id);
