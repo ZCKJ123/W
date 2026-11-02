@@ -218,10 +218,10 @@ struct Token {
 
 static const std::set<string>& keywords() {
     static const std::set<string> kw = {
-        "将", "变成", "局部", "打印", "如果", "则", "否则如果", "否则", "结束",
+        "将", "变成", "局部", "打印", "输出", "如果", "则", "否则如果", "否则", "结束",
         "当", "对于", "在", "中", "函数", "返回", "依赖",
         "中断", "继续", "真", "假", "空", "且", "或", "非", "导出",
-        "尝试", "捕获", "最终", "匹配", "情形"
+        "尝试", "捕获", "最终", "匹配", "情形", "情况"
     };
     return kw;
 }
@@ -349,6 +349,7 @@ public:
                 continue;
             }
 
+            if (tryQuotedName()) continue;
             if (scanOperator()) continue;
 
             if (isMultiByteDelimiter(src_, pos_)) {
@@ -450,6 +451,22 @@ private:
             return true;
         }
         return false;
+    }
+
+    // 「名字」：把运算符/关键字当标识符用（函数名、变量名都可以）
+    bool tryQuotedName() {
+        if (pos_ >= src_.size() || src_[pos_] != '`') return false;
+        int ln = line_, cl = col_;
+        size_t p = pos_ + 1;
+        std::string name;
+        while (p < src_.size() && src_[p] != '`' && src_[p] != '\n') { name.push_back(src_[p]); ++p; }
+        if (p >= src_.size() || src_[p] != '`')
+            throw WenError("词法错误", ln, cl, "反引号名字没有闭合：缺一个 `");
+        if (name.empty()) throw WenError("词法错误", ln, cl, "反引号名字不能为空");
+        pos_ = p + 1;
+        ++col_;
+        add(TT::Name, name, ln, cl);
+        return true;
     }
 
     bool scanOperator() {
@@ -1175,7 +1192,7 @@ private:
     StmtPtr parseStatement() {
         if (atKw("将")) return parseAssign();
         if (atKw("局部")) return parseLocal();
-        if (atKw("打印")) return parsePrint();
+        if (atKw("打印") || atKw("输出")) return parsePrint();
         if (atKw("如果")) return parseIf();
         if (atKw("当")) return parseWhile();
         if (atKw("对于")) return parseFor();
@@ -1342,7 +1359,7 @@ private:
         expectKw("在");
         ExprPtr iter = parseExpr();
         expectKw("中");
-        expectKw("则");
+            if (atKw("则")) ++idx_;   // 「则」可省略
         SymId forSym = internSymbol(nm.text);
         if (funcDepth_ == 0) topSlotFor(forSym);
         SymId forSym2 = name2.empty() ? 0 : internSymbol(name2);
@@ -1374,12 +1391,12 @@ private:
         s->k = Stmt::K::Match;
         s->expr = subject;
         s->line = line;
-        while (atKw("情形")) {
+        while ((atKw("情形") || atKw("情况"))) {
             ++idx_;
             auto pat = parseExpr();
             expectKw("则");
             endStmt();
-            auto body = parseBlock({"情形", "否则", "结束"});
+            auto body = parseBlock({"情形", "情况", "否则", "结束"});
             s->branches.emplace_back(pat, body);
         }
         if (matchKw("否则")) {
