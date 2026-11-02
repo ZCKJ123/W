@@ -15203,6 +15203,150 @@ Interpreter::Interpreter() {
         return vBytes(img);
     });
 
+    // ---------- 四维体：真正的第四维坐标（w, 层, 行, 列） ----------
+    struct Vol4 { int W = 0, L = 0, R = 0, C = 0; std::vector<unsigned char> rgb; };
+    static std::map<long long, std::shared_ptr<Vol4>> vol4Store;
+    static long long vol4Next = 1;
+    registerBuiltin("四维新建", 4, 4, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long W = needIndex(a[0], "四维新建", line);
+        long long L = needIndex(a[1], "四维新建", line);
+        long long R = needIndex(a[2], "四维新建", line);
+        long long C = needIndex(a[3], "四维新建", line);
+        if (W <= 0 || L <= 0 || R <= 0 || C <= 0)
+            throw WenError("运行时错误", line, 0, "四维新建：四个维度必须大于 0");
+        if (W * L * R * C > 4000000)
+            throw WenError("运行时错误", line, 0, "四维新建：体积太大（上限 400 万格）");
+        auto v = std::make_shared<Vol4>();
+        v->W = (int)W; v->L = (int)L; v->R = (int)R; v->C = (int)C;
+        v->rgb.assign((size_t)(W * L * R * C * 3), 0);
+        long long id = vol4Next++;
+        vol4Store[id] = v;
+        return vNum((double)id);
+    });
+    registerBuiltin("四维写", 8, 8, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "四维写", line);
+        auto it = vol4Store.find(id);
+        if (it == vol4Store.end()) throw WenError("运行时错误", line, 0, "四维写：句柄无效");
+        auto v = it->second;
+        long long w = needIndex(a[1], "四维写", line);
+        long long l = needIndex(a[2], "四维写", line);
+        long long r = needIndex(a[3], "四维写", line);
+        long long c = needIndex(a[4], "四维写", line);
+        if (w < 0 || l < 0 || r < 0 || c < 0 || w >= v->W || l >= v->L || r >= v->R || c >= v->C)
+            throw WenError("运行时错误", line, 0, "四维写：坐标越界");
+        size_t o = (size_t)((((w * v->L + l) * v->R + r) * v->C + c) * 3);
+        v->rgb[o] = (unsigned char)needIndex(a[5], "四维写", line);
+        v->rgb[o + 1] = (unsigned char)needIndex(a[6], "四维写", line);
+        v->rgb[o + 2] = (unsigned char)needIndex(a[7], "四维写", line);
+        return vNum(1);
+    });
+    // 四维球：w²+l²+r²+c² <= 半径²
+    registerBuiltin("四维球", 3, 3, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "四维球", line);
+        double rad = needNum(a[1], "四维球", line);
+        long long cr = needIndex(a[2], "四维球", line);
+        auto it = vol4Store.find(id);
+        if (it == vol4Store.end()) throw WenError("运行时错误", line, 0, "四维球：句柄无效");
+        auto v = it->second;
+        long long cw = v->W / 2, cl = v->L / 2, crr = v->R / 2, cc = v->C / 2;
+        long long n = 0;
+        for (long long w = 0; w < v->W; ++w)
+            for (long long l = 0; l < v->L; ++l)
+                for (long long r = 0; r < v->R; ++r)
+                    for (long long c = 0; c < v->C; ++c) {
+                        double d2 = (double)((w - cw) * (w - cw) + (l - cl) * (l - cl) + (r - crr) * (r - crr) + (c - cc) * (c - cc));
+                        if (d2 > rad * rad) continue;
+                        double t = 1.0 - std::sqrt(d2) / rad;
+                        size_t o = (size_t)((((w * v->L + l) * v->R + r) * v->C + c) * 3);
+                        v->rgb[o] = (unsigned char)std::min(255.0, 60 + 195 * t);
+                        v->rgb[o + 1] = (unsigned char)std::min(255.0, 120 + 130 * t);
+                        v->rgb[o + 2] = (unsigned char)std::min(255.0, 200 + 55 * t);
+                        ++n;
+                    }
+        return vNum((double)n);
+    });
+    // 四维切片：固定 w，取出一层三维体
+    registerBuiltin("四维切片", 2, 2, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "四维切片", line);
+        long long w = needIndex(a[1], "四维切片", line);
+        auto it = vol4Store.find(id);
+        if (it == vol4Store.end()) throw WenError("运行时错误", line, 0, "四维切片：句柄无效");
+        auto v = it->second;
+        if (w < 0 || w >= v->W) throw WenError("运行时错误", line, 0, "四维切片：w 越界");
+        auto out = std::make_shared<VolData>();
+        out->L = v->L; out->R = v->R; out->C = v->C; out->dense = true; out->color = true;
+        out->rgb.assign((size_t)(v->L * v->R * v->C * 3), 0);
+        size_t plane = (size_t)(v->L * v->R * v->C * 3);
+        memcpy(out->rgb.data(), v->rgb.data() + (size_t)w * plane, plane);
+        long long nid = volNext++;
+        volStore[nid] = out;
+        return vNum((double)nid);
+    });
+    // 四维投影：沿 w 取最大值压成三维体
+    registerBuiltin("四维投影", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "四维投影", line);
+        auto it = vol4Store.find(id);
+        if (it == vol4Store.end()) throw WenError("运行时错误", line, 0, "四维投影：句柄无效");
+        auto v = it->second;
+        auto out = std::make_shared<VolData>();
+        out->L = v->L; out->R = v->R; out->C = v->C; out->dense = true; out->color = true;
+        out->rgb.assign((size_t)(v->L * v->R * v->C * 3), 0);
+        size_t plane = (size_t)(v->L * v->R * v->C);
+        for (size_t i = 0; i < plane; ++i) {
+            int br = 0, bg = 0, bb = 0;
+            for (int w = 0; w < v->W; ++w) {
+                size_t o = (size_t)w * plane * 3 + i * 3;
+                int s = v->rgb[o] + v->rgb[o + 1] + v->rgb[o + 2];
+                if (s > br + bg + bb) { br = v->rgb[o]; bg = v->rgb[o + 1]; bb = v->rgb[o + 2]; }
+            }
+            out->rgb[i * 3] = (unsigned char)br;
+            out->rgb[i * 3 + 1] = (unsigned char)bg;
+            out->rgb[i * 3 + 2] = (unsigned char)bb;
+        }
+        long long nid = volNext++;
+        volStore[nid] = out;
+        return vNum((double)nid);
+    });
+    // 四维旋转：在给定的二维平面里转（0=w-l, 1=w-r, 2=w-c, 3=l-r）
+    registerBuiltin("四维旋转", 3, 3, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "四维旋转", line);
+        int plane = (int)needIndex(a[1], "四维旋转", line);
+        double deg = needNum(a[2], "四维旋转", line);
+        auto it = vol4Store.find(id);
+        if (it == vol4Store.end()) throw WenError("运行时错误", line, 0, "四维旋转：句柄无效");
+        auto v = it->second;
+        auto out = std::make_shared<Vol4>();
+        *out = *v;
+        std::fill(out->rgb.begin(), out->rgb.end(), 0);
+        double rad = deg * 3.14159265358979323846 / 180.0;
+        double cs = std::cos(rad), sn = std::sin(rad);
+        double cw = (v->W - 1) / 2.0, cl = (v->L - 1) / 2.0, cr = (v->R - 1) / 2.0, cc = (v->C - 1) / 2.0;
+        for (int w = 0; w < v->W; ++w)
+            for (int l = 0; l < v->L; ++l)
+                for (int r = 0; r < v->R; ++r)
+                    for (int c = 0; c < v->C; ++c) {
+                        double dw = w - cw, dl = l - cl, dr = r - cr, dc = c - cc;
+                        double sw = dw, sl = dl, sr = dr, sc = dc;
+                        if (plane == 0) { sw = dw * cs + dl * sn; sl = -dw * sn + dl * cs; }
+                        else if (plane == 1) { sw = dw * cs + dr * sn; sr = -dw * sn + dr * cs; }
+                        else if (plane == 2) { sw = dw * cs + dc * sn; sc = -dw * sn + dc * cs; }
+                        else { sl = dl * cs + dr * sn; sr = -dl * sn + dr * cs; }
+                        long long iw = (long long)std::lround(sw + cw);
+                        long long il = (long long)std::lround(sl + cl);
+                        long long ir = (long long)std::lround(sr + cr);
+                        long long ic = (long long)std::lround(sc + cc);
+                        if (iw < 0 || il < 0 || ir < 0 || ic < 0 || iw >= v->W || il >= v->L || ir >= v->R || ic >= v->C) continue;
+                        size_t so = (size_t)((((iw * v->L + il) * v->R + ir) * v->C + ic) * 3);
+                        size_t do2 = (size_t)((((w * v->L + l) * v->R + r) * v->C + c) * 3);
+                        out->rgb[do2] = v->rgb[so];
+                        out->rgb[do2 + 1] = v->rgb[so + 1];
+                        out->rgb[do2 + 2] = v->rgb[so + 2];
+                    }
+        long long nid = vol4Next++;
+        vol4Store[nid] = out;
+        return vNum((double)nid);
+    });
+
     // ---------- PNG 解码（inflate + 反滤波），支持 8 位灰度/RGB/RGBA ----------
     registerBuiltin("图像读PNG", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         string path = needStr(a[0], "图像读PNG", line);
