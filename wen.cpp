@@ -14532,52 +14532,126 @@ Interpreter::Interpreter() {
         return vNum((double)nid);
     });
     // 图像存 PNG：8 位灰度，zlib 用 stored 块（不压缩但合法），自带 CRC32 / Adler32
-    registerBuiltin("图像存PNG", 4, 4, [](Interpreter&, vector<Value>& a, int line) -> Value {
-        string path = needStr(a[0], "图像存PNG", line);
-        long long W = needIndex(a[1], "图像存PNG", line);
-        long long H = needIndex(a[2], "图像存PNG", line);
-        auto px = needBytes(a[3], "图像存PNG", line);
-        if (W <= 0 || H <= 0 || (long long)px->size() < W * H)
-            throw WenError("运行时错误", line, 0, "图像存PNG：尺寸与像素数据不匹配");
-        auto crc32Of = [](const unsigned char* p, size_t n) -> unsigned int {
-            static unsigned int tab[256];
-            static bool init = false;
-            if (!init) {
-                for (unsigned int i = 0; i < 256; ++i) {
-                    unsigned int c = i;
-                    for (int k = 0; k < 8; ++k) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-                    tab[i] = c;
-                }
-                init = true;
+    // 通用 PNG 编码：ch=1 灰度 / ch=3 RGB，deflate 用固定 Huffman + LZ77
+    auto writePngFile = [](const string& path, int W, int H, const unsigned char* data, int ch, int line) {
+        static unsigned int tab[256];
+        static bool tabInit = false;
+        if (!tabInit) {
+            for (unsigned int i = 0; i < 256; ++i) {
+                unsigned int c = i;
+                for (int k = 0; k < 8; ++k) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+                tab[i] = c;
             }
+            tabInit = true;
+        }
+        auto crc32Of = [](const unsigned char* p, size_t n) -> unsigned int {
             unsigned int c = 0xFFFFFFFFu;
             for (size_t i = 0; i < n; ++i) c = tab[(c ^ p[i]) & 0xFF] ^ (c >> 8);
             return c ^ 0xFFFFFFFFu;
         };
+        size_t rowBytes = (size_t)W * (size_t)ch;
+        std::string raw;
+        raw.reserve((size_t)H * (rowBytes + 1));
+        for (int y = 0; y < H; ++y) {
+            raw.push_back('\0');
+            raw.append(reinterpret_cast<const char*>(data) + (size_t)y * rowBytes, rowBytes);
+        }
+        static const int lenBase[29] = {3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258};
+        static const int lenExtra[29] = {0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0};
+        static const int distBase[30] = {1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577};
+        static const int distExtra[30] = {0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13};
+        std::vector<unsigned char> z;
+        unsigned int bitBuf = 0;
+        int bitCnt = 0;
+        auto putBits = [&](unsigned int v, int n) {
+            bitBuf |= (v << bitCnt);
+            bitCnt += n;
+            while (bitCnt >= 8) { z.push_back((unsigned char)(bitBuf & 0xFF)); bitBuf >>= 8; bitCnt -= 8; }
+        };
+        auto revBits = [](unsigned int v, int n) -> unsigned int {
+            unsigned int r = 0;
+            for (int i = 0; i < n; ++i) { r = (r << 1) | (v & 1); v >>= 1; }
+            return r;
+        };
+        auto putLit = [&](unsigned int sym) {
+            if (sym <= 143) putBits(revBits(0x30 + sym, 8), 8);
+            else if (sym <= 255) putBits(revBits(0x190 + (sym - 144), 9), 9);
+            else if (sym <= 279) putBits(revBits(sym - 256, 7), 7);
+            else putBits(revBits(0xC0 + (sym - 280), 8), 8);
+        };
+        auto putLen = [&](int len) {
+            int ci = 28;
+            for (int i = 0; i < 29; ++i) {
+                int next = (i == 28) ? 1000000 : lenBase[i + 1];
+                if (len < next) { ci = i; break; }
+            }
+            putLit(257 + ci);
+            if (lenExtra[ci]) putBits((unsigned int)(len - lenBase[ci]), lenExtra[ci]);
+        };
+        auto putDist = [&](int dist) {
+            int ci = 29;
+            for (int i = 0; i < 30; ++i) {
+                int next = (i == 29) ? 1000000 : distBase[i + 1];
+                if (dist < next) { ci = i; break; }
+            }
+            putBits(revBits((unsigned int)ci, 5), 5);
+            if (distExtra[ci]) putBits((unsigned int)(dist - distBase[ci]), distExtra[ci]);
+        };
+        putBits(1, 1);
+        putBits(1, 2);
+        const int WIN = 32768;
+        std::vector<int> head(65536, -1);
+        std::vector<int> prev(raw.size() + 1, -1);
+        size_t i = 0;
+        size_t n = raw.size();
+        while (i < n) {
+            int bestLen = 0, bestDist = 0;
+            if (i + 2 < n) {
+                unsigned int key = (((unsigned char)raw[i] << 10) ^ ((unsigned char)raw[i + 1] << 5) ^ (unsigned char)raw[i + 2]) & 65535;
+                int cand = head[key];
+                int steps = 0;
+                int maxLen = (int)std::min<size_t>(258, n - i);
+                while (cand >= 0 && steps < 128 && (int)i - cand <= WIN) {
+                    int len = 0;
+                    while (len < maxLen && raw[(size_t)cand + len] == raw[i + len]) ++len;
+                    if (len > bestLen) { bestLen = len; bestDist = (int)i - cand; if (len >= maxLen) break; }
+                    cand = prev[(size_t)cand];
+                    ++steps;
+                }
+            }
+            if (bestLen >= 3) {
+                putLen(bestLen);
+                putDist(bestDist);
+                for (int k = 0; k < bestLen; ++k) {
+                    if (i + 2 < n) {
+                        unsigned int key = (((unsigned char)raw[i] << 10) ^ ((unsigned char)raw[i + 1] << 5) ^ (unsigned char)raw[i + 2]) & 65535;
+                        prev[i] = head[key];
+                        head[key] = (int)i;
+                    }
+                    ++i;
+                }
+            } else {
+                putLit((unsigned char)raw[i]);
+                if (i + 2 < n) {
+                    unsigned int key = (((unsigned char)raw[i] << 10) ^ ((unsigned char)raw[i + 1] << 5) ^ (unsigned char)raw[i + 2]) & 65535;
+                    prev[i] = head[key];
+                    head[key] = (int)i;
+                }
+                ++i;
+            }
+        }
+        putLit(256);
+        if (bitCnt > 0) { z.push_back((unsigned char)(bitBuf & 0xFF)); bitBuf = 0; bitCnt = 0; }
         auto adler32Of = [](const unsigned char* p, size_t n) -> unsigned int {
             unsigned int s1 = 1, s2 = 0;
             for (size_t i = 0; i < n; ++i) { s1 = (s1 + p[i]) % 65521; s2 = (s2 + s1) % 65521; }
             return (s2 << 16) | s1;
         };
-        std::string raw;                       // 每行前面加一个 filter 字节 0
-        raw.reserve((size_t)(H * (W + 1)));
-        for (long long y = 0; y < H; ++y) {
-            raw.push_back('\0');
-            raw.append(reinterpret_cast<const char*>(px->data()) + (size_t)(y * W), (size_t)W);
-        }
-        std::string z;
-        z.push_back('\x78'); z.push_back('\x01');
-        size_t off = 0;
-        while (off < raw.size()) {
-            size_t n = std::min<size_t>(65535, raw.size() - off);
-            z.push_back((off + n >= raw.size()) ? '\x01' : '\x00');
-            z.push_back((char)(n & 0xFF)); z.push_back((char)((n >> 8) & 0xFF));
-            z.push_back((char)(~n & 0xFF)); z.push_back((char)((~n >> 8) & 0xFF));
-            z.append(raw.data() + off, n);
-            off += n;
-        }
         unsigned int ad = adler32Of(reinterpret_cast<const unsigned char*>(raw.data()), raw.size());
-        z.push_back((char)(ad >> 24)); z.push_back((char)(ad >> 16)); z.push_back((char)(ad >> 8)); z.push_back((char)ad);
+        std::string zs;
+        zs.push_back('\x78'); zs.push_back('\x01');
+        zs.append(reinterpret_cast<const char*>(z.data()), z.size());
+        zs.push_back((char)(ad >> 24)); zs.push_back((char)(ad >> 16)); zs.push_back((char)(ad >> 8)); zs.push_back((char)ad);
         std::string out("\x89PNG\r\n\x1A\n", 8);
         auto put32 = [](std::string& s, unsigned int v) {
             s.push_back((char)((v >> 24) & 0xFF)); s.push_back((char)((v >> 16) & 0xFF));
@@ -14592,18 +14666,33 @@ Interpreter::Interpreter() {
         };
         std::string ihdr;
         put32(ihdr, (unsigned int)W); put32(ihdr, (unsigned int)H);
-        ihdr.push_back(8); ihdr.push_back(0); ihdr.push_back(0); ihdr.push_back(0); ihdr.push_back(0);
+        ihdr.push_back(8); ihdr.push_back(ch == 3 ? 2 : 0);
+        ihdr.push_back(0); ihdr.push_back(0); ihdr.push_back(0);
         chunk("IHDR", ihdr);
-        chunk("IDAT", z);
+        chunk("IDAT", zs);
         chunk("IEND", std::string());
-        try {
-            writeWholeFile(path, out, false);
-        } catch (IoError& e) {
-            throw WenError("文件错误", line, 0, e.what());
-        }
+        try { writeWholeFile(path, out, false); }
+        catch (IoError& e) { throw WenError("文件错误", line, 0, e.what()); }
         return vStr(path);
+    };
+    registerBuiltin("图像存PNG", 4, 4, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path = needStr(a[0], "图像存PNG", line);
+        long long W = needIndex(a[1], "图像存PNG", line);
+        long long H = needIndex(a[2], "图像存PNG", line);
+        auto px = needBytes(a[3], "图像存PNG", line);
+        if (W <= 0 || H <= 0 || (long long)px->size() < W * H)
+            throw WenError("运行时错误", line, 0, "图像存PNG：尺寸与像素数据不匹配");
+        return writePngFile(path, (int)W, (int)H, px->data(), 1, line);
     });
-    registerBuiltin("图像存PGM", 4, 4, [](Interpreter&, vector<Value>& a, int line) -> Value {
+    registerBuiltin("图像存PNG彩色", 4, 4, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path = needStr(a[0], "图像存PNG彩色", line);
+        long long W = needIndex(a[1], "图像存PNG彩色", line);
+        long long H = needIndex(a[2], "图像存PNG彩色", line);
+        auto px = needBytes(a[3], "图像存PNG彩色", line);
+        if (W <= 0 || H <= 0 || (long long)px->size() < W * H * 3)
+            throw WenError("运行时错误", line, 0, "图像存PNG彩色：需要 W×H×3 字节");
+        return writePngFile(path, (int)W, (int)H, px->data(), 3, line);
+    });    registerBuiltin("图像存PGM", 4, 4, [](Interpreter&, vector<Value>& a, int line) -> Value {
         string path = needStr(a[0], "图像存PGM", line);
         long long W = needIndex(a[1], "图像存PGM", line);
         long long H = needIndex(a[2], "图像存PGM", line);
