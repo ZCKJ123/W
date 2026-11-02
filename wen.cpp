@@ -16499,16 +16499,26 @@ Interpreter::Interpreter() {
         auto X = A->second, Y = B->second;
         if (X->L != Y->L || X->R != Y->R || X->C != Y->C)
             throw WenError("运行时错误", line, 0, "体掩码：两个体尺寸必须一致");
+        if (!X->dense) throw WenError("运行时错误", line, 0, "体掩码：只支持稠密体");
+        bool color = X->color;
         auto out = std::make_shared<VolData>();
-        out->L = X->L; out->R = X->R; out->C = X->C; out->dense = true; out->color = true;
-        out->rgb.assign(X->rgb.size(), 0);
-        for (size_t i = 0; i < X->rgb.size(); i += 3) {
-            int s = Y->rgb[i] + Y->rgb[i + 1] + Y->rgb[i + 2];
-            if (s == 0) continue;
-            out->rgb[i] = X->rgb[i];
-            out->rgb[i + 1] = X->rgb[i + 1];
-            out->rgb[i + 2] = X->rgb[i + 2];
-        }
+        out->L = X->L; out->R = X->R; out->C = X->C; out->dense = true; out->color = color;
+        size_t nv = (size_t)(X->L * X->R * X->C);
+        if (color) out->rgb.assign(nv * 3, 0); else out->data.assign(nv, 0);
+        for (int l = 0; l < X->L; ++l)
+            for (int r = 0; r < X->R; ++r)
+                for (int c = 0; c < X->C; ++c) {
+                    // 掩码本身可以是彩色体，也可以是灰度体（体 > 数字 得到的就是灰度掩码）
+                    if (volScalarRead(Y, l, r, c) == 0) continue;
+                    size_t idx = (size_t)((l * X->R + r) * X->C + c);
+                    if (color) {
+                        out->rgb[idx * 3] = X->rgb[idx * 3];
+                        out->rgb[idx * 3 + 1] = X->rgb[idx * 3 + 1];
+                        out->rgb[idx * 3 + 2] = X->rgb[idx * 3 + 2];
+                    } else {
+                        out->data[idx] = X->data[idx];
+                    }
+                }
         long long id = volNext++;
         volStore[id] = out; gId3.insert(id);
         return vVol(0, id);
