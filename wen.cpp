@@ -2401,6 +2401,15 @@ static string toText(const Value& v, bool quoteStrings = false, int depth = 0) {
             size_t n = v.bytes ? v.bytes->size() : 0;
             return "<缓冲 " + std::to_string(n) + " 字节>";
         }
+        case VT::Vol: {
+            if (!v.vol) return "<体>";
+            const char* nm = v.vol->kind == 1 ? "SDF体" : (v.vol->kind == 2 ? "四维体" : "三维体");
+            // 三种体各有自己的编号空间，打印时换算成「同类里的第几个」
+            long long sid = v.vol->id;
+            if (v.vol->kind == 1) sid = sid - 1000000000LL + 1;
+            else if (v.vol->kind == 2) sid = sid - 2000000000LL + 1;
+            return "<" + string(nm) + " #" + std::to_string(sid) + ">";
+        }
         case VT::Set: {
             if (!v.list || v.list->items.empty()) return "空集";
             string out = "{";
