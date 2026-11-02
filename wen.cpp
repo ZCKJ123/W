@@ -14984,6 +14984,8 @@ Interpreter::Interpreter() {
         if (ss > 3) ss = 3;
         double ambient = getNum("环境", 0.22);
         double alphaGain = getNum("不透明度", 0.0);
+        int aoSamples = (int)getNum("遮蔽", 0);
+        int softShadow = (int)getNum("软阴影", 0);
         bool transparent = alphaGain > 0.0;
         double bgR = getNum("背景红", 0), bgG = getNum("背景绿", 0), bgB = getNum("背景蓝", 0);
         auto vn = std::sqrt(vx * vx + vy * vy + vz * vz);
@@ -15053,10 +15055,60 @@ Interpreter::Interpreter() {
                             accG += al * g0 * shade;
                             accB += al * b0 * shade;
                         } else {
-                            double shade = ambient;
+                            // 环境光遮蔽：沿法线半球打几条短射线，看被挡多少
+                            double ao = 1.0;
+                            if (aoSamples > 0) {
+                                static const double d6[6][3] = {
+                                    {1, 0, 0.35}, {-1, 0, 0.35}, {0, 1, 0.35},
+                                    {0, -1, 0.35}, {0.6, 0.6, 0.9}, {-0.6, -0.6, 0.9}};
+                                int occ = 0;
+                                for (int k = 0; k < aoSamples && k < 6; ++k) {
+                                    double ax = d6[k][0], ay = d6[k][1], az = d6[k][2];
+                                    if (ax * nx + ay * ny + az * nz < 0) { ax = -ax; ay = -ay; az = -az; }
+                                    double an = std::sqrt(ax * ax + ay * ay + az * az);
+                                    ax /= an; ay /= an; az /= an;
+                                    bool blocked = false;
+                                    for (int t = 2; t <= 10; ++t) {
+                                        long long al = hl + (long long)std::lround(az * t);
+                                        long long ar = hr + (long long)std::lround(ay * t);
+                                        long long ac = hc + (long long)std::lround(ax * t);
+                                        if (al < 0 || ar < 0 || ac < 0 || al >= v->L || ar >= v->R || ac >= v->C) break;
+                                        if (solid(al, ar, ac) > 0) { blocked = true; break; }
+                                    }
+                                    if (blocked) ++occ;
+                                }
+                                ao = 1.0 - (double)occ / (double)(aoSamples < 6 ? aoSamples : 6);
+                            }
+                            double shade = ambient * (0.35 + 0.65 * ao);
+                            int ns = softShadow > 0 ? softShadow : 1;
                             for (auto& L : lights) {
                                 double dd = nx * L[0] + ny * L[1] + nz * L[2];
-                                if (dd > 0) shade += ((1.0 - ambient) / (double)lights.size()) * dd;
+                                if (dd <= 0) continue;
+                                int occ2 = 0;
+                                for (int s = 0; s < ns; ++s) {
+                                    double jx = 0, jy = 0, jz = 0;
+                                    if (ns > 1) {
+                                        double ang = 6.2831853 * (double)s / (double)ns;
+                                        jx = 0.06 * std::cos(ang);
+                                        jy = 0.06 * std::sin(ang);
+                                        jz = 0.02 * std::cos(ang * 0.5);
+                                    }
+                                    double sx2 = L[0] + jx, sy2 = L[1] + jy, sz2 = L[2] + jz;
+                                    double sn = std::sqrt(sx2 * sx2 + sy2 * sy2 + sz2 * sz2);
+                                    sx2 /= sn; sy2 /= sn; sz2 /= sn;
+                                    int bl = hl + (int)std::lround(nz * 2.0);
+                                    int br = hr + (int)std::lround(ny * 2.0);
+                                    int bc = hc + (int)std::lround(nx * 2.0);
+                                    for (int t = 1; t <= 96; ++t) {
+                                        int nl2 = bl + (int)std::lround(sz2 * t * 2.0);
+                                        int nr2 = br + (int)std::lround(sy2 * t * 2.0);
+                                        int nc2 = bc + (int)std::lround(sx2 * t * 2.0);
+                                        if (nl2 < 0 || nr2 < 0 || nc2 < 0 || nl2 >= v->L || nr2 >= v->R || nc2 >= v->C) break;
+                                        if (solid(nl2, nr2, nc2) > 0) { ++occ2; break; }
+                                    }
+                                }
+                                double lit = 1.0 - 0.65 * (double)occ2 / (double)ns;
+                                shade += ((1.0 - ambient) / (double)lights.size()) * dd * lit;
                             }
                             accR += r0 * shade;
                             accG += g0 * shade;
