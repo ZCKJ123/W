@@ -14677,6 +14677,186 @@ Interpreter::Interpreter() {
         catch (IoError& e) { throw WenError("文件错误", line, 0, e.what()); }
         return vStr(path);
     };
+    // ---------- PNG 解码（inflate + 反滤波），支持 8 位灰度/RGB/RGBA ----------
+    registerBuiltin("图像读PNG", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path = needStr(a[0], "图像读PNG", line);
+        string raw;
+        try { raw = readWholeFile(path); } catch (IoError& e) { throw WenError("文件错误", line, 0, e.what()); }
+        if (raw.size() < 8 || raw.compare(0, 8, string("\x89PNG\r\n\x1A\n", 8)) != 0)
+            throw WenError("运行时错误", line, 0, "图像读PNG：不是 PNG 文件");
+        size_t pos = 8;
+        int W = 0, H = 0, depth = 0, ctype = 0;
+        std::string idat;
+        while (pos + 8 <= raw.size()) {
+            unsigned int len = ((unsigned char)raw[pos] << 24) | ((unsigned char)raw[pos + 1] << 16)
+                             | ((unsigned char)raw[pos + 2] << 8) | (unsigned char)raw[pos + 3];
+            std::string type = raw.substr(pos + 4, 4);
+            if (pos + 12 + len > raw.size()) break;
+            const char* data = raw.data() + pos + 8;
+            if (type == "IHDR") {
+                W = ((unsigned char)data[0] << 24) | ((unsigned char)data[1] << 16) | ((unsigned char)data[2] << 8) | (unsigned char)data[3];
+                H = ((unsigned char)data[4] << 24) | ((unsigned char)data[5] << 16) | ((unsigned char)data[6] << 8) | (unsigned char)data[7];
+                depth = (unsigned char)data[8];
+                ctype = (unsigned char)data[9];
+            } else if (type == "IDAT") {
+                idat.append(data, len);
+            } else if (type == "IEND") {
+                break;
+            }
+            pos += 12 + len;
+        }
+        if (W <= 0 || H <= 0) throw WenError("运行时错误", line, 0, "图像读PNG：缺少 IHDR");
+        if (depth != 8) throw WenError("运行时错误", line, 0, "图像读PNG：只支持 8 位深度");
+        int ch = ctype == 0 ? 1 : (ctype == 2 ? 3 : (ctype == 4 ? 2 : (ctype == 6 ? 4 : 0)));
+        if (ch == 0) throw WenError("运行时错误", line, 0, "图像读PNG：不支持的色彩类型");
+        // zlib 头 2 字节，尾部 adler 4 字节
+        if (idat.size() < 6) throw WenError("运行时错误", line, 0, "图像读PNG：IDAT 太短");
+        std::string z = idat.substr(2, idat.size() - 6);
+        size_t bitPos = 0;
+        auto getBit = [&]() -> int {
+            if (bitPos >= z.size() * 8) throw WenError("运行时错误", 0, 0, "图像读PNG：压缩数据提前结束");
+            int b = ((unsigned char)z[bitPos >> 3] >> (bitPos & 7)) & 1;
+            ++bitPos;
+            return b;
+        };
+        auto getBits = [&](int n) -> unsigned int {
+            unsigned int v = 0;
+            for (int i = 0; i < n; ++i) v |= ((unsigned int)getBit()) << i;
+            return v;
+        };
+        struct Huff { std::map<std::pair<int,int>, int> tab; int maxLen = 0; };
+        auto build = [](const std::vector<int>& lens) -> Huff {
+            Huff h;
+            std::map<int, int> count;
+            for (int l : lens) if (l > 0) { count[l]++; if (l > h.maxLen) h.maxLen = l; }
+            std::map<int, int> next;
+            int code = 0;
+            for (int len = 1; len <= h.maxLen; ++len) {
+                code = (code + (len > 1 ? count[len - 1] : 0)) << 1;
+                next[len] = code;
+            }
+            for (size_t sym = 0; sym < lens.size(); ++sym) {
+                int l = lens[sym];
+                if (l > 0) h.tab[{l, next[l]++}] = (int)sym;
+            }
+            return h;
+        };
+        auto decode = [&](const Huff& h) -> int {
+            int code = 0;
+            for (int len = 1; len <= h.maxLen; ++len) {
+                code = (code << 1) | getBit();
+                auto it2 = h.tab.find({len, code});
+                if (it2 != h.tab.end()) return it2->second;
+            }
+            throw WenError("运行时错误", 0, 0, "图像读PNG：Huffman 解码失败");
+        };
+        static const int lenBase2[29] = {3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258};
+        static const int lenExtra2[29] = {0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0};
+        static const int distBase2[30] = {1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577};
+        static const int distExtra2[30] = {0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13};
+        std::string out2;
+        bool finalBlock = false;
+        while (!finalBlock) {
+            finalBlock = getBit() == 1;
+            int btype = (int)getBits(2);
+            if (btype == 0) {
+                bitPos = (bitPos + 7) / 8 * 8;
+                unsigned int len2 = getBits(16);
+                getBits(16);
+                for (unsigned int i2 = 0; i2 < len2; ++i2) out2.push_back((char)getBits(8));
+            } else if (btype == 1 || btype == 2) {
+                std::vector<int> litLens(288, 0), distLens(30, 0);
+                if (btype == 1) {
+                    for (int i2 = 0; i2 < 144; ++i2) litLens[i2] = 8;
+                    for (int i2 = 144; i2 < 256; ++i2) litLens[i2] = 9;
+                    for (int i2 = 256; i2 < 280; ++i2) litLens[i2] = 7;
+                    for (int i2 = 280; i2 < 288; ++i2) litLens[i2] = 8;
+                    for (int i2 = 0; i2 < 30; ++i2) distLens[i2] = 5;
+                } else {
+                    int hlit = (int)getBits(5) + 257;
+                    int hdist = (int)getBits(5) + 1;
+                    int hclen = (int)getBits(4) + 4;
+                    static const int order[19] = {16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15};
+                    std::vector<int> clLens(19, 0);
+                    for (int i2 = 0; i2 < hclen; ++i2) clLens[order[i2]] = (int)getBits(3);
+                    Huff clh = build(clLens);
+                    std::vector<int> all(hlit + hdist, 0);
+                    int idx2 = 0;
+                    while (idx2 < hlit + hdist) {
+                        int sym = decode(clh);
+                        if (sym < 16) { all[idx2++] = sym; }
+                        else if (sym == 16) { int r = (int)getBits(2) + 3; int prev = idx2 > 0 ? all[idx2 - 1] : 0; for (int k = 0; k < r; ++k) all[idx2++] = prev; }
+                        else if (sym == 17) { int r = (int)getBits(3) + 3; for (int k = 0; k < r; ++k) all[idx2++] = 0; }
+                        else { int r = (int)getBits(7) + 11; for (int k = 0; k < r; ++k) all[idx2++] = 0; }
+                    }
+                    for (int i2 = 0; i2 < hlit; ++i2) litLens[i2] = all[i2];
+                    for (int i2 = 0; i2 < hdist; ++i2) distLens[i2] = all[hlit + i2];
+                }
+                Huff litH = build(litLens);
+                Huff distH = build(distLens);
+                while (true) {
+                    int sym = decode(litH);
+                    if (sym < 256) { out2.push_back((char)sym); }
+                    else if (sym == 256) { break; }
+                    else {
+                        int li = sym - 257;
+                        int length = lenBase2[li] + (int)getBits(lenExtra2[li]);
+                        int ds = decode(distH);
+                        int dist = distBase2[ds] + (int)getBits(distExtra2[ds]);
+                        size_t start = out2.size() - (size_t)dist;
+                        for (int k = 0; k < length; ++k) out2.push_back(out2[start + (size_t)k]);
+                    }
+                }
+            } else {
+                throw WenError("运行时错误", 0, 0, "图像读PNG：不支持的压缩块类型");
+            }
+        }
+        size_t stride = (size_t)W * ch;
+        if (out2.size() < stride * (size_t)H + (size_t)H)
+            throw WenError("运行时错误", line, 0, "图像读PNG：解压后数据不足");
+        std::vector<unsigned char> img((size_t)stride * H);
+        const unsigned char* src = reinterpret_cast<const unsigned char*>(out2.data());
+        for (int y = 0; y < H; ++y) {
+            int filt = src[(size_t)y * (stride + 1)];
+            const unsigned char* inp = src + (size_t)y * (stride + 1) + 1;
+            unsigned char* dst = img.data() + (size_t)y * stride;
+            const unsigned char* up = y > 0 ? img.data() + (size_t)(y - 1) * stride : nullptr;
+            for (size_t x = 0; x < stride; ++x) {
+                int rawv = inp[x];
+                int av = x >= (size_t)ch ? dst[x - ch] : 0;
+                int bv = up ? up[x] : 0;
+                int cv = (up && x >= (size_t)ch) ? up[x - ch] : 0;
+                int v = rawv;
+                if (filt == 1) v += av;
+                else if (filt == 2) v += bv;
+                else if (filt == 3) v += (av + bv) / 2;
+                else if (filt == 4) {
+                    int p = av + bv - cv;
+                    int pa = std::abs(p - av), pb = std::abs(p - bv), pc = std::abs(p - cv);
+                    v += (pa <= pb && pa <= pc) ? av : (pb <= pc ? bv : cv);
+                }
+                dst[x] = (unsigned char)(v & 0xFF);
+            }
+        }
+        auto outBuf = std::make_shared<vector<unsigned char>>((size_t)W * H * 3, 0);
+        for (int y = 0; y < H; ++y) {
+            for (int x = 0; x < W; ++x) {
+                const unsigned char* p = img.data() + (size_t)y * stride + (size_t)x * ch;
+                unsigned char r = p[0];
+                unsigned char g = ch >= 3 ? p[1] : p[0];
+                unsigned char b = ch >= 3 ? p[2] : p[0];
+                size_t o = ((size_t)y * W + x) * 3;
+                (*outBuf)[o] = r; (*outBuf)[o + 1] = g; (*outBuf)[o + 2] = b;
+            }
+        }
+        auto d = std::make_shared<Dict>();
+        d->items["宽"] = vNum((double)W);
+        d->items["高"] = vNum((double)H);
+        d->items["通道"] = vNum((double)ch);
+        d->items["像素"] = vBytes(outBuf);
+        Value out3; out3.type = VT::Dict; out3.dict = d; return out3;
+    });
+
     registerBuiltin("图像存PNG", 4, 4, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         string path = needStr(a[0], "图像存PNG", line);
         long long W = needIndex(a[1], "图像存PNG", line);
