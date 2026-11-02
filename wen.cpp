@@ -14580,7 +14580,7 @@ Interpreter::Interpreter() {
                 }
         long long nid = volNext++;
         volStore[nid] = out;
-        return vNum((double)nid);
+        return vVol(0, nid);
     });
     // 图像存 PNG：8 位灰度，zlib 用 stored 块（不压缩但合法），自带 CRC32 / Adler32
     // 通用 PNG 编码：ch=1 灰度 / ch=3 RGB，deflate 用固定 Huffman + LZ77
@@ -14888,7 +14888,7 @@ Interpreter::Interpreter() {
         }
         long long nid = volNext++;
         volStore[nid] = out;
-        return vNum((double)nid);
+        return vVol(0, nid);
     });
     registerBuiltin("体形态", 3, 3, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         long long id = needIndex(a[0], "体形态", line);
@@ -14946,7 +14946,7 @@ Interpreter::Interpreter() {
         out->rgb = cur;
         long long nid = volNext++;
         volStore[nid] = out;
-        return vNum((double)nid);
+        return vVol(0, nid);
     });
     registerBuiltin("体模糊", 2, 2, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         long long id = needIndex(a[0], "体模糊", line);
@@ -14991,7 +14991,7 @@ Interpreter::Interpreter() {
         out->rgb = tmp;
         long long nid = volNext++;
         volStore[nid] = out;
-        return vNum((double)nid);
+        return vVol(0, nid);
     });
     registerBuiltin("体缩放", 4, 4, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         long long id = needIndex(a[0], "体缩放", line);
@@ -15035,7 +15035,7 @@ Interpreter::Interpreter() {
                 }
         long long nid = volNext++;
         volStore[nid] = out;
-        return vNum((double)nid);
+        return vVol(0, nid);
     });
 
     // ---------- 等值面（Surface Nets）+ 网格光栅化 ----------
@@ -15353,7 +15353,7 @@ Interpreter::Interpreter() {
         memcpy(out->rgb.data(), v->rgb.data() + (size_t)w * plane, plane);
         long long nid = volNext++;
         volStore[nid] = out;
-        return vNum((double)nid);
+        return vVol(0, nid);
     });
     // 四维投影：沿 w 取最大值压成三维体
     registerBuiltin("四维投影", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
@@ -15378,7 +15378,7 @@ Interpreter::Interpreter() {
         }
         long long nid = volNext++;
         volStore[nid] = out;
-        return vNum((double)nid);
+        return vVol(0, nid);
     });
     // 四维旋转：在给定的二维平面里转（0=w-l, 1=w-r, 2=w-c, 3=l-r）
     registerBuiltin("四维旋转", 3, 3, [&](Interpreter&, vector<Value>& a, int line) -> Value {
@@ -15417,7 +15417,7 @@ Interpreter::Interpreter() {
                     }
         long long nid = vol4Next++;
         vol4Store[nid] = out;
-        return vNum((double)nid);
+        return vVol(2, nid);
     });
 
     // ---------- SDF：有符号距离场，几何级布尔 ----------
@@ -15495,7 +15495,7 @@ Interpreter::Interpreter() {
         }
         long long id = sdfNext++;
         sdfStore[id] = out;
-        return vNum((double)id);
+        return vVol(1, id);
     });
     // SDF 等值面：零等值线，法线用场的中心差分（解析、光滑）
     registerBuiltin("SDF等值面", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
@@ -17121,7 +17121,7 @@ Interpreter::Interpreter() {
         }
         long long nid = volNext++;
         volStore[nid] = out;
-        return vNum((double)nid);
+        return vVol(0, nid);
     });
     // 体梯度：把梯度的模长写成一个新的稠密体（用来做边缘/法线可视化）
     registerBuiltin("体梯度", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
@@ -17154,7 +17154,7 @@ Interpreter::Interpreter() {
                 }
         long long nid = volNext++;
         volStore[nid] = out;
-        return vNum((double)nid);
+        return vVol(0, nid);
     });
     // 体渲染：正交相机沿层方向推进，命中表面后按梯度算法线做 Lambert 光照
     registerBuiltin("体渲染", 3, 11, [&](Interpreter&, vector<Value>& a, int line) -> Value {
