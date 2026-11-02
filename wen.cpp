@@ -14915,9 +14915,20 @@ Interpreter::Interpreter() {
                             int s = rdpx(l, r, c, 0) + rdpx(l, r, c, 1) + rdpx(l, r, c, 2);
                             return s > 0 ? 1.0 : 0.0;
                         };
-                        double gx = solid(hl, hr, hc + 2) - solid(hl, hr, hc - 2);
-                        double gy = solid(hl, hr + 2, hc) - solid(hl, hr - 2, hc);
-                        double gz = solid(hl + 2, hr, hc) - solid(hl - 2, hr, hc);
+                        auto solidF = [&](double ql, double qr, double qc) -> double {
+                            double fl0 = std::floor(ql), fr0 = std::floor(qr), fc0 = std::floor(qc);
+                            double dl2 = ql - fl0, dr2 = qr - fr0, dc2 = qc - fc0;
+                            double acc2 = 0;
+                            for (int a2 = 0; a2 < 2; ++a2)
+                                for (int b2 = 0; b2 < 2; ++b2)
+                                    for (int c2 = 0; c2 < 2; ++c2)
+                                        acc2 += solid((long long)fl0 + a2, (long long)fr0 + b2, (long long)fc0 + c2)
+                                              * (a2 ? dl2 : 1 - dl2) * (b2 ? dr2 : 1 - dr2) * (c2 ? dc2 : 1 - dc2);
+                            return acc2;
+                        };
+                        double gx = solidF(hl, hr, hc + 1.5) - solidF(hl, hr, hc - 1.5);
+                        double gy = solidF(hl, hr + 1.5, hc) - solidF(hl, hr - 1.5, hc);
+                        double gz = solidF(hl + 1.5, hr, hc) - solidF(hl - 1.5, hr, hc);
                         double gn = std::sqrt(gx * gx + gy * gy + gz * gz);
                         double sh = 0.22;
                         if (gn > 1e-9) {
@@ -15032,9 +15043,20 @@ Interpreter::Interpreter() {
                             }
                         }
                         if (hl < 0) { continue; }
-                        double gx = solid(hl, hr, hc + 2) - solid(hl, hr, hc - 2);
-                        double gy = solid(hl, hr + 2, hc) - solid(hl, hr - 2, hc);
-                        double gz = solid(hl + 2, hr, hc) - solid(hl - 2, hr, hc);
+                        auto solidF = [&](double ql, double qr, double qc) -> double {
+                            double fl0 = std::floor(ql), fr0 = std::floor(qr), fc0 = std::floor(qc);
+                            double dl2 = ql - fl0, dr2 = qr - fr0, dc2 = qc - fc0;
+                            double acc2 = 0;
+                            for (int a2 = 0; a2 < 2; ++a2)
+                                for (int b2 = 0; b2 < 2; ++b2)
+                                    for (int c2 = 0; c2 < 2; ++c2)
+                                        acc2 += solid((long long)fl0 + a2, (long long)fr0 + b2, (long long)fc0 + c2)
+                                              * (a2 ? dl2 : 1 - dl2) * (b2 ? dr2 : 1 - dr2) * (c2 ? dc2 : 1 - dc2);
+                            return acc2;
+                        };
+                        double gx = solidF(hl, hr, hc + 1.5) - solidF(hl, hr, hc - 1.5);
+                        double gy = solidF(hl, hr + 1.5, hc) - solidF(hl, hr - 1.5, hc);
+                        double gz = solidF(hl + 1.5, hr, hc) - solidF(hl - 1.5, hr, hc);
                         double gn = std::sqrt(gx * gx + gy * gy + gz * gz);
                         double nx = 0, ny = 0, nz = 1;
                         if (gn > 1e-9) { nx = -gx / gn; ny = -gy / gn; nz = -gz / gn; }
