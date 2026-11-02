@@ -15483,6 +15483,42 @@ Interpreter::Interpreter() {
         volStore[nid] = out;
         return vVol(0, nid);
     });
+    // 四维采样：在 (w, 层, 行, 列) 上做 16 点四线性插值，w 可以带小数
+    // （w 当时间是常见用法：两张四维切片之间能取到中间值）
+    registerBuiltin("四维采样", 5, 5, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (a[0].type != VT::Vol || a[0].vol->kind != 2)
+            throw WenError("运行时错误", line, 0, "四维采样：需要四维体");
+        double sw = needNum(a[1], "四维采样", line);
+        double sl = needNum(a[2], "四维采样", line);
+        double sr = needNum(a[3], "四维采样", line);
+        double sc = needNum(a[4], "四维采样", line);
+        auto it = vol4Store.find(a[0].vol->id);
+        if (it == vol4Store.end()) throw WenError("运行时错误", line, 0, "四维采样：句柄无效");
+        auto v = it->second;
+        auto at = [&](int w, int l, int r, int c, int ch) -> double {
+            if (w < 0 || l < 0 || r < 0 || c < 0 || w >= v->W || l >= v->L || r >= v->R || c >= v->C) return 0.0;
+            size_t o = (((size_t)w * v->L + l) * v->R + r) * v->C + c;
+            return (double)v->rgb[o * 3 + (size_t)ch];
+        };
+        double fw = std::floor(sw), fl = std::floor(sl), fr = std::floor(sr), fc = std::floor(sc);
+        double dw = sw - fw, dl = sl - fl, dr = sr - fr, dc = sc - fc;
+        auto d = std::make_shared<Dict>();
+        const char* keys[3] = {"红", "绿", "蓝"};
+        for (int ch = 0; ch < 3; ++ch) {
+            double acc = 0;
+            for (int i = 0; i < 2; ++i)
+                for (int j = 0; j < 2; ++j)
+                    for (int k = 0; k < 2; ++k)
+                        for (int m = 0; m < 2; ++m) {
+                            double wgt = (i ? dw : 1 - dw) * (j ? dl : 1 - dl)
+                                       * (k ? dr : 1 - dr) * (m ? dc : 1 - dc);
+                            if (wgt == 0.0) continue;
+                            acc += at((int)fw + i, (int)fl + j, (int)fr + k, (int)fc + m, ch) * wgt;
+                        }
+            d->items[keys[ch]] = vNum(acc);
+        }
+        Value out; out.type = VT::Dict; out.dict = d; return out;
+    });
     // 四维旋转：在给定的二维平面里转（0=w-l, 1=w-r, 2=w-c, 3=l-r）
     registerBuiltin("四维旋转", 3, 3, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         long long id = needIndex(a[0], "四维旋转", line);
