@@ -15536,6 +15536,72 @@ Interpreter::Interpreter() {
         return vBytes(img);
     });
 
+    // 网格导出：把 {顶点, 索引} 写成外部工具（Blender / 切片软件）能读的文件
+    // 顶点是 float3，索引是 uint32 三角形，每 12 字节一个
+    registerBuiltin("网格存OBJ", 3, 3, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto vb = needBytes(a[0], "网格存OBJ", line);
+        auto ib = needBytes(a[1], "网格存OBJ", line);
+        string path = needStr(a[2], "网格存OBJ", line);
+        if (vb->size() % 12 != 0 || ib->size() % 12 != 0)
+            throw WenError("运行时错误", line, 0, "网格存OBJ：顶点、索引都要 12 字节一个");
+        size_t nv = vb->size() / 12, nt = ib->size() / 12;
+        std::vector<float> V(vb->size() / 4);
+        if (!V.empty()) memcpy(V.data(), vb->data(), vb->size());
+        std::vector<unsigned> T(ib->size() / 4);
+        if (!T.empty()) memcpy(T.data(), ib->data(), ib->size());
+        std::ostringstream os;
+        os << "# 文语言导出的 OBJ\n";
+        for (size_t i = 0; i < nv; ++i)
+            os << "v " << V[i * 3] << " " << V[i * 3 + 1] << " " << V[i * 3 + 2] << "\n";
+        for (size_t t = 0; t < nt; ++t)
+            os << "f " << (T[t * 3] + 1) << " " << (T[t * 3 + 1] + 1) << " " << (T[t * 3 + 2] + 1) << "\n";
+        string s = os.str();
+        try { writeWholeFile(path, s, false); } catch (IoError& e) { throw WenError("文件错误", line, 0, e.what()); }
+        return vNum((double)s.size());
+    });
+    registerBuiltin("网格存STL", 3, 3, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto vb = needBytes(a[0], "网格存STL", line);
+        auto ib = needBytes(a[1], "网格存STL", line);
+        string path = needStr(a[2], "网格存STL", line);
+        if (vb->size() % 12 != 0 || ib->size() % 12 != 0)
+            throw WenError("运行时错误", line, 0, "网格存STL：顶点、索引都要 12 字节一个");
+        size_t nv = vb->size() / 12, nt = ib->size() / 12;
+        std::vector<float> V(vb->size() / 4);
+        if (!V.empty()) memcpy(V.data(), vb->data(), vb->size());
+        std::vector<unsigned> T(ib->size() / 4);
+        if (!T.empty()) memcpy(T.data(), ib->data(), ib->size());
+        string out(80, ' ');
+        const char* head = "文语言 STL";
+        memcpy(&out[0], head, std::strlen(head));
+        auto putU32 = [&](unsigned x) {
+            out.push_back((char)(x & 0xFF)); out.push_back((char)((x >> 8) & 0xFF));
+            out.push_back((char)((x >> 16) & 0xFF)); out.push_back((char)((x >> 24) & 0xFF));
+        };
+        auto putF = [&](float f) {
+            unsigned x;
+            memcpy(&x, &f, 4);
+            putU32(x);
+        };
+        putU32((unsigned)nt);
+        for (size_t t = 0; t < nt; ++t) {
+            unsigned i0 = T[t * 3], i1 = T[t * 3 + 1], i2 = T[t * 3 + 2];
+            if (i0 >= nv || i1 >= nv || i2 >= nv)
+                throw WenError("运行时错误", line, 0, "网格存STL：索引超出顶点数");
+            // 法线由三个顶点算，外部软件也能自己重算，这里给准的
+            double ax = V[i1 * 3] - V[i0 * 3], ay = V[i1 * 3 + 1] - V[i0 * 3 + 1], az = V[i1 * 3 + 2] - V[i0 * 3 + 2];
+            double bx = V[i2 * 3] - V[i0 * 3], by = V[i2 * 3 + 1] - V[i0 * 3 + 1], bz = V[i2 * 3 + 2] - V[i0 * 3 + 2];
+            double cx = ay * bz - az * by, cy = az * bx - ax * bz, cz = ax * by - ay * bx;
+            double len = std::sqrt(cx * cx + cy * cy + cz * cz);
+            if (len < 1e-12) len = 1.0;
+            putF((float)(cx / len)); putF((float)(cy / len)); putF((float)(cz / len));
+            for (unsigned idx : {i0, i1, i2}) {
+                putF(V[idx * 3]); putF(V[idx * 3 + 1]); putF(V[idx * 3 + 2]);
+            }
+            out.push_back(0); out.push_back(0);
+        }
+        try { writeWholeFile(path, out, false); } catch (IoError& e) { throw WenError("文件错误", line, 0, e.what()); }
+        return vNum((double)out.size());
+    });
     // ---------- 四维体：真正的第四维坐标（w, 层, 行, 列） ----------
     struct Vol4 { int W = 0, L = 0, R = 0, C = 0; std::vector<unsigned char> rgb; };
     static std::map<long long, std::shared_ptr<Vol4>> vol4Store;
