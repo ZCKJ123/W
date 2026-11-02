@@ -158,6 +158,7 @@ if ($fail -gt 0) { exit 1 }
 $protocol = '✓'; & (Join-Path $PSScriptRoot '错误协议.ps1'); if ($LASTEXITCODE -ne 0) { exit 1 }
 $crash = '✓'; & (Join-Path $PSScriptRoot '防崩溃.ps1'); if ($LASTEXITCODE -ne 0) { exit 1 }
 $index = '✓'; & (Join-Path $PSScriptRoot '..\工具\索引检查.ps1'); if ($LASTEXITCODE -ne 0) { exit 1 }
+$volop = '✓'; & (Join-Path $PSScriptRoot '..\工具\体算子巡检.ps1'); if ($LASTEXITCODE -ne 0) { exit 1 }
 $self = '✓'; & (Join-Path $PSScriptRoot '..\工具\自述检查.ps1'); if ($LASTEXITCODE -ne 0) { exit 1 }
 $audio = '✓'; & (Join-Path $PSScriptRoot '..\工具\音频检查.ps1'); if ($LASTEXITCODE -ne 0) { exit 1 }
 $ts = '✓'; & (Join-Path $PSScriptRoot '..\工具\TypeScript检查.ps1')
@@ -167,6 +168,6 @@ $native = '✓'; & (Join-Path $PSScriptRoot '..\工具\原生EXE检查.ps1'); if
 $selfhost = '✓'; & (Join-Path $PSScriptRoot '..\工具\自举PE检查.ps1'); if ($LASTEXITCODE -ne 0) { exit 1 }
 $selfdisplay = '✓'; & (Join-Path $PSScriptRoot '..\工具\自举显示检查.ps1'); if ($LASTEXITCODE -ne 0) { exit 1 }
 
-Write-Host ("总账：主用例 {0}/{1}、错误 {2}/{3}、协议 {4}、防崩溃 {5}、索引 {6}、自述 {7}、TS {8}、音频 {9}、原生 {10}、自举 {11}、自举显示 {12}" -f `
-    $casePass, $caseTotal, $errorPass, $errorTotal, $protocol, $crash, $index, $self, $ts, $audio, $native, $selfhost, $selfdisplay)
+Write-Host ("总账：主用例 {0}/{1}、错误 {2}/{3}、协议 {4}、防崩溃 {5}、索引 {6}、体算子 {7}、自述 {8}、TS {9}、音频 {10}、原生 {11}、自举 {12}、自举显示 {13}" -f `
+    $casePass, $caseTotal, $errorPass, $errorTotal, $protocol, $crash, $index, $volop, $self, $ts, $audio, $native, $selfhost, $selfdisplay)
 exit 0

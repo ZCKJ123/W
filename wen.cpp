@@ -234,6 +234,12 @@ static bool isIdentCont(unsigned char c) {
     return std::isalnum(c) || c == '_' || c >= 0x80;
 }
 
+// 全角逗号「，」和顿号「、」在 UTF-8 里各占三字节，不能写成单字符字面量比较
+// （'，' 会被截成末字节 0x8C，变成「找某个续字节」，既能漏也能误命中）
+static bool atFullWidthDelim(const string& s, size_t i) {
+    return s.compare(i, 3, "\xEF\xBC\x8C") == 0 || s.compare(i, 3, "\xE3\x80\x81") == 0;
+}
+
 static string describeToken(const Token& t) {
     switch (t.type) {
         case TT::End: return "文件结束";
@@ -262,7 +268,8 @@ private:
                 while (q < src_.size() && (src_[q] == ' ' || src_[q] == '\t' || src_[q] == '\r')) ++q;
                 size_t e = q;
                 while (e < src_.size() && src_[e] != ' ' && src_[e] != '\t' &&
-                       src_[e] != '\r' && src_[e] != '\n' && src_[e] != ',' && src_[e] != '，')
+                       src_[e] != '\r' && src_[e] != '\n' && src_[e] != ',' &&
+                       !atFullWidthDelim(src_, e))
                     ++e;
                 if (e > q) {
                     string name = src_.substr(q, e - q);
@@ -14420,6 +14427,97 @@ Interpreter::Interpreter() {
         if (l < 0 || r < 0 || c < 0 || l >= v->L || r >= v->R || c >= v->C)
             throw WenError("运行时错误", line, 0, string(who) + "：坐标越界");
     };
+    // 彩色体没有灰度平面：标量读按三通道均值折灰度，标量写把三个通道一起写。
+    // 分块体一律是灰度。凡是「只要一个数」的算子都走这两个入口，
+    // 避免再直接摸 v->data（彩色体的 data 是空的，读了越界就是崩溃）。
+    static auto volScalarRead = [](shared_ptr<VolData> v, long long l, long long r, long long c) -> int {
+        if (l < 0 || r < 0 || c < 0 || l >= v->L || r >= v->R || c >= v->C) return 0;
+        if (v->color) {
+            size_t o = (size_t)((l * v->R + r) * v->C + c) * 3;
+            return ((int)v->rgb[o] + (int)v->rgb[o + 1] + (int)v->rgb[o + 2]) / 3;
+        }
+        if (v->dense) return v->data[(size_t)((l * v->R + r) * v->C + c)];
+        auto key = std::make_tuple((int)(l / v->brick), (int)(r / v->brick), (int)(c / v->brick));
+        auto bit = v->bricks.find(key);
+        if (bit == v->bricks.end()) return 0;
+        VolBrick& b = bit->second;
+        if (b.constant) return b.v;
+        return b.buf[(size_t)(((l % v->brick) * v->brick + (r % v->brick)) * v->brick + (c % v->brick))];
+    };
+    static auto volScalarWrite = [](shared_ptr<VolData> v, long long l, long long r, long long c, int val) {
+        unsigned char b = (unsigned char)val;
+        if (v->color) {
+            size_t o = (size_t)((l * v->R + r) * v->C + c) * 3;
+            v->rgb[o] = b; v->rgb[o + 1] = b; v->rgb[o + 2] = b;
+            return;
+        }
+        if (v->dense) { v->data[(size_t)((l * v->R + r) * v->C + c)] = b; return; }
+        auto key = std::make_tuple((int)(l / v->brick), (int)(r / v->brick), (int)(c / v->brick));
+        auto bit = v->bricks.find(key);
+        if (bit == v->bricks.end()) {
+            VolBrick nb; nb.constant = true; nb.v = 0;
+            bit = v->bricks.emplace(key, std::move(nb)).first;
+        }
+        VolBrick& br = bit->second;
+        size_t off = (size_t)(((l % v->brick) * v->brick + (r % v->brick)) * v->brick + (c % v->brick));
+        if (br.constant) {
+            if (b == br.v) return;
+            br.buf.assign((size_t)(v->brick * v->brick * v->brick), br.v);
+            br.constant = false;
+        }
+        br.buf[off] = b;
+    };
+    // 统计一个体：彩色体逐通道累加（体素值 = 三通道之和，>0 算非空），
+    // 灰度体按 data，分块体按块覆盖范围。总和/极值/质心/直方图都从这里取，
+    // 免得每种统计各自假设「有 rgb」或「有 data」。
+    struct VolStats { double sum = 0, mn = 0, mx = 0, sl = 0, sr = 0, sc = 0; long long nonzero = 0; bool any = false; };
+    static auto volStatsOf = [](shared_ptr<VolData> v) -> VolStats {
+        VolStats st;
+        auto bump = [&](int val) {
+            st.sum += val;
+            if (!st.any) { st.mn = st.mx = val; st.any = true; }
+            else { if (val < st.mn) st.mn = val; if (val > st.mx) st.mx = val; }
+        };
+        if (v->color) {
+            long long total = (long long)v->L * v->R * v->C;
+            for (long long i = 0; i < total; ++i) {
+                int r = v->rgb[(size_t)i * 3], g = v->rgb[(size_t)i * 3 + 1], b = v->rgb[(size_t)i * 3 + 2];
+                bump(r); bump(g); bump(b);
+                if (r + g + b > 0) {
+                    ++st.nonzero;
+                    st.sl += (double)(i / ((long long)v->R * v->C));
+                    st.sr += (double)((i / v->C) % v->R);
+                    st.sc += (double)(i % v->C);
+                }
+            }
+            return st;
+        }
+        if (v->dense) {
+            for (int l = 0; l < v->L; ++l)
+                for (int r = 0; r < v->R; ++r)
+                    for (int c = 0; c < v->C; ++c) {
+                        int val = v->data[(size_t)((l * v->R + r) * v->C + c)];
+                        bump(val);
+                        if (val > 0) { ++st.nonzero; st.sl += l; st.sr += r; st.sc += c; }
+                    }
+            return st;
+        }
+        int B = v->brick;
+        for (auto& kv : v->bricks) {
+            int l0 = std::get<0>(kv.first) * B, r0 = std::get<1>(kv.first) * B, c0 = std::get<2>(kv.first) * B;
+            int l1 = std::min(v->L, l0 + B), r1 = std::min(v->R, r0 + B), c1 = std::min(v->C, c0 + B);
+            const VolBrick& b = kv.second;
+            for (int l = l0; l < l1; ++l)
+                for (int r = r0; r < r1; ++r)
+                    for (int c = c0; c < c1; ++c) {
+                        int val = b.constant ? b.v
+                            : b.buf[(size_t)(((l % B) * B + (r % B)) * B + (c % B))];
+                        bump(val);
+                        if (val > 0) { ++st.nonzero; st.sl += l; st.sr += r; st.sc += c; }
+                    }
+        }
+        return st;
+    };
     registerBuiltin("体新建", 3, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
         long long L = needIndex(a[0], "体新建", line);
         long long R = needIndex(a[1], "体新建", line);
@@ -14452,21 +14550,7 @@ Interpreter::Interpreter() {
         volCheck(v, l, r, c, "体写", line);
         int val = (int)needIndex(a[4], "体写", line);
         if (val < 0 || val > 255) throw WenError("运行时错误", line, 0, "体写：值必须在 0..255");
-        if (v->dense) { v->data[volAt(v, l, r, c)] = (unsigned char)val; return vNum(1); }
-        auto key = std::make_tuple((int)(l / v->brick), (int)(r / v->brick), (int)(c / v->brick));
-        auto bit = v->bricks.find(key);
-        if (bit == v->bricks.end()) {
-            VolBrick b; b.constant = true; b.v = 0;
-            bit = v->bricks.emplace(key, std::move(b)).first;
-        }
-        VolBrick& b = bit->second;
-        size_t off = (size_t)(((l % v->brick) * v->brick + (r % v->brick)) * v->brick + (c % v->brick));
-        if (b.constant) {
-            if ((unsigned char)val == b.v) return vNum(1);
-            b.buf.assign((size_t)(v->brick * v->brick * v->brick), b.v);
-            b.constant = false;
-        }
-        b.buf[off] = (unsigned char)val;
+        volScalarWrite(v, l, r, c, val);
         return vNum(1);
     });
     registerBuiltin("体填空块", 5, 5, [&](Interpreter&, vector<Value>& a, int line) -> Value {
@@ -14495,14 +14579,7 @@ Interpreter::Interpreter() {
         long long r = needIndex(a[2], "体读", line);
         long long c = needIndex(a[3], "体读", line);
         if (l < 0 || r < 0 || c < 0 || l >= v->L || r >= v->R || c >= v->C) return vNum(0);
-        if (v->dense) return vNum((double)v->data[volAt(v, l, r, c)]);
-        auto key = std::make_tuple((int)(l / v->brick), (int)(r / v->brick), (int)(c / v->brick));
-        auto bit = v->bricks.find(key);
-        if (bit == v->bricks.end()) return vNum(0);
-        VolBrick& b = bit->second;
-        if (b.constant) return vNum((double)b.v);
-        size_t off = (size_t)(((l % v->brick) * v->brick + (r % v->brick)) * v->brick + (c % v->brick));
-        return vNum((double)b.buf[off]);
+        return vNum((double)volScalarRead(v, l, r, c));
     });
     registerBuiltin("体统计", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
         long long id = needIndex(a[0], "体统计", line);
@@ -14537,20 +14614,14 @@ Interpreter::Interpreter() {
         long long layer = needIndex(a[1], "体切片", line);
         if (layer < 0 || layer >= v->L) throw WenError("运行时错误", line, 0, "体切片：层号越界");
         auto buf = std::make_shared<vector<unsigned char>>((size_t)(v->R * v->C), 0);
-        if (v->dense) {
+        if (v->dense && !v->color) {
             size_t base = (size_t)(layer * v->R * v->C);
             memcpy(buf->data(), v->data.data() + base, (size_t)(v->R * v->C));
         } else {
-            for (int r = 0; r < v->R; ++r) {
-                for (int c = 0; c < v->C; ++c) {
-                    auto key = std::make_tuple((int)(layer / v->brick), r / v->brick, c / v->brick);
-                    auto bit = v->bricks.find(key);
-                    if (bit == v->bricks.end()) continue;
-                    VolBrick& b = bit->second;
-                    (*buf)[(size_t)r * v->C + c] = b.constant ? b.v
-                        : b.buf[(size_t)(((layer % v->brick) * v->brick + (r % v->brick)) * v->brick + (c % v->brick))];
-                }
-            }
+            // 彩色体折灰度、分块体走块查表，都从 volScalarRead 拿一个数
+            for (int r = 0; r < v->R; ++r)
+                for (int c = 0; c < v->C; ++c)
+                    (*buf)[(size_t)r * v->C + c] = (unsigned char)volScalarRead(v, layer, r, c);
         }
         return vBytes(buf);
     });
@@ -14560,24 +14631,32 @@ Interpreter::Interpreter() {
         if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体平滑：体句柄无效");
         auto v = it->second;
         if (!v->dense) throw WenError("运行时错误", line, 0, "体平滑：只支持稠密体（小体积）");
+        bool color = v->color;
         auto out = std::make_shared<VolData>();
-        out->L = v->L; out->R = v->R; out->C = v->C; out->dense = true;
-        out->data.assign(v->data.size(), 0);
+        out->L = v->L; out->R = v->R; out->C = v->C; out->dense = true; out->color = color;
         int L = v->L, R = v->R, C = v->C;
-        auto at = [&](int l, int r, int c) -> int {
+        int chn = color ? 3 : 1;
+        if (color) out->rgb.assign(v->rgb.size(), 0);
+        else out->data.assign(v->data.size(), 0);
+        auto at = [&](int l, int r, int c, int ch) -> int {
             if (l < 0 || r < 0 || c < 0 || l >= L || r >= R || c >= C) return 0;
-            return v->data[(size_t)((l * R + r) * C + c)];
+            size_t idx = (size_t)((l * R + r) * C + c);
+            return color ? (int)v->rgb[idx * 3 + (size_t)ch] : (int)v->data[idx];
         };
         for (int l = 0; l < L; ++l)
             for (int r = 0; r < R; ++r)
-                for (int c = 0; c < C; ++c) {
-                    int sum = 0;
-                    for (int a1 = -1; a1 <= 1; ++a1)
-                        for (int b1 = -1; b1 <= 1; ++b1)
-                            for (int c1 = -1; c1 <= 1; ++c1)
-                                sum += at(l + a1, r + b1, c + c1);
-                    out->data[(size_t)((l * R + r) * C + c)] = (unsigned char)(sum / 27);
-                }
+                for (int c = 0; c < C; ++c)
+                    for (int ch = 0; ch < chn; ++ch) {
+                        int sum = 0;
+                        for (int a1 = -1; a1 <= 1; ++a1)
+                            for (int b1 = -1; b1 <= 1; ++b1)
+                                for (int c1 = -1; c1 <= 1; ++c1)
+                                    sum += at(l + a1, r + b1, c + c1, ch);
+                        size_t idx = (size_t)((l * R + r) * C + c);
+                        unsigned char val = (unsigned char)(sum / 27);
+                        if (color) out->rgb[idx * 3 + (size_t)ch] = val;
+                        else out->data[idx] = val;
+                    }
         long long nid = volNext++;
         volStore[nid] = out;
         return vVol(0, nid);
@@ -15038,21 +15117,21 @@ Interpreter::Interpreter() {
         return vVol(0, nid);
     });
 
-    // ---------- 等值面（Surface Nets）+ 网格光栅化 ----------
-    registerBuiltin("体等值面", 2, 2, [&](Interpreter&, vector<Value>& a, int line) -> Value {
-        long long id = needIndex(a[0], "体等值面", line);
-        long long thr = needIndex(a[1], "体等值面", line);
-        auto it = volStore.find(id);
-        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体等值面：体句柄无效");
-        auto v = it->second;
-        if (!v->color) throw WenError("运行时错误", line, 0, "体等值面：需要彩色体");
+    // 等值面网格（Surface Nets）：体等值面 与 体表面积 共用同一份实现
+    static auto volSurfaceMesh = [](shared_ptr<VolData> v, long long thr,
+                                    vector<float>& verts, vector<unsigned int>& tris) {
+        verts.clear(); tris.clear();
         int L = v->L, R = v->R, C = v->C;
+        // 彩色体按三通道之和取阈值（0..765），灰度体按本身（0..255）；
+        // 两边都以「>= thr」判断，所以 thr=1 就是「非空」
         auto val = [&](int l, int r, int c) -> int {
             if (l < 0 || r < 0 || c < 0 || l >= L || r >= R || c >= C) return 0;
-            size_t o = (size_t)((l * R + r) * C + c) * 3;
-            return v->rgb[o] + v->rgb[o + 1] + v->rgb[o + 2];
+            if (v->color) {
+                size_t o = (size_t)((l * R + r) * C + c) * 3;
+                return v->rgb[o] + v->rgb[o + 1] + v->rgb[o + 2];
+            }
+            return volScalarRead(v, l, r, c);
         };
-        std::vector<float> verts;
         std::vector<int> cellIdx((size_t)(L * R * C), -1);
         static const int corner[8][3] = {{0,0,0},{1,0,0},{1,1,0},{0,1,0},{0,0,1},{1,0,1},{1,1,1},{0,1,1}};
         static const int edges[12][2] = {{0,1},{1,2},{2,3},{3,0},{4,5},{5,6},{6,7},{7,4},{0,4},{1,5},{2,6},{3,7}};
@@ -15084,7 +15163,6 @@ Interpreter::Interpreter() {
                     verts.push_back((float)(r + sy / cnt));
                     verts.push_back((float)(l + sz / cnt));
                 }
-        std::vector<unsigned int> tris;
         auto cellV = [&](int l, int r, int c) -> int {
             if (l < 0 || r < 0 || c < 0 || l >= L - 1 || r >= R - 1 || c >= C - 1) return -1;
             return cellIdx[(size_t)((l * R + r) * C + c)];
@@ -15128,6 +15206,16 @@ Interpreter::Interpreter() {
                         }
                     }
                 }
+    };
+    registerBuiltin("体等值面", 2, 2, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体等值面", line);
+        long long thr = needIndex(a[1], "体等值面", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体等值面：体句柄无效");
+        auto v = it->second;
+        if (!v->color) throw WenError("运行时错误", line, 0, "体等值面：需要彩色体");
+        vector<float> verts; vector<unsigned int> tris;
+        volSurfaceMesh(v, thr, verts, tris);
         auto vb = std::make_shared<vector<unsigned char>>(verts.size() * 4);
         if (!verts.empty()) memcpy(vb->data(), verts.data(), verts.size() * 4);
         auto ib = std::make_shared<vector<unsigned char>>(tris.size() * 4);
@@ -15873,12 +15961,18 @@ Interpreter::Interpreter() {
             auto it = volStore.find(src.vol->id);
             if (it == volStore.end()) throw WenError("运行时错误", line, 0, string(who) + "：体句柄无效");
             auto s = it->second;
-            if (!s->color) throw WenError("运行时错误", line, 0, string(who) + "：只支持彩色体");
+            if (!s->dense) throw WenError("运行时错误", line, 0, string(who) + "：只支持稠密体");
             auto out = std::make_shared<VolData>();
-            out->L = s->L; out->R = s->R; out->C = s->C; out->dense = true; out->color = true;
-            out->rgb.resize(s->rgb.size());
-            for (size_t i = 0; i < s->rgb.size(); ++i)
-                out->rgb[i] = (unsigned char)std::min(255.0, std::max(0.0, f((double)s->rgb[i])));
+            out->L = s->L; out->R = s->R; out->C = s->C; out->dense = true; out->color = s->color;
+            if (s->color) {
+                out->rgb.resize(s->rgb.size());
+                for (size_t i = 0; i < s->rgb.size(); ++i)
+                    out->rgb[i] = (unsigned char)std::min(255.0, std::max(0.0, f((double)s->rgb[i])));
+            } else {
+                out->data.resize(s->data.size());
+                for (size_t i = 0; i < s->data.size(); ++i)
+                    out->data[i] = (unsigned char)std::min(255.0, std::max(0.0, f((double)s->data[i])));
+            }
             long long id = volNext++;
             volStore[id] = out; gId3.insert(id);
             return vVol(0, id);
@@ -15901,31 +15995,51 @@ Interpreter::Interpreter() {
         return unaryVol(a[0], line, "体平方根", [](double x) { return std::sqrt(std::abs(x)); });
     });
     // 体归约：总和 / 最大 / 最小 / 均值
-    registerBuiltin("体总和", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        registerBuiltin("体总和", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         if (a[0].type != VT::Vol) throw WenError("运行时错误", line, 0, "体总和：需要体");
-        double s = 0;
-        if (a[0].vol->kind == 0) {
-            auto it = volStore.find(a[0].vol->id);
-            if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体总和：句柄无效");
-            for (unsigned char c : it->second->rgb) s += c;
-        } else {
+        if (a[0].vol->kind == 1) {
             auto it = sdfStore.find(a[0].vol->id);
             if (it == sdfStore.end()) throw WenError("运行时错误", line, 0, "体总和：SDF 句柄无效");
+            double s = 0;
             for (float d : it->second->d) s += d;
+            return vNum(s);
         }
-        return vNum(s);
+        if (a[0].vol->kind == 2) {
+            auto it = vol4Store.find(a[0].vol->id);
+            if (it == vol4Store.end()) throw WenError("运行时错误", line, 0, "体总和：四维句柄无效");
+            double s = 0;
+            for (unsigned char c : it->second->rgb) s += c;
+            return vNum(s);
+        }
+        auto it = volStore.find(a[0].vol->id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体总和：句柄无效");
+        return vNum(volStatsOf(it->second).sum);
     });
-    registerBuiltin("体极值", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        registerBuiltin("体极值", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         if (a[0].type != VT::Vol) throw WenError("运行时错误", line, 0, "体极值：需要体");
-        double mx = -1e30, mn = 1e30;
-        if (a[0].vol->kind == 0) {
-            auto it = volStore.find(a[0].vol->id);
-            if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体极值：句柄无效");
-            for (unsigned char c : it->second->rgb) { if (c > mx) mx = c; if (c < mn) mn = c; }
-        } else {
+        double mx = 0, mn = 0;
+        int kd = a[0].vol->kind;
+        if (kd == 1) {
             auto it = sdfStore.find(a[0].vol->id);
             if (it == sdfStore.end()) throw WenError("运行时错误", line, 0, "体极值：SDF 句柄无效");
-            for (float d : it->second->d) { if (d > mx) mx = d; if (d < mn) mn = d; }
+            bool any = false;
+            for (float d : it->second->d) {
+                if (!any) { mx = mn = d; any = true; }
+                else { if (d > mx) mx = d; if (d < mn) mn = d; }
+            }
+        } else if (kd == 2) {
+            auto it = vol4Store.find(a[0].vol->id);
+            if (it == vol4Store.end()) throw WenError("运行时错误", line, 0, "体极值：四维句柄无效");
+            bool any = false;
+            for (unsigned char c : it->second->rgb) {
+                if (!any) { mx = mn = c; any = true; }
+                else { if (c > mx) mx = c; if (c < mn) mn = c; }
+            }
+        } else {
+            auto it = volStore.find(a[0].vol->id);
+            if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体极值：句柄无效");
+            VolStats st = volStatsOf(it->second);
+            if (st.any) { mx = st.mx; mn = st.mn; }
         }
         auto d = std::make_shared<Dict>();
         d->items["最大"] = vNum(mx);
@@ -16033,8 +16147,12 @@ Interpreter::Interpreter() {
         auto it = volStore.find(a[0].vol->id);
         if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体采样：句柄无效");
         auto v = it->second;
+        // 灰度体没有三个通道：三个键都返回同一个灰度采样值
+        bool gray = !v->color;
         auto at = [&](int l, int r, int c, int ch) -> double {
             if (l < 0 || r < 0 || c < 0 || l >= v->L || r >= v->R || c >= v->C) return 0;
+            if (gray) return v->dense ? (double)v->data[(size_t)((l * v->R + r) * v->C + c)]
+                                     : (double)volScalarRead(v, l, r, c);
             return v->rgb[(size_t)((l * v->R + r) * v->C + c) * 3 + ch];
         };
         double fl = std::floor(sl), fr = std::floor(sr), fc = std::floor(sc);
@@ -16256,39 +16374,50 @@ Interpreter::Interpreter() {
         return vVol(0, id);
     });
     // 体质心：非零体素的平均坐标
-    registerBuiltin("体质心", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        registerBuiltin("体质心", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         if (a[0].type != VT::Vol || a[0].vol->kind != 0)
             throw WenError("运行时错误", line, 0, "体质心：需要三维体");
         auto it = volStore.find(a[0].vol->id);
         if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体质心：句柄无效");
-        auto v = it->second;
-        double sl = 0, sr = 0, sc = 0;
-        long long n = 0;
-        for (int l = 0; l < v->L; ++l)
-            for (int r = 0; r < v->R; ++r)
-                for (int c = 0; c < v->C; ++c) {
-                    size_t o = (size_t)((l * v->R + r) * v->C + c) * 3;
-                    if (v->rgb[o] + v->rgb[o + 1] + v->rgb[o + 2] == 0) continue;
-                    sl += l; sr += r; sc += c; ++n;
-                }
+        VolStats st = volStatsOf(it->second);
+        long long n = st.nonzero;
         auto d = std::make_shared<Dict>();
         d->items["体素"] = vNum((double)n);
-        d->items["层"] = vNum(n ? sl / n : 0);
-        d->items["行"] = vNum(n ? sr / n : 0);
-        d->items["列"] = vNum(n ? sc / n : 0);
+        d->items["层"] = vNum(n ? st.sl / n : 0);
+        d->items["行"] = vNum(n ? st.sr / n : 0);
+        d->items["列"] = vNum(n ? st.sc / n : 0);
         Value out; out.type = VT::Dict; out.dict = d; return out;
     });
-    // 体表面积：统计暴露在外的面（6 邻域），单位是「格²」
-    registerBuiltin("体表面积", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+    // 体表面积：走等值面三角面片求面积，随分辨率收敛（单位：格²）
+    // 旧法（数暴露面）会随阶梯面稳定高估约 1.5 倍，保留为 体表面格
+    registerBuiltin("体表面积", 1, 2, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         if (a[0].type != VT::Vol || a[0].vol->kind != 0)
             throw WenError("运行时错误", line, 0, "体表面积：需要三维体");
         auto it = volStore.find(a[0].vol->id);
         if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体表面积：句柄无效");
+        long long thr = 1;
+        if (a.size() >= 2) thr = needIndex(a[1], "体表面积", line);
+        vector<float> verts; vector<unsigned int> tris;
+        volSurfaceMesh(it->second, thr, verts, tris);
+        double area = 0;
+        for (size_t i = 0; i + 2 < tris.size(); i += 3) {
+            size_t i0 = (size_t)tris[i] * 3, i1 = (size_t)tris[i + 1] * 3, i2 = (size_t)tris[i + 2] * 3;
+            double ax = verts[i1] - verts[i0], ay = verts[i1 + 1] - verts[i0 + 1], az = verts[i1 + 2] - verts[i0 + 2];
+            double bx = verts[i2] - verts[i0], by = verts[i2 + 1] - verts[i0 + 1], bz = verts[i2 + 2] - verts[i0 + 2];
+            double cx = ay * bz - az * by, cy = az * bx - ax * bz, cz = ax * by - ay * bx;
+            area += 0.5 * std::sqrt(cx * cx + cy * cy + cz * cz);
+        }
+        return vNum(area);
+    });
+    // 体表面格：数暴露在外的面（6 邻域），整数、稳定，但阶梯面会高估
+    registerBuiltin("体表面格", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (a[0].type != VT::Vol || a[0].vol->kind != 0)
+            throw WenError("运行时错误", line, 0, "体表面格：需要三维体");
+        auto it = volStore.find(a[0].vol->id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体表面格：句柄无效");
         auto v = it->second;
         auto solidAt = [&](int l, int r, int c) -> bool {
-            if (l < 0 || r < 0 || c < 0 || l >= v->L || r >= v->R || c >= v->C) return false;
-            size_t o = (size_t)((l * v->R + r) * v->C + c) * 3;
-            return v->rgb[o] + v->rgb[o + 1] + v->rgb[o + 2] > 0;
+            return volScalarRead(v, l, r, c) > 0;
         };
         long long faces = 0;
         for (int l = 0; l < v->L; ++l)
@@ -17034,18 +17163,22 @@ Interpreter::Interpreter() {
         return vBytes(img);
     });
     // 体彩直方图：各通道 8 档统计 + 均值 + 非零格数
-    registerBuiltin("体彩直方图", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        registerBuiltin("体彩直方图", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         long long id = needIndex(a[0], "体彩直方图", line);
         auto it = volStore.find(id);
         if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体彩直方图：体句柄无效");
         auto v = it->second;
-        if (!v->color) throw WenError("运行时错误", line, 0, "体彩直方图：不是彩色体");
+        if (!v->dense) throw WenError("运行时错误", line, 0, "体彩直方图：只支持稠密体");
         long long binsR[8] = {0}, binsG[8] = {0}, binsB[8] = {0};
         double sumR = 0, sumG = 0, sumB = 0;
         long long nonZero = 0;
         size_t total = (size_t)(v->L * v->R * v->C);
+        // 灰度体没有三个通道：把灰度值同时当作红/绿/蓝，形状保持不变，
+        // 这样 体计数（取「非零」）对两种体都能用
         for (size_t i = 0; i < total; ++i) {
-            int r = v->rgb[i * 3], g = v->rgb[i * 3 + 1], b = v->rgb[i * 3 + 2];
+            int r, g, b;
+            if (v->color) { r = v->rgb[i * 3]; g = v->rgb[i * 3 + 1]; b = v->rgb[i * 3 + 2]; }
+            else { r = g = b = v->data[i]; }
             sumR += r; sumG += g; sumB += b;
             if (r + g + b > 0) ++nonZero;
             binsR[std::min(7, r / 32)]++;
@@ -17126,14 +17259,7 @@ Interpreter::Interpreter() {
     // 体梯度：把梯度的模长写成一个新的稠密体（用来做边缘/法线可视化）
     registerBuiltin("体梯度", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         auto rd2 = [&](shared_ptr<VolData>& v, int l, int r, int c) -> int {
-            if (l < 0 || r < 0 || c < 0 || l >= v->L || r >= v->R || c >= v->C) return 0;
-            if (v->dense) return v->data[(size_t)((l * v->R + r) * v->C + c)];
-            auto key = std::make_tuple(l / v->brick, r / v->brick, c / v->brick);
-            auto bit = v->bricks.find(key);
-            if (bit == v->bricks.end()) return 0;
-            VolBrick& b = bit->second;
-            if (b.constant) return b.v;
-            return b.buf[(size_t)(((l % v->brick) * v->brick + (r % v->brick)) * v->brick + (c % v->brick))];
+            return volScalarRead(v, l, r, c);
         };
         long long id = needIndex(a[0], "体梯度", line);
         auto it = volStore.find(id);
@@ -17159,14 +17285,7 @@ Interpreter::Interpreter() {
     // 体渲染：正交相机沿层方向推进，命中表面后按梯度算法线做 Lambert 光照
     registerBuiltin("体渲染", 3, 11, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         auto rd = [&](shared_ptr<VolData>& v, int l, int r, int c) -> int {
-            if (l < 0 || r < 0 || c < 0 || l >= v->L || r >= v->R || c >= v->C) return 0;
-            if (v->dense) return v->data[(size_t)((l * v->R + r) * v->C + c)];
-            auto key = std::make_tuple(l / v->brick, r / v->brick, c / v->brick);
-            auto bit = v->bricks.find(key);
-            if (bit == v->bricks.end()) return 0;
-            VolBrick& b = bit->second;
-            if (b.constant) return b.v;
-            return b.buf[(size_t)(((l % v->brick) * v->brick + (r % v->brick)) * v->brick + (c % v->brick))];
+            return volScalarRead(v, l, r, c);
         };
         long long id = needIndex(a[0], "体渲染", line);
         auto it = volStore.find(id);
@@ -17309,7 +17428,13 @@ Interpreter::Interpreter() {
         if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体指纹：体句柄无效");
         auto v = it->second;
         string raw;
-        if (v->dense) {
+        if (v->color) {
+            // 彩色体的内容在 rgb 里，data 是空的：只拿 data 算指纹会让不同彩色体撞同一个值
+            char head[64];
+            snprintf(head, sizeof(head), "C%d,%d,%d:", v->L, v->R, v->C);
+            raw += head;
+            raw.append(reinterpret_cast<const char*>(v->rgb.data()), v->rgb.size());
+        } else if (v->dense) {
             raw.assign(reinterpret_cast<const char*>(v->data.data()), v->data.size());
         } else {
             for (auto& kv : v->bricks) {
@@ -21927,18 +22052,22 @@ static int indexFile(const string& path, bool json) {
         string t = trimText(lines[i]);
         if (t.rfind("依赖", 0) == 0) {
             string rest = trimText(t.substr(6));
+            // 先把全角逗号「，」和顿号「、」统一成半角，再按逗号拆
+            while (true) {
+                size_t k = rest.find("，");
+                if (k == string::npos) break;
+                rest.replace(k, 3, ",");
+            }
+            while (true) {
+                size_t k = rest.find("、");
+                if (k == string::npos) break;
+                rest.replace(k, 3, ",");
+            }
             std::istringstream ds(rest);
             string item;
             while (std::getline(ds, item, ',')) {
-                size_t p = item.find('，');
-                if (p == string::npos) p = item.find('、');
-                if (p != string::npos) {
-                    deps.push_back(trimText(item.substr(0,p)));
-                    deps.push_back(trimText(item.substr(p+3)));
-                } else {
-                    string v = trimText(item);
-                    if (!v.empty()) deps.push_back(v);
-                }
+                string v = trimText(item);
+                if (!v.empty()) deps.push_back(v);
             }
         } else if (t.rfind("函数", 0) == 0) {
             string rest = trimText(t.substr(6));
