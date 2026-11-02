@@ -14976,14 +14976,18 @@ Interpreter::Interpreter() {
         auto it = volStore.find(id);
         if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体形态：体句柄无效");
         auto v = it->second;
-        if (!v->color) throw WenError("运行时错误", line, 0, "体形态：需要彩色体");
+        if (!v->dense) throw WenError("运行时错误", line, 0, "体形态：只支持稠密体");
+        bool color = v->color;
+        size_t stride = color ? 3 : 1;
         int L = v->L, R = v->R, C = v->C;
-        std::vector<unsigned char> cur(v->rgb);
-        std::vector<unsigned char> nxt(v->rgb.size(), 0);
+        std::vector<unsigned char> cur = color ? v->rgb : v->data;
+        std::vector<unsigned char> nxt(cur.size(), 0);
         auto solidAt = [&](const std::vector<unsigned char>& g, int l, int r, int c) -> bool {
             if (l < 0 || r < 0 || c < 0 || l >= L || r >= R || c >= C) return false;
-            size_t o = (size_t)((l * R + r) * C + c) * 3;
-            return g[o] + g[o + 1] + g[o + 2] > 0;
+            size_t o = (size_t)((l * R + r) * C + c) * stride;
+            int s = 0;
+            for (size_t k = 0; k < stride; ++k) s += g[o + k];
+            return s > 0;
         };
         for (long long t = 0; t < times; ++t) {
             std::fill(nxt.begin(), nxt.end(), 0);
@@ -15000,29 +15004,28 @@ Interpreter::Interpreter() {
                         }
                         bool keep = mode == 0 ? all : any;
                         if (!keep) continue;
-                        size_t o = (size_t)((l * R + r) * C + c) * 3;
-                        size_t so = o;
+                        size_t o = (size_t)((l * R + r) * C + c) * stride;
                         if (!self) {
-                            // 膨胀出来的新体素借用第一个邻居的颜色
+                            // 膨胀出来的新体素借用第一个邻居的值 / 颜色
                             bool found = false;
                             for (auto& d : d6) {
                                 if (solidAt(cur, l + d[0], r + d[1], c + d[2])) {
-                                    size_t no = (size_t)(((l + d[0]) * R + (r + d[1])) * C + (c + d[2])) * 3;
-                                    nxt[o] = cur[no]; nxt[o + 1] = cur[no + 1]; nxt[o + 2] = cur[no + 2];
+                                    size_t no = (size_t)(((l + d[0]) * R + (r + d[1])) * C + (c + d[2])) * stride;
+                                    for (size_t k = 0; k < stride; ++k) nxt[o + k] = cur[no + k];
                                     found = true;
                                     break;
                                 }
                             }
-                            if (!found) { nxt[o] = 200; nxt[o + 1] = 200; nxt[o + 2] = 200; }
+                            if (!found) { for (size_t k = 0; k < stride; ++k) nxt[o + k] = 200; }
                         } else {
-                            nxt[o] = cur[so]; nxt[o + 1] = cur[so + 1]; nxt[o + 2] = cur[so + 2];
+                            for (size_t k = 0; k < stride; ++k) nxt[o + k] = cur[o + k];
                         }
                     }
             cur.swap(nxt);
         }
         auto out = std::make_shared<VolData>();
-        out->L = L; out->R = R; out->C = C; out->dense = true; out->color = true;
-        out->rgb = cur;
+        out->L = L; out->R = R; out->C = C; out->dense = true; out->color = color;
+        if (color) out->rgb = cur; else out->data = cur;
         long long nid = volNext++;
         volStore[nid] = out;
         return vVol(0, nid);
@@ -15033,41 +15036,40 @@ Interpreter::Interpreter() {
         auto it = volStore.find(id);
         if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体模糊：体句柄无效");
         auto v = it->second;
-        if (!v->color) throw WenError("运行时错误", line, 0, "体模糊：需要彩色体");
+        if (!v->dense) throw WenError("运行时错误", line, 0, "体模糊：只支持稠密体");
+        bool color = v->color;
+        size_t stride = color ? 3 : 1;
         int L = v->L, R = v->R, C = v->C;
         if (rad < 1) rad = 1;
         if (rad > 4) rad = 4;
-        std::vector<unsigned char> cur(v->rgb);
-        std::vector<unsigned char> tmp(v->rgb.size(), 0), outb(v->rgb.size(), 0);
+        std::vector<unsigned char> tmp = color ? v->rgb : v->data;
+        std::vector<unsigned char> outb(tmp.size(), 0);
         auto pass = [&](int axis) {
             for (int l = 0; l < L; ++l)
                 for (int r = 0; r < R; ++r)
                     for (int c = 0; c < C; ++c) {
-                        int sr = 0, sg = 0, sb = 0, cnt = 0;
+                        int acc[3] = {0, 0, 0};
+                        int cnt = 0;
                         for (long long d = -rad; d <= rad; ++d) {
                             int nl = l, nr = r, nc = c;
                             if (axis == 0) nl = (int)(l + d);
                             else if (axis == 1) nr = (int)(r + d);
                             else nc = (int)(c + d);
                             if (nl < 0 || nr < 0 || nc < 0 || nl >= L || nr >= R || nc >= C) continue;
-                            size_t o = (size_t)((nl * R + nr) * C + nc) * 3;
-                            sr += tmp[o]; sg += tmp[o + 1]; sb += tmp[o + 2]; ++cnt;
+                            size_t o = (size_t)((nl * R + nr) * C + nc) * stride;
+                            for (size_t k = 0; k < stride; ++k) acc[k] += tmp[o + k];
+                            ++cnt;
                         }
-                        size_t o2 = (size_t)((l * R + r) * C + c) * 3;
-                        outb[o2] = (unsigned char)(sr / cnt);
-                        outb[o2 + 1] = (unsigned char)(sg / cnt);
-                        outb[o2 + 2] = (unsigned char)(sb / cnt);
+                        size_t o2 = (size_t)((l * R + r) * C + c) * stride;
+                        for (size_t k = 0; k < stride; ++k) outb[o2 + k] = (unsigned char)(acc[k] / cnt);
                     }
             tmp.swap(outb);
             std::fill(outb.begin(), outb.end(), 0);
         };
-        tmp = cur;
-        std::fill(outb.begin(), outb.end(), 0);
-        std::vector<unsigned char> keep = tmp;
-        for (int axis = 0; axis < 3; ++axis) { pass(axis); }
+        for (int axis = 0; axis < 3; ++axis) pass(axis);
         auto out = std::make_shared<VolData>();
-        out->L = L; out->R = R; out->C = C; out->dense = true; out->color = true;
-        out->rgb = tmp;
+        out->L = L; out->R = R; out->C = C; out->dense = true; out->color = color;
+        if (color) out->rgb = tmp; else out->data = tmp;
         long long nid = volNext++;
         volStore[nid] = out;
         return vVol(0, nid);
@@ -15080,13 +15082,17 @@ Interpreter::Interpreter() {
         auto it = volStore.find(id);
         if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体缩放：体句柄无效");
         auto v = it->second;
-        if (!v->color) throw WenError("运行时错误", line, 0, "体缩放：需要彩色体");
+        if (!v->dense) throw WenError("运行时错误", line, 0, "体缩放：只支持稠密体");
         if (NL <= 0 || NR <= 0 || NC <= 0 || NL * NR * NC > 8000000)
             throw WenError("运行时错误", line, 0, "体缩放：目标尺寸非法");
+        bool color = v->color;
+        size_t stride = color ? 3 : 1;
+        const std::vector<unsigned char>& src = color ? v->rgb : v->data;
         auto out = std::make_shared<VolData>();
-        out->L = (int)NL; out->R = (int)NR; out->C = (int)NC; out->dense = true; out->color = true;
-        out->rgb.assign((size_t)(NL * NR * NC * 3), 0);
-        auto sample = [&](double sl, double sr, double sc, int ch) -> int {
+        out->L = (int)NL; out->R = (int)NR; out->C = (int)NC; out->dense = true; out->color = color;
+        if (color) out->rgb.assign((size_t)(NL * NR * NC) * 3, 0);
+        else out->data.assign((size_t)(NL * NR * NC), 0);
+        auto sample = [&](double sl, double sr, double sc, size_t ch) -> int {
             // 三线性采样
             double fl = std::floor(sl), fr = std::floor(sr), fc = std::floor(sc);
             double dl = sl - fl, dr = sr - fr, dc = sc - fc;
@@ -15096,8 +15102,8 @@ Interpreter::Interpreter() {
                     for (int k2 = 0; k2 < 2; ++k2) {
                         long long ql = (long long)fl + i2, qr = (long long)fr + j2, qc = (long long)fc + k2;
                         if (ql < 0 || qr < 0 || qc < 0 || ql >= v->L || qr >= v->R || qc >= v->C) continue;
-                        size_t o = (size_t)((ql * v->R + qr) * v->C + qc) * 3 + (size_t)ch;
-                        acc += v->rgb[o] * (i2 ? dl : 1 - dl) * (j2 ? dr : 1 - dr) * (k2 ? dc : 1 - dc);
+                        size_t o = (size_t)((ql * v->R + qr) * v->C + qc) * stride + ch;
+                        acc += src[o] * (i2 ? dl : 1 - dl) * (j2 ? dr : 1 - dr) * (k2 ? dc : 1 - dc);
                     }
             return (int)acc;
         };
@@ -15107,10 +15113,12 @@ Interpreter::Interpreter() {
                     double sl = (double)l * (v->L - 1) / (double)(NL > 1 ? NL - 1 : 1);
                     double sr = (double)r * (v->R - 1) / (double)(NR > 1 ? NR - 1 : 1);
                     double sc2 = (double)c * (v->C - 1) / (double)(NC > 1 ? NC - 1 : 1);
-                    size_t o = (size_t)((l * NR + r) * NC + c) * 3;
-                    out->rgb[o] = (unsigned char)std::min(255, sample(sl, sr, sc2, 0));
-                    out->rgb[o + 1] = (unsigned char)std::min(255, sample(sl, sr, sc2, 1));
-                    out->rgb[o + 2] = (unsigned char)std::min(255, sample(sl, sr, sc2, 2));
+                    size_t o = (size_t)((l * NR + r) * NC + c) * stride;
+                    for (size_t ch = 0; ch < stride; ++ch) {
+                        int val = std::min(255, sample(sl, sr, sc2, ch));
+                        if (color) out->rgb[o + ch] = (unsigned char)val;
+                        else out->data[o + ch] = (unsigned char)val;
+                    }
                 }
         long long nid = volNext++;
         volStore[nid] = out;
@@ -15814,7 +15822,8 @@ Interpreter::Interpreter() {
                 double va = A ? (color ? (double)A->rgb[i] : (double)A->data[i]) : sval;
                 double vb = B ? (color ? (double)B->rgb[i] : (double)B->data[i]) : sval;
                 double rr = combine(va, vb);
-                unsigned char rb = (unsigned char)std::min(255.0, std::max(0.0, rr));
+                // 四舍五入：截断会让 体 * (255/极) 停在 254，归一化到不了顶
+                unsigned char rb = (unsigned char)std::lround(std::min(255.0, std::max(0.0, rr)));
                 if (color) out->rgb[i] = rb; else out->data[i] = rb;
             }
             long long id = volNext++;
@@ -15859,7 +15868,7 @@ Interpreter::Interpreter() {
             double va = A ? (double)A->rgb[i] : sval;
             double vb = B ? (double)B->rgb[i] : sval;
             double rr = combine(va, vb);
-            out->rgb[i] = (unsigned char)std::min(255.0, std::max(0.0, rr));
+            out->rgb[i] = (unsigned char)std::lround(std::min(255.0, std::max(0.0, rr)));
         }
         long long id = vol4Next++;
         vol4Store[id] = out;
@@ -16106,7 +16115,7 @@ Interpreter::Interpreter() {
         int axis = (int)needIndex(a[1], "体沿轴", line);
         int mode = (int)needIndex(a[2], "体沿轴", line);
         if (a[0].vol->kind != 0)
-            throw WenError("运行时错误", line, 0, "体沿轴：只支持三维彩色体");
+            throw WenError("运行时错误", line, 0, "体沿轴：只支持三维体");
         auto it = volStore.find(a[0].vol->id);
         if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体沿轴：句柄无效");
         auto v = it->second;
@@ -16117,6 +16126,8 @@ Interpreter::Interpreter() {
         else n = (size_t)(L * R);
         auto out = std::make_shared<vector<unsigned char>>(n, 0);
         auto lumAt = [&](int l, int r, int c) -> int {
+            // 彩色体按亮度权重，灰度体取本身
+            if (!v->color) return volScalarRead(v, l, r, c);
             size_t o = (size_t)((l * R + r) * C + c) * 3;
             return (v->rgb[o] * 30 + v->rgb[o + 1] * 59 + v->rgb[o + 2] * 11) / 100;
         };
