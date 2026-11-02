@@ -15748,7 +15748,22 @@ Interpreter::Interpreter() {
                 bool r = op == "==" ? va == vb : op == "!=" ? va != vb : op == "<" ? va < vb : op == "<=" ? va <= vb : op == ">" ? va > vb : va >= vb;
                 return r ? 255 : 0;
             };
-            if (kd == 2) throw WenError("运行时错误", line, 0, "体比较：四维体比较暂未实现");
+            if (kd == 2) {
+                auto A = vol4Store.find(a.vol->id), B = vol4Store.find(b.vol->id);
+                if (A == vol4Store.end() || B == vol4Store.end())
+                    throw WenError("运行时错误", line, 0, "体比较：四维句柄无效");
+                auto X = A->second, Y = B->second;
+                if (X->W != Y->W || X->L != Y->L || X->R != Y->R || X->C != Y->C)
+                    throw WenError("运行时错误", line, 0, "体比较：四维尺寸不一致");
+                auto out = std::make_shared<Vol4>();
+                out->W = X->W; out->L = X->L; out->R = X->R; out->C = X->C;
+                out->rgb.resize(X->rgb.size());
+                for (size_t i = 0; i < X->rgb.size(); ++i)
+                    out->rgb[i] = pick((double)X->rgb[i], (double)Y->rgb[i]);
+                long long id = vol4Next++;
+                vol4Store[id] = out; gId4.insert(id);
+                return vVol(2, id);
+            }
             if (kd == 0) {
                 auto A = volStore.find(a.vol->id), B = volStore.find(b.vol->id);
                 if (A == volStore.end() || B == volStore.end()) throw WenError("运行时错误", line, 0, "体比较：句柄无效");
@@ -15868,6 +15883,51 @@ Interpreter::Interpreter() {
         long long id = vol4Next++;
         vol4Store[id] = out; gId4.insert(id);
         return vVol(2, id);
+    });
+
+    // 三角与指数作用在体上
+    registerBuiltin("体正弦", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        return unaryVol(a[0], line, "体正弦", [](double x) { return (std::sin(x * 0.0245437) + 1.0) * 127.5; });
+    });
+    registerBuiltin("体余弦", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        return unaryVol(a[0], line, "体余弦", [](double x) { return (std::cos(x * 0.0245437) + 1.0) * 127.5; });
+    });
+    registerBuiltin("体指数", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        return unaryVol(a[0], line, "体指数", [](double x) { return std::min(255.0, std::exp(std::min(8.0, std::abs(x) * 0.02)) * 4.0); });
+    });
+    // 沿轴归约：0=层轴 1=行轴 2=列轴；模式 0=求和 1=最大 2=均值；返回二维缓冲
+    registerBuiltin("体沿轴", 3, 3, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (a[0].type != VT::Vol) throw WenError("运行时错误", line, 0, "体沿轴：需要体");
+        int axis = (int)needIndex(a[1], "体沿轴", line);
+        int mode = (int)needIndex(a[2], "体沿轴", line);
+        if (a[0].vol->kind != 0)
+            throw WenError("运行时错误", line, 0, "体沿轴：只支持三维彩色体");
+        auto it = volStore.find(a[0].vol->id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体沿轴：句柄无效");
+        auto v = it->second;
+        int L = v->L, R = v->R, C = v->C;
+        size_t n = 0;
+        if (axis == 0) n = (size_t)(R * C);
+        else if (axis == 1) n = (size_t)(L * C);
+        else n = (size_t)(L * R);
+        auto out = std::make_shared<vector<unsigned char>>(n, 0);
+        auto lumAt = [&](int l, int r, int c) -> int {
+            size_t o = (size_t)((l * R + r) * C + c) * 3;
+            return (v->rgb[o] * 30 + v->rgb[o + 1] * 59 + v->rgb[o + 2] * 11) / 100;
+        };
+        for (int i = 0; i < L; ++i)
+            for (int j = 0; j < R; ++j)
+                for (int k = 0; k < C; ++k) {
+                    long long idx = 0; int cnt = 0; int acc = 0, mx = 0;
+                    auto take = [&](int val) { acc += val; if (val > mx) mx = val; ++cnt; };
+                    if (axis == 0) { idx = (size_t)j * C + k; for (int l = 0; l < L; ++l) take(lumAt(l, j, k)); }
+                    else if (axis == 1) { idx = (size_t)i * C + k; for (int r = 0; r < R; ++r) take(lumAt(i, r, k)); }
+                    else { idx = (size_t)i * R + j; for (int c = 0; c < C; ++c) take(lumAt(i, j, c)); }
+                    int val = mode == 0 ? (cnt ? acc / std::max(1, cnt) : 0) : (mode == 1 ? mx : (cnt ? acc / cnt : 0));
+                    if (val > 255) val = 255;
+                    (*out)[(size_t)idx] = (unsigned char)val;
+                }
+        return vBytes(out);
     });
 
     // ---------- PNG 解码（inflate + 反滤波），支持 8 位灰度/RGB/RGBA ----------
