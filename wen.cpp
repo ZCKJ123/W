@@ -16255,6 +16255,55 @@ Interpreter::Interpreter() {
         volStore[id] = out; gId3.insert(id);
         return vVol(0, id);
     });
+    // 体质心：非零体素的平均坐标
+    registerBuiltin("体质心", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (a[0].type != VT::Vol || a[0].vol->kind != 0)
+            throw WenError("运行时错误", line, 0, "体质心：需要三维体");
+        auto it = volStore.find(a[0].vol->id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体质心：句柄无效");
+        auto v = it->second;
+        double sl = 0, sr = 0, sc = 0;
+        long long n = 0;
+        for (int l = 0; l < v->L; ++l)
+            for (int r = 0; r < v->R; ++r)
+                for (int c = 0; c < v->C; ++c) {
+                    size_t o = (size_t)((l * v->R + r) * v->C + c) * 3;
+                    if (v->rgb[o] + v->rgb[o + 1] + v->rgb[o + 2] == 0) continue;
+                    sl += l; sr += r; sc += c; ++n;
+                }
+        auto d = std::make_shared<Dict>();
+        d->items["体素"] = vNum((double)n);
+        d->items["层"] = vNum(n ? sl / n : 0);
+        d->items["行"] = vNum(n ? sr / n : 0);
+        d->items["列"] = vNum(n ? sc / n : 0);
+        Value out; out.type = VT::Dict; out.dict = d; return out;
+    });
+    // 体表面积：统计暴露在外的面（6 邻域），单位是「格²」
+    registerBuiltin("体表面积", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (a[0].type != VT::Vol || a[0].vol->kind != 0)
+            throw WenError("运行时错误", line, 0, "体表面积：需要三维体");
+        auto it = volStore.find(a[0].vol->id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体表面积：句柄无效");
+        auto v = it->second;
+        auto solidAt = [&](int l, int r, int c) -> bool {
+            if (l < 0 || r < 0 || c < 0 || l >= v->L || r >= v->R || c >= v->C) return false;
+            size_t o = (size_t)((l * v->R + r) * v->C + c) * 3;
+            return v->rgb[o] + v->rgb[o + 1] + v->rgb[o + 2] > 0;
+        };
+        long long faces = 0;
+        for (int l = 0; l < v->L; ++l)
+            for (int r = 0; r < v->R; ++r)
+                for (int c = 0; c < v->C; ++c) {
+                    if (!solidAt(l, r, c)) continue;
+                    if (!solidAt(l + 1, r, c)) ++faces;
+                    if (!solidAt(l - 1, r, c)) ++faces;
+                    if (!solidAt(l, r + 1, c)) ++faces;
+                    if (!solidAt(l, r - 1, c)) ++faces;
+                    if (!solidAt(l, r, c + 1)) ++faces;
+                    if (!solidAt(l, r, c - 1)) ++faces;
+                }
+        return vNum((double)faces);
+    });
     registerBuiltin("体掩码", 2, 2, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         if (a[0].type != VT::Vol || a[1].type != VT::Vol)
             throw WenError("运行时错误", line, 0, "体掩码：需要两个体");
