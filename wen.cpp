@@ -16304,6 +16304,34 @@ Interpreter::Interpreter() {
                 }
         return vNum((double)faces);
     });
+    // 体拷贝：深拷贝任意种类的体
+    registerBuiltin("体拷贝", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (a[0].type != VT::Vol) throw WenError("运行时错误", line, 0, "体拷贝：需要体");
+        int kd = a[0].vol->kind;
+        if (kd == 0) {
+            auto it = volStore.find(a[0].vol->id);
+            if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体拷贝：句柄无效");
+            auto src = it->second;
+            auto out = std::make_shared<VolData>(*src);
+            long long id = volNext++;
+            volStore[id] = out; gId3.insert(id);
+            return vVol(0, id);
+        }
+        if (kd == 1) {
+            auto it = sdfStore.find(a[0].vol->id);
+            if (it == sdfStore.end()) throw WenError("运行时错误", line, 0, "体拷贝：SDF 句柄无效");
+            auto out = std::make_shared<SdfVol>(*it->second);
+            long long id = sdfNext++;
+            sdfStore[id] = out; gIdSdf.insert(id);
+            return vVol(1, id);
+        }
+        auto it = vol4Store.find(a[0].vol->id);
+        if (it == vol4Store.end()) throw WenError("运行时错误", line, 0, "体拷贝：四维句柄无效");
+        auto out = std::make_shared<Vol4>(*it->second);
+        long long id = vol4Next++;
+        vol4Store[id] = out; gId4.insert(id);
+        return vVol(2, id);
+    });
     registerBuiltin("体掩码", 2, 2, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         if (a[0].type != VT::Vol || a[1].type != VT::Vol)
             throw WenError("运行时错误", line, 0, "体掩码：需要两个体");
