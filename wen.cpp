@@ -14939,6 +14939,178 @@ Interpreter::Interpreter() {
         return vBytes(img);
     });
 
+    // 体彩绘制：多光源 + 传递函数 + 透明累积，全部由选项字典控制
+    registerBuiltin("体彩绘制", 4, 4, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体彩绘制", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体彩绘制：体句柄无效");
+        auto v = it->second;
+        if (!v->color) throw WenError("运行时错误", line, 0, "体彩绘制：不是彩色体");
+        long long W = needIndex(a[1], "体彩绘制", line);
+        long long H = needIndex(a[2], "体彩绘制", line);
+        if (W <= 0 || H <= 0 || W > 2048 || H > 2048)
+            throw WenError("运行时错误", line, 0, "体彩绘制：宽高必须在 1..2048");
+        if (a[3].type != VT::Dict || !a[3].dict)
+            throw WenError("运行时错误", line, 0, "体彩绘制：第四个参数必须是选项字典");
+        auto opt = a[3].dict;
+        auto getNum = [&](const char* key, double def) -> double {
+            auto f = opt->items.find(key);
+            if (f == opt->items.end()) return def;
+            return needNum(f->second, "体彩绘制", line);
+        };
+        double vx = 0.25, vy = -0.55, vz = -0.8;
+        auto fv = opt->items.find("视向");
+        if (fv != opt->items.end() && fv->second.type == VT::List && fv->second.list && fv->second.list->items.size() >= 3) {
+            vx = needNum(fv->second.list->items[0], "体彩绘制", line);
+            vy = needNum(fv->second.list->items[1], "体彩绘制", line);
+            vz = needNum(fv->second.list->items[2], "体彩绘制", line);
+        }
+        std::vector<std::array<double, 3>> lights;
+        auto fl = opt->items.find("光源");
+        if (fl != opt->items.end() && fl->second.type == VT::List && fl->second.list) {
+            for (auto& item : fl->second.list->items) {
+                if (item.type == VT::List && item.list && item.list->items.size() >= 3) {
+                    double x = needNum(item.list->items[0], "体彩绘制", line);
+                    double y = needNum(item.list->items[1], "体彩绘制", line);
+                    double z = needNum(item.list->items[2], "体彩绘制", line);
+                    double n2 = std::sqrt(x * x + y * y + z * z);
+                    if (n2 > 1e-9) lights.push_back({x / n2, y / n2, z / n2});
+                }
+            }
+        }
+        if (lights.empty()) lights.push_back({0.45, 0.5, 0.74});
+        int ss = (int)getNum("超采样", 1);
+        if (ss < 1) ss = 1;
+        if (ss > 3) ss = 3;
+        double ambient = getNum("环境", 0.22);
+        double alphaGain = getNum("不透明度", 0.0);
+        bool transparent = alphaGain > 0.0;
+        double bgR = getNum("背景红", 0), bgG = getNum("背景绿", 0), bgB = getNum("背景蓝", 0);
+        auto vn = std::sqrt(vx * vx + vy * vy + vz * vz);
+        if (vn < 1e-9) { vx = 0; vy = 0; vz = 1; vn = 1; }
+        vx /= vn; vy /= vn; vz /= vn;
+        double ux = -vy, uy = vx, uz = 0.0;
+        auto un = std::sqrt(ux * ux + uy * uy + uz * uz);
+        if (un < 1e-9) { ux = 1; uy = 0; uz = 0; un = 1; }
+        ux /= un; uy /= un; uz /= un;
+        double wx = uy * vz - uz * vy, wy = uz * vx - ux * vz, wz = ux * vy - uy * vx;
+        double cx = (v->C - 1) / 2.0, cy = (v->R - 1) / 2.0, cz = (v->L - 1) / 2.0;
+        double rad = std::max(v->C, std::max(v->R, v->L)) * 0.75 + 2.0;
+        auto img = std::make_shared<vector<unsigned char>>((size_t)(W * H * 3), 0);
+        auto rdpx = [&](long long l, long long r, long long c, int ch) -> int {
+            if (l < 0 || r < 0 || c < 0 || l >= v->L || r >= v->R || c >= v->C) return 0;
+            return v->rgb[(size_t)((l * v->R + r) * v->C + c) * 3 + (size_t)ch];
+        };
+        auto solid = [&](long long l, long long r, long long c) -> double {
+            if (l < 0 || r < 0 || c < 0 || l >= v->L || r >= v->R || c >= v->C) return 0.0;
+            int s = rdpx(l, r, c, 0) + rdpx(l, r, c, 1) + rdpx(l, r, c, 2);
+            return s > 0 ? 1.0 : 0.0;
+        };
+        for (long long py = 0; py < H; ++py) {
+            for (long long px = 0; px < W; ++px) {
+                double accR = 0, accG = 0, accB = 0;
+                for (int sy = 0; sy < ss; ++sy) {
+                    for (int sx = 0; sx < ss; ++sx) {
+                        double u = (2.0 * ((px * ss + sx) + 0.5) / (W * ss) - 1.0);
+                        double vv = (1.0 - 2.0 * ((py * ss + sy) + 0.5) / (H * ss));
+                        double ox = cx - vx * rad + ux * u * rad + wx * vv * rad;
+                        double oy = cy - vy * rad + uy * u * rad + wy * vv * rad;
+                        double oz = cz - vz * rad + uz * u * rad + wz * vv * rad;
+                        int hl = -1, hr = 0, hc = 0;
+                        double tr = 0.0;
+                        for (double tt = 0; tt <= 2.0 * rad; tt += 1.0) {
+                            long long sl = (long long)std::lround(oz + vz * tt);
+                            long long sr = (long long)std::lround(oy + vy * tt);
+                            long long sc = (long long)std::lround(ox + vx * tt);
+                            if (sl < 0 || sr < 0 || sc < 0 || sl >= v->L || sr >= v->R || sc >= v->C) continue;
+                            if (solid((int)sl, (int)sr, (int)sc) > 0) {
+                                hl = (int)sl; hr = (int)sr; hc = (int)sc;
+                                tr = (tt - 1.0) / (2.0 * rad);
+                                break;
+                            }
+                        }
+                        if (hl < 0) { continue; }
+                        double gx = solid(hl, hr, hc + 2) - solid(hl, hr, hc - 2);
+                        double gy = solid(hl, hr + 2, hc) - solid(hl, hr - 2, hc);
+                        double gz = solid(hl + 2, hr, hc) - solid(hl - 2, hr, hc);
+                        double gn = std::sqrt(gx * gx + gy * gy + gz * gz);
+                        double nx = 0, ny = 0, nz = 1;
+                        if (gn > 1e-9) { nx = -gx / gn; ny = -gy / gn; nz = -gz / gn; }
+                        double r0 = (double)rdpx(hl, hr, hc, 0);
+                        double g0 = (double)rdpx(hl, hr, hc, 1);
+                        double b0 = (double)rdpx(hl, hr, hc, 2);
+                        if (transparent) {
+                            double lum = (r0 * 0.3 + g0 * 0.59 + b0 * 0.11) / 255.0;
+                            double al = lum * alphaGain;
+                            if (al > 0.9) al = 0.9;
+                            double shade = ambient;
+                            for (auto& L : lights) {
+                                double dd = nx * L[0] + ny * L[1] + nz * L[2];
+                                if (dd > 0) shade += (1.0 - ambient) * dd / (double)lights.size();
+                            }
+                            double fade = 1.0 - 0.55 * tr;
+                            accR += (1.0 - fade * 0.0) * al * r0 * shade;
+                            accG += al * g0 * shade;
+                            accB += al * b0 * shade;
+                        } else {
+                            double shade = ambient;
+                            for (auto& L : lights) {
+                                double dd = nx * L[0] + ny * L[1] + nz * L[2];
+                                if (dd > 0) shade += ((1.0 - ambient) / (double)lights.size()) * dd;
+                            }
+                            accR += r0 * shade;
+                            accG += g0 * shade;
+                            accB += b0 * shade;
+                        }
+                    }
+                }
+                long long div = (long long)ss * ss;
+                size_t o = (size_t)(py * W + px) * 3;
+                double rr2 = accR / div, gg2 = accG / div, bb2 = accB / div;
+                if (transparent) { rr2 += bgR; gg2 += bgG; bb2 += bgB; }
+                (*img)[o] = (unsigned char)std::min(255.0, std::max(0.0, rr2));
+                (*img)[o + 1] = (unsigned char)std::min(255.0, std::max(0.0, gg2));
+                (*img)[o + 2] = (unsigned char)std::min(255.0, std::max(0.0, bb2));
+            }
+        }
+        return vBytes(img);
+    });
+    // 体彩直方图：各通道 8 档统计 + 均值 + 非零格数
+    registerBuiltin("体彩直方图", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体彩直方图", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体彩直方图：体句柄无效");
+        auto v = it->second;
+        if (!v->color) throw WenError("运行时错误", line, 0, "体彩直方图：不是彩色体");
+        long long binsR[8] = {0}, binsG[8] = {0}, binsB[8] = {0};
+        double sumR = 0, sumG = 0, sumB = 0;
+        long long nonZero = 0;
+        size_t total = (size_t)(v->L * v->R * v->C);
+        for (size_t i = 0; i < total; ++i) {
+            int r = v->rgb[i * 3], g = v->rgb[i * 3 + 1], b = v->rgb[i * 3 + 2];
+            sumR += r; sumG += g; sumB += b;
+            if (r + g + b > 0) ++nonZero;
+            binsR[std::min(7, r / 32)]++;
+            binsG[std::min(7, g / 32)]++;
+            binsB[std::min(7, b / 32)]++;
+        }
+        auto d = std::make_shared<Dict>();
+        d->items["格数"] = vNum((double)total);
+        d->items["非零"] = vNum((double)nonZero);
+        d->items["均值红"] = vNum(total ? sumR / (double)total : 0);
+        d->items["均值绿"] = vNum(total ? sumG / (double)total : 0);
+        d->items["均值蓝"] = vNum(total ? sumB / (double)total : 0);
+        auto mkList = [&](long long* bins) {
+            auto lst = std::make_shared<List>();
+            for (int i = 0; i < 8; ++i) lst->items.push_back(vNum((double)bins[i]));
+            Value vv; vv.type = VT::List; vv.list = lst; return vv;
+        };
+        d->items["红直方图"] = mkList(binsR);
+        d->items["绿直方图"] = mkList(binsG);
+        d->items["蓝直方图"] = mkList(binsB);
+        Value out; out.type = VT::Dict; out.dict = d; return out;
+    });
+
     // 体旋转：绕指定轴转一个角度（最近邻重采样），轴 0=层轴 1=行轴 2=列轴
     registerBuiltin("体旋转", 3, 3, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         long long id = needIndex(a[0], "体旋转", line);
