@@ -14743,6 +14743,67 @@ Interpreter::Interpreter() {
         catch (IoError& e) { throw WenError("文件错误", line, 0, e.what()); }
         return vStr(path);
     });
+    // 体高度场：把一张灰度图当成高度，生成实心柱体（图 → 三维的第一步）
+    registerBuiltin("体高度场", 4, 4, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体高度场", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体高度场：体句柄无效");
+        auto v = it->second;
+        auto buf = needBytes(a[1], "体高度场", line);
+        long long rows = needIndex(a[2], "体高度场", line);
+        long long cols = needIndex(a[3], "体高度场", line);
+        if (!v->dense) throw WenError("运行时错误", line, 0, "体高度场：只支持稠密体");
+        if (rows != v->R || cols != v->C)
+            throw WenError("运行时错误", line, 0, "体高度场：图尺寸必须和体的行×列一致");
+        if ((long long)buf->size() < rows * cols)
+            throw WenError("运行时错误", line, 0, "体高度场：像素数据不够");
+        for (long long r = 0; r < rows; ++r) {
+            for (long long c = 0; c < cols; ++c) {
+                int g = (*buf)[(size_t)(r * cols + c)];
+                long long h = (long long)g * v->L / 256;
+                if (h > v->L) h = v->L;
+                for (long long l = v->L - h; l < v->L; ++l)
+                    v->data[(size_t)((l * v->R + r) * v->C + c)] = (unsigned char)(180 + g / 8);
+            }
+        }
+        return vNum(1);
+    });
+    // 体旋转：绕指定轴转一个角度（最近邻重采样），轴 0=层轴 1=行轴 2=列轴
+    registerBuiltin("体旋转", 3, 3, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体旋转", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体旋转：体句柄无效");
+        auto v = it->second;
+        if (!v->dense) throw WenError("运行时错误", line, 0, "体旋转：只支持稠密体");
+        int axis = (int)needIndex(a[1], "体旋转", line);
+        double deg = needNum(a[2], "体旋转", line);
+        double rad = deg * 3.14159265358979323846 / 180.0;
+        double cs = std::cos(rad), sn = std::sin(rad);
+        auto out = std::make_shared<VolData>();
+        out->L = v->L; out->R = v->R; out->C = v->C; out->dense = true;
+        out->data.assign(v->data.size(), 0);
+        double cl = (v->L - 1) / 2.0, cr = (v->R - 1) / 2.0, cc = (v->C - 1) / 2.0;
+        for (int l = 0; l < v->L; ++l) {
+            for (int r = 0; r < v->R; ++r) {
+                for (int c = 0; c < v->C; ++c) {
+                    double dl = l - cl, dr = r - cr, dc = c - cc;
+                    double sl = dl, sr = dr, sc = dc;
+                    if (axis == 0) { sl = dl * cs + dr * sn; sr = -dl * sn + dr * cs; }
+                    else if (axis == 1) { sr = dr * cs + dc * sn; sc = -dr * sn + dc * cs; }
+                    else { sl = dl * cs + dc * sn; sc = -dl * sn + dc * cs; }
+                    long long il = (long long)std::lround(sl + cl);
+                    long long ir = (long long)std::lround(sr + cr);
+                    long long ic = (long long)std::lround(sc + cc);
+                    if (il < 0 || ir < 0 || ic < 0 || il >= v->L || ir >= v->R || ic >= v->C) continue;
+                    out->data[(size_t)((l * v->R + r) * v->C + c)] =
+                        v->data[(size_t)((il * v->R + ir) * v->C + ic)];
+                }
+            }
+        }
+        long long nid = volNext++;
+        volStore[nid] = out;
+        return vNum((double)nid);
+    });
     // 体梯度：把梯度的模长写成一个新的稠密体（用来做边缘/法线可视化）
     registerBuiltin("体梯度", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         auto rd2 = [&](shared_ptr<VolData>& v, int l, int r, int c) -> int {
@@ -14777,7 +14838,7 @@ Interpreter::Interpreter() {
         return vNum((double)nid);
     });
     // 体渲染：正交相机沿层方向推进，命中表面后按梯度算法线做 Lambert 光照
-    registerBuiltin("体渲染", 3, 8, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+    registerBuiltin("体渲染", 3, 11, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         auto rd = [&](shared_ptr<VolData>& v, int l, int r, int c) -> int {
             if (l < 0 || r < 0 || c < 0 || l >= v->L || r >= v->R || c >= v->C) return 0;
             if (v->dense) return v->data[(size_t)((l * v->R + r) * v->C + c)];
@@ -14811,6 +14872,61 @@ Interpreter::Interpreter() {
         if (ss > 4) ss = 4;
         bool shadows = false;
         if (a.size() >= 8) shadows = needIndex(a[7], "体渲染", line) != 0;
+        // 任意视角：给了 3 个方向参数就走这条路（真正的斜视渲染）
+        if (a.size() >= 11) {
+            double vx = needNum(a[8], "体渲染", line);
+            double vy = needNum(a[9], "体渲染", line);
+            double vz = needNum(a[10], "体渲染", line);
+            double vn = std::sqrt(vx * vx + vy * vy + vz * vz);
+            if (vn < 1e-9) { vx = 0; vy = 0; vz = 1; vn = 1; }
+            vx /= vn; vy /= vn; vz /= vn;
+            double ux = -vy, uy = vx, uz = 0.0;          // 右向量 = d × up
+            double un = std::sqrt(ux * ux + uy * uy + uz * uz);
+            if (un < 1e-9) { ux = 1; uy = 0; uz = 0; un = 1; }
+            ux /= un; uy /= un; uz /= un;
+            double wx = uy * vz - uz * vy, wy = uz * vx - ux * vz, wz = ux * vy - uy * vx;
+            double cx = (v->C - 1) / 2.0, cy = (v->R - 1) / 2.0, cz = (v->L - 1) / 2.0;
+            double rad = std::max(v->C, std::max(v->R, v->L)) * 0.75 + 2.0;
+            for (long long py = 0; py < H; ++py) {
+                for (long long px = 0; px < W; ++px) {
+                    double u = (2.0 * (px + 0.5) / W - 1.0);
+                    double vv = (1.0 - 2.0 * (py + 0.5) / H);
+                    double ox = cx - vx * rad + ux * u * rad + wx * vv * rad;
+                    double oy = cy - vy * rad + uy * u * rad + wy * vv * rad;
+                    double oz = cz - vz * rad + uz * u * rad + wz * vv * rad;
+                    int hitL = -1, hitR = 0, hitC = 0;
+                    for (double t = 0; t <= 2.0 * rad; t += 1.0) {
+                        long long sl = (long long)std::lround(oz + vz * t);
+                        long long sr = (long long)std::lround(oy + vy * t);
+                        long long sc = (long long)std::lround(ox + vx * t);
+                        if (sl < 0 || sr < 0 || sc < 0 || sl >= v->L || sr >= v->R || sc >= v->C) continue;
+                        int g = rd(v, (int)sl, (int)sr, (int)sc);
+                        if (g > 0) { hitL = (int)sl; hitR = (int)sr; hitC = (int)sc; break; }
+                    }
+                    if (hitL < 0) continue;
+                    double gx = (double)rd(v, hitL, hitR, hitC + 1) - (double)rd(v, hitL, hitR, hitC - 1);
+                    double gy = (double)rd(v, hitL, hitR + 1, hitC) - (double)rd(v, hitL, hitR - 1, hitC);
+                    double gz = (double)rd(v, hitL + 1, hitR, hitC) - (double)rd(v, hitL - 1, hitR, hitC);
+                    double gn = std::sqrt(gx * gx + gy * gy + gz * gz);
+                    double sh = 0.18;
+                    if (gn > 1e-9) {
+                        double d = (-gx * lx + -gy * ly + -gz * lz) / gn;
+                        if (d > 0) sh += 0.82 * d;
+                    }
+                    int alb = rd(v, hitL, hitR, hitC);
+                    for (int t2 = 1; t2 <= 4; ++t2) {
+                        int nl2 = hitL + (int)std::lround(vz * t2), nr2 = hitR + (int)std::lround(vy * t2), nc2 = hitC + (int)std::lround(vx * t2);
+                        if (nl2 < 0 || nr2 < 0 || nc2 < 0 || nl2 >= v->L || nr2 >= v->R || nc2 >= v->C) break;
+                        alb = std::max(alb, rd(v, nl2, nr2, nc2));
+                    }
+                    int val = (int)(sh * (double)alb);
+                    if (val > 255) val = 255;
+                    if (val < 0) val = 0;
+                    (*img)[(size_t)(py * W + px)] = (unsigned char)val;
+                }
+            }
+            return vBytes(img);
+        }
         // 沿光线找第一个非空体素
         auto firstHit = [&](int r, int c) -> int {
             for (int l = 0; l < v->L; ++l) {
