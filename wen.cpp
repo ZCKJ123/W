@@ -14603,6 +14603,85 @@ Interpreter::Interpreter() {
         gId3.insert(id);
         return vVol(0, id);
     });
+    // 形状填充：球和盒，按体积坐标直接写（别再用脚本三重循环，太慢）
+    // 彩色体写三通道，灰度体按亮度权重折成一个 0..255
+    auto volShapeFill = [](shared_ptr<VolData> v, long long l0, long long l1, long long r0, long long r1,
+                           long long c0, long long c1, int rr, int gg, int bb) -> long long {
+        if (!v->dense) throw WenError("运行时错误", 0, 0, "体形状：只支持稠密体");
+        long long n = 0;
+        int chunk = v->color ? 3 : 1;
+        int gray = (rr * 30 + gg * 59 + bb * 11) / 100;
+        for (long long l = std::max(0LL, l0); l <= std::min((long long)v->L - 1, l1); ++l)
+            for (long long r = std::max(0LL, r0); r <= std::min((long long)v->R - 1, r1); ++r)
+                for (long long c = std::max(0LL, c0); c <= std::min((long long)v->C - 1, c1); ++c) {
+                    size_t o = (size_t)((l * v->R + r) * v->C + c) * chunk;
+                    if (v->color) {
+                        v->rgb[o] = (unsigned char)rr;
+                        v->rgb[o + 1] = (unsigned char)gg;
+                        v->rgb[o + 2] = (unsigned char)bb;
+                    } else {
+                        v->data[o] = (unsigned char)gray;
+                    }
+                    ++n;
+                }
+        return n;
+    };
+    registerBuiltin("体球", 8, 8, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体球", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体球：体句柄无效");
+        auto v = it->second;
+        double cl = needNum(a[1], "体球", line), cr = needNum(a[2], "体球", line);
+        double cc = needNum(a[3], "体球", line), rad = needNum(a[4], "体球", line);
+        if (rad < 0) throw WenError("运行时错误", line, 0, "体球：半径不能是负数");
+        auto chan = [&](const Value& x) -> int {
+            long long q = needIndex(x, "体球", line);
+            if (q < 0 || q > 255) throw WenError("运行时错误", line, 0, "体球：颜色分量必须在 0..255");
+            return (int)q;
+        };
+        int rr = chan(a[5]), gg = chan(a[6]), bb = chan(a[7]);
+        long long n = 0;
+        int chunk = v->color ? 3 : 1;
+        int gray = (rr * 30 + gg * 59 + bb * 11) / 100;
+        long long l0 = (long long)std::floor(cl - rad), l1 = (long long)std::ceil(cl + rad);
+        long long r0 = (long long)std::floor(cr - rad), r1 = (long long)std::ceil(cr + rad);
+        long long c0 = (long long)std::floor(cc - rad), c1 = (long long)std::ceil(cc + rad);
+        if (!v->dense) throw WenError("运行时错误", line, 0, "体球：只支持稠密体");
+        for (long long l = std::max(0LL, l0); l <= std::min((long long)v->L - 1, l1); ++l)
+            for (long long r = std::max(0LL, r0); r <= std::min((long long)v->R - 1, r1); ++r)
+                for (long long c = std::max(0LL, c0); c <= std::min((long long)v->C - 1, c1); ++c) {
+                    double d2 = (l - cl) * (l - cl) + (r - cr) * (r - cr) + (c - cc) * (c - cc);
+                    if (d2 > rad * rad) continue;
+                    size_t o = (size_t)((l * v->R + r) * v->C + c) * chunk;
+                    if (v->color) {
+                        v->rgb[o] = (unsigned char)rr;
+                        v->rgb[o + 1] = (unsigned char)gg;
+                        v->rgb[o + 2] = (unsigned char)bb;
+                    } else {
+                        v->data[o] = (unsigned char)gray;
+                    }
+                    ++n;
+                }
+        return vNum((double)n);
+    });
+    registerBuiltin("体盒", 10, 10, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体盒", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体盒：体句柄无效");
+        auto v = it->second;
+        long long l0 = needIndex(a[1], "体盒", line), r0 = needIndex(a[2], "体盒", line), c0 = needIndex(a[3], "体盒", line);
+        long long l1 = needIndex(a[4], "体盒", line), r1 = needIndex(a[5], "体盒", line), c1 = needIndex(a[6], "体盒", line);
+        auto chan = [&](const Value& x) -> int {
+            long long q = needIndex(x, "体盒", line);
+            if (q < 0 || q > 255) throw WenError("运行时错误", line, 0, "体盒：颜色分量必须在 0..255");
+            return (int)q;
+        };
+        int rr = chan(a[7]), gg = chan(a[8]), bb = chan(a[9]);
+        long long n = volShapeFill(v, std::min(l0, l1), std::max(l0, l1),
+                                   std::min(r0, r1), std::max(r0, r1),
+                                   std::min(c0, c1), std::max(c0, c1), rr, gg, bb);
+        return vNum((double)n);
+    });
     registerBuiltin("体写", 5, 5, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         long long id = needIndex(a[0], "体写", line);
         auto it = volStore.find(id);
@@ -15484,7 +15563,7 @@ Interpreter::Interpreter() {
     registerBuiltin("四维球", 3, 3, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         long long id = needIndex(a[0], "四维球", line);
         double rad = needNum(a[1], "四维球", line);
-        long long cr = needIndex(a[2], "四维球", line);
+        long long cr = needIndex(a[2], "四维球", line);   // 0 = 默认渐变，否则 0xRRGGBB
         auto it = vol4Store.find(id);
         if (it == vol4Store.end()) throw WenError("运行时错误", line, 0, "四维球：句柄无效");
         auto v = it->second;
@@ -15496,11 +15575,17 @@ Interpreter::Interpreter() {
                     for (long long c = 0; c < v->C; ++c) {
                         double d2 = (double)((w - cw) * (w - cw) + (l - cl) * (l - cl) + (r - crr) * (r - crr) + (c - cc) * (c - cc));
                         if (d2 > rad * rad) continue;
-                        double t = 1.0 - std::sqrt(d2) / rad;
                         size_t o = (size_t)((((w * v->L + l) * v->R + r) * v->C + c) * 3);
-                        v->rgb[o] = (unsigned char)std::min(255.0, 60 + 195 * t);
-                        v->rgb[o + 1] = (unsigned char)std::min(255.0, 120 + 130 * t);
-                        v->rgb[o + 2] = (unsigned char)std::min(255.0, 200 + 55 * t);
+                        if (cr != 0) {
+                            v->rgb[o] = (unsigned char)((cr >> 16) & 0xFF);
+                            v->rgb[o + 1] = (unsigned char)((cr >> 8) & 0xFF);
+                            v->rgb[o + 2] = (unsigned char)(cr & 0xFF);
+                        } else {
+                            double t = 1.0 - std::sqrt(d2) / rad;
+                            v->rgb[o] = (unsigned char)std::min(255.0, 60 + 195 * t);
+                            v->rgb[o + 1] = (unsigned char)std::min(255.0, 120 + 130 * t);
+                            v->rgb[o + 2] = (unsigned char)std::min(255.0, 200 + 55 * t);
+                        }
                         ++n;
                     }
         return vNum((double)n);
