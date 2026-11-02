@@ -15980,6 +15980,188 @@ Interpreter::Interpreter() {
         Value out; out.type = VT::Dict; out.dict = d; return out;
     });
 
+    // 体落盘 / 读回：让体像普通数据一样能存、能传、能进库
+    registerBuiltin("体存文件", 2, 2, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (a[0].type != VT::Vol) throw WenError("运行时错误", line, 0, "体存文件：需要体");
+        string path = needStr(a[1], "体存文件", line);
+        int kd = a[0].vol->kind;
+        std::string out = "WENVOL1";
+        auto put32 = [&](std::string& s, unsigned int v) {
+            s.push_back((char)(v & 0xFF)); s.push_back((char)((v >> 8) & 0xFF));
+            s.push_back((char)((v >> 16) & 0xFF)); s.push_back((char)((v >> 24) & 0xFF));
+        };
+        char kindB = (char)kd;
+        out.push_back(kindB);
+        if (kd == 0) {
+            auto it = volStore.find(a[0].vol->id);
+            if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体存文件：句柄无效");
+            auto v = it->second;
+            put32(out, (unsigned)v->L); put32(out, (unsigned)v->R); put32(out, (unsigned)v->C);
+            out.push_back(v->color ? 1 : 0);
+            if (v->color) out.append(reinterpret_cast<const char*>(v->rgb.data()), v->rgb.size());
+            else out.append(reinterpret_cast<const char*>(v->data.data()), v->data.size());
+        } else if (kd == 1) {
+            auto it = sdfStore.find(a[0].vol->id);
+            if (it == sdfStore.end()) throw WenError("运行时错误", line, 0, "体存文件：SDF 句柄无效");
+            auto v = it->second;
+            put32(out, (unsigned)v->L); put32(out, (unsigned)v->R); put32(out, (unsigned)v->C);
+            out.append(reinterpret_cast<const char*>(v->d.data()), v->d.size() * 4);
+        } else {
+            auto it = vol4Store.find(a[0].vol->id);
+            if (it == vol4Store.end()) throw WenError("运行时错误", line, 0, "体存文件：四维句柄无效");
+            auto v = it->second;
+            put32(out, (unsigned)v->W); put32(out, (unsigned)v->L);
+            put32(out, (unsigned)v->R); put32(out, (unsigned)v->C);
+            out.append(reinterpret_cast<const char*>(v->rgb.data()), v->rgb.size());
+        }
+        try { writeWholeFile(path, out, false); }
+        catch (IoError& e) { throw WenError("文件错误", line, 0, e.what()); }
+        return vNum((double)out.size());
+    });
+    registerBuiltin("体读文件", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path = needStr(a[0], "体读文件", line);
+        string raw;
+        try { raw = readWholeFile(path); } catch (IoError& e) { throw WenError("文件错误", line, 0, e.what()); }
+        if (raw.size() < 9 || raw.compare(0, 7, "WENVOL1") != 0)
+            throw WenError("运行时错误", line, 0, "体读文件：不是体文件");
+        int kd = (unsigned char)raw[7];
+        size_t pos = 8;
+        auto get32 = [&]() -> unsigned {
+            unsigned v = (unsigned char)raw[pos] | ((unsigned)(unsigned char)raw[pos + 1] << 8)
+                       | ((unsigned)(unsigned char)raw[pos + 2] << 16) | ((unsigned)(unsigned char)raw[pos + 3] << 24);
+            pos += 4;
+            return v;
+        };
+        if (kd == 0) {
+            unsigned L = get32(), R = get32(), C = get32();
+            bool color = (unsigned char)raw[pos++] != 0;
+            auto v = std::make_shared<VolData>();
+            v->L = (int)L; v->R = (int)R; v->C = (int)C; v->dense = true; v->color = color;
+            size_t n = color ? (size_t)(L * R * C * 3) : (size_t)(L * R * C);
+            if (raw.size() < pos + n) throw WenError("运行时错误", line, 0, "体读文件：数据不完整");
+            if (color) v->rgb.assign(raw.begin() + (long)pos, raw.begin() + (long)(pos + n));
+            else v->data.assign(raw.begin() + (long)pos, raw.begin() + (long)(pos + n));
+            long long id = volNext++;
+            volStore[id] = v; gId3.insert(id);
+            return vVol(0, id);
+        }
+        if (kd == 1) {
+            unsigned L = get32(), R = get32(), C = get32();
+            auto v = std::make_shared<SdfVol>();
+            v->L = (int)L; v->R = (int)R; v->C = (int)C;
+            size_t n = (size_t)(L * R * C);
+            if (raw.size() < pos + n * 4) throw WenError("运行时错误", line, 0, "体读文件：SDF 数据不完整");
+            v->d.resize(n);
+            memcpy(v->d.data(), raw.data() + pos, n * 4);
+            long long id = sdfNext++;
+            sdfStore[id] = v; gIdSdf.insert(id);
+            return vVol(1, id);
+        }
+        unsigned W = get32(), L = get32(), R = get32(), C = get32();
+        auto v = std::make_shared<Vol4>();
+        v->W = (int)W; v->L = (int)L; v->R = (int)R; v->C = (int)C;
+        size_t n = (size_t)(W * L * R * C * 3);
+        if (raw.size() < pos + n) throw WenError("运行时错误", line, 0, "体读文件：四维数据不完整");
+        v->rgb.assign(raw.begin() + (long)pos, raw.begin() + (long)(pos + n));
+        long long id = vol4Next++;
+        vol4Store[id] = v; gId4.insert(id);
+        return vVol(2, id);
+    });
+    // 体 ↔ 缓冲：让体可以进容量层、算哈希、走文件
+    registerBuiltin("体转缓冲", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (a[0].type != VT::Vol) throw WenError("运行时错误", line, 0, "体转缓冲：需要体");
+        int kd = a[0].vol->kind;
+        auto buf = std::make_shared<vector<unsigned char>>();
+        auto put32 = [&](unsigned int v) {
+            buf->push_back((unsigned char)(v & 0xFF)); buf->push_back((unsigned char)((v >> 8) & 0xFF));
+            buf->push_back((unsigned char)((v >> 16) & 0xFF)); buf->push_back((unsigned char)((v >> 24) & 0xFF));
+        };
+        const char magic[7] = {'W','E','N','V','O','L','1'};
+        for (char ch : magic) buf->push_back((unsigned char)ch);
+        buf->push_back((unsigned char)kd);
+        if (kd == 0) {
+            auto v = volStore[a[0].vol->id];
+            put32((unsigned)v->L); put32((unsigned)v->R); put32((unsigned)v->C);
+            buf->push_back(v->color ? 1 : 0);
+            if (v->color) buf->insert(buf->end(), v->rgb.begin(), v->rgb.end());
+            else buf->insert(buf->end(), v->data.begin(), v->data.end());
+        } else if (kd == 1) {
+            auto v = sdfStore[a[0].vol->id];
+            put32((unsigned)v->L); put32((unsigned)v->R); put32((unsigned)v->C);
+            const unsigned char* p = reinterpret_cast<const unsigned char*>(v->d.data());
+            buf->insert(buf->end(), p, p + v->d.size() * 4);
+        } else {
+            auto v = vol4Store[a[0].vol->id];
+            put32((unsigned)v->W); put32((unsigned)v->L); put32((unsigned)v->R); put32((unsigned)v->C);
+            buf->insert(buf->end(), v->rgb.begin(), v->rgb.end());
+        }
+        return vBytes(buf);
+    });
+    registerBuiltin("缓冲转体", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto raw = needBytes(a[0], "缓冲转体", line);
+        if (raw->size() < 9 || memcmp(raw->data(), "WENVOL1", 7) != 0)
+            throw WenError("运行时错误", line, 0, "缓冲转体：格式不对");
+        int kd = (*raw)[7];
+        size_t pos = 8;
+        auto get32 = [&]() -> unsigned {
+            unsigned v = (*raw)[pos] | ((unsigned)(*raw)[pos + 1] << 8)
+                       | ((unsigned)(*raw)[pos + 2] << 16) | ((unsigned)(*raw)[pos + 3] << 24);
+            pos += 4;
+            return v;
+        };
+        if (kd == 0) {
+            unsigned L = get32(), R = get32(), C = get32();
+            bool color = (*raw)[pos++] != 0;
+            auto v = std::make_shared<VolData>();
+            v->L = (int)L; v->R = (int)R; v->C = (int)C; v->dense = true; v->color = color;
+            size_t n = color ? (size_t)(L * R * C * 3) : (size_t)(L * R * C);
+            if (color) v->rgb.assign(raw->begin() + (long)pos, raw->begin() + (long)(pos + n));
+            else v->data.assign(raw->begin() + (long)pos, raw->begin() + (long)(pos + n));
+            long long id = volNext++;
+            volStore[id] = v; gId3.insert(id);
+            return vVol(0, id);
+        }
+        if (kd == 1) {
+            unsigned L = get32(), R = get32(), C = get32();
+            auto v = std::make_shared<SdfVol>();
+            v->L = (int)L; v->R = (int)R; v->C = (int)C;
+            size_t n = (size_t)(L * R * C);
+            v->d.resize(n);
+            memcpy(v->d.data(), raw->data() + pos, n * 4);
+            long long id = sdfNext++;
+            sdfStore[id] = v; gIdSdf.insert(id);
+            return vVol(1, id);
+        }
+        unsigned W = get32(), L = get32(), R = get32(), C = get32();
+        auto v = std::make_shared<Vol4>();
+        v->W = (int)W; v->L = (int)L; v->R = (int)R; v->C = (int)C;
+        size_t n = (size_t)(W * L * R * C * 3);
+        v->rgb.assign(raw->begin() + (long)pos, raw->begin() + (long)(pos + n));
+        long long id = vol4Next++;
+        vol4Store[id] = v; gId4.insert(id);
+        return vVol(2, id);
+    });
+    // 体的元信息
+    registerBuiltin("体尺寸", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (a[0].type != VT::Vol) throw WenError("运行时错误", line, 0, "体尺寸：需要体");
+        auto d = std::make_shared<Dict>();
+        int kd = a[0].vol->kind;
+        d->items["类型"] = vStr(kd == 0 ? "三维" : (kd == 1 ? "SDF" : "四维"));
+        if (kd == 0) {
+            auto v = volStore[a[0].vol->id];
+            d->items["层"] = vNum(v->L); d->items["行"] = vNum(v->R); d->items["列"] = vNum(v->C);
+            d->items["彩色"] = vBool(v->color);
+        } else if (kd == 1) {
+            auto v = sdfStore[a[0].vol->id];
+            d->items["层"] = vNum(v->L); d->items["行"] = vNum(v->R); d->items["列"] = vNum(v->C);
+        } else {
+            auto v = vol4Store[a[0].vol->id];
+            d->items["w"] = vNum(v->W); d->items["层"] = vNum(v->L);
+            d->items["行"] = vNum(v->R); d->items["列"] = vNum(v->C);
+        }
+        Value out; out.type = VT::Dict; out.dict = d; return out;
+    });
+
     // ---------- PNG 解码（inflate + 反滤波），支持 8 位灰度/RGB/RGBA ----------
     registerBuiltin("图像读PNG", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         string path = needStr(a[0], "图像读PNG", line);
