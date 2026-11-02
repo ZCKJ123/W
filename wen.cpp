@@ -16236,6 +16236,25 @@ Interpreter::Interpreter() {
     });
 
     // 掩码保留：只在掩码非零处保留 A 的颜色，其余清零
+    // 体差分：逐通道绝对差（颜色有 0..255 截断，不能靠减法再取绝对值）
+    registerBuiltin("体差分", 2, 2, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (a[0].type != VT::Vol || a[1].type != VT::Vol || a[0].vol->kind != 0 || a[1].vol->kind != 0)
+            throw WenError("运行时错误", line, 0, "体差分：需要两个三维体");
+        auto A = volStore.find(a[0].vol->id), B = volStore.find(a[1].vol->id);
+        if (A == volStore.end() || B == volStore.end())
+            throw WenError("运行时错误", line, 0, "体差分：句柄无效");
+        auto X = A->second, Y = B->second;
+        if (X->L != Y->L || X->R != Y->R || X->C != Y->C)
+            throw WenError("运行时错误", line, 0, "体差分：两个体尺寸必须一致");
+        auto out = std::make_shared<VolData>();
+        out->L = X->L; out->R = X->R; out->C = X->C; out->dense = true; out->color = true;
+        out->rgb.resize(X->rgb.size(), 0);
+        for (size_t i = 0; i < X->rgb.size(); ++i)
+            out->rgb[i] = (unsigned char)std::abs((int)X->rgb[i] - (int)Y->rgb[i]);
+        long long id = volNext++;
+        volStore[id] = out; gId3.insert(id);
+        return vVol(0, id);
+    });
     registerBuiltin("体掩码", 2, 2, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         if (a[0].type != VT::Vol || a[1].type != VT::Vol)
             throw WenError("运行时错误", line, 0, "体掩码：需要两个体");
