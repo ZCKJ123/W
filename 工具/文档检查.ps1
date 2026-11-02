@@ -52,6 +52,18 @@ foreach ($doc in $specDocs) {
     }
 }
 
+# 术语检查：.wen 源文件叫「脚本」，编译产物叫「程序」；不能再出现「程序.wen」
+$termDocs = $docs + @('README.md')
+foreach ($doc in $termDocs) {
+    $p2 = Join-Path $root $doc
+    if (-not (Test-Path $p2)) { continue }
+    $body2 = [IO.File]::ReadAllText($p2, [Text.Encoding]::UTF8)
+    $cnt = ([regex]::Matches($body2, '程序\.wen')).Count
+    if ($cnt -gt 0) {
+        $fail++
+        Write-Host ("失败：{0} 仍有 {1} 处「程序.wen」，应写「脚本.wen」" -f $doc, $cnt)
+    }
+}
 foreach ($doc in $docs) {
     $path = Join-Path $root $doc
     if (-not (Test-Path $path)) { continue }
