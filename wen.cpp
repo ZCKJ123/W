@@ -20722,6 +20722,7 @@ private:
                 }
                 if (name == "文本")
                     err(e->line, "「文本」在编译模式里只能直接放在「打印」里");
+                if (gBuiltinArity.count(name))                     err(e->line, "「" + name + "」是解释器内建（体 / SDF / 四维算子），编译模式不支持；请用解释模式运行");
                 err(e->line, "编译模式不认识的函数「" + name + "」");
             }
             case Expr::K::Index:
@@ -21613,7 +21614,7 @@ static void checkExprNames(const ExprPtr& e, const std::set<string>& vars,
                 " 个参数，收到 " + std::to_string(n) + " 个"));
         }
     }
-    for (const auto& a : e->args) checkExprNames(a, vars, funcs, errors, skipUndefined);
+    for (const auto& a2 : e->args) checkExprNames(a2, vars, funcs, errors, skipUndefined);
     for (const auto& kv : e->pairs) {
         checkExprNames(kv.first, vars, funcs, errors, skipUndefined);
         checkExprNames(kv.second, vars, funcs, errors, skipUndefined);
