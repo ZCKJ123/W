@@ -16563,6 +16563,8 @@ Interpreter::Interpreter() {
             throw WenError("运行时错误", line, 0, "体表面积：需要三维体");
         auto it = volStore.find(a[0].vol->id);
         if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体表面积：句柄无效");
+        // 等值面网格要逐格记录顶点，分块体请先体缩放成稠密体
+        if (!it->second->dense) throw WenError("运行时错误", line, 0, "体表面积：只支持稠密体");
         long long thr = 1;
         if (a.size() >= 2) thr = needIndex(a[1], "体表面积", line);
         vector<float> verts; vector<unsigned int> tris;
