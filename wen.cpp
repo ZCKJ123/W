@@ -14677,6 +14677,79 @@ Interpreter::Interpreter() {
         catch (IoError& e) { throw WenError("文件错误", line, 0, e.what()); }
         return vStr(path);
     };
+    // 视差定深：两幅左右视图做块匹配，返回视差图（0..255，越大越近）
+    registerBuiltin("视差深度", 5, 6, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto left = needBytes(a[0], "视差深度", line);
+        auto right = needBytes(a[1], "视差深度", line);
+        long long W = needIndex(a[2], "视差深度", line);
+        long long H = needIndex(a[3], "视差深度", line);
+        long long maxD = needIndex(a[4], "视差深度", line);
+        long long win = a.size() >= 6 ? needIndex(a[5], "视差深度", line) : 3;
+        if (W <= 0 || H <= 0 || (long long)left->size() < W * H * 3 || (long long)right->size() < W * H * 3)
+            throw WenError("运行时错误", line, 0, "视差深度：图像尺寸与数据不匹配");
+        if (maxD < 1 || maxD > 128) maxD = 32;
+        if (win < 1 || win > 9) win = 3;
+        auto out = std::make_shared<vector<unsigned char>>((size_t)(W * H), 0);
+        auto lum = [&](const vector<unsigned char>& img, long long x, long long y) -> int {
+            if (x < 0 || y < 0 || x >= W || y >= H) return 0;
+            size_t o = (size_t)((y * W + x) * 3);
+            return (img[o] * 30 + img[o + 1] * 59 + img[o + 2] * 11) / 100;
+        };
+        for (long long y = 0; y < H; ++y) {
+            for (long long x = 0; x < W; ++x) {
+                long long bestD = 0;
+                long long bestCost = -1;
+                for (long long d = 0; d < maxD; ++d) {
+                    if (x - d < 0) break;
+                    long long cost = 0;
+                    for (long long wy = -win; wy <= win; ++wy) {
+                        for (long long wx = -win; wx <= win; ++wx) {
+                            long long lv = lum(*left, x + wx, y + wy);
+                            long long rv = lum(*right, x - d + wx, y + wy);
+                            cost += std::abs(lv - rv);
+                        }
+                    }
+                    if (bestCost < 0 || cost < bestCost) { bestCost = cost; bestD = d; }
+                }
+                int v = (int)(bestD * 255 / (maxD > 0 ? maxD : 1));
+                if (v > 255) v = 255;
+                (*out)[(size_t)(y * W + x)] = (unsigned char)v;
+            }
+        }
+        return vBytes(out);
+    });
+    // 视差图 → 彩色体：视差越大越高，颜色取自左图
+    registerBuiltin("视差建体", 5, 5, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "视差建体", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "视差建体：体句柄无效");
+        auto v = it->second;
+        if (!v->color) throw WenError("运行时错误", line, 0, "视差建体：不是彩色体");
+        auto disp = needBytes(a[1], "视差建体", line);
+        auto color = needBytes(a[2], "视差建体", line);
+        long long rows = needIndex(a[3], "视差建体", line);
+        long long cols = needIndex(a[4], "视差建体", line);
+        if (rows != v->R || cols != v->C)
+            throw WenError("运行时错误", line, 0, "视差建体：尺寸必须等于体的行×列");
+        if ((long long)disp->size() < rows * cols || (long long)color->size() < rows * cols * 3)
+            throw WenError("运行时错误", line, 0, "视差建体：数据不足");
+        for (long long r = 0; r < rows; ++r) {
+            for (long long c = 0; c < cols; ++c) {
+                int d0 = (*disp)[(size_t)(r * cols + c)];
+                long long h = (long long)d0 * v->L / 256;
+                if (h < 1) h = 1;
+                size_t ci = (size_t)(r * cols + c) * 3;
+                for (long long l = v->L - h; l < v->L; ++l) {
+                    size_t idx = (size_t)((l * v->R + r) * v->C + c) * 3;
+                    v->rgb[idx] = (*color)[ci];
+                    v->rgb[idx + 1] = (*color)[ci + 1];
+                    v->rgb[idx + 2] = (*color)[ci + 2];
+                }
+            }
+        }
+        return vNum(1);
+    });
+
     // ---------- PNG 解码（inflate + 反滤波），支持 8 位灰度/RGB/RGBA ----------
     registerBuiltin("图像读PNG", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         string path = needStr(a[0], "图像读PNG", line);
