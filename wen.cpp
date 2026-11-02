@@ -14353,6 +14353,205 @@ Interpreter::Interpreter() {
         string raw(reinterpret_cast<const char*>(b->data()), b->size());
         return vStr(sha256Hex(raw));
     });
+    // ---------- 三维体（原生实现，脚本直接可用） ----------
+    struct VolBrick { bool constant = true; unsigned char v = 0; vector<unsigned char> buf; };
+    struct VolData {
+        int L = 0, R = 0, C = 0, brick = 32;
+        bool dense = true;
+        vector<unsigned char> data;
+        std::map<std::tuple<int,int,int>, VolBrick> bricks;
+    };
+    static map<long long, shared_ptr<VolData>> volStore;
+    static long long volNext = 1;
+    auto volAt = [](shared_ptr<VolData>& v, long long l, long long r, long long c) -> size_t {
+        return (size_t)((l * v->R + r) * v->C + c);
+    };
+    auto volCheck = [](shared_ptr<VolData>& v, long long l, long long r, long long c, const char* who, int line) {
+        if (l < 0 || r < 0 || c < 0 || l >= v->L || r >= v->R || c >= v->C)
+            throw WenError("运行时错误", line, 0, string(who) + "：坐标越界");
+    };
+    registerBuiltin("体新建", 3, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long L = needIndex(a[0], "体新建", line);
+        long long R = needIndex(a[1], "体新建", line);
+        long long C = needIndex(a[2], "体新建", line);
+        if (L <= 0 || R <= 0 || C <= 0)
+            throw WenError("运行时错误", line, 0, "体新建：三个维度必须大于 0");
+        if (L * R * C > 1000000000LL)
+            throw WenError("运行时错误", line, 0, "体新建：体积太大（上限 10 亿格）");
+        auto v = std::make_shared<VolData>();
+        v->L = (int)L; v->R = (int)R; v->C = (int)C;
+        if (L * R * C <= 262144) {
+            v->dense = true;
+            v->data.assign((size_t)(L * R * C), 0);
+        } else {
+            v->dense = false;
+        }
+        long long id = volNext++;
+        volStore[id] = v;
+        return vNum((double)id);
+    });
+    registerBuiltin("体写", 5, 5, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体写", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体写：体句柄无效");
+        auto v = it->second;
+        long long l = needIndex(a[1], "体写", line);
+        long long r = needIndex(a[2], "体写", line);
+        long long c = needIndex(a[3], "体写", line);
+        volCheck(v, l, r, c, "体写", line);
+        int val = (int)needIndex(a[4], "体写", line);
+        if (val < 0 || val > 255) throw WenError("运行时错误", line, 0, "体写：值必须在 0..255");
+        if (v->dense) { v->data[volAt(v, l, r, c)] = (unsigned char)val; return vNum(1); }
+        auto key = std::make_tuple((int)(l / v->brick), (int)(r / v->brick), (int)(c / v->brick));
+        auto bit = v->bricks.find(key);
+        if (bit == v->bricks.end()) {
+            VolBrick b; b.constant = true; b.v = 0;
+            bit = v->bricks.emplace(key, std::move(b)).first;
+        }
+        VolBrick& b = bit->second;
+        size_t off = (size_t)(((l % v->brick) * v->brick + (r % v->brick)) * v->brick + (c % v->brick));
+        if (b.constant) {
+            if ((unsigned char)val == b.v) return vNum(1);
+            b.buf.assign((size_t)(v->brick * v->brick * v->brick), b.v);
+            b.constant = false;
+        }
+        b.buf[off] = (unsigned char)val;
+        return vNum(1);
+    });
+    registerBuiltin("体填空块", 5, 5, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体填空块", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体填空块：体句柄无效");
+        auto v = it->second;
+        if (v->dense) throw WenError("运行时错误", line, 0, "体填空块：只支持分块体（大体积）");
+        long long l = needIndex(a[1], "体填空块", line);
+        long long r = needIndex(a[2], "体填空块", line);
+        long long c = needIndex(a[3], "体填空块", line);
+        int val = (int)needIndex(a[4], "体填空块", line);
+        if (val < 0 || val > 255) throw WenError("运行时错误", line, 0, "体填空块：值必须在 0..255");
+        volCheck(v, l, r, c, "体填空块", line);
+        auto key = std::make_tuple((int)(l / v->brick), (int)(r / v->brick), (int)(c / v->brick));
+        VolBrick b; b.constant = true; b.v = (unsigned char)val; b.buf.clear();
+        v->bricks[key] = std::move(b);
+        return vNum(1);
+    });
+    registerBuiltin("体读", 4, 4, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体读", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体读：体句柄无效");
+        auto v = it->second;
+        long long l = needIndex(a[1], "体读", line);
+        long long r = needIndex(a[2], "体读", line);
+        long long c = needIndex(a[3], "体读", line);
+        if (l < 0 || r < 0 || c < 0 || l >= v->L || r >= v->R || c >= v->C) return vNum(0);
+        if (v->dense) return vNum((double)v->data[volAt(v, l, r, c)]);
+        auto key = std::make_tuple((int)(l / v->brick), (int)(r / v->brick), (int)(c / v->brick));
+        auto bit = v->bricks.find(key);
+        if (bit == v->bricks.end()) return vNum(0);
+        VolBrick& b = bit->second;
+        if (b.constant) return vNum((double)b.v);
+        size_t off = (size_t)(((l % v->brick) * v->brick + (r % v->brick)) * v->brick + (c % v->brick));
+        return vNum((double)b.buf[off]);
+    });
+    registerBuiltin("体统计", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体统计", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体统计：体句柄无效");
+        auto v = it->second;
+        long long logical = (long long)v->L * v->R * v->C;
+        long long physical = 0, n = 0, constN = 0;
+        if (v->dense) {
+            physical = logical + 8;
+        } else {
+            for (auto& kv : v->bricks) {
+                ++n;
+                if (kv.second.constant) { physical += 8; ++constN; }
+                else physical += (long long)v->brick * v->brick * v->brick;
+            }
+            physical += n * 16;
+        }
+        auto d = std::make_shared<Dict>();
+        d->items["逻辑格"] = vNum((double)logical);
+        d->items["物理字节"] = vNum((double)physical);
+        d->items["块数"] = vNum((double)n);
+        d->items["常量块"] = vNum((double)constN);
+        d->items["倍数"] = vNum(physical > 0 ? (double)logical / (double)physical : 0);
+        Value out; out.type = VT::Dict; out.dict = d; return out;
+    });
+    registerBuiltin("体切片", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体切片", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体切片：体句柄无效");
+        auto v = it->second;
+        long long layer = needIndex(a[1], "体切片", line);
+        if (layer < 0 || layer >= v->L) throw WenError("运行时错误", line, 0, "体切片：层号越界");
+        auto buf = std::make_shared<vector<unsigned char>>((size_t)(v->R * v->C), 0);
+        if (v->dense) {
+            size_t base = (size_t)(layer * v->R * v->C);
+            memcpy(buf->data(), v->data.data() + base, (size_t)(v->R * v->C));
+        } else {
+            for (int r = 0; r < v->R; ++r) {
+                for (int c = 0; c < v->C; ++c) {
+                    auto key = std::make_tuple((int)(layer / v->brick), r / v->brick, c / v->brick);
+                    auto bit = v->bricks.find(key);
+                    if (bit == v->bricks.end()) continue;
+                    VolBrick& b = bit->second;
+                    (*buf)[(size_t)r * v->C + c] = b.constant ? b.v
+                        : b.buf[(size_t)(((layer % v->brick) * v->brick + (r % v->brick)) * v->brick + (c % v->brick))];
+                }
+            }
+        }
+        return vBytes(buf);
+    });
+    registerBuiltin("体平滑", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体平滑", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体平滑：体句柄无效");
+        auto v = it->second;
+        if (!v->dense) throw WenError("运行时错误", line, 0, "体平滑：只支持稠密体（小体积）");
+        auto out = std::make_shared<VolData>();
+        out->L = v->L; out->R = v->R; out->C = v->C; out->dense = true;
+        out->data.assign(v->data.size(), 0);
+        int L = v->L, R = v->R, C = v->C;
+        auto at = [&](int l, int r, int c) -> int {
+            if (l < 0 || r < 0 || c < 0 || l >= L || r >= R || c >= C) return 0;
+            return v->data[(size_t)((l * R + r) * C + c)];
+        };
+        for (int l = 0; l < L; ++l)
+            for (int r = 0; r < R; ++r)
+                for (int c = 0; c < C; ++c) {
+                    int sum = 0;
+                    for (int a1 = -1; a1 <= 1; ++a1)
+                        for (int b1 = -1; b1 <= 1; ++b1)
+                            for (int c1 = -1; c1 <= 1; ++c1)
+                                sum += at(l + a1, r + b1, c + c1);
+                    out->data[(size_t)((l * R + r) * C + c)] = (unsigned char)(sum / 27);
+                }
+        long long nid = volNext++;
+        volStore[nid] = out;
+        return vNum((double)nid);
+    });
+    registerBuiltin("体指纹", 1, 1, [sha256Hex](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体指纹", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体指纹：体句柄无效");
+        auto v = it->second;
+        string raw;
+        if (v->dense) {
+            raw.assign(reinterpret_cast<const char*>(v->data.data()), v->data.size());
+        } else {
+            for (auto& kv : v->bricks) {
+                VolBrick& b = kv.second;
+                char head[64];
+                snprintf(head, sizeof(head), "%d,%d,%d:%s", std::get<0>(kv.first), std::get<1>(kv.first), std::get<2>(kv.first),
+                         b.constant ? "C" : "B");
+                raw += head;
+                if (b.constant) raw.push_back((char)b.v);
+                else raw.append(reinterpret_cast<const char*>(b.buf.data()), b.buf.size());
+            }
+        }
+        return vStr(sha256Hex(raw));
+    });
     registerBuiltin("校验和", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
         string s = needStr(a[0], "校验和", line);
         unsigned int crc = 0xFFFFFFFFu;
