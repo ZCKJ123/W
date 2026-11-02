@@ -17509,6 +17509,31 @@ Interpreter::Interpreter() {
         return vBytes(img);
     });
     registerBuiltin("体指纹", 1, 1, [sha256Hex](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (a[0].type != VT::Vol) throw WenError("运行时错误", line, 0, "体指纹：需要体");
+        int kd = a[0].vol->kind;
+        // 三种体都要有指纹：SDF 哈希浮点场，四维体把 w 也拼进头部
+        if (kd == 1) {
+            auto it = sdfStore.find(a[0].vol->id);
+            if (it == sdfStore.end()) throw WenError("运行时错误", line, 0, "体指纹：SDF 句柄无效");
+            auto s = it->second;
+            string sraw;
+            char shead[64];
+            snprintf(shead, sizeof(shead), "S%d,%d,%d:", s->L, s->R, s->C);
+            sraw += shead;
+            sraw.append(reinterpret_cast<const char*>(s->d.data()), s->d.size() * 4);
+            return vStr(sha256Hex(sraw));
+        }
+        if (kd == 2) {
+            auto it4 = vol4Store.find(a[0].vol->id);
+            if (it4 == vol4Store.end()) throw WenError("运行时错误", line, 0, "体指纹：四维句柄无效");
+            auto s4 = it4->second;
+            string raw4;
+            char head4[64];
+            snprintf(head4, sizeof(head4), "4%d,%d,%d,%d:", s4->W, s4->L, s4->R, s4->C);
+            raw4 += head4;
+            raw4.append(reinterpret_cast<const char*>(s4->rgb.data()), s4->rgb.size());
+            return vStr(sha256Hex(raw4));
+        }
         long long id = needIndex(a[0], "体指纹", line);
         auto it = volStore.find(id);
         if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体指纹：体句柄无效");

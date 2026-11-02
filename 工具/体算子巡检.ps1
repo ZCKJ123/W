@@ -129,17 +129,39 @@ $四维 = @(
     '将 出 变成 体读文件("巡四维.bin")'
 )
 
+$SDF = @(
+    '打印 体尺寸(体)',
+    '打印 体总和(体)',
+    '打印 体极值(体)',
+    '打印 体指纹(体)',
+    '打印 体采样(体, 2, 2, 2)',
+    '将 出 变成 体拷贝(体)',
+    '将 出 变成 体 * 2',
+    '将 出 变成 体 + 体',
+    '将 出 变成 体绝对值(体)',
+    '将 出 变成 体平方根(体)',
+    '将 出 变成 SDF布尔(体, 体, 0)',
+    '将 出 变成 SDF等值面(体, 0)',
+    '体存文件(体, "巡SDF.bin")',
+    '将 出 变成 体读文件("巡SDF.bin")',
+    '打印 缓冲长度(体转缓冲(体))',
+    '将 出 变成 缓冲转体(体转缓冲(体))'
+)
+
 $fail = 0
 $checked = 0
 $sections = @(
-    @{n = '灰'; t = "依赖 体库`r`n依赖 体算法`r`n依赖 容量层`r`n将 体 变成 体新建(6, 6, 6)"; calls = $灰},
-    @{n = '彩'; t = "依赖 体库`r`n依赖 体算法`r`n依赖 容量层`r`n将 体 变成 体新建彩色(6, 6, 6)"; calls = $彩},
-    @{n = '四维'; t = "依赖 四维库`r`n依赖 容量层`r`n将 体 变成 四维球体(5, 6, 6, 6, 2)"; calls = $四维}
+    @{n = '灰'; t = "依赖 体库`r`n依赖 体算法`r`n依赖 容量层`r`n将 体 变成 体新建(6, 6, 6)"; calls = $灰; pre = '体写(体, 1, 1, 1, 80)'},
+    @{n = '彩'; t = "依赖 体库`r`n依赖 体算法`r`n依赖 容量层`r`n将 体 变成 体新建彩色(6, 6, 6)"; calls = $彩; pre = '体写(体, 1, 1, 1, 80)'},
+    @{n = '四维'; t = "依赖 四维库`r`n依赖 容量层`r`n将 体 变成 四维球体(5, 6, 6, 6, 2)"; calls = $四维; pre = '体写(体, 1, 1, 1, 80)'},
+    @{n = 'SDF'; t = "依赖 数学库`r`n将 体 变成 新建SDF(7, 7, 7)`r`nSDF球(体, 3, 3, 3, 2)"; calls = $SDF; pre = ''}
 )
 foreach ($case in $sections) {
     foreach ($call in $case.calls) {
         $checked++
-        $src = $case.t + "`r`n体写(体, 1, 1, 1, 80)`r`n" + $call + "`r`n"
+        $src = $case.t + "`r`n"
+        if ($case.pre -ne '') { $src += $case.pre + "`r`n" }
+        $src += $call + "`r`n"
         $f = Join-Path $dir '巡检.wen'
         [IO.File]::WriteAllText($f, $src, (New-Object Text.UTF8Encoding($false)))
         $out = & $exe $f 2>&1 | Out-String
@@ -156,5 +178,5 @@ foreach ($case in $sections) {
     }
 }
 if ($fail -gt 0) { Write-Host ("体算子巡检：{0} 项有问题" -f $fail); exit 1 }
-Write-Host ("体算子巡检：灰度/彩色/四维，共 {0} 项，无崩溃" -f $checked)
+Write-Host ("体算子巡检：灰度/彩色/四维/SDF，共 {0} 项，无崩溃" -f $checked)
 exit 0
