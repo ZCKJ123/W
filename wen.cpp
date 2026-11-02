@@ -14940,29 +14940,31 @@ Interpreter::Interpreter() {
         if (fa == volStore.end() || fb == volStore.end())
             throw WenError("运行时错误", line, 0, "体布尔：体句柄无效");
         auto A = fa->second, B = fb->second;
-        if (!A->color || !B->color) throw WenError("运行时错误", line, 0, "体布尔：需要两个彩色体");
+        if (!A->dense || !B->dense) throw WenError("运行时错误", line, 0, "体布尔：只支持稠密体");
+        if (A->color != B->color)
+            throw WenError("运行时错误", line, 0, "体布尔：一个彩色体一个灰度体，不能直接算");
         if (A->L != B->L || A->R != B->R || A->C != B->C)
             throw WenError("运行时错误", line, 0, "体布尔：两个体尺寸必须一致");
+        bool color = A->color;
+        size_t stride = color ? 3 : 1;
+        const std::vector<unsigned char>& sa = color ? A->rgb : A->data;
+        const std::vector<unsigned char>& sb = color ? B->rgb : B->data;
         auto out = std::make_shared<VolData>();
-        out->L = A->L; out->R = A->R; out->C = A->C; out->dense = true; out->color = true;
-        out->rgb.assign(A->rgb.size(), 0);
+        out->L = A->L; out->R = A->R; out->C = A->C; out->dense = true; out->color = color;
         size_t n = (size_t)(A->L * A->R * A->C);
+        if (color) out->rgb.assign(n * 3, 0); else out->data.assign(n, 0);
         for (size_t i = 0; i < n; ++i) {
-            int sa = A->rgb[i * 3] + A->rgb[i * 3 + 1] + A->rgb[i * 3 + 2];
-            int sb = B->rgb[i * 3] + B->rgb[i * 3 + 1] + B->rgb[i * 3 + 2];
+            int va = 0, vb = 0;
+            for (size_t k = 0; k < stride; ++k) { va += sa[i * stride + k]; vb += sb[i * stride + k]; }
             bool keep = false;
-            if (op == 0) keep = sa > 0 || sb > 0;
-            else if (op == 1) keep = sa > 0 && sb > 0;
-            else keep = sa > 0 && sb == 0;
+            if (op == 0) keep = va > 0 || vb > 0;
+            else if (op == 1) keep = va > 0 && vb > 0;
+            else keep = va > 0 && vb == 0;
             if (!keep) continue;
-            if (sa > 0) {
-                out->rgb[i * 3] = A->rgb[i * 3];
-                out->rgb[i * 3 + 1] = A->rgb[i * 3 + 1];
-                out->rgb[i * 3 + 2] = A->rgb[i * 3 + 2];
-            } else {
-                out->rgb[i * 3] = B->rgb[i * 3];
-                out->rgb[i * 3 + 1] = B->rgb[i * 3 + 1];
-                out->rgb[i * 3 + 2] = B->rgb[i * 3 + 2];
+            const std::vector<unsigned char>& src = va > 0 ? sa : sb;
+            for (size_t k = 0; k < stride; ++k) {
+                if (color) out->rgb[i * 3 + k] = src[i * 3 + k];
+                else out->data[i] = src[i];
             }
         }
         long long nid = volNext++;
