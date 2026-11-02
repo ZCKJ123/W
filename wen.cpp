@@ -15930,6 +15930,56 @@ Interpreter::Interpreter() {
         return vBytes(out);
     });
 
+    // 体采样：任意浮点坐标三线性取色（形变、扭曲、非整数坐标的基础）
+    registerBuiltin("体采样", 4, 4, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (a[0].type != VT::Vol) throw WenError("运行时错误", line, 0, "体采样：需要体");
+        double sl = needNum(a[1], "体采样", line);
+        double sr = needNum(a[2], "体采样", line);
+        double sc = needNum(a[3], "体采样", line);
+        if (a[0].vol->kind == 1) {
+            auto it = sdfStore.find(a[0].vol->id);
+            if (it == sdfStore.end()) throw WenError("运行时错误", line, 0, "体采样：SDF 句柄无效");
+            auto v = it->second;
+            auto at = [&](int l, int r, int c) -> double {
+                if (l < 0 || r < 0 || c < 0 || l >= v->L || r >= v->R || c >= v->C) return 1e6;
+                return v->d[(size_t)((l * v->R + r) * v->C + c)];
+            };
+            double fl = std::floor(sl), fr = std::floor(sr), fc = std::floor(sc);
+            double dl = sl - fl, dr = sr - fr, dc = sc - fc;
+            double acc = 0;
+            for (int i = 0; i < 2; ++i)
+                for (int j = 0; j < 2; ++j)
+                    for (int k = 0; k < 2; ++k)
+                        acc += at((int)fl + i, (int)fr + j, (int)fc + k)
+                             * (i ? dl : 1 - dl) * (j ? dr : 1 - dr) * (k ? dc : 1 - dc);
+            auto d = std::make_shared<Dict>();
+            d->items["值"] = vNum(acc);
+            Value out; out.type = VT::Dict; out.dict = d; return out;
+        }
+        if (a[0].vol->kind != 0) throw WenError("运行时错误", line, 0, "体采样：四维体请先切片");
+        auto it = volStore.find(a[0].vol->id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体采样：句柄无效");
+        auto v = it->second;
+        auto at = [&](int l, int r, int c, int ch) -> double {
+            if (l < 0 || r < 0 || c < 0 || l >= v->L || r >= v->R || c >= v->C) return 0;
+            return v->rgb[(size_t)((l * v->R + r) * v->C + c) * 3 + ch];
+        };
+        double fl = std::floor(sl), fr = std::floor(sr), fc = std::floor(sc);
+        double dl = sl - fl, dr = sr - fr, dc = sc - fc;
+        auto d = std::make_shared<Dict>();
+        for (int ch = 0; ch < 3; ++ch) {
+            double acc = 0;
+            for (int i = 0; i < 2; ++i)
+                for (int j = 0; j < 2; ++j)
+                    for (int k = 0; k < 2; ++k)
+                        acc += at((int)fl + i, (int)fr + j, (int)fc + k, ch)
+                             * (i ? dl : 1 - dl) * (j ? dr : 1 - dr) * (k ? dc : 1 - dc);
+            const char* keys[3] = {"红", "绿", "蓝"};
+            d->items[keys[ch]] = vNum(acc);
+        }
+        Value out; out.type = VT::Dict; out.dict = d; return out;
+    });
+
     // ---------- PNG 解码（inflate + 反滤波），支持 8 位灰度/RGB/RGBA ----------
     registerBuiltin("图像读PNG", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         string path = needStr(a[0], "图像读PNG", line);
