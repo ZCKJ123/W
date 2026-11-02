@@ -14718,6 +14718,59 @@ Interpreter::Interpreter() {
         }
         return vBytes(out);
     });
+    // 视差点云建体：按视差反投影到三维点，散开到体素里（保留前后关系，不是高度场）
+    registerBuiltin("视差点云建体", 6, 8, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "视差点云建体", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "视差点云建体：体句柄无效");
+        auto v = it->second;
+        if (!v->color) throw WenError("运行时错误", line, 0, "视差点云建体：不是彩色体");
+        auto disp = needBytes(a[1], "视差点云建体", line);
+        auto color = needBytes(a[2], "视差点云建体", line);
+        long long rows = needIndex(a[3], "视差点云建体", line);
+        long long cols = needIndex(a[4], "视差点云建体", line);
+        double near2 = 8.0;
+        if (a.size() >= 7) near2 = needNum(a[6], "视差点云建体", line);
+        if (rows != v->R || cols != v->C)
+            throw WenError("运行时错误", line, 0, "视差点云建体：尺寸必须等于体的行×列");
+        if ((long long)disp->size() < rows * cols || (long long)color->size() < rows * cols * 3)
+            throw WenError("运行时错误", line, 0, "视差点云建体：数据不足");
+        double ccx = (cols - 1) / 2.0, ccy = (rows - 1) / 2.0;
+        long long written = 0;
+        for (long long r = 0; r < rows; ++r) {
+            for (long long c = 0; c < cols; ++c) {
+                int d0 = (*disp)[(size_t)(r * cols + c)];
+                if (d0 <= 0) continue;                    // 视差为 0 视为远景/背景，跳过
+                double u = (double)d0 / 255.0;            // 1 = 最近
+                double zrel = 1.0 / (u * near2 + 1.0);    // 视差越大，深度越小
+                double l = (1.0 - zrel) * (double)(v->L - 1);
+                double sc = 1.0 - 0.35 * (1.0 - zrel);    // 远处稍向内收，模拟透视
+                double yy = ccy + (double)(r - ccy) * sc;
+                double xx = ccx + (double)(c - ccx) * sc;
+                size_t ci = (size_t)(r * cols + c) * 3;
+                unsigned char rr = (*color)[ci], gg = (*color)[ci + 1], bb = (*color)[ci + 2];
+                for (int dl = -1; dl <= 1; ++dl) {
+                    long long ll = (long long)std::lround(l) + dl;
+                    if (ll < 0 || ll >= v->L) continue;
+                    for (int dy = -1; dy <= 1; ++dy) {
+                        long long yr = (long long)std::lround(yy) + dy;
+                        if (yr < 0 || yr >= v->R) continue;
+                        for (int dx = -1; dx <= 1; ++dx) {
+                            long long xc = (long long)std::lround(xx) + dx;
+                            if (xc < 0 || xc >= v->C) continue;
+                            size_t idx = (size_t)((ll * v->R + yr) * v->C + xc) * 3;
+                            v->rgb[idx] = rr;
+                            v->rgb[idx + 1] = gg;
+                            v->rgb[idx + 2] = bb;
+                            ++written;
+                        }
+                    }
+                }
+            }
+        }
+        return vNum((double)written);
+    });
+
     // 视差图 → 彩色体：视差越大越高，颜色取自左图
     registerBuiltin("视差建体", 5, 5, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         long long id = needIndex(a[0], "视差建体", line);
