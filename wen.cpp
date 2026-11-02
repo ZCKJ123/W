@@ -14467,6 +14467,70 @@ Interpreter::Interpreter() {
         }
         br.buf[off] = b;
     };
+    // 分块体（大体积）的序列化：按块列表写，不摊平成上亿字节。
+    // 格式 WENVOL2：magic 8 + 种类 1 + L,R,C 12 + 彩色 1 + 块边长 4 + 块数 4 + 每块 (l,r,c 12 + 常量 1 + 数据)
+    static auto volBrickPack = [](shared_ptr<VolData> v) -> std::vector<unsigned char> {
+        std::vector<unsigned char> out;
+        auto put32 = [&](unsigned int x) {
+            out.push_back((unsigned char)(x & 0xFF));
+            out.push_back((unsigned char)((x >> 8) & 0xFF));
+            out.push_back((unsigned char)((x >> 16) & 0xFF));
+            out.push_back((unsigned char)((x >> 24) & 0xFF));
+        };
+        const char magic[8] = {'W','E','N','V','O','L','2','\0'};
+        out.insert(out.end(), magic, magic + 8);
+        out.push_back(0);                 // 种类：三维
+        put32((unsigned)v->L); put32((unsigned)v->R); put32((unsigned)v->C);
+        out.push_back(0);                 // 彩色：分块体一律灰度
+        put32((unsigned)v->brick);
+        put32((unsigned)v->bricks.size());
+        for (auto& kv : v->bricks) {
+            put32((unsigned)std::get<0>(kv.first));
+            put32((unsigned)std::get<1>(kv.first));
+            put32((unsigned)std::get<2>(kv.first));
+            const VolBrick& b = kv.second;
+            out.push_back(b.constant ? 1 : 0);
+            if (b.constant) out.push_back(b.v);
+            else out.insert(out.end(), b.buf.begin(), b.buf.end());
+        }
+        return out;
+    };
+    static auto volBrickUnpack = [](const std::vector<unsigned char>& raw, size_t pos, int line) -> shared_ptr<VolData> {
+        auto need = [&](size_t n) {
+            if (pos + n > raw.size()) throw WenError("运行时错误", line, 0, "缓冲转体：分块体数据不完整");
+        };
+        auto get32 = [&]() -> unsigned {
+            need(4);
+            unsigned x = raw[pos] | ((unsigned)raw[pos + 1] << 8)
+                       | ((unsigned)raw[pos + 2] << 16) | ((unsigned)raw[pos + 3] << 24);
+            pos += 4;
+            return x;
+        };
+        need(1); ++pos;                  // 种类（只有三维会走到这里）
+        unsigned L = get32(), R = get32(), C = get32();
+        need(1); ++pos;                  // 彩色
+        unsigned B = get32();
+        unsigned nb = get32();
+        if (B == 0 || B > 256) throw WenError("运行时错误", line, 0, "缓冲转体：块尺寸不对");
+        auto v = std::make_shared<VolData>();
+        v->L = (int)L; v->R = (int)R; v->C = (int)C; v->brick = (int)B;
+        v->dense = false; v->color = false;
+        for (unsigned i = 0; i < nb; ++i) {
+            unsigned bl = get32(), br = get32(), bc = get32();
+            need(1);
+            bool constant = raw[pos++] != 0;
+            VolBrick b; b.constant = constant;
+            if (constant) { need(1); b.v = raw[pos++]; }
+            else {
+                size_t n = (size_t)B * B * B;
+                need(n);
+                b.buf.assign(raw.begin() + (long)pos, raw.begin() + (long)(pos + n));
+                pos += n;
+            }
+            v->bricks[std::make_tuple((int)bl, (int)br, (int)bc)] = std::move(b);
+        }
+        return v;
+    };
     // 统计一个体：彩色体逐通道累加（体素值 = 三通道之和，>0 算非空），
     // 灰度体按 data，分块体按块覆盖范围。总和/极值/质心/直方图都从这里取，
     // 免得每种统计各自假设「有 rgb」或「有 data」。
@@ -16254,6 +16318,13 @@ Interpreter::Interpreter() {
             auto it = volStore.find(a[0].vol->id);
             if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体存文件：句柄无效");
             auto v = it->second;
+            if (!v->dense) {
+                auto packed = volBrickPack(v);
+                string braw(packed.begin(), packed.end());
+                try { writeWholeFile(path, braw, false); }
+                catch (IoError& e) { throw WenError("文件错误", line, 0, e.what()); }
+                return vNum((double)braw.size());
+            }
             put32(out, (unsigned)v->L); put32(out, (unsigned)v->R); put32(out, (unsigned)v->C);
             out.push_back(v->color ? 1 : 0);
             if (v->color) out.append(reinterpret_cast<const char*>(v->rgb.data()), v->rgb.size());
@@ -16280,6 +16351,13 @@ Interpreter::Interpreter() {
         string path = needStr(a[0], "体读文件", line);
         string raw;
         try { raw = readWholeFile(path); } catch (IoError& e) { throw WenError("文件错误", line, 0, e.what()); }
+        if (raw.size() >= 8 && raw.compare(0, 7, "WENVOL2") == 0) {
+            std::vector<unsigned char> bytes(raw.begin(), raw.end());
+            auto v = volBrickUnpack(bytes, 8, line);
+            long long nid = volNext++;
+            volStore[nid] = v; gId3.insert(nid);
+            return vVol(0, nid);
+        }
         if (raw.size() < 9 || raw.compare(0, 7, "WENVOL1") != 0)
             throw WenError("运行时错误", line, 0, "体读文件：不是体文件");
         int kd = (unsigned char)raw[7];
@@ -16329,6 +16407,14 @@ Interpreter::Interpreter() {
     registerBuiltin("体转缓冲", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         if (a[0].type != VT::Vol) throw WenError("运行时错误", line, 0, "体转缓冲：需要体");
         int kd = a[0].vol->kind;
+        if (kd == 0) {
+            auto itd = volStore.find(a[0].vol->id);
+            if (itd == volStore.end()) throw WenError("运行时错误", line, 0, "体转缓冲：句柄无效");
+            if (!itd->second->dense) {
+                auto packed = volBrickPack(itd->second);
+                return vBytes(std::make_shared<vector<unsigned char>>(std::move(packed)));
+            }
+        }
         auto buf = std::make_shared<vector<unsigned char>>();
         auto put32 = [&](unsigned int v) {
             buf->push_back((unsigned char)(v & 0xFF)); buf->push_back((unsigned char)((v >> 8) & 0xFF));
@@ -16357,6 +16443,12 @@ Interpreter::Interpreter() {
     });
     registerBuiltin("缓冲转体", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         auto raw = needBytes(a[0], "缓冲转体", line);
+        if (raw->size() >= 8 && memcmp(raw->data(), "WENVOL2", 7) == 0) {
+            auto v = volBrickUnpack(*raw, 8, line);
+            long long nid = volNext++;
+            volStore[nid] = v; gId3.insert(nid);
+            return vVol(0, nid);
+        }
         if (raw->size() < 9 || memcmp(raw->data(), "WENVOL1", 7) != 0)
             throw WenError("运行时错误", line, 0, "缓冲转体：格式不对");
         int kd = (*raw)[7];
