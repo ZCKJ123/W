@@ -14380,7 +14380,7 @@ Interpreter::Interpreter() {
             throw WenError("运行时错误", line, 0, "体新建：体积太大（上限 10 亿格）");
         auto v = std::make_shared<VolData>();
         v->L = (int)L; v->R = (int)R; v->C = (int)C;
-        if (L * R * C <= 262144) {
+        if (L * R * C <= 8000000) {
             v->dense = true;
             v->data.assign((size_t)(L * R * C), 0);
         } else {
@@ -14777,7 +14777,7 @@ Interpreter::Interpreter() {
         return vNum((double)nid);
     });
     // 体渲染：正交相机沿层方向推进，命中表面后按梯度算法线做 Lambert 光照
-    registerBuiltin("体渲染", 3, 6, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+    registerBuiltin("体渲染", 3, 8, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         auto rd = [&](shared_ptr<VolData>& v, int l, int r, int c) -> int {
             if (l < 0 || r < 0 || c < 0 || l >= v->L || r >= v->R || c >= v->C) return 0;
             if (v->dense) return v->data[(size_t)((l * v->R + r) * v->C + c)];
@@ -14805,28 +14805,65 @@ Interpreter::Interpreter() {
         }
         double ln = std::sqrt(lx * lx + ly * ly + lz * lz);
         lx /= ln; ly /= ln; lz /= ln;
+        int ss = 1;
+        if (a.size() >= 7) ss = (int)needIndex(a[6], "体渲染", line);
+        if (ss < 1) ss = 1;
+        if (ss > 4) ss = 4;
+        bool shadows = false;
+        if (a.size() >= 8) shadows = needIndex(a[7], "体渲染", line) != 0;
+        // 沿光线找第一个非空体素
+        auto firstHit = [&](int r, int c) -> int {
+            for (int l = 0; l < v->L; ++l) {
+                if (rd(v, l, r, c) > 0) return l;
+            }
+            return -1;
+        };
         for (long long py = 0; py < H; ++py) {
-            int r = (int)((py * v->R) / H);
             for (long long px = 0; px < W; ++px) {
-                int c = (int)((px * v->C) / W);
-                int hit = -1;
-                for (int l = 0; l < v->L; ++l) {
-                    if (rd(v, l, r, c) > 0) { hit = l; break; }
+                long long acc = 0;
+                int cnt = 0;
+                for (int sy = 0; sy < ss; ++sy) {
+                    for (int sx = 0; sx < ss; ++sx) {
+                        int r = (int)(((py * ss + sy) * v->R) / (H * ss));
+                        int c = (int)(((px * ss + sx) * v->C) / (W * ss));
+                        int hit = firstHit(r, c);
+                        if (hit < 0) { ++cnt; continue; }
+                        double gx = (double)rd(v, hit, r, c + 1) - (double)rd(v, hit, r, c - 1);
+                        double gy = (double)rd(v, hit, r + 1, c) - (double)rd(v, hit, r - 1, c);
+                        double gz = (double)rd(v, hit + 1, r, c) - (double)rd(v, hit - 1, r, c);
+                        double gn = std::sqrt(gx * gx + gy * gy + gz * gz);
+                        double sh = 0.15;
+                        if (gn > 1e-9) {
+                            double d = (-gx * lx + -gy * ly + -gz * lz) / gn;
+                            if (d > 0) sh += 0.85 * d;
+                        }
+                        if (shadows && gn > 1e-9) {
+                            // 从表面沿法线推出去再朝光走，避免自遮挡
+                            double nx2 = -gx / gn, ny2 = -gy / gn, nz2 = -gz / gn;
+                            int bl = hit + (int)std::lround(nz2 * 2.0);
+                            int br = r + (int)std::lround(ny2 * 2.0);
+                            int bc = c + (int)std::lround(nx2 * 2.0);
+                            int occ = 0;
+                            for (int t = 1; t <= 128; ++t) {
+                                int nl = bl + (int)std::lround(lz * t);
+                                int nr = br + (int)std::lround(ly * t);
+                                int nc = bc + (int)std::lround(lx * t);
+                                if (nl < 0 || nr < 0 || nc < 0 || nl >= v->L || nr >= v->R || nc >= v->C) break;
+                                if (rd(v, nl, nr, nc) > 0) { occ = 1; break; }
+                                t += 1;
+                            }
+                            if (occ) sh *= 0.45;
+                        }
+                        int alb = rd(v, hit, r, c);
+                        for (int t = 1; t <= 4 && hit + t < v->L; ++t) alb = std::max(alb, rd(v, hit + t, r, c));
+                        int val = (int)(sh * (double)alb);
+                        if (val > 255) val = 255;
+                        if (val < 0) val = 0;
+                        acc += val;
+                        ++cnt;
+                    }
                 }
-                if (hit < 0) continue;
-                double gx = (double)rd(v, hit, r, c + 1) - (double)rd(v, hit, r, c - 1);
-                double gy = (double)rd(v, hit, r + 1, c) - (double)rd(v, hit, r - 1, c);
-                double gz = (double)rd(v, hit + 1, r, c) - (double)rd(v, hit - 1, r, c);
-                double gn = std::sqrt(gx * gx + gy * gy + gz * gz);
-                double sh = 0.15;
-                if (gn > 1e-9) {
-                    double d = (-gx * lx + -gy * ly + -gz * lz) / gn;
-                    if (d > 0) sh += 0.85 * d;
-                }
-                int val = (int)(sh * (double)rd(v, hit, r, c));
-                if (val > 255) val = 255;
-                if (val < 0) val = 0;
-                (*img)[(size_t)(py * W + px)] = (unsigned char)val;
+                (*img)[(size_t)(py * W + px)] = (unsigned char)(cnt > 0 ? acc / cnt : 0);
             }
         }
         return vBytes(img);
