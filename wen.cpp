@@ -1219,6 +1219,8 @@ private:
     // 局部 名 变成 表达式：强制在当前函数帧里建变量，即使外层有同名全局也不改它
     StmtPtr parseLocal() {
         int line = peek().line;
+        if (funcDepth_ == 0)
+            err(peek(), "「局部」只能用在函数内；顶层直接写「将 名字 变成 值」");
         ++idx_;
         Token nm = expectName();
         ExprPtr target = mkVar(nm.text, nm.line);
@@ -4560,7 +4562,7 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
     switch (s->k) {
         case Stmt::K::Assign: {
             Value v = eval(s->expr, scope);
-            if (s->declareLocal && s->target && s->target->k == Expr::K::Var) {
+            if (s->declareLocal && s->target && s->target->k == Expr::K::Var && s->target->gslot < 0) {
                 scope->set(s->target->sym, std::move(v));
                 break;
             }
