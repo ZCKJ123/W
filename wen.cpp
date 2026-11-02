@@ -15794,18 +15794,23 @@ Interpreter::Interpreter() {
             auto A = aScalar ? std::shared_ptr<VolData>() : ita->second;
             auto B = bScalar ? std::shared_ptr<VolData>() : itb->second;
             auto ref = A ? A : B;
-            if (!ref->color) throw WenError("运行时错误", line, 0, "体运算：只支持彩色体");
+            if (!ref->dense) throw WenError("运行时错误", line, 0, "体运算：只支持稠密体");
+            if (A && B && A->color != B->color)
+                throw WenError("运行时错误", line, 0, "体运算：一个彩色体一个灰度体，不能直接算");
+            bool color = ref->color;
             if (A && B && (A->L != B->L || A->R != B->R || A->C != B->C))
                 throw WenError("运行时错误", line, 0, "体运算：两个体尺寸必须一致");
             auto out = std::make_shared<VolData>();
-            out->L = ref->L; out->R = ref->R; out->C = ref->C; out->dense = true; out->color = true;
-            size_t n3 = (size_t)(ref->L * ref->R * ref->C) * 3;
-            out->rgb.resize(n3);
+            out->L = ref->L; out->R = ref->R; out->C = ref->C; out->dense = true; out->color = color;
+            size_t nv = (size_t)(ref->L * ref->R * ref->C);
+            size_t n3 = color ? nv * 3 : nv;
+            if (color) out->rgb.resize(n3); else out->data.resize(n3);
             for (size_t i = 0; i < n3; ++i) {
-                double va = A ? (double)A->rgb[i] : sval;
-                double vb = B ? (double)B->rgb[i] : sval;
+                double va = A ? (color ? (double)A->rgb[i] : (double)A->data[i]) : sval;
+                double vb = B ? (color ? (double)B->rgb[i] : (double)B->data[i]) : sval;
                 double rr = combine(va, vb);
-                out->rgb[i] = (unsigned char)std::min(255.0, std::max(0.0, rr));
+                unsigned char rb = (unsigned char)std::min(255.0, std::max(0.0, rr));
+                if (color) out->rgb[i] = rb; else out->data[i] = rb;
             }
             long long id = volNext++;
             volStore[id] = out;
@@ -15873,14 +15878,17 @@ Interpreter::Interpreter() {
                     auto it2 = volStore.find(vv.vol->id);
                     if (it2 == volStore.end()) throw WenError("运行时错误", line, 0, "体比较：句柄无效");
                     auto src = it2->second;
+                    if (!src->dense) throw WenError("运行时错误", line, 0, "体比较：只支持稠密体");
                     auto out2 = std::make_shared<VolData>();
-                    out2->L = src->L; out2->R = src->R; out2->C = src->C; out2->dense = true; out2->color = true;
-                    out2->rgb.resize(src->rgb.size());
-                    for (size_t i = 0; i < src->rgb.size(); ++i) {
-                        double x = (double)src->rgb[i];
+                    out2->L = src->L; out2->R = src->R; out2->C = src->C; out2->dense = true; out2->color = src->color;
+                    if (src->color) out2->rgb.resize(src->rgb.size()); else out2->data.resize(src->data.size());
+                    size_t bn = out2->color ? out2->rgb.size() : out2->data.size();
+                    for (size_t i = 0; i < bn; ++i) {
+                        double x = out2->color ? (double)src->rgb[i] : (double)src->data[i];
                         bool r = aVol ? (op == "==" ? x == sv : op == "!=" ? x != sv : op == "<" ? x < sv : op == "<=" ? x <= sv : op == ">" ? x > sv : x >= sv)
                                      : (op == "==" ? sv == x : op == "!=" ? sv != x : op == "<" ? sv < x : op == "<=" ? sv <= x : op == ">" ? sv > x : sv >= x);
-                        out2->rgb[i] = r ? 255 : 0;
+                        if (out2->color) out2->rgb[i] = r ? 255 : 0;
+                        else out2->data[i] = r ? 255 : 0;
                     }
                     long long id2 = volNext++;
                     volStore[id2] = out2; gId3.insert(id2);
@@ -15928,12 +15936,17 @@ Interpreter::Interpreter() {
             if (kd == 0) {
                 auto A = volStore.find(a.vol->id), B = volStore.find(b.vol->id);
                 if (A == volStore.end() || B == volStore.end()) throw WenError("运行时错误", line, 0, "体比较：句柄无效");
+                if (A->second->color != B->second->color)
+                    throw WenError("运行时错误", line, 0, "体比较：一个彩色体一个灰度体，不能直接比");
+                bool color = A->second->color;
                 auto out = std::make_shared<VolData>();
-                out->L = A->second->L; out->R = A->second->R; out->C = A->second->C; out->dense = true; out->color = true;
-                out->rgb.resize(A->second->rgb.size());
-                for (size_t i = 0; i < out->rgb.size(); ++i) {
-                    unsigned char vv = pick((double)A->second->rgb[i], (double)B->second->rgb[i]);
-                    out->rgb[i] = vv;
+                out->L = A->second->L; out->R = A->second->R; out->C = A->second->C; out->dense = true; out->color = color;
+                size_t n = color ? A->second->rgb.size() : A->second->data.size();
+                if (color) out->rgb.resize(n); else out->data.resize(n);
+                for (size_t i = 0; i < n; ++i) {
+                    unsigned char vv = pick(color ? (double)A->second->rgb[i] : (double)A->second->data[i],
+                                            color ? (double)B->second->rgb[i] : (double)B->second->data[i]);
+                    if (color) out->rgb[i] = vv; else out->data[i] = vv;
                 }
                 long long id = volNext++;
                 volStore[id] = out; gId3.insert(id);
@@ -16364,11 +16377,20 @@ Interpreter::Interpreter() {
         auto X = A->second, Y = B->second;
         if (X->L != Y->L || X->R != Y->R || X->C != Y->C)
             throw WenError("运行时错误", line, 0, "体差分：两个体尺寸必须一致");
+        if (X->color != Y->color)
+            throw WenError("运行时错误", line, 0, "体差分：一个彩色体一个灰度体，不能直接比");
+        bool color = X->color;
         auto out = std::make_shared<VolData>();
-        out->L = X->L; out->R = X->R; out->C = X->C; out->dense = true; out->color = true;
-        out->rgb.resize(X->rgb.size(), 0);
-        for (size_t i = 0; i < X->rgb.size(); ++i)
-            out->rgb[i] = (unsigned char)std::abs((int)X->rgb[i] - (int)Y->rgb[i]);
+        out->L = X->L; out->R = X->R; out->C = X->C; out->dense = true; out->color = color;
+        if (color) {
+            out->rgb.resize(X->rgb.size(), 0);
+            for (size_t i = 0; i < X->rgb.size(); ++i)
+                out->rgb[i] = (unsigned char)std::abs((int)X->rgb[i] - (int)Y->rgb[i]);
+        } else {
+            out->data.resize(X->data.size(), 0);
+            for (size_t i = 0; i < X->data.size(); ++i)
+                out->data[i] = (unsigned char)std::abs((int)X->data[i] - (int)Y->data[i]);
+        }
         long long id = volNext++;
         volStore[id] = out; gId3.insert(id);
         return vVol(0, id);
