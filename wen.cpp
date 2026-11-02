@@ -21440,7 +21440,7 @@ static void checkExprNames(const ExprPtr& e, const std::set<string>& vars,
             if (n < req) {
                 errors.push_back(WenError("静态错误", e->line, 0,
                     "函数「" + callee + "」至少需要 " + std::to_string(req) +
-                    " 个参数，收到 " + std::to_string(n) + " 个"));
+                    " 个参数，收到 " + std::to_string(n) + " 个" + (n == 1 && req >= 2 ? "；多参数请写括号：" + callee + "(…, …)" : "")));
             } else if (n > maxArgs) {
                 errors.push_back(WenError("静态错误", e->line, 0,
                     "函数「" + callee + "」需要 " + std::to_string(maxArgs) +
