@@ -15733,6 +15733,143 @@ Interpreter::Interpreter() {
         return vVol(2, id);
     };
 
+    // 体的比较：逐格比较，得到 0/255 的掩码体
+    {
+        auto oldHook = gVolArith;
+        gVolArith = [oldHook](const std::string& op, const Value& a, const Value& b, int line) -> Value {
+            bool cmp = op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=";
+            if (!cmp) return oldHook(op, a, b, line);
+            bool aVol = a.type == VT::Vol, bVol = b.type == VT::Vol;
+            if (!aVol && !bVol) return Value();
+            if (aVol != bVol) throw WenError("运行时错误", line, 0, "体比较：一边是体、一边是数字，请两边都用体");
+            if (a.vol->kind != b.vol->kind) throw WenError("运行时错误", line, 0, "体比较：两边类型不同");
+            int kd = a.vol->kind;
+            auto pick = [&](double va, double vb) -> unsigned char {
+                bool r = op == "==" ? va == vb : op == "!=" ? va != vb : op == "<" ? va < vb : op == "<=" ? va <= vb : op == ">" ? va > vb : va >= vb;
+                return r ? 255 : 0;
+            };
+            if (kd == 2) throw WenError("运行时错误", line, 0, "体比较：四维体比较暂未实现");
+            if (kd == 0) {
+                auto A = volStore.find(a.vol->id), B = volStore.find(b.vol->id);
+                if (A == volStore.end() || B == volStore.end()) throw WenError("运行时错误", line, 0, "体比较：句柄无效");
+                auto out = std::make_shared<VolData>();
+                out->L = A->second->L; out->R = A->second->R; out->C = A->second->C; out->dense = true; out->color = true;
+                out->rgb.resize(A->second->rgb.size());
+                for (size_t i = 0; i < out->rgb.size(); ++i) {
+                    unsigned char vv = pick((double)A->second->rgb[i], (double)B->second->rgb[i]);
+                    out->rgb[i] = vv;
+                }
+                long long id = volNext++;
+                volStore[id] = out; gId3.insert(id);
+                return vVol(0, id);
+            }
+            auto A = sdfStore.find(a.vol->id), B = sdfStore.find(b.vol->id);
+            if (A == sdfStore.end() || B == sdfStore.end()) throw WenError("运行时错误", line, 0, "体比较：SDF 句柄无效");
+            auto out = std::make_shared<VolData>();
+            out->L = A->second->L; out->R = A->second->R; out->C = A->second->C; out->dense = true; out->color = true;
+            out->rgb.resize((size_t)(out->L * out->R * out->C * 3));
+            for (size_t i = 0; i < (size_t)(out->L * out->R * out->C); ++i) {
+                unsigned char vv = pick((double)A->second->d[i], (double)B->second->d[i]);
+                out->rgb[i * 3] = vv; out->rgb[i * 3 + 1] = vv; out->rgb[i * 3 + 2] = vv;
+            }
+            long long id = volNext++;
+            volStore[id] = out; gId3.insert(id);
+            return vVol(0, id);
+        };
+    }
+    // 体的一元函数
+    auto unaryVol = [&](const Value& src, int line, const char* who, std::function<double(double)> f) -> Value {
+        if (src.type != VT::Vol) throw WenError("运行时错误", line, 0, string(who) + "：需要体");
+        int kd = src.vol->kind;
+        if (kd == 0) {
+            auto it = volStore.find(src.vol->id);
+            if (it == volStore.end()) throw WenError("运行时错误", line, 0, string(who) + "：体句柄无效");
+            auto s = it->second;
+            if (!s->color) throw WenError("运行时错误", line, 0, string(who) + "：只支持彩色体");
+            auto out = std::make_shared<VolData>();
+            out->L = s->L; out->R = s->R; out->C = s->C; out->dense = true; out->color = true;
+            out->rgb.resize(s->rgb.size());
+            for (size_t i = 0; i < s->rgb.size(); ++i)
+                out->rgb[i] = (unsigned char)std::min(255.0, std::max(0.0, f((double)s->rgb[i])));
+            long long id = volNext++;
+            volStore[id] = out; gId3.insert(id);
+            return vVol(0, id);
+        }
+        auto it = sdfStore.find(src.vol->id);
+        if (it == sdfStore.end()) throw WenError("运行时错误", line, 0, string(who) + "：SDF 句柄无效");
+        auto s = it->second;
+        auto out = std::make_shared<SdfVol>();
+        out->L = s->L; out->R = s->R; out->C = s->C;
+        out->d.resize(s->d.size());
+        for (size_t i = 0; i < s->d.size(); ++i) out->d[i] = (float)f((double)s->d[i]);
+        long long id = sdfNext++;
+        sdfStore[id] = out; gIdSdf.insert(id);
+        return vVol(1, id);
+    };
+    registerBuiltin("体绝对值", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        return unaryVol(a[0], line, "体绝对值", [](double x) { return std::abs(x); });
+    });
+    registerBuiltin("体平方根", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        return unaryVol(a[0], line, "体平方根", [](double x) { return std::sqrt(std::abs(x)); });
+    });
+    // 体归约：总和 / 最大 / 最小 / 均值
+    registerBuiltin("体总和", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (a[0].type != VT::Vol) throw WenError("运行时错误", line, 0, "体总和：需要体");
+        double s = 0;
+        if (a[0].vol->kind == 0) {
+            auto it = volStore.find(a[0].vol->id);
+            if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体总和：句柄无效");
+            for (unsigned char c : it->second->rgb) s += c;
+        } else {
+            auto it = sdfStore.find(a[0].vol->id);
+            if (it == sdfStore.end()) throw WenError("运行时错误", line, 0, "体总和：SDF 句柄无效");
+            for (float d : it->second->d) s += d;
+        }
+        return vNum(s);
+    });
+    registerBuiltin("体极值", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (a[0].type != VT::Vol) throw WenError("运行时错误", line, 0, "体极值：需要体");
+        double mx = -1e30, mn = 1e30;
+        if (a[0].vol->kind == 0) {
+            auto it = volStore.find(a[0].vol->id);
+            if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体极值：句柄无效");
+            for (unsigned char c : it->second->rgb) { if (c > mx) mx = c; if (c < mn) mn = c; }
+        } else {
+            auto it = sdfStore.find(a[0].vol->id);
+            if (it == sdfStore.end()) throw WenError("运行时错误", line, 0, "体极值：SDF 句柄无效");
+            for (float d : it->second->d) { if (d > mx) mx = d; if (d < mn) mn = d; }
+        }
+        auto d = std::make_shared<Dict>();
+        d->items["最大"] = vNum(mx);
+        d->items["最小"] = vNum(mn);
+        Value out; out.type = VT::Dict; out.dict = d; return out;
+    });
+    // 四维布尔：并/交/差
+    registerBuiltin("四维布尔", 3, 3, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (a[0].type != VT::Vol || a[1].type != VT::Vol || a[0].vol->kind != 2 || a[1].vol->kind != 2)
+            throw WenError("运行时错误", line, 0, "四维布尔：需要两个四维体");
+        int op = (int)needIndex(a[2], "四维布尔", line);
+        auto A = vol4Store.find(a[0].vol->id), B = vol4Store.find(a[1].vol->id);
+        if (A == vol4Store.end() || B == vol4Store.end()) throw WenError("运行时错误", line, 0, "四维布尔：句柄无效");
+        auto X = A->second, Y = B->second;
+        if (X->W != Y->W || X->L != Y->L || X->R != Y->R || X->C != Y->C)
+            throw WenError("运行时错误", line, 0, "四维布尔：尺寸必须一致");
+        auto out = std::make_shared<Vol4>();
+        out->W = X->W; out->L = X->L; out->R = X->R; out->C = X->C;
+        out->rgb.assign(X->rgb.size(), 0);
+        for (size_t i = 0; i < X->rgb.size(); i += 3) {
+            int sa = X->rgb[i] + X->rgb[i + 1] + X->rgb[i + 2];
+            int sb = Y->rgb[i] + Y->rgb[i + 1] + Y->rgb[i + 2];
+            bool keep = op == 0 ? (sa > 0 || sb > 0) : (op == 1 ? (sa > 0 && sb > 0) : (sa > 0 && sb == 0));
+            if (!keep) continue;
+            if (sa > 0) { out->rgb[i] = X->rgb[i]; out->rgb[i + 1] = X->rgb[i + 1]; out->rgb[i + 2] = X->rgb[i + 2]; }
+            else { out->rgb[i] = Y->rgb[i]; out->rgb[i + 1] = Y->rgb[i + 1]; out->rgb[i + 2] = Y->rgb[i + 2]; }
+        }
+        long long id = vol4Next++;
+        vol4Store[id] = out; gId4.insert(id);
+        return vVol(2, id);
+    });
+
     // ---------- PNG 解码（inflate + 反滤波），支持 8 位灰度/RGB/RGBA ----------
     registerBuiltin("图像读PNG", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         string path = needStr(a[0], "图像读PNG", line);
