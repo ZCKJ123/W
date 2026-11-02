@@ -14803,6 +14803,192 @@ Interpreter::Interpreter() {
         return vNum(1);
     });
 
+    // ---------- 三维体运算：布尔 / 形态学 / 模糊 / 缩放 ----------
+    registerBuiltin("体布尔", 3, 3, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long ia = needIndex(a[0], "体布尔", line);
+        long long ib = needIndex(a[1], "体布尔", line);
+        int op = (int)needIndex(a[2], "体布尔", line);
+        auto fa = volStore.find(ia), fb = volStore.find(ib);
+        if (fa == volStore.end() || fb == volStore.end())
+            throw WenError("运行时错误", line, 0, "体布尔：体句柄无效");
+        auto A = fa->second, B = fb->second;
+        if (!A->color || !B->color) throw WenError("运行时错误", line, 0, "体布尔：需要两个彩色体");
+        if (A->L != B->L || A->R != B->R || A->C != B->C)
+            throw WenError("运行时错误", line, 0, "体布尔：两个体尺寸必须一致");
+        auto out = std::make_shared<VolData>();
+        out->L = A->L; out->R = A->R; out->C = A->C; out->dense = true; out->color = true;
+        out->rgb.assign(A->rgb.size(), 0);
+        size_t n = (size_t)(A->L * A->R * A->C);
+        for (size_t i = 0; i < n; ++i) {
+            int sa = A->rgb[i * 3] + A->rgb[i * 3 + 1] + A->rgb[i * 3 + 2];
+            int sb = B->rgb[i * 3] + B->rgb[i * 3 + 1] + B->rgb[i * 3 + 2];
+            bool keep = false;
+            if (op == 0) keep = sa > 0 || sb > 0;
+            else if (op == 1) keep = sa > 0 && sb > 0;
+            else keep = sa > 0 && sb == 0;
+            if (!keep) continue;
+            if (sa > 0) {
+                out->rgb[i * 3] = A->rgb[i * 3];
+                out->rgb[i * 3 + 1] = A->rgb[i * 3 + 1];
+                out->rgb[i * 3 + 2] = A->rgb[i * 3 + 2];
+            } else {
+                out->rgb[i * 3] = B->rgb[i * 3];
+                out->rgb[i * 3 + 1] = B->rgb[i * 3 + 1];
+                out->rgb[i * 3 + 2] = B->rgb[i * 3 + 2];
+            }
+        }
+        long long nid = volNext++;
+        volStore[nid] = out;
+        return vNum((double)nid);
+    });
+    registerBuiltin("体形态", 3, 3, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体形态", line);
+        long long times = needIndex(a[1], "体形态", line);
+        int mode = (int)needIndex(a[2], "体形态", line);   // 0=腐蚀 1=膨胀
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体形态：体句柄无效");
+        auto v = it->second;
+        if (!v->color) throw WenError("运行时错误", line, 0, "体形态：需要彩色体");
+        int L = v->L, R = v->R, C = v->C;
+        std::vector<unsigned char> cur(v->rgb);
+        std::vector<unsigned char> nxt(v->rgb.size(), 0);
+        auto solidAt = [&](const std::vector<unsigned char>& g, int l, int r, int c) -> bool {
+            if (l < 0 || r < 0 || c < 0 || l >= L || r >= R || c >= C) return false;
+            size_t o = (size_t)((l * R + r) * C + c) * 3;
+            return g[o] + g[o + 1] + g[o + 2] > 0;
+        };
+        for (long long t = 0; t < times; ++t) {
+            std::fill(nxt.begin(), nxt.end(), 0);
+            for (int l = 0; l < L; ++l)
+                for (int r = 0; r < R; ++r)
+                    for (int c = 0; c < C; ++c) {
+                        bool self = solidAt(cur, l, r, c);
+                        bool any = self, all = self;
+                        const int d6[6][3] = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
+                        for (auto& d : d6) {
+                            bool s2 = solidAt(cur, l + d[0], r + d[1], c + d[2]);
+                            any = any || s2;
+                            all = all && s2;
+                        }
+                        bool keep = mode == 0 ? all : any;
+                        if (!keep) continue;
+                        size_t o = (size_t)((l * R + r) * C + c) * 3;
+                        size_t so = o;
+                        if (!self) {
+                            // 膨胀出来的新体素借用第一个邻居的颜色
+                            bool found = false;
+                            for (auto& d : d6) {
+                                if (solidAt(cur, l + d[0], r + d[1], c + d[2])) {
+                                    size_t no = (size_t)(((l + d[0]) * R + (r + d[1])) * C + (c + d[2])) * 3;
+                                    nxt[o] = cur[no]; nxt[o + 1] = cur[no + 1]; nxt[o + 2] = cur[no + 2];
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found) { nxt[o] = 200; nxt[o + 1] = 200; nxt[o + 2] = 200; }
+                        } else {
+                            nxt[o] = cur[so]; nxt[o + 1] = cur[so + 1]; nxt[o + 2] = cur[so + 2];
+                        }
+                    }
+            cur.swap(nxt);
+        }
+        auto out = std::make_shared<VolData>();
+        out->L = L; out->R = R; out->C = C; out->dense = true; out->color = true;
+        out->rgb = cur;
+        long long nid = volNext++;
+        volStore[nid] = out;
+        return vNum((double)nid);
+    });
+    registerBuiltin("体模糊", 2, 2, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体模糊", line);
+        long long rad = needIndex(a[1], "体模糊", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体模糊：体句柄无效");
+        auto v = it->second;
+        if (!v->color) throw WenError("运行时错误", line, 0, "体模糊：需要彩色体");
+        int L = v->L, R = v->R, C = v->C;
+        if (rad < 1) rad = 1;
+        if (rad > 4) rad = 4;
+        std::vector<unsigned char> cur(v->rgb);
+        std::vector<unsigned char> tmp(v->rgb.size(), 0), outb(v->rgb.size(), 0);
+        auto pass = [&](int axis) {
+            for (int l = 0; l < L; ++l)
+                for (int r = 0; r < R; ++r)
+                    for (int c = 0; c < C; ++c) {
+                        int sr = 0, sg = 0, sb = 0, cnt = 0;
+                        for (long long d = -rad; d <= rad; ++d) {
+                            int nl = l, nr = r, nc = c;
+                            if (axis == 0) nl = (int)(l + d);
+                            else if (axis == 1) nr = (int)(r + d);
+                            else nc = (int)(c + d);
+                            if (nl < 0 || nr < 0 || nc < 0 || nl >= L || nr >= R || nc >= C) continue;
+                            size_t o = (size_t)((nl * R + nr) * C + nc) * 3;
+                            sr += tmp[o]; sg += tmp[o + 1]; sb += tmp[o + 2]; ++cnt;
+                        }
+                        size_t o2 = (size_t)((l * R + r) * C + c) * 3;
+                        outb[o2] = (unsigned char)(sr / cnt);
+                        outb[o2 + 1] = (unsigned char)(sg / cnt);
+                        outb[o2 + 2] = (unsigned char)(sb / cnt);
+                    }
+            tmp.swap(outb);
+            std::fill(outb.begin(), outb.end(), 0);
+        };
+        tmp = cur;
+        std::fill(outb.begin(), outb.end(), 0);
+        std::vector<unsigned char> keep = tmp;
+        for (int axis = 0; axis < 3; ++axis) { pass(axis); }
+        auto out = std::make_shared<VolData>();
+        out->L = L; out->R = R; out->C = C; out->dense = true; out->color = true;
+        out->rgb = tmp;
+        long long nid = volNext++;
+        volStore[nid] = out;
+        return vNum((double)nid);
+    });
+    registerBuiltin("体缩放", 4, 4, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体缩放", line);
+        long long NL = needIndex(a[1], "体缩放", line);
+        long long NR = needIndex(a[2], "体缩放", line);
+        long long NC = needIndex(a[3], "体缩放", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体缩放：体句柄无效");
+        auto v = it->second;
+        if (!v->color) throw WenError("运行时错误", line, 0, "体缩放：需要彩色体");
+        if (NL <= 0 || NR <= 0 || NC <= 0 || NL * NR * NC > 8000000)
+            throw WenError("运行时错误", line, 0, "体缩放：目标尺寸非法");
+        auto out = std::make_shared<VolData>();
+        out->L = (int)NL; out->R = (int)NR; out->C = (int)NC; out->dense = true; out->color = true;
+        out->rgb.assign((size_t)(NL * NR * NC * 3), 0);
+        auto sample = [&](double sl, double sr, double sc, int ch) -> int {
+            // 三线性采样
+            double fl = std::floor(sl), fr = std::floor(sr), fc = std::floor(sc);
+            double dl = sl - fl, dr = sr - fr, dc = sc - fc;
+            double acc = 0;
+            for (int i2 = 0; i2 < 2; ++i2)
+                for (int j2 = 0; j2 < 2; ++j2)
+                    for (int k2 = 0; k2 < 2; ++k2) {
+                        long long ql = (long long)fl + i2, qr = (long long)fr + j2, qc = (long long)fc + k2;
+                        if (ql < 0 || qr < 0 || qc < 0 || ql >= v->L || qr >= v->R || qc >= v->C) continue;
+                        size_t o = (size_t)((ql * v->R + qr) * v->C + qc) * 3 + (size_t)ch;
+                        acc += v->rgb[o] * (i2 ? dl : 1 - dl) * (j2 ? dr : 1 - dr) * (k2 ? dc : 1 - dc);
+                    }
+            return (int)acc;
+        };
+        for (long long l = 0; l < NL; ++l)
+            for (long long r = 0; r < NR; ++r)
+                for (long long c = 0; c < NC; ++c) {
+                    double sl = (double)l * (v->L - 1) / (double)(NL > 1 ? NL - 1 : 1);
+                    double sr = (double)r * (v->R - 1) / (double)(NR > 1 ? NR - 1 : 1);
+                    double sc2 = (double)c * (v->C - 1) / (double)(NC > 1 ? NC - 1 : 1);
+                    size_t o = (size_t)((l * NR + r) * NC + c) * 3;
+                    out->rgb[o] = (unsigned char)std::min(255, sample(sl, sr, sc2, 0));
+                    out->rgb[o + 1] = (unsigned char)std::min(255, sample(sl, sr, sc2, 1));
+                    out->rgb[o + 2] = (unsigned char)std::min(255, sample(sl, sr, sc2, 2));
+                }
+        long long nid = volNext++;
+        volStore[nid] = out;
+        return vNum((double)nid);
+    });
+
     // ---------- PNG 解码（inflate + 反滤波），支持 8 位灰度/RGB/RGBA ----------
     registerBuiltin("图像读PNG", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         string path = needStr(a[0], "图像读PNG", line);
