@@ -16702,6 +16702,18 @@ Interpreter::Interpreter() {
                 }
         return vNum((double)faces);
     });
+    // 体释放：把体从句柄表里删掉，让内存能还回去。
+    // 释放之后这个编号就失效了，别的变量再引用它只会得到「句柄无效」。
+    registerBuiltin("体释放", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (a[0].type != VT::Vol || !a[0].vol)
+            throw WenError("运行时错误", line, 0, "体释放：需要体");
+        int kd = a[0].vol->kind;
+        long long id = a[0].vol->id;
+        if (kd == 1) { gIdSdf.erase(id); return vBool(sdfStore.erase(id) > 0); }
+        if (kd == 2) { gId4.erase(id); return vBool(vol4Store.erase(id) > 0); }
+        gId3.erase(id);
+        return vBool(volStore.erase(id) > 0);
+    });
     // 体拷贝：深拷贝任意种类的体
     registerBuiltin("体拷贝", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         if (a[0].type != VT::Vol) throw WenError("运行时错误", line, 0, "体拷贝：需要体");
