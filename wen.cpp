@@ -14989,6 +14989,220 @@ Interpreter::Interpreter() {
         return vNum((double)nid);
     });
 
+    // ---------- 等值面（Surface Nets）+ 网格光栅化 ----------
+    registerBuiltin("体等值面", 2, 2, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体等值面", line);
+        long long thr = needIndex(a[1], "体等值面", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体等值面：体句柄无效");
+        auto v = it->second;
+        if (!v->color) throw WenError("运行时错误", line, 0, "体等值面：需要彩色体");
+        int L = v->L, R = v->R, C = v->C;
+        auto val = [&](int l, int r, int c) -> int {
+            if (l < 0 || r < 0 || c < 0 || l >= L || r >= R || c >= C) return 0;
+            size_t o = (size_t)((l * R + r) * C + c) * 3;
+            return v->rgb[o] + v->rgb[o + 1] + v->rgb[o + 2];
+        };
+        std::vector<float> verts;
+        std::vector<int> cellIdx((size_t)(L * R * C), -1);
+        static const int corner[8][3] = {{0,0,0},{1,0,0},{1,1,0},{0,1,0},{0,0,1},{1,0,1},{1,1,1},{0,1,1}};
+        static const int edges[12][2] = {{0,1},{1,2},{2,3},{3,0},{4,5},{5,6},{6,7},{7,4},{0,4},{1,5},{2,6},{3,7}};
+        for (int l = 0; l < L - 1; ++l)
+            for (int r = 0; r < R - 1; ++r)
+                for (int c = 0; c < C - 1; ++c) {
+                    int cv[8];
+                    bool inside = false, outside = false;
+                    for (int k = 0; k < 8; ++k) {
+                        cv[k] = val(l + corner[k][0], r + corner[k][1], c + corner[k][2]);
+                        if (cv[k] >= thr) inside = true; else outside = true;
+                    }
+                    if (!inside || !outside) continue;
+                    double sx = 0, sy = 0, sz = 0;
+                    int cnt = 0;
+                    for (int e = 0; e < 12; ++e) {
+                        int a2 = edges[e][0], b2 = edges[e][1];
+                        bool ia = cv[a2] >= thr, ib = cv[b2] >= thr;
+                        if (ia == ib) continue;
+                        double t = (double)(thr - cv[a2]) / (double)(cv[b2] - cv[a2]);
+                        double px = corner[a2][2] + t * (corner[b2][2] - corner[a2][2]);
+                        double py = corner[a2][1] + t * (corner[b2][1] - corner[a2][1]);
+                        double pz = corner[a2][0] + t * (corner[b2][0] - corner[a2][0]);
+                        sx += px; sy += py; sz += pz; ++cnt;
+                    }
+                    if (cnt == 0) continue;
+                    cellIdx[(size_t)((l * R + r) * C + c)] = (int)(verts.size() / 3);
+                    verts.push_back((float)(c + sx / cnt));
+                    verts.push_back((float)(r + sy / cnt));
+                    verts.push_back((float)(l + sz / cnt));
+                }
+        std::vector<unsigned int> tris;
+        auto cellV = [&](int l, int r, int c) -> int {
+            if (l < 0 || r < 0 || c < 0 || l >= L - 1 || r >= R - 1 || c >= C - 1) return -1;
+            return cellIdx[(size_t)((l * R + r) * C + c)];
+        };
+        for (int l = 0; l < L - 1; ++l)
+            for (int r = 0; r < R - 1; ++r)
+                for (int c = 0; c < C - 1; ++c) {
+                    bool s0 = val(l, r, c) >= thr;
+                    // 沿 c 方向的边
+                    if (c + 1 < C) {
+                        bool s1 = val(l, r, c + 1) >= thr;
+                        if (s0 != s1) {
+                            int q0 = cellV(l - 1, r - 1, c), q1 = cellV(l - 1, r, c);
+                            int q2 = cellV(l, r, c), q3 = cellV(l, r - 1, c);
+                            if (q0 >= 0 && q1 >= 0 && q2 >= 0 && q3 >= 0) {
+                                tris.push_back((unsigned)q0); tris.push_back((unsigned)q1); tris.push_back((unsigned)q2);
+                                tris.push_back((unsigned)q0); tris.push_back((unsigned)q2); tris.push_back((unsigned)q3);
+                            }
+                        }
+                    }
+                    if (r + 1 < R) {
+                        bool s1 = val(l, r + 1, c) >= thr;
+                        if (s0 != s1) {
+                            int q0 = cellV(l - 1, r, c - 1), q1 = cellV(l, r, c - 1);
+                            int q2 = cellV(l, r, c), q3 = cellV(l - 1, r, c);
+                            if (q0 >= 0 && q1 >= 0 && q2 >= 0 && q3 >= 0) {
+                                tris.push_back((unsigned)q0); tris.push_back((unsigned)q1); tris.push_back((unsigned)q2);
+                                tris.push_back((unsigned)q0); tris.push_back((unsigned)q2); tris.push_back((unsigned)q3);
+                            }
+                        }
+                    }
+                    if (l + 1 < L) {
+                        bool s1 = val(l + 1, r, c) >= thr;
+                        if (s0 != s1) {
+                            int q0 = cellV(l, r - 1, c - 1), q1 = cellV(l, r, c - 1);
+                            int q2 = cellV(l, r, c), q3 = cellV(l, r - 1, c);
+                            if (q0 >= 0 && q1 >= 0 && q2 >= 0 && q3 >= 0) {
+                                tris.push_back((unsigned)q0); tris.push_back((unsigned)q1); tris.push_back((unsigned)q2);
+                                tris.push_back((unsigned)q0); tris.push_back((unsigned)q2); tris.push_back((unsigned)q3);
+                            }
+                        }
+                    }
+                }
+        auto vb = std::make_shared<vector<unsigned char>>(verts.size() * 4);
+        if (!verts.empty()) memcpy(vb->data(), verts.data(), verts.size() * 4);
+        auto ib = std::make_shared<vector<unsigned char>>(tris.size() * 4);
+        if (!tris.empty()) memcpy(ib->data(), tris.data(), tris.size() * 4);
+        auto d = std::make_shared<Dict>();
+        d->items["顶点"] = vBytes(vb);
+        d->items["索引"] = vBytes(ib);
+        d->items["点数"] = vNum((double)(verts.size() / 3));
+        d->items["面数"] = vNum((double)(tris.size() / 3));
+        Value out; out.type = VT::Dict; out.dict = d; return out;
+    });
+    // 网格光栅化：正交投影 + z 缓冲 + 逐顶点法线
+    registerBuiltin("网格渲染", 5, 8, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto vb = needBytes(a[0], "网格渲染", line);
+        auto ib = needBytes(a[1], "网格渲染", line);
+        long long W = needIndex(a[2], "网格渲染", line);
+        long long H = needIndex(a[3], "网格渲染", line);
+        long long id = needIndex(a[4], "网格渲染", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "网格渲染：体句柄无效（取颜色域）");
+        auto vol = it->second;
+        double lx = 0.45, ly = 0.5, lz = 0.72;
+        double vx = 0.25, vy = -0.5, vz = -0.83;
+        if (a.size() >= 8) {
+            lx = needNum(a[5], "网格渲染", line); ly = needNum(a[6], "网格渲染", line); lz = needNum(a[7], "网格渲染", line);
+        }
+        auto ln = std::sqrt(lx * lx + ly * ly + lz * lz); lx /= ln; ly /= ln; lz /= ln;
+        auto vn = std::sqrt(vx * vx + vy * vy + vz * vz); vx /= vn; vy /= vn; vz /= vn;
+        double ux = -vy, uy = vx, uz = 0.0;
+        auto un = std::sqrt(ux * ux + uy * uy + uz * uz);
+        if (un < 1e-9) { ux = 1; uy = 0; uz = 0; un = 1; }
+        ux /= un; uy /= un; uz /= un;
+        double wx = uy * vz - uz * vy, wy = uz * vx - ux * vz, wz = ux * vy - uy * vx;
+        size_t nv = vb->size() / 12;
+        size_t nt = ib->size() / 12;
+        const float* V = reinterpret_cast<const float*>(vb->data());
+        const unsigned int* T = reinterpret_cast<const unsigned int*>(ib->data());
+        std::vector<double> nx(nv, 0), ny(nv, 0), nz(nv, 0);
+        for (size_t t = 0; t < nt; ++t) {
+            unsigned i0 = T[t * 3], i1 = T[t * 3 + 1], i2 = T[t * 3 + 2];
+            if (i0 >= nv || i1 >= nv || i2 >= nv) continue;
+            double ax = V[i1 * 3] - V[i0 * 3], ay = V[i1 * 3 + 1] - V[i0 * 3 + 1], az = V[i1 * 3 + 2] - V[i0 * 3 + 2];
+            double bx = V[i2 * 3] - V[i0 * 3], by = V[i2 * 3 + 1] - V[i0 * 3 + 1], bz = V[i2 * 3 + 2] - V[i0 * 3 + 2];
+            double cx2 = ay * bz - az * by, cy2 = az * bx - ax * bz, cz2 = ax * by - ay * bx;
+            for (unsigned ii : {i0, i1, i2}) { nx[ii] += cx2; ny[ii] += cy2; nz[ii] += cz2; }
+        }
+        double cen[3] = {(vol->C - 1) / 2.0, (vol->R - 1) / 2.0, (vol->L - 1) / 2.0};
+        double sc = std::max(vol->C, std::max(vol->R, vol->L)) * 1.45;
+        auto img = std::make_shared<vector<unsigned char>>((size_t)(W * H * 3), 0);
+        std::vector<double> zbuf((size_t)(W * H), 1e30);
+        for (size_t t = 0; t < nt; ++t) {
+            unsigned idx3[3] = {T[t * 3], T[t * 3 + 1], T[t * 3 + 2]};
+            double sx[3], sy[3], sz[3];
+            bool ok = true;
+            for (int k = 0; k < 3; ++k) {
+                if (idx3[k] >= nv) { ok = false; break; }
+                double px = V[idx3[k] * 3] - cen[0], py = V[idx3[k] * 3 + 1] - cen[1], pz = V[idx3[k] * 3 + 2] - cen[2];
+                double u = px * ux + py * uy + pz * uz;
+                double w2 = px * wx + py * wy + pz * wz;
+                double d3 = px * vx + py * vy + pz * vz;
+                sx[k] = (u / sc + 0.5) * W;
+                sy[k] = (0.5 - w2 / sc) * H;
+                sz[k] = d3;
+            }
+            if (!ok) continue;
+            double minx = std::min(sx[0], std::min(sx[1], sx[2]));
+            double maxx = std::max(sx[0], std::max(sx[1], sx[2]));
+            double miny = std::min(sy[0], std::min(sy[1], sy[2]));
+            double maxy = std::max(sy[0], std::max(sy[1], sy[2]));
+            int x0 = (int)std::max(0.0, std::floor(minx)), x1 = (int)std::min((double)W - 1, std::ceil(maxx));
+            int y0 = (int)std::max(0.0, std::floor(miny)), y1 = (int)std::min((double)H - 1, std::ceil(maxy));
+            double den = (sy[1] - sy[2]) * (sx[0] - sx[2]) + (sx[2] - sx[1]) * (sy[0] - sy[2]);
+            if (std::abs(den) < 1e-9) continue;
+            double nr[3] = {nx[idx3[0]], ny[idx3[0]], nz[idx3[0]]};
+            for (int y = y0; y <= y1; ++y) {
+                for (int x = x0; x <= x1; ++x) {
+                    double px2 = x + 0.5, py2 = y + 0.5;
+                    double l0 = ((sy[1] - sy[2]) * (px2 - sx[2]) + (sx[2] - sx[1]) * (py2 - sy[2])) / den;
+                    double l1 = ((sy[2] - sy[0]) * (px2 - sx[2]) + (sx[0] - sx[2]) * (py2 - sy[2])) / den;
+                    double l2 = 1.0 - l0 - l1;
+                    if (l0 < 0 || l1 < 0 || l2 < 0) continue;
+                    double zz = l0 * sz[0] + l1 * sz[1] + l2 * sz[2];
+                    size_t o = (size_t)(y * W + x);
+                    if (zz >= zbuf[o]) continue;
+                    zbuf[o] = zz;
+                    double gx2 = l0 * nx[idx3[0]] + l1 * nx[idx3[1]] + l2 * nx[idx3[2]];
+                    double gy2 = l0 * ny[idx3[0]] + l1 * ny[idx3[1]] + l2 * ny[idx3[2]];
+                    double gz2 = l0 * nz[idx3[0]] + l1 * nz[idx3[1]] + l2 * nz[idx3[2]];
+                    double gn2 = std::sqrt(gx2 * gx2 + gy2 * gy2 + gz2 * gz2);
+                    double sh = 0.22;
+                    if (gn2 > 1e-9) {
+                        double dd = (gx2 * lx + gy2 * ly + gz2 * lz) / gn2;
+                        if (dd > 0) sh += 0.78 * dd;
+                    }
+                    double ccx = (double)(l0 * V[idx3[0] * 3] + l1 * V[idx3[1] * 3] + l2 * V[idx3[2] * 3]);
+                    double ccy = (double)(l0 * V[idx3[0] * 3 + 1] + l1 * V[idx3[1] * 3 + 1] + l2 * V[idx3[2] * 3 + 1]);
+                    double ccz = (double)(l0 * V[idx3[0] * 3 + 2] + l1 * V[idx3[1] * 3 + 2] + l2 * V[idx3[2] * 3 + 2]);
+                    int ql = (int)std::lround(ccz), qr = (int)std::lround(ccy), qc = (int)std::lround(ccx);
+                    int rr2 = 0, gg2 = 0, bb2 = 0;
+                    bool gotColor = false;
+                    for (int qrad = 0; qrad <= 3 && !gotColor; ++qrad) {
+                        for (int qdz = -qrad; qdz <= qrad && !gotColor; ++qdz)
+                            for (int qdy = -qrad; qdy <= qrad && !gotColor; ++qdy)
+                                for (int qdx = -qrad; qdx <= qrad && !gotColor; ++qdx) {
+                                    int zl = ql + qdz, zr = qr + qdy, zc = qc + qdx;
+                                    if (zl < 0 || zr < 0 || zc < 0 || zl >= vol->L || zr >= vol->R || zc >= vol->C) continue;
+                                    size_t so = (size_t)((zl * vol->R + zr) * vol->C + zc) * 3;
+                                    int sr2 = vol->rgb[so] + vol->rgb[so + 1] + vol->rgb[so + 2];
+                                    if (sr2 > 0) {
+                                        rr2 = vol->rgb[so]; gg2 = vol->rgb[so + 1]; bb2 = vol->rgb[so + 2];
+                                        gotColor = true;
+                                    }
+                                }
+                    }
+                    if (!gotColor) { rr2 = 200; gg2 = 200; bb2 = 200; }
+                    (*img)[o * 3] = (unsigned char)std::min(255.0, sh * rr2);
+                    (*img)[o * 3 + 1] = (unsigned char)std::min(255.0, sh * gg2);
+                    (*img)[o * 3 + 2] = (unsigned char)std::min(255.0, sh * bb2);
+                }
+            }
+        }
+        return vBytes(img);
+    });
+
     // ---------- PNG 解码（inflate + 反滤波），支持 8 位灰度/RGB/RGBA ----------
     registerBuiltin("图像读PNG", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         string path = needStr(a[0], "图像读PNG", line);
