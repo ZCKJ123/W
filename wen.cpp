@@ -22422,6 +22422,9 @@ static int compileFile(const string& path, const string& output, bool build) {
     try {
         string src = readWholeFile(resolveWenPath(path));
         src = normalizeWenSource(src);
+        // 编译路径没有构造解释器，内建名从未注册；这里补一次，供静态检查识别
+        static Interpreter* gBuiltinProbe = nullptr;
+        if (!gBuiltinProbe) gBuiltinProbe = new Interpreter();
         vector<WenError> errors;
         string expanded;
         int blocks = processSaveBlocks(src, false, expanded, errors);
