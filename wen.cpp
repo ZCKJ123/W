@@ -15605,6 +15605,35 @@ Interpreter::Interpreter() {
                     }
         return vNum((double)n);
     });
+    // 四维盒：四维超矩形，端点顺序随便，颜色 0 表示浅灰
+    registerBuiltin("四维盒", 10, 10, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "四维盒", line);
+        auto it = vol4Store.find(id);
+        if (it == vol4Store.end()) throw WenError("运行时错误", line, 0, "四维盒：句柄无效");
+        auto v = it->second;
+        long long w0 = needIndex(a[1], "四维盒", line), l0 = needIndex(a[2], "四维盒", line);
+        long long r0 = needIndex(a[3], "四维盒", line), c0 = needIndex(a[4], "四维盒", line);
+        long long w1 = needIndex(a[5], "四维盒", line), l1 = needIndex(a[6], "四维盒", line);
+        long long r1 = needIndex(a[7], "四维盒", line), c1 = needIndex(a[8], "四维盒", line);
+        long long col = needIndex(a[9], "四维盒", line);
+        if (col < 0 || col > 0xFFFFFF)
+            throw WenError("运行时错误", line, 0, "四维盒：颜色要写成 0xRRGGBB 或 0");
+        int rr, gg, bb;
+        if (col == 0) { rr = 200; gg = 200; bb = 200; }
+        else { rr = (int)((col >> 16) & 0xFF); gg = (int)((col >> 8) & 0xFF); bb = (int)(col & 0xFF); }
+        long long n = 0;
+        for (long long w = std::max(0LL, std::min(w0, w1)); w <= std::min((long long)v->W - 1, std::max(w0, w1)); ++w)
+            for (long long l = std::max(0LL, std::min(l0, l1)); l <= std::min((long long)v->L - 1, std::max(l0, l1)); ++l)
+                for (long long r = std::max(0LL, std::min(r0, r1)); r <= std::min((long long)v->R - 1, std::max(r0, r1)); ++r)
+                    for (long long c = std::max(0LL, std::min(c0, c1)); c <= std::min((long long)v->C - 1, std::max(c0, c1)); ++c) {
+                        size_t o = (size_t)((((w * v->L + l) * v->R + r) * v->C + c) * 3);
+                        v->rgb[o] = (unsigned char)rr;
+                        v->rgb[o + 1] = (unsigned char)gg;
+                        v->rgb[o + 2] = (unsigned char)bb;
+                        ++n;
+                    }
+        return vNum((double)n);
+    });
     // 四维切片：固定 w，取出一层三维体
     registerBuiltin("四维切片", 2, 2, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         long long id = needIndex(a[0], "四维切片", line);
