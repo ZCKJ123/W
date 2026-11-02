@@ -14810,7 +14810,7 @@ Interpreter::Interpreter() {
                                 for (int c1 = -1; c1 <= 1; ++c1)
                                     sum += at(l + a1, r + b1, c + c1, ch);
                         size_t idx = (size_t)((l * R + r) * C + c);
-                        unsigned char val = (unsigned char)(sum / 27);
+                        unsigned char val = (unsigned char)((sum + 13) / 27);   // 四舍五入
                         if (color) out->rgb[idx * 3 + (size_t)ch] = val;
                         else out->data[idx] = val;
                     }
@@ -15220,7 +15220,7 @@ Interpreter::Interpreter() {
                             ++cnt;
                         }
                         size_t o2 = (size_t)((l * R + r) * C + c) * stride;
-                        for (size_t k = 0; k < stride; ++k) outb[o2 + k] = (unsigned char)(acc[k] / cnt);
+                        for (size_t k = 0; k < stride; ++k) outb[o2 + k] = (unsigned char)((acc[k] + cnt / 2) / cnt);
                     }
             tmp.swap(outb);
             std::fill(outb.begin(), outb.end(), 0);
