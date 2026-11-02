@@ -15549,13 +15549,17 @@ Interpreter::Interpreter() {
         if (!V.empty()) memcpy(V.data(), vb->data(), vb->size());
         std::vector<unsigned> T(ib->size() / 4);
         if (!T.empty()) memcpy(T.data(), ib->data(), ib->size());
-        std::ostringstream os;
-        os << "# 文语言导出的 OBJ\n";
-        for (size_t i = 0; i < nv; ++i)
-            os << "v " << V[i * 3] << " " << V[i * 3 + 1] << " " << V[i * 3 + 2] << "\n";
-        for (size_t t = 0; t < nt; ++t)
-            os << "f " << (T[t * 3] + 1) << " " << (T[t * 3 + 1] + 1) << " " << (T[t * 3 + 2] + 1) << "\n";
-        string s = os.str();
+        string s = "# 文语言导出的 OBJ\n";
+        char buf[96];
+        for (size_t i = 0; i < nv; ++i) {
+            // %.9g：float32 的 9 位有效数字能精确往返，读回来和写出去逐字节一样
+            snprintf(buf, sizeof(buf), "v %.9g %.9g %.9g\n", V[i * 3], V[i * 3 + 1], V[i * 3 + 2]);
+            s += buf;
+        }
+        for (size_t t = 0; t < nt; ++t) {
+            snprintf(buf, sizeof(buf), "f %u %u %u\n", T[t * 3] + 1, T[t * 3 + 1] + 1, T[t * 3 + 2] + 1);
+            s += buf;
+        }
         try { writeWholeFile(path, s, false); } catch (IoError& e) { throw WenError("文件错误", line, 0, e.what()); }
         return vNum((double)s.size());
     });
@@ -15601,6 +15605,57 @@ Interpreter::Interpreter() {
         }
         try { writeWholeFile(path, out, false); } catch (IoError& e) { throw WenError("文件错误", line, 0, e.what()); }
         return vNum((double)out.size());
+    });
+    // 网格读OBJ：读回 {顶点, 索引, 点数, 面数}，多边形按扇形拆成三角形
+    registerBuiltin("网格读OBJ", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path = needStr(a[0], "网格读OBJ", line);
+        string text;
+        try { text = readWholeFile(path); } catch (IoError& e) { throw WenError("文件错误", line, 0, e.what()); }
+        std::vector<float> verts;
+        std::vector<unsigned> tris;
+        std::istringstream in(text);
+        string row;
+        long long ln = 0;
+        while (std::getline(in, row)) {
+            ++ln;
+            if (row.size() > 1 && row[0] == 'v' && row[1] == ' ') {
+                std::istringstream ls(row.substr(2));
+                double x = 0, y = 0, z = 0;
+                if (!(ls >> x >> y >> z))
+                    throw WenError("运行时错误", line, 0, "网格读OBJ：第 " + std::to_string(ln) + " 行顶点读不出来");
+                verts.push_back((float)x); verts.push_back((float)y); verts.push_back((float)z);
+            } else if (row.size() > 1 && row[0] == 'f' && row[1] == ' ') {
+                std::istringstream ls(row.substr(2));
+                std::vector<long long> idx;
+                string token;
+                while (ls >> token) {
+                    size_t slash = token.find('/');
+                    long long id = std::atoll(token.substr(0, slash).c_str());
+                    if (id < 0) id = (long long)(verts.size() / 3) + id + 1;   // 允许相对索引
+                    idx.push_back(id - 1);
+                }
+                if (idx.size() < 3)
+                    throw WenError("运行时错误", line, 0, "网格读OBJ：第 " + std::to_string(ln) + " 行面少于三个点");
+                for (long long i : idx)
+                    if (i < 0 || (size_t)i >= verts.size() / 3)
+                        throw WenError("运行时错误", line, 0, "网格读OBJ：第 " + std::to_string(ln) + " 行索引超出顶点数");
+                for (size_t i = 1; i + 1 < idx.size(); ++i) {
+                    tris.push_back((unsigned)idx[0]);
+                    tris.push_back((unsigned)idx[i]);
+                    tris.push_back((unsigned)idx[i + 1]);
+                }
+            }
+        }
+        auto vb = std::make_shared<vector<unsigned char>>(verts.size() * 4);
+        if (!verts.empty()) memcpy(vb->data(), verts.data(), verts.size() * 4);
+        auto ib = std::make_shared<vector<unsigned char>>(tris.size() * 4);
+        if (!tris.empty()) memcpy(ib->data(), tris.data(), tris.size() * 4);
+        auto d = std::make_shared<Dict>();
+        d->items["顶点"] = vBytes(vb);
+        d->items["索引"] = vBytes(ib);
+        d->items["点数"] = vNum((double)(verts.size() / 3));
+        d->items["面数"] = vNum((double)(tris.size() / 3));
+        Value out; out.type = VT::Dict; out.dict = d; return out;
     });
     // ---------- 四维体：真正的第四维坐标（w, 层, 行, 列） ----------
     struct Vol4 { int W = 0, L = 0, R = 0, C = 0; std::vector<unsigned char> rgb; };
