@@ -15116,6 +15116,17 @@ Interpreter::Interpreter() {
         size_t nt = ib->size() / 12;
         const float* V = reinterpret_cast<const float*>(vb->data());
         const unsigned int* T = reinterpret_cast<const unsigned int*>(ib->data());
+        // 先把包围盒算出来（取景 + 法线定向都要用）
+        double bmin3[3] = {1e30, 1e30, 1e30}, bmax3[3] = {-1e30, -1e30, -1e30};
+        if (nv > 0) {
+            for (size_t i = 0; i < nv; ++i)
+                for (int k = 0; k < 3; ++k) {
+                    double q = V[i * 3 + k];
+                    if (q < bmin3[k]) bmin3[k] = q;
+                    if (q > bmax3[k]) bmax3[k] = q;
+                }
+        }
+        double boxc[3] = {(bmin3[0] + bmax3[0]) / 2.0, (bmin3[1] + bmax3[1]) / 2.0, (bmin3[2] + bmax3[2]) / 2.0};
         std::vector<double> nx(nv, 0), ny(nv, 0), nz(nv, 0);
         for (size_t t = 0; t < nt; ++t) {
             unsigned i0 = T[t * 3], i1 = T[t * 3 + 1], i2 = T[t * 3 + 2];
@@ -15123,10 +15134,21 @@ Interpreter::Interpreter() {
             double ax = V[i1 * 3] - V[i0 * 3], ay = V[i1 * 3 + 1] - V[i0 * 3 + 1], az = V[i1 * 3 + 2] - V[i0 * 3 + 2];
             double bx = V[i2 * 3] - V[i0 * 3], by = V[i2 * 3 + 1] - V[i0 * 3 + 1], bz = V[i2 * 3 + 2] - V[i0 * 3 + 2];
             double cx2 = ay * bz - az * by, cy2 = az * bx - ax * bz, cz2 = ax * by - ay * bx;
+            // 用「从包围盒中心指向三角形」的方向定向，保证法线朝外
+            double mx2 = (V[i0 * 3] + V[i1 * 3] + V[i2 * 3]) / 3.0 - boxc[0];
+            double my2 = (V[i0 * 3 + 1] + V[i1 * 3 + 1] + V[i2 * 3 + 1]) / 3.0 - boxc[1];
+            double mz2 = (V[i0 * 3 + 2] + V[i1 * 3 + 2] + V[i2 * 3 + 2]) / 3.0 - boxc[2];
+            if (cx2 * mx2 + cy2 * my2 + cz2 * mz2 < 0) { cx2 = -cx2; cy2 = -cy2; cz2 = -cz2; }
             for (unsigned ii : {i0, i1, i2}) { nx[ii] += cx2; ny[ii] += cy2; nz[ii] += cz2; }
         }
+        // 自动取景：按顶点包围盒定中心与比例
         double cen[3] = {(vol->C - 1) / 2.0, (vol->R - 1) / 2.0, (vol->L - 1) / 2.0};
         double sc = std::max(vol->C, std::max(vol->R, vol->L)) * 1.45;
+        if (nv > 0) {
+            for (int k = 0; k < 3; ++k) cen[k] = boxc[k];
+            double ext = std::max(bmax3[0] - bmin3[0], std::max(bmax3[1] - bmin3[1], bmax3[2] - bmin3[2]));
+            if (ext > 1e-6) sc = ext * 1.6;
+        }
         auto img = std::make_shared<vector<unsigned char>>((size_t)(W * H * 3), 0);
         std::vector<double> zbuf((size_t)(W * H), 1e30);
         for (size_t t = 0; t < nt; ++t) {
@@ -15159,6 +15181,7 @@ Interpreter::Interpreter() {
                     double l0 = ((sy[1] - sy[2]) * (px2 - sx[2]) + (sx[2] - sx[1]) * (py2 - sy[2])) / den;
                     double l1 = ((sy[2] - sy[0]) * (px2 - sx[2]) + (sx[0] - sx[2]) * (py2 - sy[2])) / den;
                     double l2 = 1.0 - l0 - l1;
+                    if (l0 < 0 || l1 < 0 || l2 < 0) { l0 = -l0; l1 = -l1; l2 = -l2; }
                     if (l0 < 0 || l1 < 0 || l2 < 0) continue;
                     double zz = l0 * sz[0] + l1 * sz[1] + l2 * sz[2];
                     size_t o = (size_t)(y * W + x);
@@ -15867,8 +15890,31 @@ Interpreter::Interpreter() {
         auto solid = [&](long long l, long long r, long long c) -> double {
             if (l < 0 || r < 0 || c < 0 || l >= v->L || r >= v->R || c >= v->C) return 0.0;
             int s = rdpx(l, r, c, 0) + rdpx(l, r, c, 1) + rdpx(l, r, c, 2);
-            return s > 0 ? 1.0 : 0.0;
+            return s > 96 ? 1.0 : 0.0;      // 阈值化：三线性放大出来的半透明边界不算实体
         };
+        // 自动取景：扫一遍内容包围盒，物体再小也会占满画面
+        {
+            int lo[3] = {v->L, v->R, v->C}, hi[3] = {-1, -1, -1};
+            for (int l = 0; l < v->L; ++l)
+                for (int r = 0; r < v->R; ++r)
+                    for (int c = 0; c < v->C; ++c) {
+                        size_t o = (size_t)((l * v->R + r) * v->C + c) * 3;
+                        if (v->rgb[o] + v->rgb[o + 1] + v->rgb[o + 2] == 0) continue;
+                        if (l < lo[0]) lo[0] = l;
+                        if (l > hi[0]) hi[0] = l;
+                        if (r < lo[1]) lo[1] = r;
+                        if (r > hi[1]) hi[1] = r;
+                        if (c < lo[2]) lo[2] = c;
+                        if (c > hi[2]) hi[2] = c;
+                    }
+            if (hi[0] >= 0) {
+                cz = (lo[0] + hi[0]) / 2.0;
+                cy = (lo[1] + hi[1]) / 2.0;
+                cx = (lo[2] + hi[2]) / 2.0;
+                double ext = std::max(hi[0] - lo[0], std::max(hi[1] - lo[1], hi[2] - lo[2])) + 1.0;
+                rad = ext * 0.95 + 1.0;
+            }
+        }
         for (long long py = 0; py < H; ++py) {
             for (long long px = 0; px < W; ++px) {
                 double accR = 0, accG = 0, accB = 0;
