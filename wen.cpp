@@ -2464,6 +2464,11 @@ static bool valueEquals(const Value& a, const Value& b, int depth = 0) {
             return true;
         }
         case VT::Num: return a.num == b.num;
+        case VT::Vol: {
+            // 体按「同一份」比：种类 + 内部编号。比内容请用 体指纹。
+            if (!a.vol || !b.vol) return a.vol == b.vol;
+            return a.vol->kind == b.vol->kind && a.vol->id == b.vol->id;
+        }
         case VT::Bytes: {
             if (!a.bytes || !b.bytes) return a.bytes == b.bytes;
             return *a.bytes == *b.bytes;
