@@ -15777,7 +15777,44 @@ Interpreter::Interpreter() {
             if (!cmp) return oldHook(op, a, b, line);
             bool aVol = a.type == VT::Vol, bVol = b.type == VT::Vol;
             if (!aVol && !bVol) return Value();
-            if (aVol != bVol) throw WenError("运行时错误", line, 0, "体比较：两边要么都是体，要么都是数字");
+            if (aVol != bVol) {
+                // 体和数字比：逐通道和标量比，得到掩码体
+                const Value& vv = aVol ? a : b;
+                double sv = needNum(aVol ? b : a, "体比较", line);
+                if (vv.vol->kind == 0) {
+                    auto it2 = volStore.find(vv.vol->id);
+                    if (it2 == volStore.end()) throw WenError("运行时错误", line, 0, "体比较：句柄无效");
+                    auto src = it2->second;
+                    auto out2 = std::make_shared<VolData>();
+                    out2->L = src->L; out2->R = src->R; out2->C = src->C; out2->dense = true; out2->color = true;
+                    out2->rgb.resize(src->rgb.size());
+                    for (size_t i = 0; i < src->rgb.size(); ++i) {
+                        double x = (double)src->rgb[i];
+                        bool r = aVol ? (op == "==" ? x == sv : op == "!=" ? x != sv : op == "<" ? x < sv : op == "<=" ? x <= sv : op == ">" ? x > sv : x >= sv)
+                                     : (op == "==" ? sv == x : op == "!=" ? sv != x : op == "<" ? sv < x : op == "<=" ? sv <= x : op == ">" ? sv > x : sv >= x);
+                        out2->rgb[i] = r ? 255 : 0;
+                    }
+                    long long id2 = volNext++;
+                    volStore[id2] = out2; gId3.insert(id2);
+                    return vVol(0, id2);
+                }
+                auto it2 = sdfStore.find(vv.vol->id);
+                if (it2 == sdfStore.end()) throw WenError("运行时错误", line, 0, "体比较：SDF 句柄无效");
+                auto src = it2->second;
+                auto out2 = std::make_shared<VolData>();
+                out2->L = src->L; out2->R = src->R; out2->C = src->C; out2->dense = true; out2->color = true;
+                out2->rgb.resize((size_t)(out2->L * out2->R * out2->C * 3), 0);
+                for (size_t i = 0; i < src->d.size(); ++i) {
+                    double x = (double)src->d[i];
+                    bool r = aVol ? (op == "==" ? x == sv : op == "!=" ? x != sv : op == "<" ? x < sv : op == "<=" ? x <= sv : op == ">" ? x > sv : x >= sv)
+                                 : (op == "==" ? sv == x : op == "!=" ? sv != x : op == "<" ? sv < x : op == "<=" ? sv <= x : op == ">" ? sv > x : sv >= x);
+                    unsigned char m = r ? 255 : 0;
+                    out2->rgb[i * 3] = m; out2->rgb[i * 3 + 1] = m; out2->rgb[i * 3 + 2] = m;
+                }
+                long long id2 = volNext++;
+                volStore[id2] = out2; gId3.insert(id2);
+                return vVol(0, id2);
+            }
             if (a.vol->kind != b.vol->kind) throw WenError("运行时错误", line, 0, "体比较：两边类型不同");
             int kd = a.vol->kind;
             auto pick = [&](double va, double vb) -> unsigned char {
@@ -16198,6 +16235,32 @@ Interpreter::Interpreter() {
         Value out; out.type = VT::Dict; out.dict = d; return out;
     });
 
+    // 掩码保留：只在掩码非零处保留 A 的颜色，其余清零
+    registerBuiltin("体掩码", 2, 2, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (a[0].type != VT::Vol || a[1].type != VT::Vol)
+            throw WenError("运行时错误", line, 0, "体掩码：需要两个体");
+        if (a[0].vol->kind != 0 || a[1].vol->kind != 0)
+            throw WenError("运行时错误", line, 0, "体掩码：只支持三维体");
+        auto A = volStore.find(a[0].vol->id), B = volStore.find(a[1].vol->id);
+        if (A == volStore.end() || B == volStore.end())
+            throw WenError("运行时错误", line, 0, "体掩码：句柄无效");
+        auto X = A->second, Y = B->second;
+        if (X->L != Y->L || X->R != Y->R || X->C != Y->C)
+            throw WenError("运行时错误", line, 0, "体掩码：两个体尺寸必须一致");
+        auto out = std::make_shared<VolData>();
+        out->L = X->L; out->R = X->R; out->C = X->C; out->dense = true; out->color = true;
+        out->rgb.assign(X->rgb.size(), 0);
+        for (size_t i = 0; i < X->rgb.size(); i += 3) {
+            int s = Y->rgb[i] + Y->rgb[i + 1] + Y->rgb[i + 2];
+            if (s == 0) continue;
+            out->rgb[i] = X->rgb[i];
+            out->rgb[i + 1] = X->rgb[i + 1];
+            out->rgb[i + 2] = X->rgb[i + 2];
+        }
+        long long id = volNext++;
+        volStore[id] = out; gId3.insert(id);
+        return vVol(0, id);
+    });
     // ---------- PNG 解码（inflate + 反滤波），支持 8 位灰度/RGB/RGBA ----------
     registerBuiltin("图像读PNG", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         string path = needStr(a[0], "图像读PNG", line);
