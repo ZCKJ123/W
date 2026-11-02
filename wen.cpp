@@ -15213,7 +15213,7 @@ Interpreter::Interpreter() {
         auto it = volStore.find(id);
         if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体等值面：体句柄无效");
         auto v = it->second;
-        if (!v->color) throw WenError("运行时错误", line, 0, "体等值面：需要彩色体");
+        if (!v->dense) throw WenError("运行时错误", line, 0, "体等值面：只支持稠密体");
         vector<float> verts; vector<unsigned int> tris;
         volSurfaceMesh(v, thr, verts, tris);
         auto vb = std::make_shared<vector<unsigned char>>(verts.size() * 4);
@@ -15345,12 +15345,17 @@ Interpreter::Interpreter() {
                                 for (int qdx = -qrad; qdx <= qrad && !gotColor; ++qdx) {
                                     int zl = ql + qdz, zr = qr + qdy, zc = qc + qdx;
                                     if (zl < 0 || zr < 0 || zc < 0 || zl >= vol->L || zr >= vol->R || zc >= vol->C) continue;
-                                    size_t so = (size_t)((zl * vol->R + zr) * vol->C + zc) * 3;
-                                    int sr2 = vol->rgb[so] + vol->rgb[so + 1] + vol->rgb[so + 2];
-                                    if (sr2 > 0) {
-                                        rr2 = vol->rgb[so]; gg2 = vol->rgb[so + 1]; bb2 = vol->rgb[so + 2];
-                                        gotColor = true;
+                                    size_t ci = (size_t)((zl * vol->R + zr) * vol->C + zc);
+                                    int sr2;
+                                    if (vol->color) {
+                                        size_t so = ci * 3;
+                                        sr2 = vol->rgb[so] + vol->rgb[so + 1] + vol->rgb[so + 2];
+                                        if (sr2 > 0) { rr2 = vol->rgb[so]; gg2 = vol->rgb[so + 1]; bb2 = vol->rgb[so + 2]; }
+                                    } else {
+                                        sr2 = volScalarRead(vol, zl, zr, zc);
+                                        if (sr2 > 0) { rr2 = gg2 = bb2 = sr2; }
                                     }
+                                    if (sr2 > 0) gotColor = true;
                                 }
                     }
                     if (!gotColor) { rr2 = 200; gg2 = 200; bb2 = 200; }
