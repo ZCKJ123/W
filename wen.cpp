@@ -1878,13 +1878,14 @@ private:
 // 5. 运行时值
 // ============================================================
 
-enum class VT { None, Bool, Num, Str, List, Dict, Func, Set, Bytes, Range, Int, Big };
+enum class VT { None, Bool, Num, Str, List, Dict, Func, Set, Bytes, Range, Int, Big, Vol };
 
 struct List;
 struct Dict;
 struct Callable;
 class Interpreter;
 
+struct VolRef { int kind = 0; long long id = 0; };
 struct Value {
     VT type = VT::None;
     bool b = false;
@@ -1898,6 +1899,7 @@ struct Value {
     shared_ptr<Dict> dict;
     shared_ptr<Callable> callable;
     shared_ptr<vector<unsigned char>> bytes;
+    shared_ptr<VolRef> vol;
     double rstart = 0, rstop = 0, rstep = 1;
 };
 
@@ -2152,6 +2154,7 @@ static Value vFunc(shared_ptr<Callable> c) { Value v; v.type = VT::Func; v.calla
 static Value vSet() { Value v; v.type = VT::Set; v.list = std::make_shared<List>(); return v; }
 static Value vSet(shared_ptr<List> l) { Value v; v.type = VT::Set; v.list = std::move(l); return v; }
 static Value vBytes(shared_ptr<vector<unsigned char>> b) { Value v; v.type = VT::Bytes; v.bytes = std::move(b); return v; }
+static Value vVol(int k, long long id) { Value v; v.type = VT::Vol; v.vol = std::make_shared<VolRef>(); v.vol->kind = k; v.vol->id = id; return v; }
 static Value vRange(double a, double b, double c) { Value v; v.type = VT::Range; v.rstart = a; v.rstop = b; v.rstep = c; return v; }
 static uint64_t intMask(int w) { return w >= 64 ? ~0ULL : ((1ULL << w) - 1); }
 static Value vBig(string s) { Value v; v.type = VT::Big; v.big = std::move(s); return v; }
@@ -2245,6 +2248,7 @@ static string typeName(const Value& v) {
         case VT::Func: return "函数";
         case VT::Set: return "集合";
         case VT::Bytes: return "缓冲";
+        case VT::Vol: return "体";
         case VT::Range: return "范围";
         case VT::Int: return (v.isSigned ? "i" : "u") + std::to_string(v.width);
         case VT::Big: return "大整数";
@@ -2263,6 +2267,7 @@ static bool truthy(const Value& v) {
         case VT::Func: return true;
         case VT::Set: return v.list && !v.list->items.empty();
         case VT::Bytes: return v.bytes && !v.bytes->empty();
+        case VT::Vol: return v.vol != nullptr;
         case VT::Range: return (v.rstep > 0 ? v.rstart < v.rstop : v.rstart > v.rstop);
         case VT::Int: return (v.i & intMask(v.width)) != 0;
         case VT::Big: return v.big != "0";
@@ -2468,6 +2473,7 @@ static shared_ptr<Dict> needDict(const Value& v, const string& where, int line) 
 }
 
 static long long needIndex(const Value& v, const string& where, int line) {
+    if (v.type == VT::Vol) return v.vol ? v.vol->id : 0;
     double d = needNum(v, where, line);
     if (!std::isfinite(d) || std::floor(d) != d)
         throw WenError("运行时错误", line, 0, where + "必须是整数");
@@ -3471,7 +3477,13 @@ static string htmlTitleText(const string& html) {
 
 // ---------- 运算 ----------
 
-static Value applyBinary(const string& op, const Value& a, const Value& b, int line) {
+static std::function<Value(const std::string&, const Value&, const Value&, int)> gVolArith;
+    static std::set<long long> gId3, gIdSdf, gId4;
+    static Value applyBinary(const string& op, const Value& a, const Value& b, int line) {
+    if (gVolArith) {
+        Value vr = gVolArith(op, a, b, line);
+        if (vr.type != VT::None) return vr;
+    }
     if ((a.type == VT::Func || b.type == VT::Func) &&
         (op == "+" || op == "-" || op == "*" || op == "/" || op == "//" ||
          op == "%" || op == "**" || op == "<" || op == "<=" || op == ">" || op == ">=")) {
@@ -14390,7 +14402,8 @@ Interpreter::Interpreter() {
         }
         long long id = volNext++;
         volStore[id] = v;
-        return vNum((double)id);
+        gId3.insert(id);
+        return vVol(0, id);
     });
     registerBuiltin("体写", 5, 5, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         long long id = needIndex(a[0], "体写", line);
@@ -15229,7 +15242,7 @@ Interpreter::Interpreter() {
     // ---------- 四维体：真正的第四维坐标（w, 层, 行, 列） ----------
     struct Vol4 { int W = 0, L = 0, R = 0, C = 0; std::vector<unsigned char> rgb; };
     static std::map<long long, std::shared_ptr<Vol4>> vol4Store;
-    static long long vol4Next = 1;
+    static long long vol4Next = 2000000000LL;
     registerBuiltin("四维新建", 4, 4, [](Interpreter&, vector<Value>& a, int line) -> Value {
         long long W = needIndex(a[0], "四维新建", line);
         long long L = needIndex(a[1], "四维新建", line);
@@ -15244,7 +15257,8 @@ Interpreter::Interpreter() {
         v->rgb.assign((size_t)(W * L * R * C * 3), 0);
         long long id = vol4Next++;
         vol4Store[id] = v;
-        return vNum((double)id);
+        gId4.insert(id);
+        return vVol(2, id);
     });
     registerBuiltin("四维写", 8, 8, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         long long id = needIndex(a[0], "四维写", line);
@@ -15373,7 +15387,7 @@ Interpreter::Interpreter() {
     // ---------- SDF：有符号距离场，几何级布尔 ----------
     struct SdfVol { int L = 0, R = 0, C = 0; std::vector<float> d; };
     static std::map<long long, std::shared_ptr<SdfVol>> sdfStore;
-    static long long sdfNext = 1;
+    static long long sdfNext = 1000000000LL;
     registerBuiltin("新建SDF", 3, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
         long long L = needIndex(a[0], "新建SDF", line);
         long long R = needIndex(a[1], "新建SDF", line);
@@ -15385,7 +15399,8 @@ Interpreter::Interpreter() {
         v->d.assign((size_t)(L * R * C), 1e9f);
         long long id = sdfNext++;
         sdfStore[id] = v;
-        return vNum((double)id);
+        gIdSdf.insert(id);
+        return vVol(1, id);
     });
     registerBuiltin("SDF球", 5, 5, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         long long id = needIndex(a[0], "SDF球", line);
@@ -15623,6 +15638,100 @@ Interpreter::Interpreter() {
         }
         return vBytes(img);
     });
+
+    // ---------- 体的算术：+ - * / 直接作用在体上 ----------
+    gVolArith = [&](const std::string& op, const Value& a, const Value& b, int line) -> Value {
+        auto kindOf = [](const Value& v) -> int {
+            if (v.type == VT::Vol) return v.vol ? v.vol->kind : -1;
+            return -1;
+        };
+        int ka = kindOf(a), kb = kindOf(b);
+        if (ka < 0 && kb < 0) return Value();
+        if (op != "+" && op != "-" && op != "*" && op != "/") return Value();
+        bool aScalar = ka < 0, bScalar = kb < 0;
+        int kind = aScalar ? kb : ka;
+        if (!aScalar && !bScalar && ka != kb)
+            throw WenError("运行时错误", line, 0, "体运算：两边类型不同（三维 / 四维 / SDF 不能混算）");
+        long long ia = aScalar ? 0 : (a.vol ? a.vol->id : 0);
+        long long ib = bScalar ? 0 : (b.vol ? b.vol->id : 0);
+        double sval = 0.0;
+        if (aScalar) sval = needNum(a, "体运算", line);
+        else if (bScalar) sval = needNum(b, "体运算", line);
+        auto combine = [&](double va, double vb) -> double {
+            if (op == "+") return va + vb;
+            if (op == "-") return va - vb;
+            if (op == "*") return va * vb;
+            return vb == 0.0 ? 0.0 : va / vb;
+        };
+        if (kind == 0) {
+            auto ita = volStore.find(ia), itb = volStore.find(ib);
+            if (!aScalar && ita == volStore.end()) throw WenError("运行时错误", line, 0, "体运算：左手体句柄无效");
+            if (!bScalar && itb == volStore.end()) throw WenError("运行时错误", line, 0, "体运算：右手体句柄无效");
+            auto A = aScalar ? std::shared_ptr<VolData>() : ita->second;
+            auto B = bScalar ? std::shared_ptr<VolData>() : itb->second;
+            auto ref = A ? A : B;
+            if (!ref->color) throw WenError("运行时错误", line, 0, "体运算：只支持彩色体");
+            if (A && B && (A->L != B->L || A->R != B->R || A->C != B->C))
+                throw WenError("运行时错误", line, 0, "体运算：两个体尺寸必须一致");
+            auto out = std::make_shared<VolData>();
+            out->L = ref->L; out->R = ref->R; out->C = ref->C; out->dense = true; out->color = true;
+            size_t n3 = (size_t)(ref->L * ref->R * ref->C) * 3;
+            out->rgb.resize(n3);
+            for (size_t i = 0; i < n3; ++i) {
+                double va = A ? (double)A->rgb[i] : sval;
+                double vb = B ? (double)B->rgb[i] : sval;
+                double rr = combine(va, vb);
+                out->rgb[i] = (unsigned char)std::min(255.0, std::max(0.0, rr));
+            }
+            long long id = volNext++;
+            volStore[id] = out;
+            gId3.insert(id);
+            return vVol(0, id);
+        }
+        if (kind == 1) {
+            auto ita = sdfStore.find(ia), itb = sdfStore.find(ib);
+            if (!aScalar && ita == sdfStore.end()) throw WenError("运行时错误", line, 0, "体运算：左手 SDF 句柄无效");
+            if (!bScalar && itb == sdfStore.end()) throw WenError("运行时错误", line, 0, "体运算：右手 SDF 句柄无效");
+            auto A = aScalar ? std::shared_ptr<SdfVol>() : ita->second;
+            auto B = bScalar ? std::shared_ptr<SdfVol>() : itb->second;
+            auto ref = A ? A : B;
+            if (A && B && (A->L != B->L || A->R != B->R || A->C != B->C))
+                throw WenError("运行时错误", line, 0, "体运算：两个 SDF 尺寸必须一致");
+            auto out = std::make_shared<SdfVol>();
+            out->L = ref->L; out->R = ref->R; out->C = ref->C;
+            out->d.resize(ref->d.size());
+            for (size_t i = 0; i < ref->d.size(); ++i) {
+                double va = A ? (double)A->d[i] : sval;
+                double vb = B ? (double)B->d[i] : sval;
+                out->d[i] = (float)combine(va, vb);
+            }
+            long long id = sdfNext++;
+            sdfStore[id] = out;
+            gIdSdf.insert(id);
+            return vVol(1, id);
+        }
+        auto ita = vol4Store.find(ia), itb = vol4Store.find(ib);
+        if (!aScalar && ita == vol4Store.end()) throw WenError("运行时错误", line, 0, "体运算：左手四维句柄无效");
+        if (!bScalar && itb == vol4Store.end()) throw WenError("运行时错误", line, 0, "体运算：右手四维句柄无效");
+        auto A = aScalar ? std::shared_ptr<Vol4>() : ita->second;
+        auto B = bScalar ? std::shared_ptr<Vol4>() : itb->second;
+        auto ref = A ? A : B;
+        if (A && B && (A->W != B->W || A->L != B->L || A->R != B->R || A->C != B->C))
+            throw WenError("运行时错误", line, 0, "体运算：两个四维体尺寸必须一致");
+        auto out = std::make_shared<Vol4>();
+        out->W = ref->W; out->L = ref->L; out->R = ref->R; out->C = ref->C;
+        out->rgb.resize(ref->rgb.size());
+        for (size_t i = 0; i < ref->rgb.size(); ++i) {
+            double va = A ? (double)A->rgb[i] : sval;
+            double vb = B ? (double)B->rgb[i] : sval;
+            double rr = combine(va, vb);
+            out->rgb[i] = (unsigned char)std::min(255.0, std::max(0.0, rr));
+        }
+        long long id = vol4Next++;
+        vol4Store[id] = out;
+        gId4.insert(id);
+        return vVol(2, id);
+    };
 
     // ---------- PNG 解码（inflate + 反滤波），支持 8 位灰度/RGB/RGBA ----------
     registerBuiltin("图像读PNG", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
@@ -15912,7 +16021,8 @@ Interpreter::Interpreter() {
         v->rgb.assign((size_t)(L * R * C * 3), 0);
         long long id = volNext++;
         volStore[id] = v;
-        return vNum((double)id);
+        gId3.insert(id);
+        return vVol(0, id);
     });
     registerBuiltin("体彩写", 7, 7, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         long long id = needIndex(a[0], "体彩写", line);
