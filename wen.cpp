@@ -15264,7 +15264,8 @@ Interpreter::Interpreter() {
                         size_t o = (size_t)((ql * v->R + qr) * v->C + qc) * stride + ch;
                         acc += src[o] * (i2 ? dl : 1 - dl) * (j2 ? dr : 1 - dr) * (k2 ? dc : 1 - dc);
                     }
-            return (int)acc;
+            // 四舍五入：截断会让每次缩放都系统性损失一点亮度
+            return (int)std::lround(acc);
         };
         for (long long l = 0; l < NL; ++l)
             for (long long r = 0; r < NR; ++r)
