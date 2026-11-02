@@ -16704,9 +16704,25 @@ Interpreter::Interpreter() {
         double rad = deg * 3.14159265358979323846 / 180.0;
         double cs = std::cos(rad), sn = std::sin(rad);
         auto out = std::make_shared<VolData>();
-        out->L = v->L; out->R = v->R; out->C = v->C; out->dense = true;
-        out->data.assign(v->data.size(), 0);
+        out->L = v->L; out->R = v->R; out->C = v->C; out->dense = true; out->color = v->color;
+        if (v->color) out->rgb.assign(v->rgb.size(), 0);
+        else out->data.assign(v->data.size(), 0);
         double cl = (v->L - 1) / 2.0, cr = (v->R - 1) / 2.0, cc = (v->C - 1) / 2.0;
+        auto samp = [&](double ql, double qr, double qc, int ch) -> double {
+            double fl2 = std::floor(ql), fr2 = std::floor(qr), fc2 = std::floor(qc);
+            double dl2 = ql - fl2, dr2 = qr - fr2, dc2 = qc - fc2;
+            double acc = 0;
+            for (int i2 = 0; i2 < 2; ++i2)
+                for (int j2 = 0; j2 < 2; ++j2)
+                    for (int k2 = 0; k2 < 2; ++k2) {
+                        long long l2 = (long long)fl2 + i2, r2 = (long long)fr2 + j2, c2 = (long long)fc2 + k2;
+                        if (l2 < 0 || r2 < 0 || c2 < 0 || l2 >= v->L || r2 >= v->R || c2 >= v->C) continue;
+                        size_t idx = (size_t)((l2 * v->R + r2) * v->C + c2);
+                        double val = v->color ? (double)v->rgb[idx * 3 + (size_t)ch] : (double)v->data[idx];
+                        acc += val * (i2 ? dl2 : 1 - dl2) * (j2 ? dr2 : 1 - dr2) * (k2 ? dc2 : 1 - dc2);
+                    }
+            return acc;
+        };
         for (int l = 0; l < v->L; ++l) {
             for (int r = 0; r < v->R; ++r) {
                 for (int c = 0; c < v->C; ++c) {
@@ -16715,12 +16731,14 @@ Interpreter::Interpreter() {
                     if (axis == 0) { sl = dl * cs + dr * sn; sr = -dl * sn + dr * cs; }
                     else if (axis == 1) { sr = dr * cs + dc * sn; sc = -dr * sn + dc * cs; }
                     else { sl = dl * cs + dc * sn; sc = -dl * sn + dc * cs; }
-                    long long il = (long long)std::lround(sl + cl);
-                    long long ir = (long long)std::lround(sr + cr);
-                    long long ic = (long long)std::lround(sc + cc);
-                    if (il < 0 || ir < 0 || ic < 0 || il >= v->L || ir >= v->R || ic >= v->C) continue;
-                    out->data[(size_t)((l * v->R + r) * v->C + c)] =
-                        v->data[(size_t)((il * v->R + ir) * v->C + ic)];
+                    double ql = sl + cl, qr = sr + cr, qc = sc + cc;
+                    size_t oi = (size_t)((l * v->R + r) * v->C + c);
+                    if (v->color) {
+                        for (int ch = 0; ch < 3; ++ch)
+                            out->rgb[oi * 3 + (size_t)ch] = (unsigned char)std::min(255.0, std::max(0.0, samp(ql, qr, qc, ch)));
+                    } else {
+                        out->data[oi] = (unsigned char)std::min(255.0, std::max(0.0, samp(ql, qr, qc, 0)));
+                    }
                 }
             }
         }
