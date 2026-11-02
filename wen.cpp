@@ -965,12 +965,14 @@ static int superscriptDigit(const string& s) {
     return -1;
 }
 
+static int builtinMinArityOf(const string& name);
 class Parser {
 public:
     explicit Parser(vector<Token> tokens, bool recover = false)
         : tokens_(std::move(tokens)), recover_(recover) {}
 
     const vector<WenError>& errors() const { return errors_; }
+    std::map<string, int> funcMinArity_;
 
     vector<StmtPtr> parseProgram() {
         try {
@@ -1443,6 +1445,7 @@ private:
                 matchOp(",");
             }
         }
+        funcMinArity_[nm.text] = (int)std::count_if(paramDefaults.begin(), paramDefaults.end(), [](const ExprPtr& e) { return !e; });
         bool seenDefault = false, badDefaultOrder = false;
         for (size_t di=0; di<paramDefaults.size(); ++di) {
             if (paramDefaults[di]) seenDefault = true;
@@ -1737,6 +1740,18 @@ private:
             }
             // 无括号单参数调用：正弦 30°、平方根 2、圆面积 3
             if (e->k == Expr::K::Var && startsCallArg(peek())) {
+                {
+                    string nm = e->text;
+                    int needArgs = -1;
+                    needArgs = builtinMinArityOf(nm);
+                    if (needArgs < 0) {
+                        auto ui = funcMinArity_.find(nm);
+                        if (ui != funcMinArity_.end()) needArgs = ui->second;
+                    }
+                    if (needArgs >= 2)
+                        err(peek(), "「" + nm + "」至少要 " + std::to_string(needArgs) +
+                            " 个参数，无括号调用只传一个；请写成「" + nm + "(…, …)」");
+                }
                 int line = peek().line;
                 ExprPtr arg = parseUnary();
                 vector<ExprPtr> args{arg};
@@ -1909,6 +1924,10 @@ struct Dict { map<string, Value> items; };
 
 static std::set<string> gCallableNames;
 static std::map<string, std::pair<int,int>> gBuiltinArity;
+static int builtinMinArityOf(const string& name) {
+    auto it = gBuiltinArity.find(name);
+    return it == gBuiltinArity.end() ? -1 : it->second.first;
+}
 static bool gNoNameCheck = false;
 static bool gBriefErrors = false;   // --简短：不打印每条的通用「说明」
 static bool gCompactJson = false;   // --精简：JSON 省略 detail/message
@@ -8306,7 +8325,7 @@ Interpreter::Interpreter() {
             double span = (v.rstop - v.rstart) / v.rstep;
             return vNum(span <= 0 ? 0.0 : std::ceil(span - 1e-12));
         }
-        throw WenError("运行时错误", line, 0, "「长度」不支持" + typeName(v));
+        throw WenError("运行时错误", line, 0, "「长度」不支持" + typeName(v) + "这种类型");
     });
     registerBuiltin("类型", 1, 1, [](Interpreter&, vector<Value>& a, int) -> Value {
         return vStr(typeName(a[0]));
@@ -10918,7 +10937,7 @@ Interpreter::Interpreter() {
         long long i = needIndex(a[1], "缓冲读", line);
         if (i < 0) i += (long long)b->size();
         if (i < 0 || (size_t)i >= b->size())
-            throw WenError("运行时错误", line, 0, "缓冲下标越界");
+            throw WenError("运行时错误", line, 0, "缓冲下标越界（下标超出缓冲长度）");
         return vNum((double)(*b)[(size_t)i]);
     });
     registerBuiltin("缓冲写", 3, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
@@ -10927,7 +10946,7 @@ Interpreter::Interpreter() {
         long long v = needIndex(a[2], "缓冲写", line);
         if (i < 0) i += (long long)b->size();
         if (i < 0 || (size_t)i >= b->size())
-            throw WenError("运行时错误", line, 0, "缓冲下标越界");
+            throw WenError("运行时错误", line, 0, "缓冲下标越界（下标超出缓冲长度）");
         if (v < 0 || v > 255)
             throw WenError("运行时错误", line, 0, "缓冲字节必须在 0..255");
         (*b)[(size_t)i] = (unsigned char)v;
@@ -11193,7 +11212,7 @@ Interpreter::Interpreter() {
     registerBuiltin("存点", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         string key = needStr(a[0], "存点", line);
         if (gPoints.size() >= kMaxPoints && !gPoints.count(key))
-            throw WenError("运行时错误", line, 0, "检查点数量超过上限，请先清点");
+            throw WenError("运行时错误", line, 0, "检查点数量超过上限，请先清理旧检查点");
         gPoints[key] = a[1];
         return vBool(true);
     });
@@ -13706,7 +13725,7 @@ Interpreter::Interpreter() {
             "第一条 语言边界：关键字只有中文，英文不是关键字。",
             "第二条 文件：UTF-8，推荐用途后缀。",
             "第三条 语句边界：换行或分号，连续两个空行报错，块必须结束。",
-            "第四条 表达式：** 比一元紧，并置调用只吃一个一元表达式，比较不能连写。",
+            "第四条 表达式：** 比一元紧；并置调用只接受一个参数（多参数必须写括号：面积(3, 4)）；比较不能连写。",
             "第五条 变量与函数：参数和首次赋值是局部，递归上限 1000。",
             "第六条 资源限制：大整数 5000 万位、内存值 64MB、范围 100 万。",
             "第七条 文件与沙盒：只允许沙盒根、程序目录、当前目录、额外目录。",
@@ -15741,7 +15760,7 @@ Interpreter::Interpreter() {
             if (!cmp) return oldHook(op, a, b, line);
             bool aVol = a.type == VT::Vol, bVol = b.type == VT::Vol;
             if (!aVol && !bVol) return Value();
-            if (aVol != bVol) throw WenError("运行时错误", line, 0, "体比较：一边是体、一边是数字，请两边都用体");
+            if (aVol != bVol) throw WenError("运行时错误", line, 0, "体比较：两边要么都是体，要么都是数字");
             if (a.vol->kind != b.vol->kind) throw WenError("运行时错误", line, 0, "体比较：两边类型不同");
             int kd = a.vol->kind;
             auto pick = [&](double va, double vb) -> unsigned char {
@@ -17804,7 +17823,7 @@ Interpreter::Interpreter() {
     });
     registerBuiltin("二进制破坏", 1, 2, [this](Interpreter&, vector<Value>& a, int line) -> Value {
         if (!adminGranted || !dangerousMode)
-            throw WenError("权限错误", line, 0, "二进制破坏需要管理员 + 危险模式");
+            throw WenError("权限错误", line, 0, "二进制破坏需要管理员模式和危险模式");
         string s = needStr(a[0], "二进制破坏", line);
         string key = a.size() > 1 ? needStr(a[1], "二进制破坏", line) : "wen";
         if (key.empty()) key = "wen";
@@ -17819,7 +17838,7 @@ Interpreter::Interpreter() {
     });
     registerBuiltin("二进制恢复", 1, 2, [this](Interpreter&, vector<Value>& a, int line) -> Value {
         if (!adminGranted || !dangerousMode)
-            throw WenError("权限错误", line, 0, "二进制恢复需要管理员 + 危险模式");
+            throw WenError("权限错误", line, 0, "二进制恢复需要管理员模式和危险模式");
         string s = needStr(a[0], "二进制恢复", line);
         if (s.rfind("WENB:", 0) != 0)
             throw WenError("运行时错误", line, 0, "不是二进制破坏数据");
