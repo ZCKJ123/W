@@ -14358,7 +14358,9 @@ Interpreter::Interpreter() {
     struct VolData {
         int L = 0, R = 0, C = 0, brick = 32;
         bool dense = true;
+        bool color = false;
         vector<unsigned char> data;
+        vector<unsigned char> rgb;
         std::map<std::tuple<int,int,int>, VolBrick> bricks;
     };
     static map<long long, shared_ptr<VolData>> volStore;
@@ -14768,6 +14770,175 @@ Interpreter::Interpreter() {
         }
         return vNum(1);
     });
+    // ---------- 彩色体 ----------
+    registerBuiltin("体新建彩色", 3, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long L = needIndex(a[0], "体新建彩色", line);
+        long long R = needIndex(a[1], "体新建彩色", line);
+        long long C = needIndex(a[2], "体新建彩色", line);
+        if (L <= 0 || R <= 0 || C <= 0)
+            throw WenError("运行时错误", line, 0, "体新建彩色：三个维度必须大于 0");
+        if (L * R * C > 8000000)
+            throw WenError("运行时错误", line, 0, "体新建彩色：体积太大（上限 800 万格）");
+        auto v = std::make_shared<VolData>();
+        v->L = (int)L; v->R = (int)R; v->C = (int)C;
+        v->dense = true; v->color = true;
+        v->rgb.assign((size_t)(L * R * C * 3), 0);
+        long long id = volNext++;
+        volStore[id] = v;
+        return vNum((double)id);
+    });
+    registerBuiltin("体彩写", 7, 7, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体彩写", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体彩写：体句柄无效");
+        auto v = it->second;
+        if (!v->color) throw WenError("运行时错误", line, 0, "体彩写：不是彩色体");
+        long long l = needIndex(a[1], "体彩写", line);
+        long long r = needIndex(a[2], "体彩写", line);
+        long long c = needIndex(a[3], "体彩写", line);
+        volCheck(v, l, r, c, "体彩写", line);
+        int rr = (int)needIndex(a[4], "体彩写", line);
+        int gg = (int)needIndex(a[5], "体彩写", line);
+        int bb = (int)needIndex(a[6], "体彩写", line);
+        size_t idx = (size_t)((l * v->R + r) * v->C + c) * 3;
+        v->rgb[idx] = (unsigned char)rr;
+        v->rgb[idx + 1] = (unsigned char)gg;
+        v->rgb[idx + 2] = (unsigned char)bb;
+        return vNum(1);
+    });
+    registerBuiltin("体彩读", 4, 4, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体彩读", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体彩读：体句柄无效");
+        auto v = it->second;
+        if (!v->color) throw WenError("运行时错误", line, 0, "体彩读：不是彩色体");
+        long long l = needIndex(a[1], "体彩读", line);
+        long long r = needIndex(a[2], "体彩读", line);
+        long long c = needIndex(a[3], "体彩读", line);
+        auto d = std::make_shared<Dict>();
+        if (l < 0 || r < 0 || c < 0 || l >= v->L || r >= v->R || c >= v->C) {
+            d->items["红"] = vNum(0); d->items["绿"] = vNum(0); d->items["蓝"] = vNum(0);
+        } else {
+            size_t idx = (size_t)((l * v->R + r) * v->C + c) * 3;
+            d->items["红"] = vNum((double)v->rgb[idx]);
+            d->items["绿"] = vNum((double)v->rgb[idx + 1]);
+            d->items["蓝"] = vNum((double)v->rgb[idx + 2]);
+        }
+        Value out; out.type = VT::Dict; out.dict = d; return out;
+    });
+    // 彩色照片 → 彩色高度场：亮度定高度，像素颜色定体素颜色
+    registerBuiltin("体彩高度场", 4, 4, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体彩高度场", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体彩高度场：体句柄无效");
+        auto v = it->second;
+        if (!v->color) throw WenError("运行时错误", line, 0, "体彩高度场：不是彩色体");
+        auto buf = needBytes(a[1], "体彩高度场", line);
+        long long rows = needIndex(a[2], "体彩高度场", line);
+        long long cols = needIndex(a[3], "体彩高度场", line);
+        if (rows != v->R || cols != v->C)
+            throw WenError("运行时错误", line, 0, "体彩高度场：图尺寸必须和体的行×列一致");
+        if ((long long)buf->size() < rows * cols * 3)
+            throw WenError("运行时错误", line, 0, "体彩高度场：像素数据不够（需要 RGB）");
+        for (long long r = 0; r < rows; ++r) {
+            for (long long c = 0; c < cols; ++c) {
+                size_t pi = (size_t)(r * cols + c) * 3;
+                int rr = (*buf)[pi], gg = (*buf)[pi + 1], bb = (*buf)[pi + 2];
+                int lum = (rr * 30 + gg * 59 + bb * 11) / 100;
+                long long h = (long long)lum * v->L / 256;
+                for (long long l = v->L - h; l < v->L; ++l) {
+                    size_t idx = (size_t)((l * v->R + r) * v->C + c) * 3;
+                    v->rgb[idx] = (unsigned char)rr;
+                    v->rgb[idx + 1] = (unsigned char)gg;
+                    v->rgb[idx + 2] = (unsigned char)bb;
+                }
+            }
+        }
+        return vNum(1);
+    });
+    // 彩色体渲染：任意视角，输出 RGB 缓冲（宽×高×3）
+    registerBuiltin("体彩渲染", 3, 11, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体彩渲染", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体彩渲染：体句柄无效");
+        auto v = it->second;
+        if (!v->color) throw WenError("运行时错误", line, 0, "体彩渲染：不是彩色体");
+        long long W = needIndex(a[1], "体彩渲染", line);
+        long long H = needIndex(a[2], "体彩渲染", line);
+        if (W <= 0 || H <= 0 || W > 2048 || H > 2048)
+            throw WenError("运行时错误", line, 0, "体彩渲染：宽高必须在 1..2048");
+        double lx = 0.45, ly = 0.5, lz = 0.74;
+        double vx = 0.25, vy = -0.55, vz = -0.8;
+        if (a.size() >= 6) { lx = needNum(a[3], "体彩渲染", line); ly = needNum(a[4], "体彩渲染", line); lz = needNum(a[5], "体彩渲染", line); }
+        if (a.size() >= 9) { vx = needNum(a[6], "体彩渲染", line); vy = needNum(a[7], "体彩渲染", line); vz = needNum(a[8], "体彩渲染", line); }
+        int ss = 1;
+        if (a.size() >= 10) ss = (int)needIndex(a[9], "体彩渲染", line);
+        if (ss < 1) ss = 1;
+        if (ss > 3) ss = 3;
+        auto ln = std::sqrt(lx * lx + ly * ly + lz * lz); lx /= ln; ly /= ln; lz /= ln;
+        auto vn = std::sqrt(vx * vx + vy * vy + vz * vz); vx /= vn; vy /= vn; vz /= vn;
+        double ux = -vy, uy = vx, uz = 0.0;
+        auto un = std::sqrt(ux * ux + uy * uy + uz * uz);
+        if (un < 1e-9) { ux = 1; uy = 0; uz = 0; un = 1; }
+        ux /= un; uy /= un; uz /= un;
+        double wx = uy * vz - uz * vy, wy = uz * vx - ux * vz, wz = ux * vy - uy * vx;
+        double cx = (v->C - 1) / 2.0, cy = (v->R - 1) / 2.0, cz = (v->L - 1) / 2.0;
+        double rad = std::max(v->C, std::max(v->R, v->L)) * 0.75 + 2.0;
+        auto img = std::make_shared<vector<unsigned char>>((size_t)(W * H * 3), 0);
+        auto rdpx = [&](long long l, long long r, long long c, int ch) -> int {
+            if (l < 0 || r < 0 || c < 0 || l >= v->L || r >= v->R || c >= v->C) return 0;
+            return v->rgb[(size_t)((l * v->R + r) * v->C + c) * 3 + (size_t)ch];
+        };
+        for (long long py = 0; py < H; ++py) {
+            for (long long px = 0; px < W; ++px) {
+                long long accR = 0, accG = 0, accB = 0;
+                for (int sy = 0; sy < ss; ++sy) {
+                    for (int sx = 0; sx < ss; ++sx) {
+                        double u = (2.0 * ((px * ss + sx) + 0.5) / (W * ss) - 1.0);
+                        double vv = (1.0 - 2.0 * ((py * ss + sy) + 0.5) / (H * ss));
+                        double ox = cx - vx * rad + ux * u * rad + wx * vv * rad;
+                        double oy = cy - vy * rad + uy * u * rad + wy * vv * rad;
+                        double oz = cz - vz * rad + uz * u * rad + wz * vv * rad;
+                        int hl = -1, hr = 0, hc = 0;
+                        for (double tt = 0; tt <= 2.0 * rad; tt += 1.0) {
+                            long long sl = (long long)std::lround(oz + vz * tt);
+                            long long sr = (long long)std::lround(oy + vy * tt);
+                            long long sc = (long long)std::lround(ox + vx * tt);
+                            if (sl < 0 || sr < 0 || sc < 0 || sl >= v->L || sr >= v->R || sc >= v->C) continue;
+                            if (rdpx((int)sl, (int)sr, (int)sc, 0) + rdpx((int)sl, (int)sr, (int)sc, 1) + rdpx((int)sl, (int)sr, (int)sc, 2) > 0) {
+                                hl = (int)sl; hr = (int)sr; hc = (int)sc; break;
+                            }
+                        }
+                        if (hl < 0) continue;
+                        auto solid = [&](long long l, long long r, long long c) -> double {
+                            if (l < 0 || r < 0 || c < 0 || l >= v->L || r >= v->R || c >= v->C) return 0.0;
+                            int s = rdpx(l, r, c, 0) + rdpx(l, r, c, 1) + rdpx(l, r, c, 2);
+                            return s > 0 ? 1.0 : 0.0;
+                        };
+                        double gx = solid(hl, hr, hc + 2) - solid(hl, hr, hc - 2);
+                        double gy = solid(hl, hr + 2, hc) - solid(hl, hr - 2, hc);
+                        double gz = solid(hl + 2, hr, hc) - solid(hl - 2, hr, hc);
+                        double gn = std::sqrt(gx * gx + gy * gy + gz * gz);
+                        double sh = 0.22;
+                        if (gn > 1e-9) {
+                            double dd = (-gx * lx + -gy * ly + -gz * lz) / gn;
+                            if (dd > 0) sh += 0.78 * dd;
+                        }
+                        accR += (long long)(sh * rdpx(hl, hr, hc, 0));
+                        accG += (long long)(sh * rdpx(hl, hr, hc, 1));
+                        accB += (long long)(sh * rdpx(hl, hr, hc, 2));
+                    }
+                }
+                long long div = (long long)ss * ss;
+                size_t o = (size_t)(py * W + px) * 3;
+                (*img)[o] = (unsigned char)std::min<long long>(255, accR / div);
+                (*img)[o + 1] = (unsigned char)std::min<long long>(255, accG / div);
+                (*img)[o + 2] = (unsigned char)std::min<long long>(255, accB / div);
+            }
+        }
+        return vBytes(img);
+    });
+
     // 体旋转：绕指定轴转一个角度（最近邻重采样），轴 0=层轴 1=行轴 2=列轴
     registerBuiltin("体旋转", 3, 3, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         long long id = needIndex(a[0], "体旋转", line);
