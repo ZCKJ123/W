@@ -160,6 +160,7 @@ $crash = '✓'; & (Join-Path $PSScriptRoot '防崩溃.ps1'); if ($LASTEXITCODE -
 $index = '✓'; & (Join-Path $PSScriptRoot '..\工具\索引检查.ps1'); if ($LASTEXITCODE -ne 0) { exit 1 }
 $volop = '✓'; & (Join-Path $PSScriptRoot '..\工具\体算子巡检.ps1'); if ($LASTEXITCODE -ne 0) { exit 1 }
 $volmis = '✓'; & (Join-Path $PSScriptRoot '..\工具\体误用巡检.ps1'); if ($LASTEXITCODE -ne 0) { exit 1 }
+$voldim = '✓'; & (Join-Path $PSScriptRoot '..\工具\体尺寸巡检.ps1'); if ($LASTEXITCODE -ne 0) { exit 1 }
 $self = '✓'; & (Join-Path $PSScriptRoot '..\工具\自述检查.ps1'); if ($LASTEXITCODE -ne 0) { exit 1 }
 $audio = '✓'; & (Join-Path $PSScriptRoot '..\工具\音频检查.ps1'); if ($LASTEXITCODE -ne 0) { exit 1 }
 $ts = '✓'; & (Join-Path $PSScriptRoot '..\工具\TypeScript检查.ps1')
@@ -169,6 +170,6 @@ $native = '✓'; & (Join-Path $PSScriptRoot '..\工具\原生EXE检查.ps1'); if
 $selfhost = '✓'; & (Join-Path $PSScriptRoot '..\工具\自举PE检查.ps1'); if ($LASTEXITCODE -ne 0) { exit 1 }
 $selfdisplay = '✓'; & (Join-Path $PSScriptRoot '..\工具\自举显示检查.ps1'); if ($LASTEXITCODE -ne 0) { exit 1 }
 
-Write-Host ("总账：主用例 {0}/{1}、错误 {2}/{3}、协议 {4}、防崩溃 {5}、索引 {6}、体算子 {7}、体误用 {8}、自述 {9}、TS {10}、音频 {11}、原生 {12}、自举 {13}、自举显示 {14}" -f `
-    $casePass, $caseTotal, $errorPass, $errorTotal, $protocol, $crash, $index, $volop, $volmis, $self, $ts, $audio, $native, $selfhost, $selfdisplay)
+Write-Host ("总账：主用例 {0}/{1}、错误 {2}/{3}、协议 {4}、防崩溃 {5}、索引 {6}、体算子 {7}、体误用 {8}、体尺寸 {9}、自述 {10}、TS {11}、音频 {12}、原生 {13}、自举 {14}、自举显示 {15}" -f `
+    $casePass, $caseTotal, $errorPass, $errorTotal, $protocol, $crash, $index, $volop, $volmis, $voldim, $self, $ts, $audio, $native, $selfhost, $selfdisplay)
 exit 0
