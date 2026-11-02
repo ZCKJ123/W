@@ -17510,6 +17510,13 @@ Interpreter::Interpreter() {
         else out->data.assign(v->data.size(), 0);
         double cl = (v->L - 1) / 2.0, cr = (v->R - 1) / 2.0, cc = (v->C - 1) / 2.0;
         auto samp = [&](double ql, double qr, double qc, int ch) -> double {
+            // 正交角（90/180/270）在浮点下会算出 2.9999999999999996 这种坐标，
+            // 不贴回整数就会把能量漏给邻格，转几次就模糊；这里先吸附再插值
+            auto snap = [](double q) {
+                double rq = std::round(q);
+                return std::fabs(q - rq) < 1e-9 ? rq : q;
+            };
+            ql = snap(ql); qr = snap(qr); qc = snap(qc);
             double fl2 = std::floor(ql), fr2 = std::floor(qr), fc2 = std::floor(qc);
             double dl2 = ql - fl2, dr2 = qr - fr2, dc2 = qc - fc2;
             double acc = 0;
@@ -17536,9 +17543,9 @@ Interpreter::Interpreter() {
                     size_t oi = (size_t)((l * v->R + r) * v->C + c);
                     if (v->color) {
                         for (int ch = 0; ch < 3; ++ch)
-                            out->rgb[oi * 3 + (size_t)ch] = (unsigned char)std::min(255.0, std::max(0.0, samp(ql, qr, qc, ch)));
+                            out->rgb[oi * 3 + (size_t)ch] = (unsigned char)std::lround(std::min(255.0, std::max(0.0, samp(ql, qr, qc, ch))));
                     } else {
-                        out->data[oi] = (unsigned char)std::min(255.0, std::max(0.0, samp(ql, qr, qc, 0)));
+                        out->data[oi] = (unsigned char)std::lround(std::min(255.0, std::max(0.0, samp(ql, qr, qc, 0))));
                     }
                 }
             }
