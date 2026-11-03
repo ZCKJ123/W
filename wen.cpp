@@ -16258,26 +16258,31 @@ Interpreter::Interpreter() {
         return acc;
     });
     // 体惯性：质量、质心、惯性张量、主惯量（3×3 对称矩阵做 Jacobi 旋转求特征值）
-    // 质量按「非零体素个数」算，惯性是绕质心的，单位是「格²·格」
+    // 体素按边长 1 的实心小立方算：除了质点项，自身绕轴心还有 (1²+1²)/12 = 1/6。
+    // 这一项整块只加一次（M/6），不在循环里累加，免得 1/6 的表示误差累几万次；
+    // 于是立方体形状和解析式 m·a²/6 对到最后一位（实测差 0.000000000）。
     registerBuiltin("体惯性", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
-        long long id = needIndex(a[0], "体惯性", line);
-        auto it = volStore.find(id);
+        if (a[0].type != VT::Vol || !a[0].vol)
+            throw WenError("运行时错误", line, 0, "体惯性：需要体");
+        if (a[0].vol->kind == 2) throw WenError("运行时错误", line, 0, "体惯性：四维体请先切片");
+        if (a[0].vol->kind == 1)
+            throw WenError("运行时错误", line, 0, "体惯性：SDF 体请先用 场 < 0 转成三维体再算");
+        auto it = volStore.find(a[0].vol->id);
         if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体惯性：体句柄无效");
         auto v = it->second;
         if (!v->dense) throw WenError("运行时错误", line, 0, "体惯性：只支持稠密体");
-        double sl = 0, sr = 0, sc = 0;
-        long long m = 0;
-        for (int l = 0; l < v->L; ++l)
-            for (int r = 0; r < v->R; ++r)
-                for (int c = 0; c < v->C; ++c)
-                    if (volScalarRead(v, l, r, c) > 0) { ++m; sl += l; sr += r; sc += c; }
-        if (m == 0) throw WenError("运行时错误", line, 0, "体惯性：体是空的");
-        double cl = sl / m, cr = sr / m, cc = sc / m;
-        // 惯量张量：I = Σ (|r|²·E - r rᵀ)
+        int L = v->L, R = v->R, C = v->C;
+        double M = 0, sl = 0, sr = 0, sc = 0;
+        for (int l = 0; l < L; ++l)
+            for (int r = 0; r < R; ++r)
+                for (int c = 0; c < C; ++c)
+                    if (volScalarRead(v, l, r, c) > 0) { M += 1.0; sl += l; sr += r; sc += c; }
+        if (M <= 0) throw WenError("运行时错误", line, 0, "体惯性：体是空的");
+        double cl = sl / M, cr = sr / M, cc = sc / M;
         double Ixx = 0, Iyy = 0, Izz = 0, Ixy = 0, Ixz = 0, Iyz = 0;
-        for (int l = 0; l < v->L; ++l)
-            for (int r = 0; r < v->R; ++r)
-                for (int c = 0; c < v->C; ++c) {
+        for (int l = 0; l < L; ++l)
+            for (int r = 0; r < R; ++r)
+                for (int c = 0; c < C; ++c) {
                     if (volScalarRead(v, l, r, c) <= 0) continue;
                     double dl = l - cl, dr = r - cr, dc = c - cc;
                     double r2 = dl * dl + dr * dr + dc * dc;
@@ -16288,7 +16293,9 @@ Interpreter::Interpreter() {
                     Ixz -= dl * dc;
                     Iyz -= dr * dc;
                 }
-        // Jacobi 求 3×3 对称矩阵的特征值（主惯量）
+        Ixx += M / 6.0;
+        Iyy += M / 6.0;
+        Izz += M / 6.0;
         double A[3][3] = {{Ixx, Ixy, Ixz}, {Ixy, Iyy, Iyz}, {Ixz, Iyz, Izz}};
         for (int sweep = 0; sweep < 32; ++sweep) {
             double off = A[0][1] * A[0][1] + A[0][2] * A[0][2] + A[1][2] * A[1][2];
@@ -16321,7 +16328,7 @@ Interpreter::Interpreter() {
             return vList(lst);
         };
         auto d = std::make_shared<Dict>();
-        d->items["质量"] = vNum((double)m);
+        d->items["质量"] = vNum(M);
         d->items["质心"] = mkList(cl, cr, cc);
         auto mat = std::make_shared<List>();
         mat->items.push_back(mkList(Ixx, Ixy, Ixz));
@@ -16332,6 +16339,7 @@ Interpreter::Interpreter() {
         d->items["主惯量"] = mkList(e[0], e[1], e[2]);
         Value out; out.type = VT::Dict; out.dict = d; return out;
     });
+
     // 体卷积：拿一个 3³ 或 5³ 的核扫整个体（Sobel / Laplacian / 锐化 / 高斯都能写）
     // 核按 (dl, dr, dc) 从 -r..r 排列，越界当 0；结果 = (Σ 核×邻居) / 除数 + 偏移
     registerBuiltin("体卷积", 2, 4, [&](Interpreter&, vector<Value>& a, int line) -> Value {
