@@ -16257,6 +16257,124 @@ Interpreter::Interpreter() {
                 }
         return acc;
     });
+    // 体按公式：逐格算一个公式写进去——公式就是脚本函数，随便什么形状/渐变都行
+    // 回调收 (层, 行, 列)，返回值夹到 0..255 写进格子；彩色体三通道同值
+    registerBuiltin("体按公式", 2, 2, [&](Interpreter& vm, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体按公式", line);
+        if (a[1].type != VT::Func)
+            throw WenError("运行时错误", line, 0, "体按公式：第二个参数必须是函数");
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体按公式：体句柄无效");
+        auto v = it->second;
+        if (!v->dense) throw WenError("运行时错误", line, 0, "体按公式：只支持稠密体");
+        long long calls = 0;
+        for (int l = 0; l < v->L; ++l)
+            for (int r = 0; r < v->R; ++r)
+                for (int c = 0; c < v->C; ++c) {
+                    vector<Value> args{vNum(l), vNum(r), vNum(c)};
+                    Value res = vm.callValue(a[1], args, line);
+                    if (res.type != VT::Num && res.type != VT::Int && res.type != VT::Big)
+                        throw WenError("运行时错误", line, 0, "体按公式：公式要返回数字");
+                    double d = needNum(res, "体按公式", line);
+                    if (d < 0) d = 0;
+                    if (d > 255) d = 255;
+                    size_t idx = (size_t)((l * v->R + r) * v->C + c);
+                    unsigned char b = (unsigned char)std::lround(d);
+                    if (v->color) {
+                        v->rgb[idx * 3] = b;
+                        v->rgb[idx * 3 + 1] = b;
+                        v->rgb[idx * 3 + 2] = b;
+                    } else {
+                        v->data[idx] = b;
+                    }
+                    ++calls;
+                }
+        return vNum((double)calls);
+    });
+    // 公式场：用公式直接造一个 SDF（d = 公式(层,行,列)，负里面、正外面），能直接取等值面
+    registerBuiltin("公式场", 2, 2, [&](Interpreter& vm, vector<Value>& a, int line) -> Value {
+        long long side = needIndex(a[0], "公式场", line);
+        if (side < 3 || side > 512)
+            throw WenError("运行时错误", line, 0, "公式场：边长要在 3..512");
+        if (a[1].type != VT::Func)
+            throw WenError("运行时错误", line, 0, "公式场：第二个参数必须是函数");
+        auto out = std::make_shared<SdfVol>();
+        out->L = (int)side; out->R = (int)side; out->C = (int)side;
+        out->d.resize((size_t)(side * side * side));
+        for (int l = 0; l < side; ++l)
+            for (int r = 0; r < side; ++r)
+                for (int c = 0; c < side; ++c) {
+                    vector<Value> args{vNum(l), vNum(r), vNum(c)};
+                    Value res = vm.callValue(a[1], args, line);
+                    if (res.type != VT::Num && res.type != VT::Int && res.type != VT::Big)
+                        throw WenError("运行时错误", line, 0, "公式场：公式要返回数字");
+                    out->d[(size_t)((l * side + r) * side + c)] = (float)needNum(res, "公式场", line);
+                }
+        long long nid = sdfNext++;
+        sdfStore[nid] = out; gIdSdf.insert(nid);
+        return vVol(1, nid);
+    });
+    // 体卷积公式：核由公式给（收 (dl, dr, dc) 返回权重），半径 1..2
+    registerBuiltin("体卷积公式", 3, 5, [&](Interpreter& vm, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体卷积公式", line);
+        long long rad = needIndex(a[1], "体卷积公式", line);
+        if (rad < 1 || rad > 2) throw WenError("运行时错误", line, 0, "体卷积公式：半径要在 1..2");
+        if (a[2].type != VT::Func)
+            throw WenError("运行时错误", line, 0, "体卷积公式：第三个参数必须是函数");
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体卷积公式：体句柄无效");
+        auto v = it->second;
+        if (!v->dense) throw WenError("运行时错误", line, 0, "体卷积公式：只支持稠密体");
+        int side = (int)(2 * rad + 1);
+        std::vector<double> k((size_t)(side * side * side), 0.0);
+        for (int dl = -(int)rad; dl <= (int)rad; ++dl)
+            for (int dr = -(int)rad; dr <= (int)rad; ++dr)
+                for (int dc = -(int)rad; dc <= (int)rad; ++dc) {
+                    vector<Value> args{vNum(dl), vNum(dr), vNum(dc)};
+                    Value res = vm.callValue(a[2], args, line);
+                    size_t ki = (size_t)(((dl + rad) * side + (dr + rad)) * side + (dc + rad));
+                    if (res.type == VT::Num) k[ki] = res.num;
+                    else if (res.type == VT::Bool) k[ki] = res.b ? 1.0 : 0.0;
+                }
+        double div = 1.0, off = 0.0;
+        if (a.size() >= 4) div = needNum(a[3], "体卷积公式", line);
+        if (a.size() >= 5) off = needNum(a[4], "体卷积公式", line);
+        if (std::fabs(div) < 1e-12) throw WenError("运行时错误", line, 0, "体卷积公式：除数不能是 0");
+        int L = v->L, R = v->R, C = v->C;
+        bool color = v->color;
+        int stride = color ? 3 : 1;
+        auto out = std::make_shared<VolData>();
+        out->L = L; out->R = R; out->C = C; out->dense = true; out->color = color;
+        size_t nv2 = (size_t)(L * R * C);
+        if (color) out->rgb.assign(nv2 * 3, 0); else out->data.assign(nv2, 0);
+        for (int l = 0; l < L; ++l)
+            for (int r = 0; r < R; ++r)
+                for (int c = 0; c < C; ++c) {
+                    size_t o = (size_t)((l * R + r) * C + c) * stride;
+                    for (int ch = 0; ch < stride; ++ch) {
+                        double acc = 0;
+                        size_t ki = 0;
+                        for (int dl = -(int)rad; dl <= (int)rad; ++dl)
+                            for (int dr = -(int)rad; dr <= (int)rad; ++dr)
+                                for (int dc = -(int)rad; dc <= (int)rad; ++dc, ++ki) {
+                                    double wgt = k[ki];
+                                    if (wgt == 0.0) continue;
+                                    int nl = l + dl, nr = r + dr, nc = c + dc;
+                                    if (nl < 0 || nr < 0 || nc < 0 || nl >= L || nr >= R || nc >= C) continue;
+                                    size_t ni = (size_t)((nl * R + nr) * C + nc) * stride + ch;
+                                    acc += wgt * (color ? (double)v->rgb[ni] : (double)v->data[ni]);
+                                }
+                        double val = acc / div + off;
+                        if (val < 0) val = 0;
+                        if (val > 255) val = 255;
+                        unsigned char b = (unsigned char)std::lround(val);
+                        if (color) out->rgb[o + ch] = b; else out->data[o] = b;
+                    }
+                }
+        long long nid = volNext++;
+        volStore[nid] = out; gId3.insert(nid);
+        return vVol(0, nid);
+    });
     // 体惯性：质量、质心、惯性张量、主惯量（3×3 对称矩阵做 Jacobi 旋转求特征值）
     // 体素按边长 1 的实心小立方算：除了质点项，自身绕轴心还有 (1²+1²)/12 = 1/6。
     // 这一项整块只加一次（M/6），不在循环里累加，免得 1/6 的表示误差累几万次；
