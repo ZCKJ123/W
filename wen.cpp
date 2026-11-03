@@ -15552,10 +15552,37 @@ Interpreter::Interpreter() {
 
     // 网格导出：把 {顶点, 索引} 写成外部工具（Blender / 切片软件）能读的文件
     // 顶点是 float3，索引是 uint32 三角形，每 12 字节一个
-    registerBuiltin("网格存OBJ", 3, 3, [&](Interpreter&, vector<Value>& a, int line) -> Value {
-        auto vb = needBytes(a[0], "网格存OBJ", line);
-        auto ib = needBytes(a[1], "网格存OBJ", line);
-        string path = needStr(a[2], "网格存OBJ", line);
+    registerBuiltin("网格存OBJ", 2, 3, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        // 两种调用都行：把网格字典整个传进来，或者分开传顶点/索引
+        Value meshArg;
+        size_t argBase = 0;
+        if (a[0].type == VT::Dict) {
+            meshArg = a[0];
+            argBase = 1;
+            if (a.size() != 2)
+                throw WenError("运行时错误", line, 0, "网格存OBJ：传网格字典时只要「网格, 路径」两个参数");
+        } else {
+            argBase = 0;
+            if (a.size() != 3)
+                throw WenError("运行时错误", line, 0, "网格存OBJ：要么「网格, 路径」，要么「顶点, 索引, 路径」");
+        }
+        Value vArg, iArg;
+        if (meshArg.type != VT::Dict) {
+            vArg = a[argBase];
+            iArg = a[argBase + 1];
+        }
+        if (meshArg.type == VT::Dict) {
+            auto dm = needDict(meshArg, "网格存OBJ", line);
+            auto itV = dm->items.find("顶点");
+            auto itI = dm->items.find("索引");
+            if (itV == dm->items.end() || itI == dm->items.end())
+                throw WenError("运行时错误", line, 0, "网格存OBJ：网格字典要有「顶点」和「索引」");
+            vArg = itV->second;
+            iArg = itI->second;
+        }
+        auto vb = needBytes(vArg, "网格存OBJ", line);
+        auto ib = needBytes(iArg, "网格存OBJ", line);
+        string path = needStr(a[meshArg.type == VT::Dict ? 1 : 2], "网格存OBJ", line);
         if (vb->size() % 12 != 0 || ib->size() % 12 != 0)
             throw WenError("运行时错误", line, 0, "网格存OBJ：顶点、索引都要 12 字节一个");
         size_t nv = vb->size() / 12, nt = ib->size() / 12;
@@ -15577,10 +15604,37 @@ Interpreter::Interpreter() {
         try { writeWholeFile(path, s, false); } catch (IoError& e) { throw WenError("文件错误", line, 0, e.what()); }
         return vNum((double)s.size());
     });
-    registerBuiltin("网格存STL", 3, 3, [&](Interpreter&, vector<Value>& a, int line) -> Value {
-        auto vb = needBytes(a[0], "网格存STL", line);
-        auto ib = needBytes(a[1], "网格存STL", line);
-        string path = needStr(a[2], "网格存STL", line);
+    registerBuiltin("网格存STL", 2, 3, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        // 两种调用都行：把网格字典整个传进来，或者分开传顶点/索引
+        Value meshArg;
+        size_t argBase = 0;
+        if (a[0].type == VT::Dict) {
+            meshArg = a[0];
+            argBase = 1;
+            if (a.size() != 2)
+                throw WenError("运行时错误", line, 0, "网格存STL：传网格字典时只要「网格, 路径」两个参数");
+        } else {
+            argBase = 0;
+            if (a.size() != 3)
+                throw WenError("运行时错误", line, 0, "网格存STL：要么「网格, 路径」，要么「顶点, 索引, 路径」");
+        }
+        Value vArg, iArg;
+        if (meshArg.type != VT::Dict) {
+            vArg = a[argBase];
+            iArg = a[argBase + 1];
+        }
+        if (meshArg.type == VT::Dict) {
+            auto dm = needDict(meshArg, "网格存STL", line);
+            auto itV = dm->items.find("顶点");
+            auto itI = dm->items.find("索引");
+            if (itV == dm->items.end() || itI == dm->items.end())
+                throw WenError("运行时错误", line, 0, "网格存STL：网格字典要有「顶点」和「索引」");
+            vArg = itV->second;
+            iArg = itI->second;
+        }
+        auto vb = needBytes(vArg, "网格存STL", line);
+        auto ib = needBytes(iArg, "网格存STL", line);
+        string path = needStr(a[meshArg.type == VT::Dict ? 1 : 2], "网格存STL", line);
         if (vb->size() % 12 != 0 || ib->size() % 12 != 0)
             throw WenError("运行时错误", line, 0, "网格存STL：顶点、索引都要 12 字节一个");
         size_t nv = vb->size() / 12, nt = ib->size() / 12;
@@ -15673,11 +15727,32 @@ Interpreter::Interpreter() {
     });
     // 网格转体：把三角网格表面体素化成一个三维体（导入外部模型后接着做体积运算）
     // 顶点按包围盒等比缩放塞进 边×边×边 的体，三角形按边长加密采样，落最近的一格
-    registerBuiltin("网格转体", 4, 4, [&](Interpreter&, vector<Value>& a, int line) -> Value {
-        auto vb = needBytes(a[0], "网格转体", line);
-        auto ib = needBytes(a[1], "网格转体", line);
-        long long side = needIndex(a[2], "网格转体", line);
-        long long val = needIndex(a[3], "网格转体", line);
+    registerBuiltin("网格转体", 3, 4, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        // 两种调用都行：网格转体(网格, 边长, 灰度) 或 网格转体(顶点, 索引, 边长, 灰度)
+        Value vArg, iArg;
+        size_t argBase;
+        if (a[0].type == VT::Dict) {
+            if (a.size() != 3)
+                throw WenError("运行时错误", line, 0, "网格转体：传网格字典时写「网格, 边长, 灰度」");
+            auto dm = needDict(a[0], "网格转体", line);
+            auto itV = dm->items.find("顶点");
+            auto itI = dm->items.find("索引");
+            if (itV == dm->items.end() || itI == dm->items.end())
+                throw WenError("运行时错误", line, 0, "网格转体：网格字典要有「顶点」和「索引」");
+            vArg = itV->second;
+            iArg = itI->second;
+            argBase = 1;
+        } else {
+            if (a.size() != 4)
+                throw WenError("运行时错误", line, 0, "网格转体：分开传时写「顶点, 索引, 边长, 灰度」");
+            vArg = a[0];
+            iArg = a[1];
+            argBase = 2;
+        }
+        auto vb = needBytes(vArg, "网格转体", line);
+        auto ib = needBytes(iArg, "网格转体", line);
+        long long side = needIndex(a[argBase], "网格转体", line);
+        long long val = needIndex(a[argBase + 1], "网格转体", line);
         if (side < 2 || side > 512)
             throw WenError("运行时错误", line, 0, "网格转体：边长要在 2..512");
         if (val < 0 || val > 255)
@@ -16524,6 +16599,26 @@ Interpreter::Interpreter() {
         long long nid = volNext++;
         volStore[nid] = out; gId3.insert(nid);
         return vVol(0, nid);
+    });
+    // 体线性：value * 倍数 + 偏移，结果存成 SDF（浮点），**不会**像体算术那样饱和到 255
+    // 用处：想在字节体上做放大/加法又不丢信息时，先转成浮点再算，最后再归一化回去
+    registerBuiltin("体线性", 3, 3, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体线性", line);
+        double scale = needNum(a[1], "体线性", line);
+        double offset = needNum(a[2], "体线性", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体线性：体句柄无效");
+        auto v = it->second;
+        if (!v->dense) throw WenError("运行时错误", line, 0, "体线性：只支持稠密体");
+        auto out = std::make_shared<SdfVol>();
+        out->L = v->L; out->R = v->R; out->C = v->C;
+        size_t nv = (size_t)(v->L * v->R * v->C);
+        out->d.resize(nv);
+        for (size_t i = 0; i < nv; ++i)
+            out->d[i] = (float)((v->color ? (double)v->rgb[i * 3] : (double)v->data[i]) * scale + offset);
+        long long nid = sdfNext++;
+        sdfStore[nid] = out; gIdSdf.insert(nid);
+        return vVol(1, nid);
     });
     // 体惯性：质量、质心、惯性张量、主惯量（3×3 对称矩阵做 Jacobi 旋转求特征值）
     // 体素按边长 1 的实心小立方算：除了质点项，自身绕轴心还有 (1²+1²)/12 = 1/6。
