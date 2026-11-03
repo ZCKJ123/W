@@ -16171,6 +16171,191 @@ Interpreter::Interpreter() {
         d->items["面数"] = vNum((double)(tris.size() / 3));
         Value out; out.type = VT::Dict; out.dict = d; return out;
     });
+
+    // 体映射 / 体归约：逐格调用脚本自己写的函数，等于让语言自己定义体算法
+    // 灰度体回调 (层, 行, 列, 值)，彩色体回调 (层, 行, 列, 红, 绿, 蓝)
+    // 逐格过解释器，适合中小体积和原型；热点算法还是写内建更快
+    registerBuiltin("体映射", 2, 2, [&](Interpreter& vm, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体映射", line);
+        if (a[1].type != VT::Func)
+            throw WenError("运行时错误", line, 0, "体映射：第二个参数必须是函数");
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体映射：体句柄无效");
+        auto v = it->second;
+        if (!v->dense) throw WenError("运行时错误", line, 0, "体映射：只支持稠密体");
+        auto toByte = [&](const Value& x, const char* what) -> int {
+            if (x.type != VT::Num && x.type != VT::Int && x.type != VT::Big)
+                throw WenError("运行时错误", line, 0, string("体映射：函数要返回数字（") + what + "）");
+            double d = needNum(x, "体映射", line);
+            if (d < 0) d = 0;
+            if (d > 255) d = 255;
+            return (int)std::lround(d);
+        };
+        auto out = std::make_shared<VolData>();
+        out->L = v->L; out->R = v->R; out->C = v->C; out->dense = true; out->color = v->color;
+        size_t nv = (size_t)(v->L * v->R * v->C);
+        if (v->color) out->rgb.assign(nv * 3, 0); else out->data.assign(nv, 0);
+        long long calls = 0;
+        for (int l = 0; l < v->L; ++l)
+            for (int r = 0; r < v->R; ++r)
+                for (int c = 0; c < v->C; ++c) {
+                    size_t idx = (size_t)((l * v->R + r) * v->C + c);
+                    if (v->color) {
+                        size_t o = idx * 3;
+                        vector<Value> args{vNum(l), vNum(r), vNum(c),
+                                           vNum(v->rgb[o]), vNum(v->rgb[o + 1]), vNum(v->rgb[o + 2])};
+                        Value res = vm.callValue(a[1], args, line);
+                        if (res.type == VT::List && res.list && res.list->items.size() >= 3) {
+                            out->rgb[o] = (unsigned char)toByte(res.list->items[0], "红");
+                            out->rgb[o + 1] = (unsigned char)toByte(res.list->items[1], "绿");
+                            out->rgb[o + 2] = (unsigned char)toByte(res.list->items[2], "蓝");
+                        } else {
+                            int b = toByte(res, "灰度");
+                            out->rgb[o] = (unsigned char)b;
+                            out->rgb[o + 1] = (unsigned char)b;
+                            out->rgb[o + 2] = (unsigned char)b;
+                        }
+                    } else {
+                        vector<Value> args{vNum(l), vNum(r), vNum(c), vNum(v->data[idx])};
+                        out->data[idx] = (unsigned char)toByte(vm.callValue(a[1], args, line), "灰度");
+                    }
+                    ++calls;
+                }
+        long long nid = volNext++;
+        volStore[nid] = out; gId3.insert(nid);
+        auto d = std::make_shared<Dict>();
+        d->items["体"] = vVol(0, nid);
+        d->items["调用次数"] = vNum((double)calls);
+        Value res2; res2.type = VT::Dict; res2.dict = d; return res2;
+    });
+    registerBuiltin("体归约", 3, 3, [&](Interpreter& vm, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体归约", line);
+        if (a[2].type != VT::Func)
+            throw WenError("运行时错误", line, 0, "体归约：第三个参数必须是函数");
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体归约：体句柄无效");
+        auto v = it->second;
+        Value acc = a[1];
+        for (int l = 0; l < v->L; ++l)
+            for (int r = 0; r < v->R; ++r)
+                for (int c = 0; c < v->C; ++c) {
+                    size_t idx = (size_t)((l * v->R + r) * v->C + c);
+                    vector<Value> args;
+                    args.push_back(acc);
+                    args.push_back(vNum(l));
+                    args.push_back(vNum(r));
+                    args.push_back(vNum(c));
+                    if (v->color) {
+                        size_t o = idx * 3;
+                        args.push_back(vNum(v->rgb[o]));
+                        args.push_back(vNum(v->rgb[o + 1]));
+                        args.push_back(vNum(v->rgb[o + 2]));
+                    } else {
+                        args.push_back(vNum(v->dense ? (double)v->data[idx] : (double)volScalarRead(v, l, r, c)));
+                    }
+                    acc = vm.callValue(a[2], args, line);
+                }
+        return acc;
+    });
+    // 体距离场：把 0/非零 的体积算成有符号距离场（里面负、外面正，单位是格）
+    // 用精确欧氏距离变换（Felzenszwalb 抛物线包络，沿三个轴各做一遍一维变换），
+    // 不是 chamfer 近似，所以误差只有浮点级别的。里面负距离 = 到最近空格的距离，
+    // 外面正距离 = 到最近实格的距离，两个场各算一遍。
+    registerBuiltin("体距离场", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体距离场", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体距离场：体句柄无效");
+        auto v = it->second;
+        if (!v->dense) throw WenError("运行时错误", line, 0, "体距离场：只支持稠密体");
+        int L = v->L, R = v->R, C = v->C;
+        size_t n = (size_t)(L * R * C);
+        std::vector<unsigned char> solid(n, 0);
+        bool anySolid = false, anyEmpty = false;
+        for (int l = 0; l < L; ++l)
+            for (int r = 0; r < R; ++r)
+                for (int c = 0; c < C; ++c) {
+                    size_t i = (size_t)((l * R + r) * C + c);
+                    if (volScalarRead(v, l, r, c) > 0) { solid[i] = 1; anySolid = true; }
+                    else anyEmpty = true;
+                }
+        if (!anySolid) throw WenError("运行时错误", line, 0, "体距离场：体是空的，没有东西可算");
+        if (!anyEmpty) throw WenError("运行时错误", line, 0, "体距离场：体里没有空格，外面没地方可算");
+        // 一维平方距离变换（抛物线包络）
+        // 哨兵不能用 1e18：抛物线求交时要算 (f + q²)，1e18 加几十就丢精度，
+        // 交叉点会算成 0，包络就错了（球这类「离种子远」的数据最先露馅）。
+        // 1e9 对 512 边长的体完全够（q² 最多二十万，和 1e9 相加仍是精确的）
+        const double BIG = 1e9;
+        auto dt1d = [&](std::vector<double>& f) {
+            int len = (int)f.size();
+            std::vector<int> vv(len);
+            std::vector<double> zz(len + 1);
+            int k = 0;
+            vv[0] = 0; zz[0] = -BIG; zz[1] = BIG;
+            for (int q = 1; q < len; ++q) {
+                double s = ((f[q] + (double)q * q) - (f[vv[k]] + (double)vv[k] * vv[k])) / (2.0 * q - 2.0 * vv[k]);
+                while (s <= zz[k] && k > 0) {
+                    --k;
+                    s = ((f[q] + (double)q * q) - (f[vv[k]] + (double)vv[k] * vv[k])) / (2.0 * q - 2.0 * vv[k]);
+                }
+                ++k; vv[k] = q; zz[k] = s; zz[k + 1] = BIG;
+            }
+            k = 0;
+            // 必须写到独立的输出再拷回：v[k] 常常小于 q，就地写会把还没读的
+            // f[v[k]] 覆盖掉，结果会偏小（球这类远离种子的格子最先错）
+            std::vector<double> outv(len);
+            for (int q = 0; q < len; ++q) {
+                while (zz[k + 1] < q) ++k;
+                double dq = q - vv[k];
+                outv[q] = dq * dq + f[vv[k]];
+            }
+            f.swap(outv);
+        };
+        // seeds 为真的格子是 0，其余求到最近种子的平方距离
+        auto edt = [&](const std::vector<unsigned char>& seeds) -> std::vector<double> {
+            std::vector<double> f(n);
+            for (size_t i = 0; i < n; ++i) f[i] = seeds[i] ? 0.0 : BIG;
+            std::vector<double> line;
+            // 沿列（c）
+            line.resize(C);
+            for (int l = 0; l < L; ++l)
+                for (int r = 0; r < R; ++r) {
+                    for (int c = 0; c < C; ++c) line[c] = f[(size_t)((l * R + r) * C + c)];
+                    dt1d(line);
+                    for (int c = 0; c < C; ++c) f[(size_t)((l * R + r) * C + c)] = line[c];
+                }
+            // 沿行（r）
+            line.resize(R);
+            for (int l = 0; l < L; ++l)
+                for (int c = 0; c < C; ++c) {
+                    for (int r = 0; r < R; ++r) line[r] = f[(size_t)((l * R + r) * C + c)];
+                    dt1d(line);
+                    for (int r = 0; r < R; ++r) f[(size_t)((l * R + r) * C + c)] = line[r];
+                }
+            // 沿层（l）
+            line.resize(L);
+            for (int r = 0; r < R; ++r)
+                for (int c = 0; c < C; ++c) {
+                    for (int l = 0; l < L; ++l) line[l] = f[(size_t)((l * R + r) * C + c)];
+                    dt1d(line);
+                    for (int l = 0; l < L; ++l) f[(size_t)((l * R + r) * C + c)] = line[l];
+                }
+            return f;
+        };
+        std::vector<unsigned char> emptySet(n, 0), solidSet(n, 0);
+        for (size_t i = 0; i < n; ++i) { emptySet[i] = solid[i] ? 0 : 1; solidSet[i] = solid[i]; }
+        std::vector<double> dIn = edt(emptySet);    // 实格到最近空格
+        std::vector<double> dOut = edt(solidSet);   // 空格到最近实格
+        auto out = std::make_shared<SdfVol>();
+        out->L = L; out->R = R; out->C = C;
+        out->d.resize(n);
+        for (size_t i = 0; i < n; ++i) {
+            double dist = std::sqrt(solid[i] ? dIn[i] : dOut[i]);
+            out->d[i] = (float)(solid[i] ? -dist : dist);   // 里面负、外面正
+        }
+        long long nid = sdfNext++;
+        sdfStore[nid] = out; gIdSdf.insert(nid);
+        return vVol(1, nid);
+    });
     // 带法线的网格渲染：颜色由三次调用方给定，法线用 SDF 的解析法线
     registerBuiltin("网格渲染法线", 8, 11, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         auto vb = needBytes(a[0], "网格渲染法线", line);
