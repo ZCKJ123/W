@@ -5085,7 +5085,12 @@ void Interpreter::assignTarget(const ExprPtr& target, Value val,
             // 内建名不能被函数里的普通赋值改掉：`值`、`长度` 这些名字同时是内建函数，
             // 直接 assign 会写进全局的内建槽，递归时所有层共用一个变量，循环会莫名退出。
             // 函数里碰到内建名就退化成局部变量（要改全局请显式用别的名字）。
-            if (scope != globals && gBuiltinArity.count(target->text)) {
+            // 名字现在绑定的是一个函数（内建或用户函数）时，也不能在函数里被普通赋值改掉：
+            // 那会写到全局上，递归时所有层共用，还会把函数本身顶掉。
+            Value existing;
+            bool shadowMe = gBuiltinArity.count(target->text) ||
+                            (scope->lookup(target->text, existing) && existing.type == VT::Func);
+            if (scope != globals && shadowMe) {
                 scope->set(target->sym, std::move(val));
                 return;
             }
