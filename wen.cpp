@@ -16259,7 +16259,8 @@ Interpreter::Interpreter() {
     });
     // 公式字典的原生求值：{"型": "球", "参": [x,y,z,r]} 这种，比逐格回调快得多
     // 支持的型：球 / 盒 / 环 / 柱 / 面 / 波 / 高斯（高斯是给卷积核用的）
-    auto evalFormulaDict = [](const Value& f, double l, double r, double c, int line) -> double {
+    static std::function<double(const Value&, double, double, double, int)> evalFormulaDict;
+    evalFormulaDict = [&evalFormulaDict](const Value& f, double l, double r, double c, int line) -> double {
         if (f.type != VT::Dict || !f.dict) throw WenError("运行时错误", line, 0, "公式：需要字典");
         auto itType = f.dict->items.find("型");
         auto itArgs = f.dict->items.find("参");
@@ -16319,6 +16320,44 @@ Interpreter::Interpreter() {
             need(1);
             double s = p[0] == 0 ? 1.0 : p[0];
             return std::exp(-(l * l + r * r + c * c) / (2.0 * s * s));
+        }
+        if (k == "并" || k == "交" || k == "差") {
+            auto itKids = f.dict->items.find("子");
+            if (itKids == f.dict->items.end() || itKids->second.type != VT::List || !itKids->second.list)
+                throw WenError("运行时错误", line, 0, "公式：" + k + " 需要一个「子」公式列表");
+            auto& kids = itKids->second.list->items;
+            if (k == "差") {
+                if (kids.size() < 2) throw WenError("运行时错误", line, 0, "公式：差 要两个公式");
+                double a = evalFormulaDict(kids[0], l, r, c, line);
+                double b = evalFormulaDict(kids[1], l, r, c, line);
+                return std::max(a, -b);
+            }
+            if (kids.empty()) throw WenError("运行时错误", line, 0, "公式：" + k + " 的公式表是空的");
+            double acc = evalFormulaDict(kids[0], l, r, c, line);
+            for (size_t i = 1; i < kids.size(); ++i) {
+                double v2 = evalFormulaDict(kids[i], l, r, c, line);
+                acc = (k == "并") ? std::min(acc, v2) : std::max(acc, v2);
+            }
+            return acc;
+        }
+        if (k == "平移" || k == "缩放" || k == "壳") {
+            auto itKids = f.dict->items.find("子");
+            if (itKids == f.dict->items.end() || itKids->second.type != VT::List || !itKids->second.list ||
+                itKids->second.list->items.empty())
+                throw WenError("运行时错误", line, 0, "公式：" + k + " 需要一个「子」公式");
+            const Value& kid = itKids->second.list->items[0];
+            if (k == "平移") {
+                need(3);
+                return evalFormulaDict(kid, l - p[0], r - p[1], c - p[2], line);
+            }
+            if (k == "缩放") {
+                need(1);
+                double s = p[0] == 0 ? 1.0 : p[0];
+                return evalFormulaDict(kid, l / s, r / s, c / s, line) * s;
+            }
+            need(1);
+            double inner = evalFormulaDict(kid, l, r, c, line);
+            return std::fabs(inner) - p[0];
         }
         throw WenError("运行时错误", line, 0, "公式：不认识的型「" + k + "」");
     };
