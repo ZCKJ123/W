@@ -16257,27 +16257,113 @@ Interpreter::Interpreter() {
                 }
         return acc;
     });
+    // 公式字典的原生求值：{"型": "球", "参": [x,y,z,r]} 这种，比逐格回调快得多
+    // 支持的型：球 / 盒 / 环 / 柱 / 面 / 波 / 高斯（高斯是给卷积核用的）
+    auto evalFormulaDict = [](const Value& f, double l, double r, double c, int line) -> double {
+        if (f.type != VT::Dict || !f.dict) throw WenError("运行时错误", line, 0, "公式：需要字典");
+        auto itType = f.dict->items.find("型");
+        auto itArgs = f.dict->items.find("参");
+        if (itType == f.dict->items.end() || itType->second.type != VT::Str)
+            throw WenError("运行时错误", line, 0, "公式：缺少「型」");
+        std::vector<double> p;
+        if (itArgs != f.dict->items.end() && itArgs->second.type == VT::List && itArgs->second.list)
+            for (auto& x : itArgs->second.list->items) {
+                if (x.type != VT::Num) throw WenError("运行时错误", line, 0, "公式：参数要都是数字");
+                p.push_back(x.num);
+            }
+        const string& k = itType->second.str;
+        auto need = [&](size_t n) {
+            if (p.size() < n)
+                throw WenError("运行时错误", line, 0, "公式：" + k + " 要 " + std::to_string(n) + " 个参数");
+        };
+        if (k == "球") {
+            need(4);
+            double dx = c - p[0], dy = r - p[1], dz = l - p[2];
+            return std::sqrt(dx * dx + dy * dy + dz * dz) - p[3];
+        }
+        if (k == "盒") {
+            need(6);
+            double dx = std::fabs(c - p[0]) - p[3];
+            double dy = std::fabs(r - p[1]) - p[4];
+            double dz = std::fabs(l - p[2]) - p[5];
+            double ox = dx > 0 ? dx : 0, oy = dy > 0 ? dy : 0, oz = dz > 0 ? dz : 0;
+            double outside = std::sqrt(ox * ox + oy * oy + oz * oz);
+            double inner = std::min(std::max(dx, std::max(dy, dz)), 0.0);
+            return outside + inner;
+        }
+        if (k == "环") {
+            need(5);
+            double dx = c - p[0], dy = r - p[1], dz = l - p[2];
+            double q = std::sqrt(dx * dx + dz * dz) - p[3];
+            return std::sqrt(q * q + dy * dy) - p[4];
+        }
+        if (k == "柱") {
+            need(5);
+            double dx = c - p[0], dy = r - p[1];
+            double rad = std::sqrt(dx * dx + dy * dy) - p[3];
+            double hz = std::fabs(l - p[2]) - p[4];
+            return std::max(rad, hz);
+        }
+        if (k == "面") {
+            need(6);
+            double dx = c - p[0], dy = r - p[1], dz = l - p[2];
+            double len = std::sqrt(p[3] * p[3] + p[4] * p[4] + p[5] * p[5]);
+            if (len < 1e-12) len = 1;
+            return (dx * p[3] + dy * p[4] + dz * p[5]) / len;
+        }
+        if (k == "波") {
+            need(3);
+            return (l - 10) - p[0] * std::sin((c + r) / p[1] * 6.283185307179586 + p[2]);
+        }
+        if (k == "高斯") {
+            need(1);
+            double s = p[0] == 0 ? 1.0 : p[0];
+            return std::exp(-(l * l + r * r + c * c) / (2.0 * s * s));
+        }
+        throw WenError("运行时错误", line, 0, "公式：不认识的型「" + k + "」");
+    };
+
     // 体按公式：逐格算一个公式写进去——公式就是脚本函数，随便什么形状/渐变都行
     // 回调收 (层, 行, 列)，返回值夹到 0..255 写进格子；彩色体三通道同值
-    registerBuiltin("体按公式", 2, 2, [&](Interpreter& vm, vector<Value>& a, int line) -> Value {
+    registerBuiltin("体按公式", 2, 4, [&](Interpreter& vm, vector<Value>& a, int line) -> Value {
         long long id = needIndex(a[0], "体按公式", line);
-        if (a[1].type != VT::Func)
-            throw WenError("运行时错误", line, 0, "体按公式：第二个参数必须是函数");
+        bool byFunc = a[1].type == VT::Func;
+        if (!byFunc && a[1].type != VT::Dict)
+            throw WenError("运行时错误", line, 0, "体按公式：第二个参数要是函数或公式字典");
         auto it = volStore.find(id);
         if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体按公式：体句柄无效");
         auto v = it->second;
         if (!v->dense) throw WenError("运行时错误", line, 0, "体按公式：只支持稠密体");
+        // 给了第 3、4 个参数就是「按 SDF 填」：公式 < 0 写里面值，否则写外面值
+        bool binary = a.size() >= 3;
+        int inVal = 0, outVal = 0;
+        if (binary) {
+            long long iv = needIndex(a[2], "体按公式", line);
+            long long ov = a.size() >= 4 ? needIndex(a[3], "体按公式", line) : 0;
+            if (iv < 0 || iv > 255 || ov < 0 || ov > 255)
+                throw WenError("运行时错误", line, 0, "体按公式：里面/外面的值要在 0..255");
+            inVal = (int)iv; outVal = (int)ov;
+        }
         long long calls = 0;
         for (int l = 0; l < v->L; ++l)
             for (int r = 0; r < v->R; ++r)
                 for (int c = 0; c < v->C; ++c) {
-                    vector<Value> args{vNum(l), vNum(r), vNum(c)};
-                    Value res = vm.callValue(a[1], args, line);
-                    if (res.type != VT::Num && res.type != VT::Int && res.type != VT::Big)
-                        throw WenError("运行时错误", line, 0, "体按公式：公式要返回数字");
-                    double d = needNum(res, "体按公式", line);
-                    if (d < 0) d = 0;
-                    if (d > 255) d = 255;
+                    double d;
+                    if (byFunc) {
+                        vector<Value> args{vNum(l), vNum(r), vNum(c)};
+                        Value res = vm.callValue(a[1], args, line);
+                        if (res.type != VT::Num && res.type != VT::Int && res.type != VT::Big)
+                            throw WenError("运行时错误", line, 0, "体按公式：公式要返回数字");
+                        d = needNum(res, "体按公式", line);
+                    } else {
+                        d = evalFormulaDict(a[1], l, r, c, line);
+                    }
+                    if (binary) {
+                        d = d <= 0 ? (double)inVal : (double)outVal;
+                    } else {
+                        if (d < 0) d = 0;
+                        if (d > 255) d = 255;
+                    }
                     size_t idx = (size_t)((l * v->R + r) * v->C + c);
                     unsigned char b = (unsigned char)std::lround(d);
                     if (v->color) {
@@ -16296,19 +16382,26 @@ Interpreter::Interpreter() {
         long long side = needIndex(a[0], "公式场", line);
         if (side < 3 || side > 512)
             throw WenError("运行时错误", line, 0, "公式场：边长要在 3..512");
-        if (a[1].type != VT::Func)
-            throw WenError("运行时错误", line, 0, "公式场：第二个参数必须是函数");
+        bool byFunc = a[1].type == VT::Func;
+        if (!byFunc && a[1].type != VT::Dict)
+            throw WenError("运行时错误", line, 0, "公式场：第二个参数要是函数或公式字典");
         auto out = std::make_shared<SdfVol>();
         out->L = (int)side; out->R = (int)side; out->C = (int)side;
         out->d.resize((size_t)(side * side * side));
         for (int l = 0; l < side; ++l)
             for (int r = 0; r < side; ++r)
                 for (int c = 0; c < side; ++c) {
-                    vector<Value> args{vNum(l), vNum(r), vNum(c)};
-                    Value res = vm.callValue(a[1], args, line);
-                    if (res.type != VT::Num && res.type != VT::Int && res.type != VT::Big)
-                        throw WenError("运行时错误", line, 0, "公式场：公式要返回数字");
-                    out->d[(size_t)((l * side + r) * side + c)] = (float)needNum(res, "公式场", line);
+                    double dv;
+                    if (byFunc) {
+                        vector<Value> args{vNum(l), vNum(r), vNum(c)};
+                        Value res = vm.callValue(a[1], args, line);
+                        if (res.type != VT::Num && res.type != VT::Int && res.type != VT::Big)
+                            throw WenError("运行时错误", line, 0, "公式场：公式要返回数字");
+                        dv = needNum(res, "公式场", line);
+                    } else {
+                        dv = evalFormulaDict(a[1], l, r, c, line);
+                    }
+                    out->d[(size_t)((l * side + r) * side + c)] = (float)dv;
                 }
         long long nid = sdfNext++;
         sdfStore[nid] = out; gIdSdf.insert(nid);
@@ -16319,8 +16412,8 @@ Interpreter::Interpreter() {
         long long id = needIndex(a[0], "体卷积公式", line);
         long long rad = needIndex(a[1], "体卷积公式", line);
         if (rad < 1 || rad > 2) throw WenError("运行时错误", line, 0, "体卷积公式：半径要在 1..2");
-        if (a[2].type != VT::Func)
-            throw WenError("运行时错误", line, 0, "体卷积公式：第三个参数必须是函数");
+        if (a[2].type != VT::Func && a[2].type != VT::Dict)
+            throw WenError("运行时错误", line, 0, "体卷积公式：第三个参数要是函数或公式字典");
         auto it = volStore.find(id);
         if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体卷积公式：体句柄无效");
         auto v = it->second;
@@ -16330,11 +16423,15 @@ Interpreter::Interpreter() {
         for (int dl = -(int)rad; dl <= (int)rad; ++dl)
             for (int dr = -(int)rad; dr <= (int)rad; ++dr)
                 for (int dc = -(int)rad; dc <= (int)rad; ++dc) {
-                    vector<Value> args{vNum(dl), vNum(dr), vNum(dc)};
-                    Value res = vm.callValue(a[2], args, line);
                     size_t ki = (size_t)(((dl + rad) * side + (dr + rad)) * side + (dc + rad));
-                    if (res.type == VT::Num) k[ki] = res.num;
-                    else if (res.type == VT::Bool) k[ki] = res.b ? 1.0 : 0.0;
+                    if (a[2].type == VT::Dict) {
+                        k[ki] = evalFormulaDict(a[2], (double)dl, (double)dr, (double)dc, line);
+                    } else {
+                        vector<Value> args{vNum(dl), vNum(dr), vNum(dc)};
+                        Value res = vm.callValue(a[2], args, line);
+                        if (res.type == VT::Num) k[ki] = res.num;
+                        else if (res.type == VT::Bool) k[ki] = res.b ? 1.0 : 0.0;
+                    }
                 }
         double div = 1.0, off = 0.0;
         if (a.size() >= 4) div = needNum(a[3], "体卷积公式", line);
