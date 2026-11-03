@@ -15728,6 +15728,63 @@ Interpreter::Interpreter() {
         volStore[nid] = vol; gId3.insert(nid);
         return vVol(0, nid);
     });
+    // 体连通域：把相邻（6 邻域）的非零体素标成同一块，返回块数、标记体、最大块
+    // 用来数「有几团东西」、找最大的一团，是三维数据的常用统计
+    registerBuiltin("体连通域", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体连通域", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体连通域：体句柄无效");
+        auto v = it->second;
+        if (!v->dense) throw WenError("运行时错误", line, 0, "体连通域：只支持稠密体");
+        int L = v->L, R = v->R, C = v->C;
+        size_t n = (size_t)(L * R * C);
+        auto out = std::make_shared<VolData>();
+        out->L = L; out->R = R; out->C = C; out->dense = true; out->color = false;
+        out->data.assign(n, 0);
+        std::vector<size_t> stack;
+        long long comps = 0, biggest = 0, total = 0;
+        for (int l = 0; l < L; ++l)
+            for (int r = 0; r < R; ++r)
+                for (int c = 0; c < C; ++c) {
+                    size_t start = (size_t)((l * R + r) * C + c);
+                    if (out->data[start] != 0) continue;
+                    if (volScalarRead(v, l, r, c) == 0) continue;
+                    ++comps;
+                    int label = (int)(comps > 255 ? 255 : comps);
+                    long long size = 0;
+                    stack.clear();
+                    stack.push_back(start);
+                    out->data[start] = (unsigned char)(label == 0 ? 1 : label);
+                    while (!stack.empty()) {
+                        size_t cur = stack.back();
+                        stack.pop_back();
+                        ++size;
+                        int cl = (int)(cur / ((size_t)R * C));
+                        int cr = (int)((cur / C) % R);
+                        int cc = (int)(cur % C);
+                        const int d6[6][3] = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
+                        for (auto& d : d6) {
+                            int nl = cl + d[0], nr = cr + d[1], nc = cc + d[2];
+                            if (nl < 0 || nr < 0 || nc < 0 || nl >= L || nr >= R || nc >= C) continue;
+                            size_t ni = (size_t)((nl * R + nr) * C + nc);
+                            if (out->data[ni] != 0) continue;
+                            if (volScalarRead(v, nl, nr, nc) == 0) continue;
+                            out->data[ni] = (unsigned char)label;
+                            stack.push_back(ni);
+                        }
+                    }
+                    if (size > biggest) biggest = size;
+                    total += size;
+                }
+        long long nid = volNext++;
+        volStore[nid] = out; gId3.insert(nid);
+        auto d = std::make_shared<Dict>();
+        d->items["数量"] = vNum((double)comps);
+        d->items["标记"] = vVol(0, nid);
+        d->items["最大块"] = vNum((double)biggest);
+        d->items["非零"] = vNum((double)total);
+        Value res; res.type = VT::Dict; res.dict = d; return res;
+    });
     // ---------- 四维体：真正的第四维坐标（w, 层, 行, 列） ----------
     struct Vol4 { int W = 0, L = 0, R = 0, C = 0; std::vector<unsigned char> rgb; };
     static std::map<long long, std::shared_ptr<Vol4>> vol4Store;
