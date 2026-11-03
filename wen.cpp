@@ -16257,6 +16257,81 @@ Interpreter::Interpreter() {
                 }
         return acc;
     });
+    // 体惯性：质量、质心、惯性张量、主惯量（3×3 对称矩阵做 Jacobi 旋转求特征值）
+    // 质量按「非零体素个数」算，惯性是绕质心的，单位是「格²·格」
+    registerBuiltin("体惯性", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体惯性", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体惯性：体句柄无效");
+        auto v = it->second;
+        if (!v->dense) throw WenError("运行时错误", line, 0, "体惯性：只支持稠密体");
+        double sl = 0, sr = 0, sc = 0;
+        long long m = 0;
+        for (int l = 0; l < v->L; ++l)
+            for (int r = 0; r < v->R; ++r)
+                for (int c = 0; c < v->C; ++c)
+                    if (volScalarRead(v, l, r, c) > 0) { ++m; sl += l; sr += r; sc += c; }
+        if (m == 0) throw WenError("运行时错误", line, 0, "体惯性：体是空的");
+        double cl = sl / m, cr = sr / m, cc = sc / m;
+        // 惯量张量：I = Σ (|r|²·E - r rᵀ)
+        double Ixx = 0, Iyy = 0, Izz = 0, Ixy = 0, Ixz = 0, Iyz = 0;
+        for (int l = 0; l < v->L; ++l)
+            for (int r = 0; r < v->R; ++r)
+                for (int c = 0; c < v->C; ++c) {
+                    if (volScalarRead(v, l, r, c) <= 0) continue;
+                    double dl = l - cl, dr = r - cr, dc = c - cc;
+                    double r2 = dl * dl + dr * dr + dc * dc;
+                    Ixx += r2 - dl * dl;
+                    Iyy += r2 - dr * dr;
+                    Izz += r2 - dc * dc;
+                    Ixy -= dl * dr;
+                    Ixz -= dl * dc;
+                    Iyz -= dr * dc;
+                }
+        // Jacobi 求 3×3 对称矩阵的特征值（主惯量）
+        double A[3][3] = {{Ixx, Ixy, Ixz}, {Ixy, Iyy, Iyz}, {Ixz, Iyz, Izz}};
+        for (int sweep = 0; sweep < 32; ++sweep) {
+            double off = A[0][1] * A[0][1] + A[0][2] * A[0][2] + A[1][2] * A[1][2];
+            if (off < 1e-12) break;
+            for (int p = 0; p < 2; ++p)
+                for (int q = p + 1; q < 3; ++q) {
+                    if (std::fabs(A[p][q]) < 1e-15) continue;
+                    double theta = (A[q][q] - A[p][p]) / (2.0 * A[p][q]);
+                    double tt = (theta >= 0 ? 1.0 : -1.0) / (std::fabs(theta) + std::sqrt(theta * theta + 1.0));
+                    double cs2 = 1.0 / std::sqrt(tt * tt + 1.0), sn2 = tt * cs2;
+                    for (int k = 0; k < 3; ++k) {
+                        double akp = A[k][p], akq = A[k][q];
+                        A[k][p] = cs2 * akp - sn2 * akq;
+                        A[k][q] = sn2 * akp + cs2 * akq;
+                    }
+                    for (int k = 0; k < 3; ++k) {
+                        double apk = A[p][k], aqk = A[q][k];
+                        A[p][k] = cs2 * apk - sn2 * aqk;
+                        A[q][k] = sn2 * apk + cs2 * aqk;
+                    }
+                }
+        }
+        double e[3] = {A[0][0], A[1][1], A[2][2]};
+        std::sort(e, e + 3, [](double x, double y) { return x > y; });
+        auto mkList = [&](double x, double y, double z) {
+            auto lst = std::make_shared<List>();
+            lst->items.push_back(vNum(x));
+            lst->items.push_back(vNum(y));
+            lst->items.push_back(vNum(z));
+            return vList(lst);
+        };
+        auto d = std::make_shared<Dict>();
+        d->items["质量"] = vNum((double)m);
+        d->items["质心"] = mkList(cl, cr, cc);
+        auto mat = std::make_shared<List>();
+        mat->items.push_back(mkList(Ixx, Ixy, Ixz));
+        mat->items.push_back(mkList(Ixy, Iyy, Iyz));
+        mat->items.push_back(mkList(Ixz, Iyz, Izz));
+        Value mv; mv.type = VT::List; mv.list = mat;
+        d->items["惯量"] = mv;
+        d->items["主惯量"] = mkList(e[0], e[1], e[2]);
+        Value out; out.type = VT::Dict; out.dict = d; return out;
+    });
     // 体卷积：拿一个 3³ 或 5³ 的核扫整个体（Sobel / Laplacian / 锐化 / 高斯都能写）
     // 核按 (dl, dr, dc) 从 -r..r 排列，越界当 0；结果 = (Σ 核×邻居) / 除数 + 偏移
     registerBuiltin("体卷积", 2, 4, [&](Interpreter&, vector<Value>& a, int line) -> Value {
