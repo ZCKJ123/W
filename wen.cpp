@@ -15657,6 +15657,77 @@ Interpreter::Interpreter() {
         d->items["面数"] = vNum((double)(tris.size() / 3));
         Value out; out.type = VT::Dict; out.dict = d; return out;
     });
+    // 网格转体：把三角网格表面体素化成一个三维体（导入外部模型后接着做体积运算）
+    // 顶点按包围盒等比缩放塞进 边×边×边 的体，三角形按边长加密采样，落最近的一格
+    registerBuiltin("网格转体", 4, 4, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto vb = needBytes(a[0], "网格转体", line);
+        auto ib = needBytes(a[1], "网格转体", line);
+        long long side = needIndex(a[2], "网格转体", line);
+        long long val = needIndex(a[3], "网格转体", line);
+        if (side < 2 || side > 512)
+            throw WenError("运行时错误", line, 0, "网格转体：边长要在 2..512");
+        if (val < 0 || val > 255)
+            throw WenError("运行时错误", line, 0, "网格转体：灰度值要在 0..255");
+        if (vb->size() % 12 != 0 || ib->size() % 12 != 0)
+            throw WenError("运行时错误", line, 0, "网格转体：顶点、索引都要 12 字节一个");
+        size_t nv = vb->size() / 12, nt = ib->size() / 12;
+        std::vector<float> V(vb->size() / 4);
+        if (!V.empty()) memcpy(V.data(), vb->data(), vb->size());
+        std::vector<unsigned> T(ib->size() / 4);
+        if (!T.empty()) memcpy(T.data(), ib->data(), ib->size());
+        if (nv == 0) throw WenError("运行时错误", line, 0, "网格转体：没有顶点");
+        double mn[3] = {1e30, 1e30, 1e30}, mx[3] = {-1e30, -1e30, -1e30};
+        for (size_t i = 0; i < nv; ++i)
+            for (int k = 0; k < 3; ++k) {
+                double v = V[i * 3 + k];
+                if (v < mn[k]) mn[k] = v;
+                if (v > mx[k]) mx[k] = v;
+            }
+        double ext = 0;
+        for (int k = 0; k < 3; ++k) ext = std::max(ext, mx[k] - mn[k]);
+        if (ext < 1e-9) ext = 1.0;
+        double span = (double)(side - 3);
+        double sc = span / ext;
+        auto toVol = [&](double x, double y, double z, double& oC, double& oR, double& oL) {
+            oC = 1.0 + (x - mn[0]) * sc;
+            oR = 1.0 + (y - mn[1]) * sc;
+            oL = 1.0 + (z - mn[2]) * sc;
+        };
+        auto vol = std::make_shared<VolData>();
+        vol->L = (int)side; vol->R = (int)side; vol->C = (int)side;
+        vol->dense = true; vol->color = false;
+        vol->data.assign((size_t)(side * side * side), 0);
+        long long marked = 0;
+        auto put = [&](double c, double r, double l) {
+            long long ci = (long long)std::llround(c), ri = (long long)std::llround(r), li = (long long)std::llround(l);
+            if (ci < 0 || ri < 0 || li < 0 || ci >= side || ri >= side || li >= side) return;
+            size_t o = (size_t)((li * side + ri) * side + ci);
+            if (vol->data[o] == 0) { vol->data[o] = (unsigned char)val; ++marked; }
+        };
+        for (size_t t = 0; t < nt; ++t) {
+            unsigned i0 = T[t * 3], i1 = T[t * 3 + 1], i2 = T[t * 3 + 2];
+            if (i0 >= nv || i1 >= nv || i2 >= nv)
+                throw WenError("运行时错误", line, 0, "网格转体：索引超出顶点数");
+            double ax, ay, az, bx, by, bz, cx2, cy2, cz2;
+            toVol(V[i0 * 3], V[i0 * 3 + 1], V[i0 * 3 + 2], ax, ay, az);
+            toVol(V[i1 * 3], V[i1 * 3 + 1], V[i1 * 3 + 2], bx, by, bz);
+            toVol(V[i2 * 3], V[i2 * 3 + 1], V[i2 * 3 + 2], cx2, cy2, cz2);
+            double e1 = std::sqrt((bx - ax) * (bx - ax) + (by - ay) * (by - ay) + (bz - az) * (bz - az));
+            double e2 = std::sqrt((cx2 - bx) * (cx2 - bx) + (cy2 - by) * (cy2 - by) + (cz2 - bz) * (cz2 - bz));
+            double e3 = std::sqrt((ax - cx2) * (ax - cx2) + (ay - cy2) * (ay - cy2) + (az - cz2) * (az - cz2));
+            double e = std::max(e1, std::max(e2, e3));
+            int n = (int)std::ceil(e * 2.0) + 1;
+            if (n > 2048) n = 2048;
+            for (int i = 0; i <= n; ++i)
+                for (int j = 0; j + i <= n; ++j) {
+                    double u = (double)i / n, v = (double)j / n, w2 = 1.0 - u - v;
+                    put(ax * w2 + bx * u + cx2 * v, ay * w2 + by * u + cy2 * v, az * w2 + bz * u + cz2 * v);
+                }
+        }
+        long long nid = volNext++;
+        volStore[nid] = vol; gId3.insert(nid);
+        return vVol(0, nid);
+    });
     // ---------- 四维体：真正的第四维坐标（w, 层, 行, 列） ----------
     struct Vol4 { int W = 0, L = 0, R = 0, C = 0; std::vector<unsigned char> rgb; };
     static std::map<long long, std::shared_ptr<Vol4>> vol4Store;
