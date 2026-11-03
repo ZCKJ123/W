@@ -16257,6 +16257,142 @@ Interpreter::Interpreter() {
                 }
         return acc;
     });
+    // 体卷积：拿一个 3³ 或 5³ 的核扫整个体（Sobel / Laplacian / 锐化 / 高斯都能写）
+    // 核按 (dl, dr, dc) 从 -r..r 排列，越界当 0；结果 = (Σ 核×邻居) / 除数 + 偏移
+    registerBuiltin("体卷积", 2, 4, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体卷积", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体卷积：体句柄无效");
+        auto v = it->second;
+        if (!v->dense) throw WenError("运行时错误", line, 0, "体卷积：只支持稠密体");
+        auto kl = needList(a[1], "体卷积", line);
+        size_t kn = kl->items.size();
+        int rad = 0;
+        if (kn == 27) rad = 1;
+        else if (kn == 125) rad = 2;
+        else throw WenError("运行时错误", line, 0, "体卷积：核要有 27 个数（3³）或 125 个数（5³）");
+        std::vector<double> k(kn);
+        for (size_t i = 0; i < kn; ++i) k[i] = needNum(kl->items[i], "体卷积", line);
+        double div = 1.0, off = 0.0;
+        if (a.size() >= 3) div = needNum(a[2], "体卷积", line);
+        if (a.size() >= 4) off = needNum(a[3], "体卷积", line);
+        if (std::fabs(div) < 1e-12) throw WenError("运行时错误", line, 0, "体卷积：除数不能是 0");
+        int L = v->L, R = v->R, C = v->C;
+        bool color = v->color;
+        int stride = color ? 3 : 1;
+        auto out = std::make_shared<VolData>();
+        out->L = L; out->R = R; out->C = C; out->dense = true; out->color = color;
+        size_t nv = (size_t)(L * R * C);
+        if (color) out->rgb.assign(nv * 3, 0); else out->data.assign(nv, 0);
+        for (int l = 0; l < L; ++l)
+            for (int r = 0; r < R; ++r)
+                for (int c = 0; c < C; ++c) {
+                    size_t o = (size_t)((l * R + r) * C + c) * stride;
+                    for (int ch = 0; ch < stride; ++ch) {
+                        double acc = 0;
+                        size_t ki = 0;
+                        for (int dl = -rad; dl <= rad; ++dl)
+                            for (int dr = -rad; dr <= rad; ++dr)
+                                for (int dc = -rad; dc <= rad; ++dc, ++ki) {
+                                    double wgt = k[ki];
+                                    if (wgt == 0.0) continue;
+                                    int nl = l + dl, nr = r + dr, nc = c + dc;
+                                    if (nl < 0 || nr < 0 || nc < 0 || nl >= L || nr >= R || nc >= C) continue;
+                                    size_t ni = (size_t)((nl * R + nr) * C + nc) * stride + ch;
+                                    acc += wgt * (color ? (double)v->rgb[ni] : (double)v->data[ni]);
+                                    --ki;
+                                    ++ki;
+                                }
+                        double val = acc / div + off;
+                        if (val < 0) val = 0;
+                        if (val > 255) val = 255;
+                        unsigned char b = (unsigned char)std::lround(val);
+                        if (color) out->rgb[o + ch] = b; else out->data[o] = b;
+                    }
+                }
+        long long nid = volNext++;
+        volStore[nid] = out; gId3.insert(nid);
+        return vVol(0, nid);
+    });
+    // 体中值：半径内的中位数（去掉椒盐噪点的经典非线性滤波）
+    registerBuiltin("体中值", 2, 2, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体中值", line);
+        long long rad = needIndex(a[1], "体中值", line);
+        if (rad < 1 || rad > 3) throw WenError("运行时错误", line, 0, "体中值：半径要在 1..3");
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体中值：体句柄无效");
+        auto v = it->second;
+        if (!v->dense) throw WenError("运行时错误", line, 0, "体中值：只支持稠密体");
+        int L = v->L, R = v->R, C = v->C;
+        bool color = v->color;
+        int stride = color ? 3 : 1;
+        auto out = std::make_shared<VolData>();
+        out->L = L; out->R = R; out->C = C; out->dense = true; out->color = color;
+        size_t nv = (size_t)(L * R * C);
+        if (color) out->rgb.assign(nv * 3, 0); else out->data.assign(nv, 0);
+        std::vector<unsigned char> vals;
+        for (int l = 0; l < L; ++l)
+            for (int r = 0; r < R; ++r)
+                for (int c = 0; c < C; ++c) {
+                    size_t o = (size_t)((l * R + r) * C + c) * stride;
+                    for (int ch = 0; ch < stride; ++ch) {
+                        vals.clear();
+                        for (int dl = -(int)rad; dl <= (int)rad; ++dl)
+                            for (int dr = -(int)rad; dr <= (int)rad; ++dr)
+                                for (int dc = -(int)rad; dc <= (int)rad; ++dc) {
+                                    int nl = l + dl, nr = r + dr, nc = c + dc;
+                                    if (nl < 0 || nr < 0 || nc < 0 || nl >= L || nr >= R || nc >= C) continue;
+                                    size_t ni = (size_t)((nl * R + nr) * C + nc) * stride + ch;
+                                    vals.push_back(color ? v->rgb[ni] : v->data[ni]);
+                                }
+                        if (vals.empty()) continue;
+                        std::nth_element(vals.begin(), vals.begin() + vals.size() / 2, vals.end());
+                        unsigned char b = vals[vals.size() / 2];
+                        if (color) out->rgb[o + ch] = b; else out->data[o] = b;
+                    }
+                }
+        long long nid = volNext++;
+        volStore[nid] = out; gId3.insert(nid);
+        return vVol(0, nid);
+    });
+    // 体邻域归约：每个格子把半径内的邻居喂给脚本函数折一遍（自定义非线性滤波）
+    registerBuiltin("体邻域归约", 4, 4, [&](Interpreter& vm, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体邻域归约", line);
+        long long rad = needIndex(a[1], "体邻域归约", line);
+        if (rad < 1 || rad > 2) throw WenError("运行时错误", line, 0, "体邻域归约：半径要在 1..2");
+        if (a[3].type != VT::Func)
+            throw WenError("运行时错误", line, 0, "体邻域归约：第四个参数必须是函数");
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体邻域归约：体句柄无效");
+        auto v = it->second;
+        if (!v->dense) throw WenError("运行时错误", line, 0, "体邻域归约：只支持稠密体");
+        int L = v->L, R = v->R, C = v->C;
+        auto out = std::make_shared<VolData>();
+        out->L = L; out->R = R; out->C = C; out->dense = true; out->color = false;
+        out->data.assign((size_t)(L * R * C), 0);
+        long long calls = 0;
+        for (int l = 0; l < L; ++l)
+            for (int r = 0; r < R; ++r)
+                for (int c = 0; c < C; ++c) {
+                    Value acc = a[2];
+                    for (int dl = -(int)rad; dl <= (int)rad; ++dl)
+                        for (int dr = -(int)rad; dr <= (int)rad; ++dr)
+                            for (int dc = -(int)rad; dc <= (int)rad; ++dc) {
+                                int nl = l + dl, nr = r + dr, nc = c + dc;
+                                if (nl < 0 || nr < 0 || nc < 0 || nl >= L || nr >= R || nc >= C) continue;
+                                vector<Value> args{acc, vNum(volScalarRead(v, nl, nr, nc))};
+                                acc = vm.callValue(a[3], args, line);
+                                ++calls;
+                            }
+                    double d = needNum(acc, "体邻域归约", line);
+                    if (d < 0) d = 0;
+                    if (d > 255) d = 255;
+                    out->data[(size_t)((l * R + r) * C + c)] = (unsigned char)std::lround(d);
+                }
+        long long nid = volNext++;
+        volStore[nid] = out; gId3.insert(nid);
+        return vVol(0, nid);
+    });
     // 体距离场：把 0/非零 的体积算成有符号距离场（里面负、外面正，单位是格）
     // 用精确欧氏距离变换（Felzenszwalb 抛物线包络，沿三个轴各做一遍一维变换），
     // 不是 chamfer 近似，所以误差只有浮点级别的。里面负距离 = 到最近空格的距离，
