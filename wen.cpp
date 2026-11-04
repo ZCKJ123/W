@@ -20130,11 +20130,36 @@ Interpreter::Interpreter() {
                 double sat = (double)(mx - mn) / 255.0;
                 double blueShift = ((double)b - (double)(r + g) * 0.5) / 255.0;
                 double bright = (0.30 * r + 0.59 * g + 0.11 * b) / 255.0;
-                double nearScore = 0.45 * ((double)y / (double)(H > 1 ? H - 1 : 1))
-                                 + 0.30 * std::min(1.0, contrast / 40.0)
-                                 + 0.15 * sat
-                                 - 0.20 * blueShift
-                                 - 0.10 * (bright - 0.5);
+                // 颗粒粗细：近处纹理颗粒大（能量在大尺度），远处颗粒细（能量在小尺度）。
+                // 用 7x7 方差和 3x3 方差之比当指标——比值越小，颗粒越粗，越近。
+                double mean7 = 0, sq7 = 0;
+                int n7 = 0;
+                for (int dy = -3; dy <= 3; ++dy)
+                    for (int dx = -3; dx <= 3; ++dx) {
+                        long long yy = y + dy, xx = x + dx;
+                        if (yy < 0 || xx < 0 || yy >= H || xx >= W) continue;
+                        size_t j = (size_t)(yy * W + xx) * 3;
+                        double lum = 0.30 * px[j] + 0.59 * px[j + 1] + 0.11 * px[j + 2];
+                        mean7 += lum;
+                        sq7 += lum * lum;
+                        ++n7;
+                    }
+                mean7 /= (double)n7;
+                sq7 = sq7 / (double)n7 - mean7 * mean7;
+                if (sq7 < 0) sq7 = 0;
+                double grainNear = 0.0;
+                if (sq7 > 1e-6) {
+                    double ratio = (sq * sq7 > 0 ? 1.0 : 1.0);
+                    ratio = sq / sq7;                       // 3x3 方差 / 7x7 方差
+                    double g = 1.0 - std::min(1.0, ratio);  // 比值小 = 粗颗粒 = 近
+                    grainNear = g;
+                }
+                double nearScore = 0.40 * ((double)y / (double)(H > 1 ? H - 1 : 1))
+                                 + 0.22 * std::min(1.0, contrast / 40.0)
+                                 + 0.15 * grainNear
+                                 + 0.13 * sat
+                                 - 0.18 * blueShift
+                                 - 0.09 * (bright - 0.5);
                 if (nearScore < 0) nearScore = 0;
                 if (nearScore > 1) nearScore = 1;
                 raw[(size_t)(y * W + x)] = nearScore;
@@ -20234,6 +20259,76 @@ Interpreter::Interpreter() {
         d->items["深度"] = vBytes(std::make_shared<std::vector<unsigned char>>(out));
         d->items["像素"] = vBytes(std::make_shared<std::vector<unsigned char>>(px));
         d->items["落差"] = vNum(span);
+        Value o; o.type = VT::Dict; o.dict = d; return o;
+    });
+    // ---------- 阴影测高 ----------
+    // 光从右上斜射时，物体左边会拖出一段影子。影子长度 L 和光角 θ 的关系是
+    // 高度 h = L × tan(θ)——这就是「量影子算高度」，不需要模型，也不需要第二张图。
+    registerBuiltin("阴影高度", 3, 4, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto buf = needBytes(a[0], "阴影高度", line);
+        long long W = needIndex(a[1], "阴影高度", line);
+        long long H = needIndex(a[2], "阴影高度", line);
+        double deg = a.size() >= 4 ? needNum(a[3], "阴影高度", line) : 45.0;
+        if (W < 3 || H < 3 || (long long)buf->size() < W * H * 3)
+            throw WenError("运行时错误", line, 0, "阴影高度：需要 RGB 像素缓冲和正确的宽高");
+        if (deg < 2) deg = 2;
+        if (deg > 88) deg = 88;
+        double tanA = std::tan(deg * 3.14159265358979323846 / 180.0);
+        const auto& px = *buf;
+        std::vector<double> I((size_t)W * (size_t)H);
+        for (long long y = 0; y < H; ++y)
+            for (long long x = 0; x < W; ++x) {
+                size_t i = (size_t)(y * W + x) * 3;
+                I[(size_t)(y * W + x)] = (0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2]) / 255.0;
+            }
+        // 每行的「受光亮度」参考：取 85% 分位，避免个别高光把阈值拉飞
+        std::vector<double> rowRef((size_t)H, 0.0);
+        for (long long y = 0; y < H; ++y) {
+            std::vector<double> tmp(I.begin() + (size_t)y * W, I.begin() + (size_t)(y + 1) * W);
+            std::sort(tmp.begin(), tmp.end());
+            rowRef[(size_t)y] = tmp[(size_t)((double)(W - 1) * 0.85)];
+        }
+        std::vector<double> Z((size_t)W * (size_t)H, 0.0);
+        for (long long y = 0; y < H; ++y) {
+            long long run = 0;
+            for (long long x = 0; x < W; ++x) {
+                size_t i = (size_t)(y * W + x);
+                if (I[i] < 0.62 * rowRef[(size_t)y]) {
+                    ++run;              // 影子里的格子高度记 0，长度记着
+                    Z[i] = 0.0;
+                } else {
+                    Z[i] = (double)run * tanA;   // 影子尽头的受光面：高度 = 影长 × tanθ
+                    run = 0;
+                }
+            }
+        }
+        // 3x3 平滑，再归一化到 0..255
+        std::vector<double> S(Z.size(), 0.0);
+        for (long long y = 0; y < H; ++y)
+            for (long long x = 0; x < W; ++x) {
+                double s = 0;
+                int n = 0;
+                for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        long long yy = y + dy, xx = x + dx;
+                        if (yy < 0 || xx < 0 || yy >= H || xx >= W) continue;
+                        s += Z[(size_t)(yy * W + xx)];
+                        ++n;
+                    }
+                S[(size_t)(y * W + x)] = s / (double)n;
+            }
+        double mx = 0;
+        for (double z : S) if (z > mx) mx = z;
+        std::vector<unsigned char> out(S.size(), 0);
+        if (mx > 1e-9)
+            for (size_t i = 0; i < S.size(); ++i)
+                out[i] = (unsigned char)std::lround(S[i] / mx * 255.0);
+        auto d = std::make_shared<Dict>();
+        d->items["宽"] = vNum((double)W);
+        d->items["高"] = vNum((double)H);
+        d->items["深度"] = vBytes(std::make_shared<std::vector<unsigned char>>(out));
+        d->items["像素"] = vBytes(std::make_shared<std::vector<unsigned char>>(px));
+        d->items["最长影"] = vNum(mx / tanA);
         Value o; o.type = VT::Dict; o.dict = d; return o;
     });
     // 深度图 → 彩色体：每像素按它的深度决定从哪一层开始，往下填满到第 0 层。
