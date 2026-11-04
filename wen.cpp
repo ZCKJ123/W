@@ -2139,6 +2139,33 @@ struct Scope {
     }
 };
 
+// ============================================================
+// 语句级字节码（0.4）：只编译「语义能在编译期定死」的纯数值代码。
+// 设计见 工程/字节码VM计划.md。
+// 铁律：指令里的每一条都必须在语义上等价于 AST 路径的对应分支，
+//      两边共用同一批语义函数（assignVarSym / valueEquals / applyBinary），
+//      不允许在 VM 里重写一遍语义——上一轮就是栽在这里。
+// ============================================================
+enum : unsigned char {
+    BC_K = 0,   // 压常数      a = kconst 下标
+    BC_G,       // 读全局快槽   a = 槽号
+    BC_L,       // 按名字读     a = SymId
+    BC_POP,     // 丢弃栈顶
+    BC_STG,     // 写全局快槽   a = 槽号
+    BC_STL,     // 按名字写（走作用域链）a = SymId
+    BC_STLL,    // 写当前帧     a = SymId
+    BC_ADD, BC_SUB, BC_MUL, BC_DIV, BC_MOD,
+    BC_LT, BC_LE, BC_GT, BC_GE, BC_EQ, BC_NE,
+    BC_NEG, BC_NOT,
+    BC_JMP, BC_JZ,   // a = 目标指令下标
+    BC_RET,          // 返回栈顶
+    BC_RETN,         // 返回 空
+    BC_LINE,         // a = 行号（只用于报错定位，顺便记语句数）
+    BC_LC,           // 取被调用者（不做零参数自动调用）a = SymId, b = 全局槽或 -1
+    BC_CALL          // a = 实参个数：栈上是 被调用者 + 实参，结果压回原处
+};
+struct Instr { unsigned char op = 0; int a = 0; int b = 0; };
+
 struct Callable {
     string name;
     virtual ~Callable() = default;
@@ -2166,6 +2193,10 @@ struct Function : Callable {
     // 纯表达式编译成的栈式字节码：op 1=压常数 2=压参数 3..=加减乘除…
     std::vector<int> pureOp;
     std::vector<double> pureVal;
+    // 语句级字节码：编译成功时 body 仍保留（兜底/对拍用），运行时只跑 code。
+    std::vector<Instr> code;
+    std::vector<double> kconst;
+    int vstack = 0;   // 表达式栈的最大深度
     vector<StmtPtr> body;
     shared_ptr<Scope> closure;
     int line = 0;
@@ -4059,6 +4090,11 @@ public:
     Value eval(const ExprPtr& e, shared_ptr<Scope> scope);
     Value callValue(const Value& callee, vector<Value>& args, int line);
     void assignTarget(const ExprPtr& target, Value val, shared_ptr<Scope> scope);
+    // AST 路径和字节码路径共用的「给变量赋值」语义（gslot < 0 的那一支）。
+    void assignVarSym(SymId sym, Value val, shared_ptr<Scope> scope);
+    // 跑一段语句字节码；返回函数返回值（顶层循环返回 空）。
+    Value runCode(const std::vector<Instr>& code, const std::vector<double>& kconst,
+                  int vstack, shared_ptr<Scope> scope);
     Value getIndex(const Value& obj, const Value& idx, int line);
     void setIndex(Value& obj, const Value& idx, const Value& val, int line);
 
@@ -4709,6 +4745,405 @@ static bool fastNumericWhile(Interpreter& vm, const StmtPtr& s,
     return true;
 }
 
+// ============================================================
+// 语句级字节码：编译 + 执行
+// 只编译「纯数值」的代码：没有调用、没有文本/列表/字典、没有 try/match/for。
+// 编译不了的整块直接放弃，继续走 AST（双轨并存，按函数/循环粒度切换）。
+// ============================================================
+
+static bool gNoBytecode = false;   // --无字节码：强制走 AST，供对拍用例使用
+
+// 一元负号：AST 和字节码共用，避免两处各写一遍 Int 的取负语义。
+static Value negateValue(const Value& a, int line) {
+    if (a.type == VT::Int) return vInt((uint64_t)(-(WenI128)intSigned(a)), a.width, a.isSigned);
+    return vNum(-needNum(a, "负号", line));
+}
+
+namespace {
+
+struct WenAsm {
+    std::vector<Instr> code;
+    std::vector<double> kconst;
+    int depth = 0;
+    int maxDepth = 0;
+    bool topLevel = false;        // 作用域就是 globals，可以走全局快槽
+    shared_ptr<Scope> globals;
+    std::vector<SymId> params;
+    struct Loop {
+        std::vector<int> brks;
+        std::vector<int> conts;
+    };
+    std::vector<Loop> loops;
+
+    int emit(unsigned char op, int a = 0, int b = 0) {
+        code.push_back(Instr{op, a, b});
+        return (int)code.size() - 1;
+    }
+    void push() { if (++depth > maxDepth) maxDepth = depth; }
+    void drop() { --depth; }
+    bool isParam(SymId id) const {
+        for (SymId p : params) if (p == id) return true;
+        return false;
+    }
+    bool expr(const ExprPtr& e);
+    bool stmt(const StmtPtr& s);
+    bool block(const std::vector<StmtPtr>& b) {
+        for (const auto& st : b) if (!stmt(st)) return false;
+        return true;
+    }
+};
+
+bool WenAsm::expr(const ExprPtr& e) {
+    if (!e) return false;
+    switch (e->k) {
+        case Expr::K::Num:
+            kconst.push_back(e->num);
+            emit(BC_K, (int)kconst.size() - 1);
+            push();
+            return true;
+        case Expr::K::Var: {
+            int gs = topLevel ? topSlotOf(e->sym) : -1;
+            if (gs >= 0) emit(BC_G, gs, (int)e->sym);
+            else emit(BC_L, (int)e->sym);
+            push();
+            return true;
+        }
+        case Expr::K::Unary: {
+            if (e->args.size() != 1) return false;
+            if (e->op == "+") return expr(e->args[0]);   // 正号不改值
+            if (!expr(e->args[0])) return false;
+            drop();
+            if (e->op == "-") { emit(BC_NEG); push(); return true; }
+            if (e->op == "非") { emit(BC_NOT); push(); return true; }
+            return false;
+        }
+        case Expr::K::Binary: {
+            if (e->args.size() != 2) return false;
+            unsigned char op = 0;
+            const string& o = e->op;
+            if (o == "+") op = BC_ADD;
+            else if (o == "-") op = BC_SUB;
+            else if (o == "*") op = BC_MUL;
+            else if (o == "/") op = BC_DIV;
+            else if (o == "%") op = BC_MOD;
+            else if (o == "<") op = BC_LT;
+            else if (o == "<=") op = BC_LE;
+            else if (o == ">") op = BC_GT;
+            else if (o == ">=") op = BC_GE;
+            else if (o == "==" || o == "=") op = BC_EQ;
+            else if (o == "!=") op = BC_NE;
+            else return false;   // 且/或（短路）、整除、幂等先不编译
+            if (!expr(e->args[0])) return false;
+            if (!expr(e->args[1])) return false;
+            drop();
+            emit(op);
+            return true;
+        }
+        case Expr::K::Call: {
+            // 指挥(...) 是「按名字派发」，保持走 AST；普通调用编译成 CALL。
+            if (e->commandCall || e->args.empty()) return false;
+            const ExprPtr& callee = e->args[0];
+            if (!callee) return false;
+            if (callee->k == Expr::K::Var) {
+                int gs = topLevel ? topSlotOf(callee->sym) : -1;
+                emit(BC_LC, (int)callee->sym, gs);
+            } else if (!expr(callee)) {
+                return false;
+            }
+            push();
+            for (size_t i = 1; i < e->args.size(); ++i) {
+                if (!expr(e->args[i])) return false;
+                push();
+            }
+            emit(BC_CALL, (int)e->args.size() - 1);
+            // 被调用者 + 实参 出栈，结果入栈
+            depth -= (int)e->args.size() - 1;
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+bool WenAsm::stmt(const StmtPtr& s) {
+    if (!s) return false;
+    switch (s->k) {
+        case Stmt::K::Assign: {
+            if (!s->target || s->target->k != Expr::K::Var || !s->target->sym) return false;
+            emit(BC_LINE, s->line);
+            if (!expr(s->expr)) return false;
+            SymId sym = s->target->sym;
+            int gs = topLevel ? topSlotOf(sym) : -1;
+            if (gs >= 0) {
+                // 顶层快槽：顺手把「名字 → 槽」记上（等价的 fastBind 本来在第一次赋值时做）
+                if (globals) globals->fastBind(sym, gs);
+                emit(BC_STG, gs, (int)sym);
+            } else if (s->declareLocal) {
+                emit(BC_STLL, (int)sym);          // 「局部」：强制写当前帧
+            } else if (!topLevel && isParam(sym)) {
+                emit(BC_STLL, (int)sym);          // 形参一定在当前帧里
+            } else {
+                emit(BC_STL, (int)sym);           // 其余走作用域链，和 AST 同一套语义
+            }
+            drop();
+            return true;
+        }
+        case Stmt::K::Return: {
+            if (topLevel) return false;           // 顶层不该有「返回」
+            emit(BC_LINE, s->line);
+            if (s->expr) {
+                if (!expr(s->expr)) return false;
+                emit(BC_RET);
+                drop();
+            } else {
+                emit(BC_RETN);
+            }
+            return true;
+        }
+        case Stmt::K::If: {
+            emit(BC_LINE, s->line);
+            std::vector<int> ends;
+            for (const auto& br : s->branches) {
+                if (!expr(br.first)) return false;
+                drop();
+                int jz = emit(BC_JZ, 0);
+                if (!block(br.second)) return false;
+                ends.push_back(emit(BC_JMP, 0));
+                code[(size_t)jz].a = (int)code.size();
+            }
+            if (!block(s->elseBody)) return false;
+            for (int e2 : ends) code[(size_t)e2].a = (int)code.size();
+            return true;
+        }
+        case Stmt::K::While: {
+            int start = (int)code.size();
+            emit(BC_LINE, s->line);
+            if (!expr(s->expr)) return false;
+            drop();
+            int jz = emit(BC_JZ, 0);
+            loops.push_back(Loop{});
+            if (!block(s->body)) return false;    // 失败时整个编译结果丢弃，不用收尾
+            Loop L = loops.back();
+            loops.pop_back();
+            emit(BC_JMP, start);
+            code[(size_t)jz].a = (int)code.size();
+            for (int c : L.conts) code[(size_t)c].a = start;
+            for (int b : L.brks) code[(size_t)b].a = (int)code.size();
+            return true;
+        }
+        case Stmt::K::Break: {
+            if (loops.empty()) return false;
+            emit(BC_LINE, s->line);
+            loops.back().brks.push_back(emit(BC_JMP, 0));
+            return true;
+        }
+        case Stmt::K::Continue: {
+            if (loops.empty()) return false;
+            emit(BC_LINE, s->line);
+            loops.back().conts.push_back(emit(BC_JMP, 0));
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+}  // namespace
+
+// 把一段语句编译成字节码；失败返回 false，调用方继续用 AST。
+static bool compileBody(const std::vector<StmtPtr>& body, const std::vector<SymId>& params,
+                        bool topLevel, const shared_ptr<Scope>& globals,
+                        std::vector<Instr>& outCode, std::vector<double>& outK,
+                        int& outStack) {
+    if (body.empty()) return false;
+    WenAsm a;
+    a.topLevel = topLevel;
+    a.globals = globals;
+    a.params = params;
+    if (!a.block(body)) return false;
+    outCode.swap(a.code);
+    outK.swap(a.kconst);
+    outStack = a.maxDepth + 4;
+    return true;
+}
+
+// 表达式栈：按「深度指针」复用同一块内存，嵌套调用只是往上叠，不重新分配。
+static thread_local std::vector<Value> gVStack;
+static thread_local size_t gVSP = 0;
+
+static inline void vmSetNum(Value& v, double d) {
+    v.type = VT::Num; v.b = false; v.i = 0; v.num = d;
+    v.width = 32; v.isSigned = false;
+    v.str.clear(); v.big.clear();
+    v.list.reset(); v.dict.reset(); v.callable.reset(); v.bytes.reset(); v.vol.reset();
+}
+static inline void vmSetBool(Value& v, bool x) {
+    vmSetNum(v, x ? 1.0 : 0.0);
+    v.type = VT::Bool; v.b = x;
+}
+
+Value Interpreter::runCode(const std::vector<Instr>& code, const std::vector<double>& kconst,
+                           int vstack, shared_ptr<Scope> scope) {
+    size_t base = gVSP;
+    if (gVStack.size() < base + (size_t)vstack) gVStack.resize(base + (size_t)vstack);
+    gVSP = base + (size_t)vstack;
+    struct Restore { size_t b; ~Restore() { gVSP = b; } } restore{base};
+
+    size_t sp = 0;
+    size_t pc = 0;
+    for (;;) {
+        if (pc >= code.size()) return vNone();
+        const Instr& in = code[pc];
+        switch (in.op) {
+            case BC_LINE:
+                gLastLine = in.a;
+                ++gExecuted;
+                ++pc;
+                break;
+            case BC_K:
+                vmSetNum(gVStack[base + sp], kconst[(size_t)in.a]);
+                ++sp; ++pc;
+                break;
+            case BC_L:
+            case BC_G: {
+                Value& d = gVStack[base + sp];
+                bool got = false;
+                if (in.op == BC_G && globals->fastGet(in.a, d)) got = true;
+                if (!got && !scope->lookup((SymId)(in.op == BC_G ? in.b : in.a), d)) {
+                    SymId id = (SymId)(in.op == BC_G ? in.b : in.a);
+                    undefinedName(symbolName(id), gLastLine);
+                }
+                // 零参数函数/内置：名字后面没写括号也直接调用（同 AST 的 Var 分支）
+                if (d.type == VT::Func && d.callable && d.callable->zeroArgCall()) {
+                    vector<Value> noArgs;
+                    d = callValue(d, noArgs, gLastLine);
+                }
+                ++sp; ++pc;
+                break;
+            }
+            case BC_STG: {
+                Value& s0 = gVStack[base + sp - 1];
+                if (s0.type != VT::Num && s0.type != VT::Int && s0.type != VT::Bool)
+                    scope->set((SymId)in.b, s0);      // 非数字：名字表里也要留一份
+                globals->fastSet(in.a, std::move(s0));
+                --sp; ++pc;
+                break;
+            }
+            case BC_STL: {
+                Value v = std::move(gVStack[base + sp - 1]);
+                --sp;
+                assignVarSym((SymId)in.a, std::move(v), scope);
+                ++pc;
+                break;
+            }
+            case BC_STLL: {
+                scope->set((SymId)in.a, std::move(gVStack[base + sp - 1]));
+                --sp; ++pc;
+                break;
+            }
+            case BC_POP:
+                --sp; ++pc;
+                break;
+            case BC_ADD: case BC_SUB: case BC_MUL: case BC_DIV: case BC_MOD:
+            case BC_LT: case BC_LE: case BC_GT: case BC_GE: {
+                Value& b = gVStack[base + sp - 1];
+                Value& a = gVStack[base + sp - 2];
+                --sp; ++pc;
+                if (a.type == VT::Num && b.type == VT::Num) {
+                    double x = a.num, y = b.num;
+                    switch (in.op) {
+                        case BC_ADD: a.num = x + y; break;
+                        case BC_SUB: a.num = x - y; break;
+                        case BC_MUL: a.num = x * y; break;
+                        case BC_DIV:
+                            if (y != 0) a.num = x / y;
+                            else a = applyBinary("/", a, b, gLastLine);
+                            break;
+                        case BC_MOD:
+                            if (y != 0) a.num = x - std::floor(x / y) * y;
+                            else a = applyBinary("%", a, b, gLastLine);
+                            break;
+                        case BC_LT: vmSetBool(a, x < y); break;
+                        case BC_LE: vmSetBool(a, x <= y); break;
+                        case BC_GT: vmSetBool(a, x > y); break;
+                        default:    vmSetBool(a, x >= y); break;
+                    }
+                } else {
+                    const char* op = in.op == BC_ADD ? "+" : in.op == BC_SUB ? "-"
+                                   : in.op == BC_MUL ? "*" : in.op == BC_DIV ? "/"
+                                   : in.op == BC_MOD ? "%" : in.op == BC_LT ? "<"
+                                   : in.op == BC_LE ? "<=" : in.op == BC_GT ? ">" : ">=";
+                    a = applyBinary(op, a, b, gLastLine);
+                }
+                break;
+            }
+            case BC_EQ:
+            case BC_NE: {
+                Value& b = gVStack[base + sp - 1];
+                Value& a = gVStack[base + sp - 2];
+                bool r = valueEquals(a, b);
+                vmSetBool(a, in.op == BC_EQ ? r : !r);
+                --sp; ++pc;
+                break;
+            }
+            case BC_NEG: {
+                Value& a = gVStack[base + sp - 1];
+                if (a.type == VT::Num) a.num = -a.num;
+                else a = negateValue(a, gLastLine);
+                ++pc;
+                break;
+            }
+            case BC_NOT: {
+                Value& a = gVStack[base + sp - 1];
+                bool t = truthy(a);
+                vmSetBool(a, !t);
+                ++pc;
+                break;
+            }
+            case BC_JMP:
+                pc = (size_t)in.a;
+                break;
+            case BC_JZ: {
+                bool t = truthy(gVStack[base + sp - 1]);
+                --sp;
+                pc = t ? pc + 1 : (size_t)in.a;
+                break;
+            }
+            case BC_RET: {
+                Value out = std::move(gVStack[base + sp - 1]);
+                return out;
+            }
+            case BC_RETN:
+                return vNone();
+            case BC_LC: {
+                // 取「被调用者」的值：和 AST 的 Call 分支一样，不触发零参数自动调用
+                Value& d = gVStack[base + sp];
+                bool got = false;
+                if (in.b >= 0 && globals->fastGet(in.b, d)) got = true;
+                if (!got && !scope->lookup((SymId)in.a, d))
+                    undefinedName(symbolName((SymId)in.a), gLastLine);
+                ++sp; ++pc;
+                break;
+            }
+            case BC_CALL: {
+                int argc = in.a;
+                size_t cbase = base + sp - (size_t)argc - 1;
+                vector<Value> args;
+                args.reserve((size_t)argc);
+                for (int i = 0; i < argc; ++i)
+                    args.push_back(std::move(gVStack[cbase + 1 + (size_t)i]));
+                Value callee = std::move(gVStack[cbase]);
+                sp -= (size_t)argc + 1;
+                gVStack[base + sp] = callValue(callee, args, gLastLine);
+                ++sp; ++pc;
+                break;
+            }
+            default:
+                rtError(gLastLine, "内部错误：未知字节码指令");
+        }
+    }
+}
+
 void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
     if (retFlag) return;
     ++gExecuted;
@@ -4753,6 +5188,21 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
         case Stmt::K::While: {
             if (fastLinearSumWhile(*this, s, scope)) break;
             if (fastNumericWhile(*this, s, scope)) break;
+            // 整个循环编译成字节码，一次 runCode 跑完（编译不了就往下走 AST）
+            if (!gNoBytecode) {
+                std::vector<Instr> lcode;
+                std::vector<double> lk;
+                int lstack = 0;
+                bool tl = (scope.get() == globals.get());
+                if (compileBody(std::vector<StmtPtr>{s}, {}, tl, globals, lcode, lk, lstack)) {
+                    bool hasRet = false;
+                    for (const auto& ins : lcode)
+                        if (ins.op == BC_RET || ins.op == BC_RETN) { hasRet = true; break; }
+                    Value r = runCode(lcode, lk, lstack, scope);
+                    if (hasRet) { retVal = std::move(r); retFlag = true; }
+                    break;
+                }
+            }
             while (truthy(eval(s->expr, scope))) {
                 try {
                     for (const auto& st : s->body) {
@@ -4886,6 +5336,10 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
             fn->paramSyms = s->paramSyms;
             fn->paramDefaults = s->paramDefaults;
             fn->body = s->body;
+            // 纯数值函数编译成语句字节码；编译不了就继续走 AST（两条路语义等价）。
+            if (!gNoBytecode)
+                compileBody(s->body, s->paramSyms, false, globals,
+                            fn->code, fn->kconst, fn->vstack);
             fn->closure = scope;
             fn->line = s->line;
             // 纯表达式体：返回 <数字/参数/四则/比较/逻辑> 组成的表达式
@@ -5017,10 +5471,7 @@ Value Interpreter::eval(const ExprPtr& e, shared_ptr<Scope> scope) {
         }
         case Expr::K::Unary: {
             Value a = eval(e->args[0], scope);
-            if (e->op == "-") {
-            if (a.type == VT::Int) return vInt((uint64_t)(-(WenI128)intSigned(a)), a.width, a.isSigned);
-            return vNum(-needNum(a, "负号", e->line));
-        }
+            if (e->op == "-") return negateValue(a, e->line);
             if (e->op == "+") return vNum(needNum(a, "正号", e->line));
             if (e->op == "非") return vBool(!truthy(a));
             if (e->op == "插值") return vStr(toText(a, false));
@@ -5244,6 +5695,24 @@ Value Interpreter::callValue(const Value& callee, vector<Value>& args, int line)
     return callee.callable->call(*this, args, line);
 }
 
+void Interpreter::assignVarSym(SymId sym, Value val, shared_ptr<Scope> scope) {
+    // 内建名不能被函数里的普通赋值改掉：`值`、`长度` 这些名字同时是内建函数，
+    // 直接 assign 会写进全局的内建槽，递归时所有层共用一个变量，循环会莫名退出。
+    // 函数里碰到内建名就退化成局部变量（要改全局请显式用别的名字）。
+    // 名字现在绑定的是一个函数（内建或用户函数）时，也不能在函数里被普通赋值改掉：
+    // 那会写到全局上，递归时所有层共用，还会把函数本身顶掉。
+    Value existing;
+    bool shadowMe = gBuiltinArity.count(symbolName(sym)) ||
+                    (scope->lookup(sym, existing) && existing.type == VT::Func);
+    if (scope != globals && shadowMe) {
+        scope->set(sym, std::move(val));
+        return;
+    }
+    if (!scope->assign(sym, val)) {
+        scope->set(sym, std::move(val));
+    }
+}
+
 void Interpreter::assignTarget(const ExprPtr& target, Value val,
                                shared_ptr<Scope> scope) {
     if (target->k == Expr::K::Var) {
@@ -5254,21 +5723,7 @@ void Interpreter::assignTarget(const ExprPtr& target, Value val,
                 scope->set(target->sym, val);
             globals->fastSet(target->gslot, std::move(val));
         } else {
-            // 内建名不能被函数里的普通赋值改掉：`值`、`长度` 这些名字同时是内建函数，
-            // 直接 assign 会写进全局的内建槽，递归时所有层共用一个变量，循环会莫名退出。
-            // 函数里碰到内建名就退化成局部变量（要改全局请显式用别的名字）。
-            // 名字现在绑定的是一个函数（内建或用户函数）时，也不能在函数里被普通赋值改掉：
-            // 那会写到全局上，递归时所有层共用，还会把函数本身顶掉。
-            Value existing;
-            bool shadowMe = gBuiltinArity.count(target->text) ||
-                            (scope->lookup(target->text, existing) && existing.type == VT::Func);
-            if (scope != globals && shadowMe) {
-                scope->set(target->sym, std::move(val));
-                return;
-            }
-            if (!scope->assign(target->sym, val)) {
-                scope->set(target->sym, std::move(val));
-            }
+            assignVarSym(target->sym, std::move(val), scope);
         }
         return;
     }
@@ -5385,11 +5840,16 @@ Value Function::call(Interpreter& vm, vector<Value>& args, int callLine) {
     vm.retFlag = false;
     Value result = vNone();
     try {
-        for (const auto& st : body) {
-            vm.exec(st, scope);
-            if (vm.retFlag) break;
+        if (!code.empty()) {
+            // 有字节码就跑字节码：不再逐条语句 switch + 递归求值
+            result = vm.runCode(code, kconst, vstack, scope);
+        } else {
+            for (const auto& st : body) {
+                vm.exec(st, scope);
+                if (vm.retFlag) break;
+            }
+            if (vm.retFlag) result = vm.retVal;
         }
-        if (vm.retFlag) result = vm.retVal;
     } catch (BreakSignal&) {
         vm.retFlag = savedFlag; vm.retVal = savedVal;
         throw WenError("运行时错误", callLine, 0, "「中断」只能用在循环里");
@@ -24922,6 +25382,9 @@ static Value uiClose(Interpreter&, vector<Value>&, int) { return vNone(); }
 
 static int runMain(vector<string> args) {
     if (args.size() > 1 && args[1] == "--不快") { gNoFast = true; args.erase(args.begin() + 1); }
+    if (args.size() > 1 && (args[1] == "--无字节码" || args[1] == "--no-bytecode")) {
+        gNoBytecode = true; args.erase(args.begin() + 1);
+    }
     if (args.size() >= 3 && args[1] == "--大整数上限") {
         gBigMaxDigits = (size_t)std::stoull(args[2]);
         args.erase(args.begin() + 1, args.begin() + 3);
