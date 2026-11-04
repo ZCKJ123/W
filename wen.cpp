@@ -2163,6 +2163,9 @@ struct Function : Callable {
     // 纯表达式：函数体就是「返回 表达式」，且表达式只由数字/参数/四则/比较组成。
     // 体按公式这种每格调一次的场景，直接拿它算，不进帧、不装箱。
     ExprPtr pureExpr;
+    // 纯表达式编译成的栈式字节码：op 1=压常数 2=压参数 3..=加减乘除…
+    std::vector<int> pureOp;
+    std::vector<double> pureVal;
     vector<StmtPtr> body;
     shared_ptr<Scope> closure;
     int line = 0;
@@ -3921,6 +3924,47 @@ struct ReturnSignal { Value value; int line; };
 struct BreakSignal { int line; };
 struct ContinueSignal { int line; };
 
+// 纯表达式 → 栈式字节码（数字/参数/四则/比较/且或），失败返回 false
+static bool compilePureExpr(const ExprPtr& e, const std::vector<SymId>& ps,
+                            std::vector<int>& ops, std::vector<double>& vals) {
+    if (!e) return false;
+    if (e->k == Expr::K::Num) { ops.push_back(1); vals.push_back(e->num); return true; }
+    if (e->k == Expr::K::Var) {
+        for (size_t i = 0; i < ps.size(); ++i)
+            if (ps[i] == e->sym) { ops.push_back(2); vals.push_back((double)i); return true; }
+        return false;
+    }
+    if (e->k == Expr::K::Unary && e->args.size() == 1) {
+        if (!compilePureExpr(e->args[0], ps, ops, vals)) return false;
+        if (e->op == "-") { ops.push_back(16); vals.push_back(0); return true; }
+        if (e->op == "非") { ops.push_back(17); vals.push_back(0); return true; }
+        return false;
+    }
+    if (e->k == Expr::K::Binary && e->args.size() == 2) {
+        if (!compilePureExpr(e->args[0], ps, ops, vals)) return false;
+        if (!compilePureExpr(e->args[1], ps, ops, vals)) return false;
+        const string& o = e->op;
+        int code = 0;
+        if (o == "+") code = 3;
+        else if (o == "-") code = 4;
+        else if (o == "*") code = 5;
+        else if (o == "/") code = 6;
+        else if (o == "%") code = 7;
+        else if (o == "<") code = 8;
+        else if (o == "<=") code = 9;
+        else if (o == ">") code = 10;
+        else if (o == ">=") code = 11;
+        else if (o == "==") code = 12;
+        else if (o == "!=") code = 13;
+        else if (o == "且") code = 14;
+        else if (o == "或") code = 15;
+        if (!code) return false;
+        ops.push_back(code); vals.push_back(0);
+        return true;
+    }
+    return false;
+}
+
 class Interpreter {
 public:
     shared_ptr<Scope> globals;
@@ -4869,7 +4913,10 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
                         }
                     };
                 }
-                if (isPure(s->body[0]->expr, s->paramSyms)) fn->pureExpr = s->body[0]->expr;
+                if (isPure(s->body[0]->expr, s->paramSyms)) {
+                    fn->pureExpr = s->body[0]->expr;
+                    compilePureExpr(s->body[0]->expr, s->paramSyms, fn->pureOp, fn->pureVal);
+                }
             }
             // 识别「返回 参数 ±*/ 常数」这种单表达式函数
             if (s->body.size() == 1 && s->body[0] && s->body[0]->k == Stmt::K::Return &&
@@ -16744,6 +16791,7 @@ Interpreter::Interpreter() {
         Function* pureFn = nullptr;
         if (byFunc && a[1].callable) pureFn = dynamic_cast<Function*>(a[1].callable.get());
         if (pureFn && (!pureFn->pureExpr || pureFn->paramSyms.size() != 3)) pureFn = nullptr;
+        const bool useBc = pureFn && !pureFn->pureOp.empty();
         double pv[3] = {0, 0, 0};
         for (int l = 0; l < v->L; ++l)
             for (int r = 0; r < v->R; ++r)
@@ -16751,7 +16799,41 @@ Interpreter::Interpreter() {
                     double d;
                     if (byFunc) {
                         bool done = false;
-                        if (pureFn) {
+                        if (useBc) {
+                            double st[8];
+                            int sp = 0;
+                            const auto& ops = pureFn->pureOp;
+                            const auto& vls = pureFn->pureVal;
+                            pv[0] = l; pv[1] = r; pv[2] = c;
+                            for (size_t ii = 0; ii < ops.size(); ++ii) {
+                                int op = ops[ii];
+                                if (op == 1) st[sp++] = vls[ii];
+                                else if (op == 2) st[sp++] = pv[(int)vls[ii]];
+                                else if (op == 16) st[sp - 1] = -st[sp - 1];
+                                else if (op == 17) st[sp - 1] = st[sp - 1] == 0 ? 1 : 0;
+                                else {
+                                    double b = st[--sp], a2 = st[sp - 1];
+                                    switch (op) {
+                                        case 3: st[sp - 1] = a2 + b; break;
+                                        case 4: st[sp - 1] = a2 - b; break;
+                                        case 5: st[sp - 1] = a2 * b; break;
+                                        case 6: st[sp - 1] = b == 0 ? 0 : a2 / b; break;
+                                        case 7: st[sp - 1] = b == 0 ? 0 : std::fmod(a2, b); break;
+                                        case 8: st[sp - 1] = a2 < b ? 1 : 0; break;
+                                        case 9: st[sp - 1] = a2 <= b ? 1 : 0; break;
+                                        case 10: st[sp - 1] = a2 > b ? 1 : 0; break;
+                                        case 11: st[sp - 1] = a2 >= b ? 1 : 0; break;
+                                        case 12: st[sp - 1] = a2 == b ? 1 : 0; break;
+                                        case 13: st[sp - 1] = a2 != b ? 1 : 0; break;
+                                        case 14: st[sp - 1] = (a2 != 0 && b != 0) ? 1 : 0; break;
+                                        case 15: st[sp - 1] = (a2 != 0 || b != 0) ? 1 : 0; break;
+                                        default: st[sp - 1] = 0; break;
+                                    }
+                                }
+                            }
+                            d = st[0];
+                            done = true;
+                        } else if (pureFn) {
                             pv[0] = l; pv[1] = r; pv[2] = c;
                             bool ok = true;
                             double dv = evalPure(pureFn->pureExpr, pv, pureFn->paramSyms, ok);
