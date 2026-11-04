@@ -20304,6 +20304,106 @@ Interpreter::Interpreter() {
         d->items["从左来"] = vBool(deg >= 90 && deg <= 270);
         Value o; o.type = VT::Dict; o.dict = d; return o;
     });
+    // ---------- 高光/镜面反推高度（shape-from-specular）----------
+    // 镜面反射和漫反射不是一套物理：光斑处的亮度是 (n·h)^k，非常尖锐。
+    // 对亮度取对数后求梯度，正好给出归一化后的表面斜率——水波纹、金属、
+    // 上釉陶瓷、湿地面都属于这一类。
+    registerBuiltin("高光高度", 3, 5, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto buf = needBytes(a[0], "高光高度", line);
+        long long W = needIndex(a[1], "高光高度", line);
+        long long H = needIndex(a[2], "高光高度", line);
+        long long iters = a.size() >= 4 ? needIndex(a[3], "高光高度", line) : 400;
+        double kExp = a.size() >= 5 ? needNum(a[4], "高光高度", line) : 6.0;
+        if (W < 3 || H < 3 || (long long)buf->size() < W * H * 3)
+            throw WenError("运行时错误", line, 0, "高光高度：需要 RGB 像素缓冲和正确的宽高");
+        if (iters < 1) iters = 1;
+        if (iters > 5000) iters = 5000;
+        if (kExp < 1) kExp = 1;
+        const auto& px = *buf;
+        std::vector<double> Lg((size_t)W * (size_t)H, 0.0);
+        std::vector<unsigned char> spec((size_t)W * (size_t)H, 0);
+        for (long long y = 0; y < H; ++y)
+            for (long long x = 0; x < W; ++x) {
+                size_t i = (size_t)(y * W + x) * 3;
+                int r = px[i], g = px[i + 1], b = px[i + 2];
+                double lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0;
+                int mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+                int mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+                double sat = (double)(mx - mn) / 255.0;
+                // 镜面像素：亮且不饱和（白亮），这是高光的判据
+                if (lum > 0.45 && sat < 0.35) spec[(size_t)(y * W + x)] = 1;
+                // log 亮度：镜面反射在这种坐标下接近线性
+                Lg[(size_t)(y * W + x)] = std::log(1.0 + lum * 8.0);
+            }
+        // 只在镜面像素上求斜率，其余置零（把漫反射区域排除掉）
+        auto atL = [&](long long x, long long y) -> double {
+            if (x < 0) x = 0;
+            if (y < 0) y = 0;
+            if (x >= W) x = W - 1;
+            if (y >= H) y = H - 1;
+            return Lg[(size_t)(y * W + x)];
+        };
+        auto atS = [&](long long x, long long y) -> int {
+            if (x < 0) x = 0;
+            if (y < 0) y = 0;
+            if (x >= W) x = W - 1;
+            if (y >= H) y = H - 1;
+            return spec[(size_t)(y * W + x)];
+        };
+        std::vector<double> P((size_t)W * (size_t)H, 0.0), Q((size_t)W * (size_t)H, 0.0);
+        for (long long y = 0; y < H; ++y)
+            for (long long x = 0; x < W; ++x) {
+                size_t i = (size_t)(y * W + x);
+                if (!spec[i]) continue;
+                double gx = (atL(x + 1, y) - atL(x - 1, y)) * 0.5;
+                double gy = (atL(x, y + 1) - atL(x, y - 1)) * 0.5;
+                // 除以指数 k：高光越尖锐，同样亮度变化对应的斜率越小
+                // 符号：光斑中心法线正对半程向量，是最凸的地方；
+                // 离开中心亮度下降 = 表面往下倾，所以斜率与对数亮度同号
+                P[i] = gx / kExp;
+                Q[i] = gy / kExp;
+            }
+        std::vector<double> div((size_t)W * (size_t)H, 0.0);
+        for (long long y = 0; y < H; ++y)
+            for (long long x = 0; x < W; ++x) {
+                double dpdx = 0, dqdy = 0;
+                if (x > 0 && x < W - 1) dpdx = (P[(size_t)(y * W + x + 1)] - P[(size_t)(y * W + x - 1)]) * 0.5;
+                if (y > 0 && y < H - 1) dqdy = (Q[(size_t)((y + 1) * W + x)] - Q[(size_t)((y - 1) * W + x)]) * 0.5;
+                div[(size_t)(y * W + x)] = dpdx + dqdy;
+            }
+        std::vector<double> Z((size_t)W * (size_t)H, 0.0), Zn((size_t)W * (size_t)H, 0.0);
+        for (long long it = 0; it < iters; ++it) {
+            for (long long y = 0; y < H; ++y)
+                for (long long x = 0; x < W; ++x) {
+                    size_t i = (size_t)(y * W + x);
+                    double l = x > 0 ? Z[i - 1] : Z[i];
+                    double r = x + 1 < W ? Z[i + 1] : Z[i];
+                    double u = y > 0 ? Z[i - (size_t)W] : Z[i];
+                    double d2 = y + 1 < H ? Z[i + (size_t)W] : Z[i];
+                    Zn[i] = (l + r + u + d2 - div[i]) * 0.25;
+                }
+            Z.swap(Zn);
+        }
+        double mn = Z[0], mx = Z[0];
+        for (size_t i = 1; i < Z.size(); ++i) {
+            if (Z[i] < mn) mn = Z[i];
+            if (Z[i] > mx) mx = Z[i];
+        }
+        double span = mx - mn;
+        std::vector<unsigned char> out(Z.size(), 0);
+        for (size_t i = 0; i < Z.size(); ++i)
+            out[i] = span > 1e-12 ? (unsigned char)std::lround((Z[i] - mn) / span * 255.0) : 0;
+        long long nspec = 0;
+        for (unsigned char s : spec) nspec += s;
+        auto d = std::make_shared<Dict>();
+        d->items["宽"] = vNum((double)W);
+        d->items["高"] = vNum((double)H);
+        d->items["深度"] = vBytes(std::make_shared<std::vector<unsigned char>>(out));
+        d->items["像素"] = vBytes(std::make_shared<std::vector<unsigned char>>(px));
+        d->items["高光格"] = vNum((double)nspec);
+        d->items["落差"] = vNum(span);
+        Value o; o.type = VT::Dict; o.dict = d; return o;
+    });
     // ---------- 阴影测高 ----------
     // 光从右上斜射时，物体左边会拖出一段影子。影子长度 L 和光角 θ 的关系是
     // 高度 h = L × tan(θ)——这就是「量影子算高度」，不需要模型，也不需要第二张图。
