@@ -11282,6 +11282,106 @@ Interpreter::Interpreter() {
         }
         return false;
     };
+    // ---------- 常开解码器：一次打开、按时间反复取帧（不再每帧重开）----------
+    struct VideoDecoder {
+        IMFSourceReader* rd = nullptr;
+        UINT32 nw = 0, nh = 0;   // 原生尺寸
+        double fps = 0;
+        int sx = 1;              // 抽稀步长
+        int W = 0, H = 0;        // 输出尺寸
+        ~VideoDecoder() { if (rd) rd->Release(); }
+    };
+    static auto vdOpen = [](VideoDecoder& d, const string& full, int targetW, string& err) -> bool {
+        HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        (void)hr;
+        if (FAILED(MFStartup(MF_VERSION))) { err = "MFStartup 失败"; return false; }
+        IMFAttributes* attrs = nullptr;
+        MFCreateAttributes(&attrs, 1);
+        if (attrs) attrs->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
+        hr = MFCreateSourceReaderFromURL(utf8ToWide(full).c_str(), attrs, &d.rd);
+        if (attrs) attrs->Release();
+        if (FAILED(hr) || !d.rd) { err = "打不开视频文件"; return false; }
+        IMFMediaType* out = nullptr;
+        MFCreateMediaType(&out);
+        out->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        out->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+        hr = d.rd->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, out);
+        out->Release();
+        if (FAILED(hr)) { err = "这个文件解不出 RGB32（没有视频轨？）"; return false; }
+        IMFMediaType* cur = nullptr;
+        if (SUCCEEDED(d.rd->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, &cur)) && cur) {
+            MFGetAttributeSize(cur, MF_MT_FRAME_SIZE, &d.nw, &d.nh);
+            UINT32 fn2 = 0, fd2 = 0;
+            MFGetAttributeRatio(cur, MF_MT_FRAME_RATE, &fn2, &fd2);
+            if (fn2 > 0 && fd2 > 0) d.fps = (double)fn2 / (double)fd2;
+            cur->Release();
+        }
+        if (!d.nw || !d.nh) { err = "拿不到视频尺寸"; return false; }
+        d.sx = 1;
+        if (targetW > 0 && (int)d.nw > targetW)
+            d.sx = (int)((d.nw + (UINT32)targetW - 1) / (UINT32)targetW);
+        if (d.sx < 1) d.sx = 1;
+        d.W = (int)((d.nw + (UINT32)d.sx - 1) / (UINT32)d.sx);
+        d.H = (int)((d.nh + (UINT32)d.sx - 1) / (UINT32)d.sx);
+        return true;
+    };
+    // 按秒跳转再取一帧；跳转后读到的第一帧就是目标时间之后的那一帧
+    static auto vdGrab = [](VideoDecoder& d, double seconds,
+                            std::vector<unsigned char>& rgb, string& err) -> bool {
+        if (!d.rd) { err = "解码器没打开"; return false; }
+        if (seconds > 0.000001) {
+            PROPVARIANT pv;
+            PropVariantInit(&pv);
+            pv.vt = VT_I8;
+            pv.hVal.QuadPart = (LONGLONG)(seconds * 1e7);
+            static const GUID kNullGuid2 = {0, 0, 0, {0, 0, 0, 0, 0, 0, 0, 0}};
+            d.rd->SetCurrentPosition(kNullGuid2, pv);
+            PropVariantClear(&pv);
+        }
+        for (;;) {
+            DWORD flags = 0;
+            LONGLONG ts = 0;
+            IMFSample* sm = nullptr;
+            HRESULT hr = d.rd->ReadSample(MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, nullptr, &flags, &ts, &sm);
+            if (FAILED(hr)) { err = "读视频帧失败"; return false; }
+            if (flags & MF_SOURCE_READERF_ENDOFSTREAM) {
+                if (sm) sm->Release();
+                err = "到视频结尾了";
+                return false;
+            }
+            if (!sm) continue;
+            IMFMediaBuffer* mb = nullptr;
+            if (SUCCEEDED(sm->ConvertToContiguousBuffer(&mb)) && mb) {
+                BYTE* data = nullptr;
+                DWORD len = 0;
+                if (SUCCEEDED(mb->Lock(&data, nullptr, &len)) &&
+                    len >= (size_t)d.nw * (size_t)d.nh * 4) {
+                    rgb.assign((size_t)d.W * (size_t)d.H * 3, 0);
+                    size_t stride = (size_t)len / (size_t)d.nh;
+                    for (int y = 0; y < d.H; ++y) {
+                        UINT32 sy2 = (UINT32)y * (UINT32)d.sx;
+                        if (sy2 >= d.nh) sy2 = d.nh - 1;
+                        const BYTE* src = data + (size_t)sy2 * stride;
+                        unsigned char* dst = rgb.data() + (size_t)y * (size_t)d.W * 3;
+                        for (int x = 0; x < d.W; ++x) {
+                            UINT32 sx2 = (UINT32)x * (UINT32)d.sx;
+                            if (sx2 >= d.nw) sx2 = d.nw - 1;
+                            const BYTE* px = src + (size_t)sx2 * 4;
+                            dst[(size_t)x * 3] = px[2];
+                            dst[(size_t)x * 3 + 1] = px[1];
+                            dst[(size_t)x * 3 + 2] = px[0];
+                        }
+                    }
+                    mb->Unlock();
+                    mb->Release();
+                    sm->Release();
+                    return true;
+                }
+                mb->Release();
+            }
+            sm->Release();
+        }
+    };
     // ---------- 视频帧：MF 源读取器取一帧，转 RGB24，返回和 图像读PNG 同构的字典 ----------
     static auto readVideoFrame = [](const string& full, long long want, int& W, int& H,
                                     std::vector<unsigned char>& rgb, string& err) -> bool {
@@ -11431,6 +11531,45 @@ Interpreter::Interpreter() {
         d->items["通道"] = vNum(3);
         d->items["像素"] = vBytes(buf);
         Value vv2; vv2.type = VT::Dict; vv2.dict = d; return vv2;
+    });
+    // 常开解码器：视频打开 → 反复 视频取帧 → 视频关闭，不用每帧重开
+    static std::map<long long, std::shared_ptr<VideoDecoder>> vdStore;
+    static long long vdNext = 1;
+    registerBuiltin("视频打开", 1, 2, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path = needStr(a[0], "视频打开", line);
+        int targetW = a.size() >= 2 ? (int)needIndex(a[1], "视频打开", line) : 0;
+        auto d = std::make_shared<VideoDecoder>();
+        string err;
+        if (!vdOpen(*d, path, targetW, err))
+            throw WenError("运行时错误", line, 0, "视频打开：" + err);
+        long long id = vdNext++;
+        vdStore[id] = d;
+        return vNum((double)id);
+    });
+    registerBuiltin("视频取帧", 2, 2, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "视频取帧", line);
+        auto it = vdStore.find(id);
+        if (it == vdStore.end()) throw WenError("运行时错误", line, 0, "视频取帧：解码器句柄无效");
+        long long idx = needIndex(a[1], "视频取帧", line);
+        if (idx < 0) idx = 0;
+        std::vector<unsigned char> rgb;
+        string err;
+        double sec = it->second->fps > 0 ? (double)idx / it->second->fps : 0.0;
+        if (!vdGrab(*it->second, sec, rgb, err))
+            throw WenError("运行时错误", line, 0, "视频取帧：" + err);
+        auto buf = std::make_shared<std::vector<unsigned char>>(std::move(rgb));
+        auto d = std::make_shared<Dict>();
+        d->items["宽"] = vNum(it->second->W);
+        d->items["高"] = vNum(it->second->H);
+        d->items["通道"] = vNum(3);
+        d->items["帧率"] = vNum(it->second->fps);
+        d->items["像素"] = vBytes(buf);
+        Value o; o.type = VT::Dict; o.dict = d; return o;
+    });
+    registerBuiltin("视频关闭", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "视频关闭", line);
+        vdStore.erase(id);
+        return vNone();
     });    static auto decodeAudio = [](const string& full, WavInfo& w, string& err) -> bool {
         HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         bool com = SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE;
