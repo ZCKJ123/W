@@ -1,0 +1,11 @@
+依赖 体库, 文件库, 数学库
+
+将 影 变成 "C:/Users/Acer/Desktop/hn/steamapps/common/PUBG/TslGame/Content/Movies/PC/AtoZ/AtoZ_intro_PC.mp4"
+将 柄 变成 视频打开(影, 320)
+将 计 变成 0
+当 计 < 120 则
+    将 帧 变成 视频取帧(柄, 计)
+    将 计 变成 计 + 1
+结束
+打印("降采样句柄：首帧 " + 文本(帧["宽"]) + "x" + 文本(帧["高"]) + "，取了 " + 文本(计) + " 帧")
+视频关闭(柄)

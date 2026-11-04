@@ -20085,6 +20085,114 @@ Interpreter::Interpreter() {
         std::memcpy(dst, buf->data(), (size_t)rows * (size_t)cols * 3);
         return vNone();
     });
+    // ---------- 单张图片估深度（近处大、远处小）----------
+    // 三条线索加权：地面先验（越靠下越近）、局部对比度（越清楚越近）、
+    // 空气透视（越蓝/越亮/越灰 = 越远）。纯计算，不依赖任何模型文件。
+    registerBuiltin("深度图", 3, 3, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto buf = needBytes(a[0], "深度图", line);
+        long long W = needIndex(a[1], "深度图", line);
+        long long H = needIndex(a[2], "深度图", line);
+        if (W <= 0 || H <= 0 || (long long)buf->size() < W * H * 3)
+            throw WenError("运行时错误", line, 0, "深度图：需要 RGB 像素缓冲和正确的宽高");
+        std::vector<unsigned char> dep((size_t)W * (size_t)H, 0);
+        std::vector<double> raw((size_t)W * (size_t)H, 0.0);
+        const auto& px = *buf;
+        for (long long y = 0; y < H; ++y) {
+            for (long long x = 0; x < W; ++x) {
+                size_t i = (size_t)(y * W + x) * 3;
+                int r = px[i], g = px[i + 1], b = px[i + 2];
+                // 3x3 灰度标准差当「清晰度」
+                double mean = 0, sq = 0;
+                int n = 0;
+                for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        long long yy = y + dy, xx = x + dx;
+                        if (yy < 0 || xx < 0 || yy >= H || xx >= W) continue;
+                        size_t j = (size_t)(yy * W + xx) * 3;
+                        double lum = 0.30 * px[j] + 0.59 * px[j + 1] + 0.11 * px[j + 2];
+                        mean += lum;
+                        sq += lum * lum;
+                        ++n;
+                    }
+                mean /= (double)n;
+                sq = sq / (double)n - mean * mean;
+                if (sq < 0) sq = 0;
+                double contrast = std::sqrt(sq);
+                int mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+                int mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+                double sat = (double)(mx - mn) / 255.0;
+                double blueShift = ((double)b - (double)(r + g) * 0.5) / 255.0;
+                double bright = (0.30 * r + 0.59 * g + 0.11 * b) / 255.0;
+                double nearScore = 0.45 * ((double)y / (double)(H > 1 ? H - 1 : 1))
+                                 + 0.30 * std::min(1.0, contrast / 40.0)
+                                 + 0.15 * sat
+                                 - 0.20 * blueShift
+                                 - 0.10 * (bright - 0.5);
+                if (nearScore < 0) nearScore = 0;
+                if (nearScore > 1) nearScore = 1;
+                raw[(size_t)(y * W + x)] = nearScore;
+            }
+        }
+        // 3x3 均值平滑，压掉噪点
+        for (long long y = 0; y < H; ++y)
+            for (long long x = 0; x < W; ++x) {
+                double s = 0;
+                int n = 0;
+                for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        long long yy = y + dy, xx = x + dx;
+                        if (yy < 0 || xx < 0 || yy >= H || xx >= W) continue;
+                        s += raw[(size_t)(yy * W + xx)];
+                        ++n;
+                    }
+                dep[(size_t)(y * W + x)] = (unsigned char)std::lround(s / (double)n * 255.0);
+            }
+        auto d = std::make_shared<Dict>();
+        d->items["宽"] = vNum((double)W);
+        d->items["高"] = vNum((double)H);
+        d->items["深度"] = vBytes(std::make_shared<std::vector<unsigned char>>(dep));
+        d->items["像素"] = vBytes(std::make_shared<std::vector<unsigned char>>(px));
+        Value o; o.type = VT::Dict; o.dict = d; return o;
+    });
+    // 深度图 → 彩色体：每像素按它的深度决定从哪一层开始，往下填满到第 0 层。
+    // 这样 三维网格(体) 出来的就是「近处高、远处低」的完整模型。
+    registerBuiltin("体从深度", 2, 2, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (a[0].type != VT::Dict || !a[0].dict) throw WenError("运行时错误", line, 0, "体从深度：第一个参数要 深度图 的返回");
+        auto& dd = a[0].dict->items;
+        if (!dd.count("宽") || !dd.count("高") || !dd.count("深度") || !dd.count("像素"))
+            throw WenError("运行时错误", line, 0, "体从深度：缺 宽/高/深度/像素");
+        long long W = (long long)dd["宽"].num, H = (long long)dd["高"].num;
+        long long L = needIndex(a[1], "体从深度", line);
+        if (L < 2) throw WenError("运行时错误", line, 0, "体从深度：高度至少 2");
+        auto dbytes = dd["深度"].bytes;
+        auto pbytes = dd["像素"].bytes;
+        if (!dbytes || !pbytes) throw WenError("运行时错误", line, 0, "体从深度：深度/像素不是缓冲");
+        if ((long long)dbytes->size() < W * H || (long long)pbytes->size() < W * H * 3)
+            throw WenError("运行时错误", line, 0, "体从深度：缓冲尺寸不对");
+        if (L * W * H * 3 > 400000000LL)
+            throw WenError("运行时错误", line, 0, "体从深度：体积太大，调小高度");
+        auto vol = std::make_shared<VolData>();
+        vol->L = (int)L; vol->R = (int)H; vol->C = (int)W;
+        vol->dense = true; vol->color = true;
+        vol->rgb.assign((size_t)L * (size_t)H * (size_t)W * 3, 0);
+        for (long long y = 0; y < H; ++y)
+            for (long long x = 0; x < W; ++x) {
+                size_t pi = (size_t)(y * W + x);
+                int top = (int)((long long)(*dbytes)[pi] * (L - 1) / 255);
+                size_t si = pi * 3;
+                unsigned char r = (*pbytes)[si], g = (*pbytes)[si + 1], b = (*pbytes)[si + 2];
+                for (int l = top; l >= 0; --l) {
+                    size_t di = ((size_t)l * (size_t)H + (size_t)y) * (size_t)W + (size_t)x;
+                    vol->rgb[di * 3] = r;
+                    vol->rgb[di * 3 + 1] = g;
+                    vol->rgb[di * 3 + 2] = b;
+                }
+            }
+        long long nid = volNext++;
+        volStore[nid] = vol;
+        gId3.insert(nid);
+        return vVol(0, nid);
+    });
     // 彩色照片 → 彩色高度场：亮度定高度，像素颜色定体素颜色
     registerBuiltin("体彩高度场", 4, 4, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         long long id = needIndex(a[0], "体彩高度场", line);
