@@ -2201,6 +2201,12 @@ struct Callable {
     string name;
     virtual ~Callable() = default;
     virtual Value call(Interpreter& vm, vector<Value>& args, int line) = 0;
+    // 免拷贝调用：实参就在调用方的表达式栈上，直接给指针，省掉一次 vector 构造。
+    // 默认实现退回 call()，行为完全一致。
+    virtual Value callSpan(Interpreter& vm, const Value* a, int n, int line) {
+        vector<Value> args(a, a + n);
+        return call(vm, args, line);
+    }
     virtual string display() const = 0;
     // 零参数函数：名字后面不写括号也直接调用（少括号写法）。
     virtual bool zeroArgCall() const { return false; }
@@ -2233,6 +2239,7 @@ struct Function : Callable {
     int line = 0;
 
     Value call(Interpreter& vm, vector<Value>& args, int line) override;
+    Value callSpan(Interpreter& vm, const Value* a, int n, int line) override;
     string display() const override { return "<函数 " + name + ">"; }
     bool zeroArgCall() const override { return false; }
     string memoKey() const override { return name; }
@@ -5336,13 +5343,20 @@ Value Interpreter::runCode(const std::vector<Instr>& code, const std::vector<dou
             case BC_CALL: {
                 int argc = in.a;
                 size_t cbase = base + sp - (size_t)argc - 1;
-                vector<Value> args;
-                args.reserve((size_t)argc);
-                for (int i = 0; i < argc; ++i)
-                    args.push_back(std::move(gVStack[cbase + 1 + (size_t)i]));
                 Value callee = std::move(gVStack[cbase]);
                 sp -= (size_t)argc + 1;
-                gVStack[base + sp] = callValue(callee, args, gLastLine);
+                if (callee.type == VT::Func && callee.callable &&
+                    !accelEnabled && !leapAuto && !memoryAuto) {
+                    // 实参就在自己的表达式栈上，直接给指针：一次 vector 分配都省掉
+                    gVStack[base + sp] = callee.callable->callSpan(
+                        *this, argc > 0 ? &gVStack[cbase + 1] : nullptr, argc, gLastLine);
+                } else {
+                    vector<Value> args;
+                    args.reserve((size_t)argc);
+                    for (int i = 0; i < argc; ++i)
+                        args.push_back(std::move(gVStack[cbase + 1 + (size_t)i]));
+                    gVStack[base + sp] = callValue(callee, args, gLastLine);
+                }
                 ++sp; ++pc;
                 break;
             }
@@ -6179,6 +6193,10 @@ struct FrameHold {
 };
 
 Value Function::call(Interpreter& vm, vector<Value>& args, int callLine) {
+    return callSpan(vm, args.data(), (int)args.size(), callLine);
+}
+
+Value Function::callSpan(Interpreter& vm, const Value* a, int n, int callLine) {
     if (vm.callDepth >= vm.maxCallDepth)
         throw WenError("运行时错误", callLine, 0,
                        "递归过深：超过 " + std::to_string(vm.maxCallDepth) + " 层，可能栈溢出");
@@ -6188,14 +6206,15 @@ Value Function::call(Interpreter& vm, vector<Value>& args, int callLine) {
         ~DepthGuard() { --vm.callDepth; }
     } depthGuard(vm);
     if (vm.callStats && !name.empty()) ++vm.callCounts[name];
-    if (args.size() > params.size()) {
+    size_t argc = (size_t)n;
+    if (argc > params.size()) {
         throw WenError("运行时错误", callLine, 0,
                        "函数「" + name + "」最多需要 " + std::to_string(params.size()) +
-                       " 个参数，收到 " + std::to_string(args.size()) + " 个");
+                       " 个参数，收到 " + std::to_string(argc) + " 个");
     }
     // 单表达式快路径：不进帧、不分配作用域，直接算（放在建帧之前，省一次分配）
-    if (simpleOp && args.size() == 1 && args[0].type == VT::Num && params.size() == 1) {
-        double x = args[0].num;
+    if (simpleOp && argc == 1 && a[0].type == VT::Num && params.size() == 1) {
+        double x = a[0].num;
         switch (simpleOp) {
             case 1: return vNum(x + simpleConst);
             case 2: return vNum(x - simpleConst);
@@ -6203,7 +6222,7 @@ Value Function::call(Interpreter& vm, vector<Value>& args, int callLine) {
             case 4: return vNum(x * simpleConst);
             case 5: return vNum(simpleConst == 0 ? x : x / simpleConst);
             case 6: return vNum(x == 0 ? 0 : simpleConst / x);
-            case 7: return args[0];
+            case 7: return a[0];
             case 8: return vNum(simpleConst);
             default: break;
         }
@@ -6211,10 +6230,10 @@ Value Function::call(Interpreter& vm, vector<Value>& args, int callLine) {
     auto scope = takeFrame(closure);
     FrameHold frameHold(scope);
     // 形参和局部通常只有几个：一次留够，省掉 push_back 扩容与 200 字节搬运
-    if (scope->svars.capacity() < args.size() + params.size() + 4)
-        scope->svars.reserve(args.size() + params.size() + 4);
-    for (size_t i = 0; i < args.size(); ++i) scope->set(paramSyms[i], args[i]);
-    for (size_t i = args.size(); i < params.size(); ++i) {
+    if (scope->svars.capacity() < argc + params.size() + 4)
+        scope->svars.reserve(argc + params.size() + 4);
+    for (size_t i = 0; i < argc; ++i) scope->set(paramSyms[i], a[i]);
+    for (size_t i = argc; i < params.size(); ++i) {
         if (i >= paramDefaults.size() || !paramDefaults[i])
             throw WenError("运行时错误", callLine, 0,
                            "函数「" + name + "」缺少参数「" + params[i] + "」");
