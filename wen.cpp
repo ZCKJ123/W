@@ -15247,6 +15247,38 @@ Interpreter::Interpreter() {
         volStore[nid] = out;
         return vVol(0, nid);
     });
+    // 体平移：整体挪 (层移, 行移, 列移)，挪出去的部分丢掉，空出来的补 0
+    registerBuiltin("体平移", 4, 4, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体平移", line);
+        long long dl = needIndex(a[1], "体平移", line);
+        long long dr = needIndex(a[2], "体平移", line);
+        long long dc = needIndex(a[3], "体平移", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体平移：体句柄无效");
+        auto v = it->second;
+        if (!v->dense) throw WenError("运行时错误", line, 0, "体平移：只支持稠密体");
+        int L = v->L, R = v->R, C = v->C;
+        bool color = v->color;
+        int stride = color ? 3 : 1;
+        auto out = std::make_shared<VolData>();
+        out->L = L; out->R = R; out->C = C; out->dense = true; out->color = color;
+        size_t nv = (size_t)(L * R * C);
+        if (color) out->rgb.assign(nv * 3, 0); else out->data.assign(nv, 0);
+        for (int l = 0; l < L; ++l)
+            for (int r = 0; r < R; ++r)
+                for (int c = 0; c < C; ++c) {
+                    long long sl = l - dl, sr = r - dr, sc = c - dc;
+                    if (sl < 0 || sr < 0 || sc < 0 || sl >= L || sr >= R || sc >= C) continue;
+                    size_t o = (size_t)((l * R + r) * C + c) * stride;
+                    size_t i2 = (size_t)((sl * R + sr) * C + sc) * stride;
+                    for (int k2 = 0; k2 < stride; ++k2)
+                        if (color) out->rgb[o + k2] = v->rgb[i2 + k2];
+                        else out->data[o] = v->data[i2];
+                }
+        long long nid = volNext++;
+        volStore[nid] = out; gId3.insert(nid);
+        return vVol(0, nid);
+    });
     registerBuiltin("体缩放", 4, 4, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         long long id = needIndex(a[0], "体缩放", line);
         long long NL = needIndex(a[1], "体缩放", line);
