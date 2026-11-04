@@ -4183,6 +4183,9 @@ public:
     int vmCtl = 0;
     // 这一段字节码有没有执行过「返回」（BC_RET）
     int vmRetFlag = 0;
+    // 正在执行一条由字节码委派过来的语句：这时 exec 不要再试着把「当」编译一遍，
+    // 否则 exec → 编译 → 委派 → exec 会无限递归。
+    bool delegating = false;
     Value getIndex(const Value& obj, const Value& idx, int line);
     void setIndex(Value& obj, const Value& idx, const Value& val, int line);
 
@@ -5500,7 +5503,14 @@ Value Interpreter::runCode(const std::vector<Instr>& code, const std::vector<dou
                 ++pc;
                 break;
             case BC_EXECSTMT: {
-                // 编译不了的语句：原样交给 exec，语义和 AST 路径完全一致
+                // 编译不了的语句：原样交给 exec，语义和 AST 路径完全一致。
+                // delegating 挡住「exec 再把这个循环编译一遍」的无限递归。
+                struct DelegGuard {
+                    bool& f;
+                    bool old;
+                    explicit DelegGuard(bool& x) : f(x), old(x) { f = true; }
+                    ~DelegGuard() { f = old; }
+                } delegGuard(delegating);
                 exec(slow[(size_t)in.a], scope);
                 if (retFlag) {
                     Value out = std::move(retVal);
@@ -5562,7 +5572,7 @@ void Interpreter::exec(const StmtPtr& s, const shared_ptr<Scope>& scope) {
             if (fastLinearSumWhile(*this, s, scope)) break;
             if (fastNumericWhile(*this, s, scope)) break;
             // 整个循环编译成字节码，一次 runCode 跑完（编译不了就往下走 AST）
-            if (!gNoBytecode) {
+            if (!gNoBytecode && !delegating) {
                 std::vector<Instr> lcode;
                 std::vector<double> lk;
                 std::vector<StmtPtr> lslow;
