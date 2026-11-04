@@ -2231,7 +2231,8 @@ enum : unsigned char {
     BC_FORCHECK,     // 范围循环：栈上 [当前,终点,步长]，越界则跳到 a（不弹栈）
     BC_FORVAR,       // 把栈上「当前」写进循环变量 a=全局槽（-1 表示按名字写 b=SymId）
     BC_FORSTEP,      // 「当前」+= 步长，跳回 a
-    BC_FORDROP       // 弹掉栈顶 a 个值（范围循环收尾）
+    BC_FORDROP,      // 弹掉栈顶 a 个值（范围循环收尾）
+    BC_EXECSTMT      // 这条语句交给 exec 原样执行 a = 慢语句表下标
 };
 struct Instr { unsigned char op = 0; int a = 0; int b = 0; };
 
@@ -2271,6 +2272,7 @@ struct Function : Callable {
     // 语句级字节码：编译成功时 body 仍保留（兜底/对拍用），运行时只跑 code。
     std::vector<Instr> code;
     std::vector<double> kconst;
+    std::vector<StmtPtr> slow;   // 编译不了的语句，运行时交给 exec
     int vstack = 0;   // 表达式栈的最大深度
     vector<StmtPtr> body;
     shared_ptr<Scope> closure;
@@ -4176,7 +4178,7 @@ public:
                        bool knownBuiltin = false);
     // 跑一段语句字节码；返回函数返回值（顶层循环返回 空）。
     Value runCode(const std::vector<Instr>& code, const std::vector<double>& kconst,
-                  int vstack, const shared_ptr<Scope>& scope);
+                  const std::vector<StmtPtr>& slow, int vstack, const shared_ptr<Scope>& scope);
     // 循环体块跑完时的控制码：0 正常 / 1 继续 / 2 中断
     int vmCtl = 0;
     // 这一段字节码有没有执行过「返回」（BC_RET）
@@ -4865,6 +4867,9 @@ struct WenAsm {
     bool blockMode = false;
     std::vector<int> blkBrks;
     std::vector<int> blkConts;
+    // 编译不了的语句（对于/尝试/匹配/嵌套函数…）不放弃整个函数，
+    // 记在这里，运行时用 BC_EXECSTMT 交给 exec 原样执行——语义和 AST 路径一模一样。
+    std::vector<StmtPtr> slow;
 
     int emit(unsigned char op, int a = 0, int b = 0) {
         code.push_back(Instr{op, a, b});
@@ -5083,7 +5088,12 @@ bool WenAsm::stmt(const StmtPtr& s) {
             return true;
         }
         default:
-            return false;
+            // 编译不了的语句交给 exec 原样执行：整函数照旧编成字节码，
+            // 只有这几句多一次 exec 调用，语义与 AST 路径完全一致。
+            emit(BC_LINE, s->line);
+            slow.push_back(s);
+            emit(BC_EXECSTMT, (int)slow.size() - 1);
+            return true;
     }
 }
 
@@ -5093,7 +5103,7 @@ bool WenAsm::stmt(const StmtPtr& s) {
 static bool compileBody(const std::vector<StmtPtr>& body, const std::vector<SymId>& params,
                         bool topLevel, const shared_ptr<Scope>& globals,
                         std::vector<Instr>& outCode, std::vector<double>& outK,
-                        int& outStack) {
+                        std::vector<StmtPtr>& outSlow, int& outStack) {
     if (body.empty()) return false;
     WenAsm a;
     a.topLevel = topLevel;
@@ -5102,6 +5112,7 @@ static bool compileBody(const std::vector<StmtPtr>& body, const std::vector<SymI
     if (!a.block(body)) return false;
     outCode.swap(a.code);
     outK.swap(a.kconst);
+    outSlow.swap(a.slow);
     outStack = a.maxDepth + 4;
     return true;
 }
@@ -5111,7 +5122,7 @@ static bool compileBody(const std::vector<StmtPtr>& body, const std::vector<SymI
 static bool compileBlock(const std::vector<StmtPtr>& body, bool topLevel,
                          const shared_ptr<Scope>& globals,
                          std::vector<Instr>& outCode, std::vector<double>& outK,
-                         int& outStack, bool& hasRet) {
+                         std::vector<StmtPtr>& outSlow, int& outStack, bool& hasRet) {
     hasRet = false;
     if (body.empty()) return false;
     WenAsm a;
@@ -5130,6 +5141,7 @@ static bool compileBlock(const std::vector<StmtPtr>& body, bool topLevel,
         if (ins.op == BC_RET || ins.op == BC_RETN) { hasRet = true; break; }
     outCode.swap(a.code);
     outK.swap(a.kconst);
+    outSlow.swap(a.slow);
     outStack = a.maxDepth + 4;
     return true;
 }
@@ -5139,7 +5151,7 @@ static bool compileBlock(const std::vector<StmtPtr>& body, bool topLevel,
 static bool compileForRange(const StmtPtr& s, const Value& iter, bool topLevel,
                             const shared_ptr<Scope>& globals,
                             std::vector<Instr>& outCode, std::vector<double>& outK,
-                            int& outStack, bool& hasRet) {
+                            std::vector<StmtPtr>& outSlow, int& outStack, bool& hasRet) {
     hasRet = false;
     if (!s || s->body.empty()) return false;
     WenAsm a;
@@ -5172,6 +5184,7 @@ static bool compileForRange(const StmtPtr& s, const Value& iter, bool topLevel,
         if (ins.op == BC_RET || ins.op == BC_RETN) { hasRet = true; break; }
     outCode.swap(a.code);
     outK.swap(a.kconst);
+    outSlow.swap(a.slow);
     outStack = a.maxDepth + 4;
     return true;
 }
@@ -5192,7 +5205,8 @@ static inline void vmSetBool(Value& v, bool x) {
 }
 
 Value Interpreter::runCode(const std::vector<Instr>& code, const std::vector<double>& kconst,
-                           int vstack, const shared_ptr<Scope>& scope) {
+                           const std::vector<StmtPtr>& slow, int vstack,
+                           const shared_ptr<Scope>& scope) {
     size_t base = gVSP;
     if (gVStack.size() < base + (size_t)vstack) gVStack.resize(base + (size_t)vstack);
     gVSP = base + (size_t)vstack;
@@ -5434,6 +5448,18 @@ Value Interpreter::runCode(const std::vector<Instr>& code, const std::vector<dou
                 sp -= (size_t)in.a;
                 ++pc;
                 break;
+            case BC_EXECSTMT: {
+                // 编译不了的语句：原样交给 exec，语义和 AST 路径完全一致
+                exec(slow[(size_t)in.a], scope);
+                if (retFlag) {
+                    Value out = std::move(retVal);
+                    retFlag = false;
+                    vmRetFlag = 1;
+                    return out;
+                }
+                ++pc;
+                break;
+            }
             default:
                 rtError(gLastLine, "内部错误：未知字节码指令");
         }
@@ -5488,14 +5514,12 @@ void Interpreter::exec(const StmtPtr& s, const shared_ptr<Scope>& scope) {
             if (!gNoBytecode) {
                 std::vector<Instr> lcode;
                 std::vector<double> lk;
+                std::vector<StmtPtr> lslow;
                 int lstack = 0;
                 bool tl = (scope.get() == globals.get());
-                if (compileBody(std::vector<StmtPtr>{s}, {}, tl, globals, lcode, lk, lstack)) {
-                    bool hasRet = false;
-                    for (const auto& ins : lcode)
-                        if (ins.op == BC_RET || ins.op == BC_RETN) { hasRet = true; break; }
-                    Value r = runCode(lcode, lk, lstack, scope);
-                    if (hasRet) { retVal = std::move(r); retFlag = true; }
+                if (compileBody(std::vector<StmtPtr>{s}, {}, tl, globals, lcode, lk, lslow, lstack)) {
+                    Value r = runCode(lcode, lk, lslow, lstack, scope);
+                    if (vmRetFlag) { retVal = std::move(r); retFlag = true; }
                     break;
                 }
             }
@@ -5564,30 +5588,32 @@ void Interpreter::exec(const StmtPtr& s, const shared_ptr<Scope>& scope) {
             // 循环体整体编译成字节码块；遍历与变量绑定仍然只在这里做
             std::vector<Instr> bcode;
             std::vector<double> bk;
+            std::vector<StmtPtr> bslow;
             int bstack = 0;
             bool hasRet = false;
             bool bodyCompiled = false;
             std::vector<Instr> rcode;
             std::vector<double> rk;
+            std::vector<StmtPtr> rslow;
             int rstack = 0;
             bool rHasRet = false;
             bool rangeCompiled = false;
             if (!gNoBytecode) {
                 bool tl = (scope.get() == globals.get());
-                bodyCompiled = compileBlock(s->body, tl, globals, bcode, bk, bstack, hasRet);
+                bodyCompiled = compileBlock(s->body, tl, globals, bcode, bk, bslow, bstack, hasRet);
             }
             // 「名字 → 快槽」是幂等的，循环外记一次就够，不必每轮查表
             if (s->nameSlot >= 0) globals->fastBind(s->nameSym, s->nameSlot);
             if (two && s->name2Slot >= 0) globals->fastBind(s->name2Sym, s->name2Slot);
             if (!gNoBytecode && !two && iter.type == VT::Range)
                 rangeCompiled = compileForRange(s, iter, (scope.get() == globals.get()),
-                                                globals, rcode, rk, rstack, rHasRet);
+                                                globals, rcode, rk, rslow, rstack, rHasRet);
             auto runBody = [&]() -> bool {          // true 继续下一轮，false 结束循环
                 if (bodyCompiled) {
                     int savedCtl = vmCtl;
                     int savedRet = vmRetFlag;
                     vmRetFlag = 0;
-                    Value r = runCode(bcode, bk, bstack, scope);
+                    Value r = runCode(bcode, bk, bslow, bstack, scope);
                     bool didRet = vmRetFlag != 0;
                     int ctl = vmCtl;
                     vmCtl = savedCtl;
@@ -5651,7 +5677,7 @@ void Interpreter::exec(const StmtPtr& s, const shared_ptr<Scope>& scope) {
                     int savedCtl = vmCtl;
                     int savedRet = vmRetFlag;
                     vmRetFlag = 0;
-                    Value r = runCode(rcode, rk, rstack, scope);
+                    Value r = runCode(rcode, rk, rslow, rstack, scope);
                     bool didRet = vmRetFlag != 0;
                     vmCtl = savedCtl;
                     vmRetFlag = savedRet;
@@ -5744,7 +5770,7 @@ void Interpreter::exec(const StmtPtr& s, const shared_ptr<Scope>& scope) {
             // 纯数值函数编译成语句字节码；编译不了就继续走 AST（两条路语义等价）。
             if (!gNoBytecode)
                 compileBody(s->body, s->paramSyms, false, globals,
-                            fn->code, fn->kconst, fn->vstack);
+                            fn->code, fn->kconst, fn->slow, fn->vstack);
             fn->closure = scope;
             fn->line = s->line;
             // 纯表达式体：返回 <数字/参数/四则/比较/逻辑> 组成的表达式
@@ -6305,7 +6331,7 @@ Value Function::callSpan(Interpreter& vm, const Value* a, int n, int callLine) {
     try {
         if (!code.empty()) {
             // 有字节码就跑字节码：不再逐条语句 switch + 递归求值
-            result = vm.runCode(code, kconst, vstack, frame.s);
+            result = vm.runCode(code, kconst, slow, vstack, frame.s);
         } else {
             for (const auto& st : body) {
                 vm.exec(st, frame.s);
