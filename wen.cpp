@@ -15829,7 +15829,9 @@ Interpreter::Interpreter() {
             throw WenError("运行时错误", line, 0, "体新建：体积太大（上限 10 亿格）");
         auto v = std::make_shared<VolData>();
         v->L = (int)L; v->R = (int)R; v->C = (int)C;
-        if (L * R * C <= 8000000) {
+        // 稠密体：灰度 1 字节/格，放到 2.5 亿格（约 250 MB）。
+        // 再大就不是这个函数该干的事了（分块体/文件流）——那样也不会偷偷给个空壳。
+        if (L * R * C <= 250000000LL) {
             v->dense = true;
             v->data.assign((size_t)(L * R * C), 0);
         } else {
@@ -16497,7 +16499,7 @@ Interpreter::Interpreter() {
         if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体缩放：体句柄无效");
         auto v = it->second;
         if (!v->dense) throw WenError("运行时错误", line, 0, "体缩放：只支持稠密体");
-        if (NL <= 0 || NR <= 0 || NC <= 0 || NL * NR * NC > 8000000)
+        if (NL <= 0 || NR <= 0 || NC <= 0 || NL * NR * NC > 250000000LL)
             throw WenError("运行时错误", line, 0, "体缩放：目标尺寸非法");
         bool color = v->color;
         size_t stride = color ? 3 : 1;
@@ -19497,8 +19499,8 @@ Interpreter::Interpreter() {
         long long C = needIndex(a[2], "体新建彩色", line);
         if (L <= 0 || R <= 0 || C <= 0)
             throw WenError("运行时错误", line, 0, "体新建彩色：三个维度必须大于 0");
-        if (L * R * C > 8000000)
-            throw WenError("运行时错误", line, 0, "体新建彩色：体积太大（上限 800 万格）");
+        if (L * R * C > 100000000LL)   // 彩色 3 字节/格，1 亿格约 300 MB
+            throw WenError("运行时错误", line, 0, "体新建彩色：体积太大（上限 1 亿格，约 300 MB）");
         auto v = std::make_shared<VolData>();
         v->L = (int)L; v->R = (int)R; v->C = (int)C;
         v->dense = true; v->color = true;
