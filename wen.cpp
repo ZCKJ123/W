@@ -20190,7 +20190,7 @@ Interpreter::Interpreter() {
     // 相机拍下来的亮度就是被表面法线调制的光照：亮=朝向光源，暗=背光。
     // 先用中心差分从亮度求出「法线斜率」p、q，再解泊松方程 ∇²Z = ∂p/∂x + ∂q/∂y
     // 把斜率积分成高度。不需要模型文件，也不需要多张图。
-    registerBuiltin("明暗高度", 3, 4, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+    registerBuiltin("明暗高度", 3, 5, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         auto buf = needBytes(a[0], "明暗高度", line);
         long long W = needIndex(a[1], "明暗高度", line);
         long long H = needIndex(a[2], "明暗高度", line);
@@ -20199,6 +20199,9 @@ Interpreter::Interpreter() {
             throw WenError("运行时错误", line, 0, "明暗高度：需要 RGB 像素缓冲和正确的宽高（至少 3x3）");
         if (iters < 1) iters = 1;
         if (iters > 5000) iters = 5000;
+        // 符号：光从左上来取 +1，从右上来取 -1，否则坡度整体反号
+        double sign = 1.0;
+        if (a.size() >= 5) sign = needNum(a[4], "明暗高度", line) < 0 ? -1.0 : 1.0;
         const auto& px = *buf;
         std::vector<double> I((size_t)W * (size_t)H);
         for (long long y = 0; y < H; ++y)
@@ -20218,8 +20221,8 @@ Interpreter::Interpreter() {
         std::vector<double> P((size_t)W * (size_t)H, 0.0), Q((size_t)W * (size_t)H, 0.0);
         for (long long y = 0; y < H; ++y)
             for (long long x = 0; x < W; ++x) {
-                P[(size_t)(y * W + x)] = -(at(x + 1, y) - at(x - 1, y)) * 0.5;
-                Q[(size_t)(y * W + x)] = -(at(x, y + 1) - at(x, y - 1)) * 0.5;
+                P[(size_t)(y * W + x)] = -(at(x + 1, y) - at(x - 1, y)) * 0.5 * sign;
+                Q[(size_t)(y * W + x)] = -(at(x, y + 1) - at(x, y - 1)) * 0.5 * sign;
             }
         // 泊松右端项：斜率场的散度
         std::vector<double> div((size_t)W * (size_t)H, 0.0);
@@ -20261,10 +20264,50 @@ Interpreter::Interpreter() {
         d->items["落差"] = vNum(span);
         Value o; o.type = VT::Dict; o.dict = d; return o;
     });
+    // ---------- 估计光源方向 ----------
+    // 照片里整体亮度是朝光源那侧升高的，所以「平均亮度梯度的反方向」就是光来的方向。
+    // 返回 方位（度，0=从右来，90=从下来，180=从左来）、强度（梯度的相对大小）。
+    registerBuiltin("光向", 3, 3, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto buf = needBytes(a[0], "光向", line);
+        long long W = needIndex(a[1], "光向", line);
+        long long H = needIndex(a[2], "光向", line);
+        if (W < 3 || H < 3 || (long long)buf->size() < W * H * 3)
+            throw WenError("运行时错误", line, 0, "光向：需要 RGB 像素缓冲和正确的宽高");
+        const auto& px = *buf;
+        auto lum = [&](long long x, long long y) -> double {
+            size_t i = (size_t)(y * W + x) * 3;
+            return 0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2];
+        };
+        double sx = 0, sy = 0;
+        long long n = 0;
+        for (long long y = 1; y < H - 1; ++y)
+            for (long long x = 1; x < W - 1; ++x) {
+                sx += lum(x + 1, y) - lum(x - 1, y);
+                sy += lum(x, y + 1) - lum(x, y - 1);
+                ++n;
+            }
+        if (n == 0) n = 1;
+        sx /= (double)n;
+        sy /= (double)n;
+        double mag = std::sqrt(sx * sx + sy * sy);
+        double deg = 0;
+        if (mag > 1e-9) {
+            // 亮度梯度是从暗指向亮的，也就是「朝着光源」的方向
+            double ang = std::atan2(sy, sx) * 180.0 / 3.14159265358979323846;
+            if (ang < 0) ang += 360.0;
+            deg = ang;
+        }
+        auto d = std::make_shared<Dict>();
+        d->items["方位"] = vNum(deg);
+        d->items["强度"] = vNum(mag);
+        d->items["从右来"] = vBool(deg > 270 || deg < 90);
+        d->items["从左来"] = vBool(deg >= 90 && deg <= 270);
+        Value o; o.type = VT::Dict; o.dict = d; return o;
+    });
     // ---------- 阴影测高 ----------
     // 光从右上斜射时，物体左边会拖出一段影子。影子长度 L 和光角 θ 的关系是
     // 高度 h = L × tan(θ)——这就是「量影子算高度」，不需要模型，也不需要第二张图。
-    registerBuiltin("阴影高度", 3, 4, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+    registerBuiltin("阴影高度", 3, 5, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         auto buf = needBytes(a[0], "阴影高度", line);
         long long W = needIndex(a[1], "阴影高度", line);
         long long H = needIndex(a[2], "阴影高度", line);
@@ -20273,6 +20316,8 @@ Interpreter::Interpreter() {
             throw WenError("运行时错误", line, 0, "阴影高度：需要 RGB 像素缓冲和正确的宽高");
         if (deg < 2) deg = 2;
         if (deg > 88) deg = 88;
+        long long dirSign = a.size() >= 5 ? needIndex(a[4], "阴影高度", line) : 1;
+        if (dirSign == 0) dirSign = 1;
         double tanA = std::tan(deg * 3.14159265358979323846 / 180.0);
         const auto& px = *buf;
         std::vector<double> I((size_t)W * (size_t)H);
@@ -20291,7 +20336,8 @@ Interpreter::Interpreter() {
         std::vector<double> Z((size_t)W * (size_t)H, 0.0);
         for (long long y = 0; y < H; ++y) {
             long long run = 0;
-            for (long long x = 0; x < W; ++x) {
+            for (long long k = 0; k < W; ++k) {
+                long long x = dirSign >= 0 ? k : (W - 1 - k);   // 光从哪边来，就从哪边扫
                 size_t i = (size_t)(y * W + x);
                 if (I[i] < 0.62 * rowRef[(size_t)y]) {
                     ++run;              // 影子里的格子高度记 0，长度记着
