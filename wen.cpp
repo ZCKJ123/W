@@ -6140,6 +6140,44 @@ void Interpreter::setIndex(Value& obj, const Value& idx, const Value& val, int l
 }
 
 // 函数调用：返回信号、循环外中断、错误调用栈
+// 函数帧池：每次调用都 make_shared 一个作用域太亏，这里复用同一个对象。
+// 收回前检查 use_count()==1——只要有别处还引用这个帧（闭包捕获、嵌套函数带走），
+// 就原地丢弃、不进池，所以复用永远不会让两个调用共用一份局部变量。
+static thread_local std::vector<shared_ptr<Scope>> gFramePool;
+
+static shared_ptr<Scope> takeFrame(const shared_ptr<Scope>& closure) {
+    auto& pool = gFramePool;
+    shared_ptr<Scope> s;
+    if (pool.empty()) {
+        s = std::make_shared<Scope>(closure);
+    } else {
+        s = std::move(pool.back());
+        pool.pop_back();
+        s->svars.clear();
+        s->idVars.clear();
+        s->vars.clear();
+        s->fast.clear();
+        s->fastDefined.clear();
+        s->idSlot.clear();
+        s->parent = closure;
+    }
+    s->trackNames = false;
+    s->smallMode = true;
+    return s;
+}
+
+struct FrameHold {
+    shared_ptr<Scope>& s;
+    explicit FrameHold(shared_ptr<Scope>& x) : s(x) {}
+    ~FrameHold() {
+        if (s && s.use_count() == 1 && gFramePool.size() < 64) {
+            s->svars.clear();      // 容量留着，下次直接用
+            s->parent.reset();     // 别把闭包链一直挂住
+            gFramePool.push_back(std::move(s));
+        }
+    }
+};
+
 Value Function::call(Interpreter& vm, vector<Value>& args, int callLine) {
     if (vm.callDepth >= vm.maxCallDepth)
         throw WenError("运行时错误", callLine, 0,
@@ -6155,16 +6193,7 @@ Value Function::call(Interpreter& vm, vector<Value>& args, int callLine) {
                        "函数「" + name + "」最多需要 " + std::to_string(params.size()) +
                        " 个参数，收到 " + std::to_string(args.size()) + " 个");
     }
-    auto scope = std::make_shared<Scope>(closure);
-    scope->trackNames = false;
-    scope->smallMode = true;
-    for (size_t i = 0; i < args.size(); ++i) scope->set(paramSyms[i], args[i]);
-    for (size_t i = args.size(); i < params.size(); ++i) {
-        if (i >= paramDefaults.size() || !paramDefaults[i])
-            throw WenError("运行时错误", callLine, 0,
-                           "函数「" + name + "」缺少参数「" + params[i] + "」");
-        scope->set(paramSyms[i], vm.eval(paramDefaults[i], scope));
-    }
+    // 单表达式快路径：不进帧、不分配作用域，直接算（放在建帧之前，省一次分配）
     if (simpleOp && args.size() == 1 && args[0].type == VT::Num && params.size() == 1) {
         double x = args[0].num;
         switch (simpleOp) {
@@ -6178,6 +6207,18 @@ Value Function::call(Interpreter& vm, vector<Value>& args, int callLine) {
             case 8: return vNum(simpleConst);
             default: break;
         }
+    }
+    auto scope = takeFrame(closure);
+    FrameHold frameHold(scope);
+    // 形参和局部通常只有几个：一次留够，省掉 push_back 扩容与 200 字节搬运
+    if (scope->svars.capacity() < args.size() + params.size() + 4)
+        scope->svars.reserve(args.size() + params.size() + 4);
+    for (size_t i = 0; i < args.size(); ++i) scope->set(paramSyms[i], args[i]);
+    for (size_t i = args.size(); i < params.size(); ++i) {
+        if (i >= paramDefaults.size() || !paramDefaults[i])
+            throw WenError("运行时错误", callLine, 0,
+                           "函数「" + name + "」缺少参数「" + params[i] + "」");
+        scope->set(paramSyms[i], vm.eval(paramDefaults[i], scope));
     }
     bool savedFlag = vm.retFlag;
     Value savedVal = vm.retVal;
