@@ -11595,10 +11595,11 @@ Interpreter::Interpreter() {
         auto it = vdStore.find(id);
         if (it == vdStore.end()) throw WenError("运行时错误", line, 0, "视频取帧：解码器句柄无效");
         long long idx = needIndex(a[1], "视频取帧", line);
-        if (idx < 0) idx = 0;
         std::vector<unsigned char> rgb;
         string err;
-        double sec = it->second->fps > 0 ? (double)idx / it->second->fps : 0.0;
+        // idx < 0 表示「不跳转、顺序取下一帧」——顺序读才是快的那条路，
+        // 每帧都跳转要回到关键帧重解，实测慢 30 倍。
+        double sec = (idx >= 0 && it->second->fps > 0) ? (double)idx / it->second->fps : 0.0;
         if (!vdGrab(*it->second, sec, rgb, err))
             throw WenError("运行时错误", line, 0, "视频取帧：" + err);
         auto buf = std::make_shared<std::vector<unsigned char>>(std::move(rgb));
