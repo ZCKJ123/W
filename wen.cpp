@@ -2013,6 +2013,10 @@ struct Scope {
     // 函数帧不维护名字表（vars）：参数和局部变量只用 SymId 定位，
     // 省掉每次调用往 std::map<string, Value> 插节点的开销。
     bool trackNames = true;
+    // 函数帧用「小数组」存局部变量：参数和局部通常只有几个，
+    // 线性扫比哈希表快，也完全不做堆分配（消除每次调用的 map 节点分配）。
+    bool smallMode = false;
+    vector<std::pair<SymId, Value>> svars;
 
     Scope() = default;
     explicit Scope(shared_ptr<Scope> p) : parent(std::move(p)) {}
@@ -2021,6 +2025,10 @@ struct Scope {
         SymId sid = internSymbol(name);
         auto sit = idSlot.find(sid);
         if (sit != idSlot.end() && fastGet(sit->second, out)) return true;
+        if (smallMode) {
+            for (const auto& kv : svars)
+                if (kv.first == sid) { out = kv.second; return true; }
+        }
         auto iv = idVars.find(sid);
         if (iv != idVars.end()) { out = iv->second; return true; }
         auto it = vars.find(name);
@@ -2029,6 +2037,10 @@ struct Scope {
         return false;
     }
     bool lookup(SymId id, Value& out) const {
+        if (smallMode) {
+            for (const auto& kv : svars)
+                if (kv.first == id) { out = kv.second; return true; }
+        }
         auto it = idVars.find(id);
         if (it != idVars.end()) { out = it->second; return true; }
         // 全局数字只存在快槽里，函数体内按名字读全局时也必须看得到。
@@ -2040,6 +2052,12 @@ struct Scope {
         return false;
     }
     void set(SymId id, Value v) {
+        if (smallMode) {
+            for (auto& kv : svars)
+                if (kv.first == id) { kv.second = std::move(v); return; }
+            svars.emplace_back(id, std::move(v));
+            return;
+        }
         idVars[id] = v;
         if (trackNames) vars[symbolName(id)] = std::move(v);
     }
@@ -2051,6 +2069,14 @@ struct Scope {
     // 赋值语义：先找已经有这个绑定的那一层写入；都没找到返回 false，
     // 由调用方在当前层新建（这样函数体里的新变量才是真正的局部变量）。
     bool assign(SymId id, Value v) {
+        if (smallMode) {
+            for (auto& kv : svars)
+                if (kv.first == id) { kv.second = std::move(v); return true; }
+            // 自己帧里没有：先按原语义往外层找，找不到才建局部
+            if (parent && parent->assign(id, v)) return true;
+            svars.emplace_back(id, std::move(v));
+            return true;
+        }
         auto sit = idSlot.find(id);
         if (sit != idSlot.end()) {
             set(id, v);
@@ -2094,6 +2120,7 @@ struct Scope {
         for (const auto& kv : idSlot)
             if ((size_t)kv.second < fastDefined.size() && fastDefined[(size_t)kv.second])
                 out.push_back(symbolName(kv.first));
+        for (const auto& kv : svars) out.push_back(symbolName(kv.first));
         for (const auto& kv : idVars) out.push_back(symbolName(kv.first));
         for (const auto& kv : vars) out.push_back(kv.first);
         std::sort(out.begin(), out.end());
@@ -2127,6 +2154,9 @@ struct Function : Callable {
     vector<string> params;
     vector<SymId> paramSyms;
     vector<ExprPtr> paramDefaults;
+    // 单表达式快路径：函数体就是「返回 参数 op 常数」时，调用不进帧、直接算
+    // op：0=没有快路径 1=参数+常数 2=参数-常数 3=常数-参数 4=参数*常数
+    //     5=参数/常数 6=常数/参数 7=直接返回参数 8=直接返回常数
     int simpleOp = 0;
     double simpleConst = 0;
     SymId simpleParam = 0;
@@ -4811,6 +4841,41 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
             fn->body = s->body;
             fn->closure = scope;
             fn->line = s->line;
+            // 识别「返回 参数 ±*/ 常数」这种单表达式函数
+            if (s->body.size() == 1 && s->body[0] && s->body[0]->k == Stmt::K::Return &&
+                !s->paramSyms.empty()) {
+                ExprPtr ex = s->body[0]->expr;
+                if (ex && ex->k == Expr::K::Var && ex->sym == s->paramSyms[0]) {
+                    fn->simpleOp = 7;
+                    fn->simpleParam = ex->sym;
+                } else if (ex && ex->k == Expr::K::Num) {
+                    fn->simpleOp = 8;
+                    fn->simpleConst = ex->num;
+                } else if (ex && ex->k == Expr::K::Binary && ex->args.size() == 2) {
+                    ExprPtr L = ex->args[0], R = ex->args[1];
+                    bool lok = L && L->k == Expr::K::Var && L->sym == s->paramSyms[0];
+                    bool rok = R && R->k == Expr::K::Var && R->sym == s->paramSyms[0];
+                    bool ln = L && L->k == Expr::K::Num;
+                    bool rn = R && R->k == Expr::K::Num;
+                    const string& o = ex->op;
+                    int code = 0;
+                    double cst = 0;
+                    if (lok && rn) {
+                        cst = R->num;
+                        if (o == "+") code = 1;
+                        else if (o == "-") code = 2;
+                        else if (o == "*") code = 4;
+                        else if (o == "/") code = 5;
+                    } else if (ln && rok) {
+                        cst = L->num;
+                        if (o == "-") code = 3;
+                        else if (o == "/") code = 6;
+                        else if (o == "+") code = 1;
+                        else if (o == "*") code = 4;
+                    }
+                    if (code) { fn->simpleOp = code; fn->simpleConst = cst; fn->simpleParam = s->paramSyms[0]; }
+                }
+            }
             if (!inLibrary_ && (scope == globals || (scope->parent && scope->parent == globals))) {
                 auto owner = symbolOwner.find(s->name);
                 if (owner != symbolOwner.end() && owner->second != "用户")
@@ -4930,7 +4995,8 @@ Value Interpreter::eval(const ExprPtr& e, shared_ptr<Scope> scope) {
             // 否则 零() 会先执行一次再被当成数字调用。
             Value callee;
             if (e->args[0]->k == Expr::K::Var) {
-                if (!scope->lookup(e->args[0]->text, callee))
+                SymId csid = e->args[0]->sym ? e->args[0]->sym : internSymbol(e->args[0]->text);
+                if (!scope->lookup(csid, callee))
                     undefinedName(e->args[0]->text, e->line);
             } else {
                 callee = eval(e->args[0], scope);
@@ -5215,12 +5281,27 @@ Value Function::call(Interpreter& vm, vector<Value>& args, int callLine) {
     }
     auto scope = std::make_shared<Scope>(closure);
     scope->trackNames = false;
+    scope->smallMode = true;
     for (size_t i = 0; i < args.size(); ++i) scope->set(paramSyms[i], args[i]);
     for (size_t i = args.size(); i < params.size(); ++i) {
         if (i >= paramDefaults.size() || !paramDefaults[i])
             throw WenError("运行时错误", callLine, 0,
                            "函数「" + name + "」缺少参数「" + params[i] + "」");
         scope->set(paramSyms[i], vm.eval(paramDefaults[i], scope));
+    }
+    if (simpleOp && args.size() == 1 && args[0].type == VT::Num && params.size() == 1) {
+        double x = args[0].num;
+        switch (simpleOp) {
+            case 1: return vNum(x + simpleConst);
+            case 2: return vNum(x - simpleConst);
+            case 3: return vNum(simpleConst - x);
+            case 4: return vNum(x * simpleConst);
+            case 5: return vNum(simpleConst == 0 ? x : x / simpleConst);
+            case 6: return vNum(x == 0 ? 0 : simpleConst / x);
+            case 7: return args[0];
+            case 8: return vNum(simpleConst);
+            default: break;
+        }
     }
     bool savedFlag = vm.retFlag;
     Value savedVal = vm.retVal;
