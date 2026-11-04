@@ -69,7 +69,9 @@
 - 指令集：`BC_K/G/L/LC/STG/STL/STLL/ADD…MOD/LT…NE/NEG/NOT/JMP/JZ/RET/RETN/LINE/CALL/PRINT/LOOPEND/FORCHECK/FORVAR/FORSTEP/FORDROP/EXECSTMT`
 - 编译器 `WenAsm`：语句 + 表达式的单遍递归下降。**编译不了的语句不再导致整个函数退回 AST**——
   它们进「慢语句表」，运行时用 `BC_EXECSTMT` 原样交给 `exec` 执行，语义与 AST 路径完全一致。
-  （`对于`/`尝试`/`匹配`/嵌套 `函数` 都走这条路。）
+  （`对于`/`尝试`/`匹配`/嵌套 `函数`、以及**表达式里带下标/文本/字典的语句**都走这条路。）
+  委派的三个禁区：`中断`/`继续`（会让 BreakSignal 穿出 runCode）、`当`（exec 会再编译它，无限递归）、
+  以及任何「含外层循环控制」的语句。
 - 执行器 `Interpreter::runCode`：一条取指—执行循环，表达式栈按「深度指针」复用
   （`gVStack` + `gVSP`），嵌套调用只往上叠、不重新分配
 - **语义只写一遍**：赋值抽成 `assignVarSym`、一元负号抽成 `negateValue`，
