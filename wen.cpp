@@ -2004,7 +2004,9 @@ static string nearestName(const string& name) {
 }
 
 struct Scope {
-    map<string, Value> vars;
+    // 名字表用哈希：按名字找变量在每次赋值/读名字时都要走一遍，
+    // 红黑树的逐字符比较比哈希贵好几倍。
+    unordered_map<string, Value> vars;
     unordered_map<SymId, Value> idVars;
     vector<Value> fast;
     vector<char> fastDefined;
@@ -4129,7 +4131,8 @@ public:
     Value callValue(const Value& callee, vector<Value>& args, int line);
     void assignTarget(const ExprPtr& target, Value val, const shared_ptr<Scope>& scope);
     // AST 路径和字节码路径共用的「给变量赋值」语义（gslot < 0 的那一支）。
-    void assignVarSym(SymId sym, Value val, const shared_ptr<Scope>& scope);
+    void assignVarSym(SymId sym, Value val, const shared_ptr<Scope>& scope,
+                       bool knownBuiltin = false);
     // 跑一段语句字节码；返回函数返回值（顶层循环返回 空）。
     Value runCode(const std::vector<Instr>& code, const std::vector<double>& kconst,
                   int vstack, const shared_ptr<Scope>& scope);
@@ -4955,7 +4958,10 @@ bool WenAsm::stmt(const StmtPtr& s) {
             } else if (!topLevel && isParam(sym)) {
                 emit(BC_STLL, (int)sym);          // 形参一定在当前帧里
             } else {
-                emit(BC_STL, (int)sym);           // 其余走作用域链，和 AST 同一套语义
+                // 其余走作用域链，和 AST 同一套语义。
+                // b 里带上「这个名字是不是内建名」——内建表启动后就不再变，
+                // 编译期算一次，省掉每次赋值查 690 项的名字表。
+                emit(BC_STL, (int)sym, gBuiltinArity.count(symbolName(sym)) ? 1 : 0);
             }
             drop();
             return true;
@@ -5212,7 +5218,7 @@ Value Interpreter::runCode(const std::vector<Instr>& code, const std::vector<dou
             case BC_STL: {
                 Value v = std::move(gVStack[base + sp - 1]);
                 --sp;
-                assignVarSym((SymId)in.a, std::move(v), scope);
+                assignVarSym((SymId)in.a, std::move(v), scope, in.b != 0);
                 ++pc;
                 break;
             }
@@ -6053,15 +6059,19 @@ Value Interpreter::callValue(const Value& callee, vector<Value>& args, int line)
     return callee.callable->call(*this, args, line);
 }
 
-void Interpreter::assignVarSym(SymId sym, Value val, const shared_ptr<Scope>& scope) {
+void Interpreter::assignVarSym(SymId sym, Value val, const shared_ptr<Scope>& scope,
+                               bool knownBuiltin) {
     // 内建名不能被函数里的普通赋值改掉：`值`、`长度` 这些名字同时是内建函数，
     // 直接 assign 会写进全局的内建槽，递归时所有层共用一个变量，循环会莫名退出。
     // 函数里碰到内建名就退化成局部变量（要改全局请显式用别的名字）。
     // 名字现在绑定的是一个函数（内建或用户函数）时，也不能在函数里被普通赋值改掉：
     // 那会写到全局上，递归时所有层共用，还会把函数本身顶掉。
-    Value existing;
-    bool shadowMe = gBuiltinArity.count(symbolName(sym)) ||
-                    (scope->lookup(sym, existing) && existing.type == VT::Func);
+    // knownBuiltin 由字节码编译期算好（内建表启动后就不再变），省掉一次 690 项查表。
+    bool shadowMe = knownBuiltin;
+    if (!shadowMe) {
+        Value existing;
+        shadowMe = scope->lookup(sym, existing) && existing.type == VT::Func;
+    }
     if (scope != globals && shadowMe) {
         scope->set(sym, std::move(val));
         return;
@@ -6081,7 +6091,8 @@ void Interpreter::assignTarget(const ExprPtr& target, Value val,
                 scope->set(target->sym, val);
             globals->fastSet(target->gslot, std::move(val));
         } else {
-            assignVarSym(target->sym, std::move(val), scope);
+            assignVarSym(target->sym, std::move(val), scope,
+                          gBuiltinArity.count(target->text) != 0);
         }
         return;
     }
