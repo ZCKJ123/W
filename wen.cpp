@@ -2160,6 +2160,9 @@ struct Function : Callable {
     int simpleOp = 0;
     double simpleConst = 0;
     SymId simpleParam = 0;
+    // 纯表达式：函数体就是「返回 表达式」，且表达式只由数字/参数/四则/比较组成。
+    // 体按公式这种每格调一次的场景，直接拿它算，不进帧、不装箱。
+    ExprPtr pureExpr;
     vector<StmtPtr> body;
     shared_ptr<Scope> closure;
     int line = 0;
@@ -4841,6 +4844,33 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
             fn->body = s->body;
             fn->closure = scope;
             fn->line = s->line;
+            // 纯表达式体：返回 <数字/参数/四则/比较/逻辑> 组成的表达式
+            if (s->body.size() == 1 && s->body[0] && s->body[0]->k == Stmt::K::Return &&
+                s->body[0]->expr) {
+                static std::function<bool(const ExprPtr&, const std::vector<SymId>&)> isPure;
+                if (!isPure) {
+                    isPure = [](const ExprPtr& e, const std::vector<SymId>& ps) -> bool {
+                        if (!e) return false;
+                        switch (e->k) {
+                            case Expr::K::Num: return true;
+                            case Expr::K::Var:
+                                for (SymId s2 : ps) if (s2 == e->sym) return true;
+                                return false;
+                            case Expr::K::Unary:
+                                return e->args.size() == 1 && isPure(e->args[0], ps);
+                            case Expr::K::Binary: {
+                                const string& o = e->op;
+                                if (o != "+" && o != "-" && o != "*" && o != "/" && o != "%" &&
+                                    o != "<" && o != "<=" && o != ">" && o != ">=" &&
+                                    o != "==" && o != "!=" && o != "且" && o != "或") return false;
+                                return e->args.size() == 2 && isPure(e->args[0], ps) && isPure(e->args[1], ps);
+                            }
+                            default: return false;
+                        }
+                    };
+                }
+                if (isPure(s->body[0]->expr, s->paramSyms)) fn->pureExpr = s->body[0]->expr;
+            }
             // 识别「返回 参数 ±*/ 常数」这种单表达式函数
             if (s->body.size() == 1 && s->body[0] && s->body[0]->k == Stmt::K::Return &&
                 !s->paramSyms.empty()) {
@@ -16523,6 +16553,47 @@ Interpreter::Interpreter() {
     });
     // 公式字典的原生求值：{"型": "球", "参": [x,y,z,r]} 这种，比逐格回调快得多
     // 支持的型：球 / 盒 / 环 / 柱 / 面 / 波 / 高斯（高斯是给卷积核用的）
+    // 纯表达式求值：只认数字、参数、四则、比较、且/或，出错返回 ok=false 交给慢路径
+    static std::function<double(const ExprPtr&, const double*, const std::vector<SymId>&, bool&)> evalPure;
+    if (!evalPure) {
+        evalPure = [](const ExprPtr& e, const double* vals, const std::vector<SymId>& ps, bool& ok) -> double {
+            if (!e || !ok) return 0;
+            if (e->k == Expr::K::Num) return e->num;
+            if (e->k == Expr::K::Var) {
+                for (size_t i = 0; i < ps.size(); ++i)
+                    if (ps[i] == e->sym) return vals[i];
+                ok = false;
+                return 0;
+            }
+            if (e->k == Expr::K::Unary && e->args.size() == 1) {
+                double v = evalPure(e->args[0], vals, ps, ok);
+                if (e->op == "-") return -v;
+                if (e->op == "非") return v == 0 ? 1 : 0;
+                return v;
+            }
+            if (e->k == Expr::K::Binary && e->args.size() == 2) {
+                double a = evalPure(e->args[0], vals, ps, ok);
+                double b = evalPure(e->args[1], vals, ps, ok);
+                if (!ok) return 0;
+                const string& o = e->op;
+                if (o == "+") return a + b;
+                if (o == "-") return a - b;
+                if (o == "*") return a * b;
+                if (o == "/") return b == 0 ? 0 : a / b;
+                if (o == "%") return b == 0 ? 0 : std::fmod(a, b);
+                if (o == "<") return a < b ? 1 : 0;
+                if (o == "<=") return a <= b ? 1 : 0;
+                if (o == ">") return a > b ? 1 : 0;
+                if (o == ">=") return a >= b ? 1 : 0;
+                if (o == "==") return a == b ? 1 : 0;
+                if (o == "!=") return a != b ? 1 : 0;
+                if (o == "且") return (a != 0 && b != 0) ? 1 : 0;
+                if (o == "或") return (a != 0 || b != 0) ? 1 : 0;
+            }
+            ok = false;
+            return 0;
+        };
+    }
     // 公式字典先编译成节点树，再逐格求值——每格都去查 map 的话慢 30 倍
     struct FormulaNode {
         int op = 0;
@@ -16669,16 +16740,30 @@ Interpreter::Interpreter() {
         }
         long long calls = 0;
         vector<Value> args(3);
+        // 纯表达式函数（体就是「返回 l*7+r*3+c」这种）：不进解释器，直接算
+        Function* pureFn = nullptr;
+        if (byFunc && a[1].callable) pureFn = dynamic_cast<Function*>(a[1].callable.get());
+        if (pureFn && (!pureFn->pureExpr || pureFn->paramSyms.size() != 3)) pureFn = nullptr;
+        double pv[3] = {0, 0, 0};
         for (int l = 0; l < v->L; ++l)
             for (int r = 0; r < v->R; ++r)
                 for (int c = 0; c < v->C; ++c) {
                     double d;
                     if (byFunc) {
-                        args[0] = vNum(l); args[1] = vNum(r); args[2] = vNum(c);
-                        Value res = vm.callValue(a[1], args, line);
-                        if (res.type != VT::Num && res.type != VT::Int && res.type != VT::Big)
-                            throw WenError("运行时错误", line, 0, "体按公式：公式要返回数字");
-                        d = needNum(res, "体按公式", line);
+                        bool done = false;
+                        if (pureFn) {
+                            pv[0] = l; pv[1] = r; pv[2] = c;
+                            bool ok = true;
+                            double dv = evalPure(pureFn->pureExpr, pv, pureFn->paramSyms, ok);
+                            if (ok) { d = dv; done = true; }
+                        }
+                        if (!done) {
+                            args[0] = vNum(l); args[1] = vNum(r); args[2] = vNum(c);
+                            Value res = vm.callValue(a[1], args, line);
+                            if (res.type != VT::Num && res.type != VT::Int && res.type != VT::Big)
+                                throw WenError("运行时错误", line, 0, "体按公式：公式要返回数字");
+                            d = needNum(res, "体按公式", line);
+                        }
                     } else {
                         d = evalFormulaNode(compiled, l, r, c);
                     }
