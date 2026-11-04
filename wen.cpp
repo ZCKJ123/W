@@ -11308,14 +11308,28 @@ Interpreter::Interpreter() {
             reader->Release(); MFShutdown(); if (com) CoUninitialize(); return false;
         }
         IMFMediaType* cur = nullptr;
-        UINT32 w = 0, h = 0;
+        UINT32 w = 0, h = 0, fnum = 0, fden = 0;
         if (SUCCEEDED(reader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, &cur)) && cur) {
             MFGetAttributeSize(cur, MF_MT_FRAME_SIZE, &w, &h);
+            MFGetAttributeRatio(cur, MF_MT_FRAME_RATE, &fnum, &fden);
             cur->Release();
         }
         if (!w || !h) {
             err = "拿不到视频尺寸";
             reader->Release(); MFShutdown(); if (com) CoUninitialize(); return false;
+        }
+        // 直接跳过去：否则第 500 帧要把前面 499 帧全部解一遍
+        if (want > 0 && fnum > 0 && fden > 0) {
+            double fps = (double)fnum / (double)fden;
+            LONGLONG t = (LONGLONG)((double)want * 1e7 / fps);
+            PROPVARIANT pv;
+            PropVariantInit(&pv);
+            pv.vt = VT_I8;
+            pv.hVal.QuadPart = t;
+            static const GUID kNullGuid = {0, 0, 0, {0, 0, 0, 0, 0, 0, 0, 0}};
+            reader->SetCurrentPosition(kNullGuid, pv);
+            PropVariantClear(&pv);
+            want = 0;   // 跳到目标时间后，读到的第一帧就是它
         }
         long long seen = 0;
         bool got = false;
@@ -11359,7 +11373,49 @@ Interpreter::Interpreter() {
         if (!got) { if (err.empty()) err = "没读到这一帧（帧号超出范围？）"; return false; }
         return true;
     };
-    registerBuiltin("视频帧", 2, 2, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+    registerBuiltin("视频信息", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path = needStr(a[0], "视频信息", line);
+        HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        bool com = SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE;
+        if (FAILED(MFStartup(MF_VERSION)))
+            throw WenError("运行时错误", line, 0, "视频信息：MFStartup 失败");
+        IMFSourceReader* reader = nullptr;
+        IMFAttributes* attrs = nullptr;
+        MFCreateAttributes(&attrs, 1);
+        if (attrs) attrs->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
+        hr = MFCreateSourceReaderFromURL(utf8ToWide(path).c_str(), attrs, &reader);
+        if (attrs) attrs->Release();
+        if (FAILED(hr) || !reader) {
+            MFShutdown(); if (com) CoUninitialize();
+            throw WenError("运行时错误", line, 0, "视频信息：打不开文件");
+        }
+        UINT32 w = 0, h = 0, fnum = 0, fden = 0;
+        IMFMediaType* cur = nullptr;
+        if (SUCCEEDED(reader->GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &cur)) && cur) {
+            MFGetAttributeSize(cur, MF_MT_FRAME_SIZE, &w, &h);
+            MFGetAttributeRatio(cur, MF_MT_FRAME_RATE, &fnum, &fden);
+            cur->Release();
+        }
+        LONGLONG dur = 0;
+        PROPVARIANT pv;
+        PropVariantInit(&pv);
+        if (SUCCEEDED(reader->GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE, MF_PD_DURATION, &pv)))
+            dur = pv.hVal.QuadPart;
+        PropVariantClear(&pv);
+        reader->Release();
+        MFShutdown();
+        if (com) CoUninitialize();
+        double fps = (fnum > 0 && fden > 0) ? (double)fnum / (double)fden : 0.0;
+        double secs = (double)dur / 1e7;
+        double frames = fps > 0 ? secs * fps : 0.0;
+        auto d = std::make_shared<Dict>();
+        d->items["宽"] = vNum(w);
+        d->items["高"] = vNum(h);
+        d->items["帧率"] = vNum(fps);
+        d->items["时长"] = vNum(secs);
+        d->items["帧数"] = vNum(frames);
+        Value o; o.type = VT::Dict; o.dict = d; return o;
+    });    registerBuiltin("视频帧", 2, 2, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         string path = needStr(a[0], "视频帧", line);
         long long idx = needIndex(a[1], "视频帧", line);
         if (idx < 0) idx = 0;

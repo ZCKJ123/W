@@ -1,0 +1,5 @@
+依赖 体库, 文件库, 数学库
+
+将 影 变成 "C:/Users/Acer/Desktop/hn/steamapps/common/PUBG/TslGame/Content/Movies/PC/AtoZ/AtoZ_intro_PC.mp4"
+将 帧 变成 视频帧(影, 0)
+打印("通道=" + 文本(帧["通道"]) + " 像素长=" + 文本(缓冲长度(帧["像素"])) + " 宽高=" + 文本(帧["宽"]) + "x" + 文本(帧["高"]))
