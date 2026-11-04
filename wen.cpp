@@ -4849,6 +4849,26 @@ static Value negateValue(const Value& a, int line) {
 
 namespace {
 
+// 「这条语句里有没有属于外层循环的中断/继续」。
+// 有的话不能交给 exec：字节码里的循环是跳转，不是 C++ 的 try，
+// 委派出去的 BreakSignal 会一路穿出 runCode，变成「中断只能用在循环里」。
+static bool hasFreeLoopControl(const StmtPtr& s) {
+    if (!s) return false;
+    switch (s->k) {
+        case Stmt::K::Break:
+        case Stmt::K::Continue: return true;
+        case Stmt::K::While:
+        case Stmt::K::For: return false;   // 里面的中断属于它自己
+        default: break;
+    }
+    for (const auto& st : s->body) if (hasFreeLoopControl(st)) return true;
+    for (const auto& st : s->elseBody) if (hasFreeLoopControl(st)) return true;
+    for (const auto& st : s->finallyBody) if (hasFreeLoopControl(st)) return true;
+    for (const auto& br : s->branches)
+        for (const auto& st : br.second) if (hasFreeLoopControl(st)) return true;
+    return false;
+}
+
 struct WenAsm {
     std::vector<Instr> code;
     std::vector<double> kconst;
@@ -4883,8 +4903,35 @@ struct WenAsm {
     }
     bool expr(const ExprPtr& e, bool numCtx = false);
     bool stmt(const StmtPtr& s);
+    // 一句一句地编：这句编不出来就整体回滚，然后把它丢进慢语句表交给 exec。
+    // 这样「表达式里有下标/文本/字典」之类的语句只损失它自己，不牵连整个函数。
+    bool tryStmt(const StmtPtr& s) {
+        size_t mark = code.size();
+        int depthMark = depth;
+        size_t slowMark = slow.size();
+        size_t loopsMark = loops.size();
+        size_t brkMark = blkBrks.size();
+        size_t contMark = blkConts.size();
+        if (stmt(s)) return true;
+        code.resize(mark);
+        depth = depthMark;
+        slow.resize(slowMark);
+        loops.resize(loopsMark);
+        blkBrks.resize(brkMark);
+        blkConts.resize(contMark);
+        // 中断/继续 不能委派（它们本来就只能在循环里，交给 exec 语义会变）。
+        // 「当」也不能委派：exec 的 While 分支自己会再试着编译这个循环，
+        // 委派过去就会 exec → 编译 → 委派 → exec 地无限递归下去。
+        if (s->k == Stmt::K::Break || s->k == Stmt::K::Continue ||
+            s->k == Stmt::K::While) return false;
+        if (hasFreeLoopControl(s)) return false;
+        emit(BC_LINE, s->line);
+        slow.push_back(s);
+        emit(BC_EXECSTMT, (int)slow.size() - 1);
+        return true;
+    }
     bool block(const std::vector<StmtPtr>& b) {
-        for (const auto& st : b) if (!stmt(st)) return false;
+        for (const auto& st : b) if (!tryStmt(st)) return false;
         return true;
     }
 };
@@ -4895,6 +4942,10 @@ bool WenAsm::expr(const ExprPtr& e, bool numCtx) {
         case Expr::K::Num:
             kconst.push_back(e->num);
             emit(BC_K, (int)kconst.size() - 1);
+            push();
+            return true;
+        case Expr::K::Bool:
+            emit(e->b ? BC_PUSHT : BC_PUSHF);
             push();
             return true;
         case Expr::K::Var: {
@@ -5618,7 +5669,7 @@ void Interpreter::exec(const StmtPtr& s, const shared_ptr<Scope>& scope) {
                     int ctl = vmCtl;
                     vmCtl = savedCtl;
                     vmRetFlag = savedRet;
-                    if (hasRet && didRet) { retVal = std::move(r); retFlag = true; return false; }
+                    if (didRet) { retVal = std::move(r); retFlag = true; return false; }
                     return ctl != 2;
                 }
                 try {
@@ -5681,7 +5732,7 @@ void Interpreter::exec(const StmtPtr& s, const shared_ptr<Scope>& scope) {
                     bool didRet = vmRetFlag != 0;
                     vmCtl = savedCtl;
                     vmRetFlag = savedRet;
-                    if (rHasRet && didRet) { retVal = std::move(r); retFlag = true; }
+                    if (didRet) { retVal = std::move(r); retFlag = true; }
                 } else {
                     long long n = 0;
                     for (double x = iter.rstart; iter.rstep > 0 ? x < iter.rstop : x > iter.rstop;
