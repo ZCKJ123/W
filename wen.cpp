@@ -20065,6 +20065,26 @@ Interpreter::Interpreter() {
         }
         Value out; out.type = VT::Dict; out.dict = d; return out;
     });
+    // 把一张 RGB 缓冲整层写进彩色体的第 层 层：视频逐帧叠层用，一次 memcpy 一行
+    registerBuiltin("体写图", 5, 5, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体写图", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体写图：体句柄无效");
+        auto v = it->second;
+        if (!v->dense || !v->color) throw WenError("运行时错误", line, 0, "体写图：需要稠密彩色体");
+        long long l = needIndex(a[1], "体写图", line);
+        auto buf = needBytes(a[2], "体写图", line);
+        long long rows = needIndex(a[3], "体写图", line);
+        long long cols = needIndex(a[4], "体写图", line);
+        if (l < 0 || l >= v->L) throw WenError("运行时错误", line, 0, "体写图：层号越界");
+        if (rows != v->R || cols != v->C)
+            throw WenError("运行时错误", line, 0, "体写图：行列必须和体的行列一致");
+        if ((long long)buf->size() < rows * cols * 3)
+            throw WenError("运行时错误", line, 0, "体写图：像素数据不够（需要 RGB）");
+        unsigned char* dst = v->rgb.data() + (size_t)l * (size_t)rows * (size_t)cols * 3;
+        std::memcpy(dst, buf->data(), (size_t)rows * (size_t)cols * 3);
+        return vNone();
+    });
     // 彩色照片 → 彩色高度场：亮度定高度，像素颜色定体素颜色
     registerBuiltin("体彩高度场", 4, 4, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         long long id = needIndex(a[0], "体彩高度场", line);
