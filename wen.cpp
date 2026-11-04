@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// 文语言（wen）· 内置签名 WEN-LANG-0.2 · 2026 · 作者与贡献者
+// 文语言（wen）· 内置签名 WEN-LANG-0.3 · 2026 · 作者与贡献者
 // wen.cpp —— 「文」语言 C++17 解释器
 // 目标：不经过 Python，直接编译成原生 wen.exe；中文关键字；内置数学库。
 // 构建：C:\msys64\ucrt64\bin\g++.exe -std=c++17 -O2 -static -municode -o wen.exe wen.cpp -lwinhttp
@@ -54,14 +54,14 @@
 #include <io.h>
 
 // 源码自带标签：任何二进制都能用 --签名 打印出来。
-static const char* WEN_VERSION = "0.2.0-snapshot";
+static const char* WEN_VERSION = "0.3.0-snapshot";
 static const char* WEN_SIGNATURE =
-    "文语言（wen） · 内置签名 WEN-LANG-0.2 · 2026 · 作者 Akm / 筑宸科技";
+    "文语言（wen） · 内置签名 WEN-LANG-0.3 · 2026 · 作者 Akm / 筑宸科技";
 static std::string openWenWorkbench(const std::string& title, const std::string& initial, int line);
 
 // 永不执行的标记字符串：强制留在二进制里，用来证明源码归属。
 __attribute__((used)) static const char WEN_EMBED_MARK[] =
-    "WEN-EMBEDDED-MARK · 文语言 v0.2 · 作者 Akm / 筑宸科技 · 2026-10-25 首次发布";
+    "WEN-EMBEDDED-MARK · 文语言 v0.3 · 作者 Akm / 筑宸科技 · 2026-11-04 快照";
 #endif
 
 using std::map;
@@ -6418,7 +6418,7 @@ struct PyEmitter {
     }
     string generate() {
         for (const auto& s : program) stmt(s);
-        string head = "# 由「文」外派库生成 · WEN-LANG-0.2\n";
+        string head = "# 由「文」外派库生成 · WEN-LANG-0.3\n";
         head += "import sys\n";
         head += "sys.stdout.reconfigure(encoding='utf-8')\n";
         head += "def _文数(v):\n";
@@ -6676,7 +6676,7 @@ struct JsEmitter {
             "if(typeof v==='boolean')return '布尔';if(Array.isArray(v))return '列表';"
             "if(typeof v==='object')return '字典';return '未知';}\n"
             "function wenRandInt(a,b){return Math.floor(Math.random()*(b-a+1))+a;}\n";
-        return "// 由「文」外派库生成 · WEN-LANG-0.2\n" + string(helpers) + "\n" + out.str();
+        return "// 由「文」外派库生成 · WEN-LANG-0.3\n" + string(helpers) + "\n" + out.str();
     }
 };
 
@@ -7073,7 +7073,7 @@ struct JavaEmitter {
     }
     string generate() {
         std::ostringstream head;
-        head << "// 由「文」外派库生成 · WEN-LANG-0.2\nimport java.util.*;\n\npublic class Main {\n";
+        head << "// 由「文」外派库生成 · WEN-LANG-0.3\nimport java.util.*;\n\npublic class Main {\n";
         head << R"JAVA(static class W {
     static void print(Object... a) {
         StringBuilder b = new StringBuilder();
@@ -25043,7 +25043,7 @@ static int runMain(vector<string> args) {
         return 0;
     }
     if (cmd == "--版本" || cmd == "-v") {
-        std::cout << "文语言 v0.2 · 作者 Akm / 筑宸科技 · 2026-10-25 首次发布\n";
+        std::cout << "文语言 v0.3 · 作者 Akm / 筑宸科技 · 2026-11-04 快照\n";
         std::cout << "版本: " << WEN_VERSION << "\n";
         return 0;
     }
