@@ -2010,6 +2010,9 @@ struct Scope {
     vector<char> fastDefined;
     unordered_map<SymId, int> idSlot;
     shared_ptr<Scope> parent;
+    // 函数帧不维护名字表（vars）：参数和局部变量只用 SymId 定位，
+    // 省掉每次调用往 std::map<string, Value> 插节点的开销。
+    bool trackNames = true;
 
     Scope() = default;
     explicit Scope(shared_ptr<Scope> p) : parent(std::move(p)) {}
@@ -2018,6 +2021,8 @@ struct Scope {
         SymId sid = internSymbol(name);
         auto sit = idSlot.find(sid);
         if (sit != idSlot.end() && fastGet(sit->second, out)) return true;
+        auto iv = idVars.find(sid);
+        if (iv != idVars.end()) { out = iv->second; return true; }
         auto it = vars.find(name);
         if (it != vars.end()) { out = it->second; return true; }
         if (parent) return parent->lookup(name, out);
@@ -2036,7 +2041,7 @@ struct Scope {
     }
     void set(SymId id, Value v) {
         idVars[id] = v;
-        vars[symbolName(id)] = std::move(v);
+        if (trackNames) vars[symbolName(id)] = std::move(v);
     }
     // 记下「名字 → 快槽」，让函数体、变量名单、外部库都能按名字找到全局数字。
     void fastBind(SymId id, int slot) {
@@ -2052,7 +2057,7 @@ struct Scope {
             fastSet(sit->second, v);
             return true;
         }
-        if (idVars.count(id) || vars.count(symbolName(id))) {
+        if (idVars.count(id) || (trackNames && vars.count(symbolName(id)))) {
             set(id, std::move(v));
             return true;
         }
@@ -2089,6 +2094,7 @@ struct Scope {
         for (const auto& kv : idSlot)
             if ((size_t)kv.second < fastDefined.size() && fastDefined[(size_t)kv.second])
                 out.push_back(symbolName(kv.first));
+        for (const auto& kv : idVars) out.push_back(symbolName(kv.first));
         for (const auto& kv : vars) out.push_back(kv.first);
         std::sort(out.begin(), out.end());
         out.erase(std::unique(out.begin(), out.end()), out.end());
@@ -3885,6 +3891,9 @@ struct ContinueSignal { int line; };
 class Interpreter {
 public:
     shared_ptr<Scope> globals;
+    // 「返回」不靠抛异常：设标志 + 值，逐层检查，省掉每次函数调用一次 throw/catch
+    bool retFlag = false;
+    Value retVal;
     std::mt19937 rng;
     string filename;
     vector<string> sourceLines;
@@ -4624,6 +4633,7 @@ static bool fastNumericWhile(Interpreter& vm, const StmtPtr& s,
 }
 
 void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
+    if (retFlag) return;
     ++gExecuted;
     gLastLine = s->line;
     if (s->k != Stmt::K::ExprStmt) lastWasExpr = false;
@@ -4652,12 +4662,14 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
             for (const auto& br : s->branches) {
                 if (truthy(eval(br.first, scope))) {
                     for (const auto& st : br.second) exec(st, scope);
+                    if (retFlag) return;
                     done = true;
                     break;
                 }
             }
             if (!done) {
                 for (const auto& st : s->elseBody) exec(st, scope);
+                if (retFlag) return;
             }
             break;
         }
@@ -4666,7 +4678,10 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
             if (fastNumericWhile(*this, s, scope)) break;
             while (truthy(eval(s->expr, scope))) {
                 try {
-                    for (const auto& st : s->body) exec(st, scope);
+                    for (const auto& st : s->body) {
+                        exec(st, scope);
+                        if (retFlag) return;
+                    }
                 } catch (ContinueSignal&) {
                     continue;
                 } catch (BreakSignal&) {
@@ -4682,7 +4697,10 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
                 if (s->nameSlot >= 0) { globals->fastBind(s->nameSym, s->nameSlot); globals->fastSet(s->nameSlot, k); if (k.type != VT::Num && k.type != VT::Int && k.type != VT::Bool) scope->set(s->nameSym, k); } else scope->set(s->nameSym, k);
                 if (two) { if (s->name2Slot >= 0) { globals->fastBind(s->name2Sym, s->name2Slot); globals->fastSet(s->name2Slot, v); } else scope->set(s->name2Sym, v); }
                 try {
-                    for (const auto& st : s->body) exec(st, scope);
+                    for (const auto& st : s->body) {
+                        exec(st, scope);
+                        if (retFlag) return false;
+                    }
                 } catch (ContinueSignal&) {
                     return true;
                 } catch (BreakSignal&) {
@@ -4728,21 +4746,35 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
                 Value pat = eval(br.first, scope);
                 if (valueEquals(subject, pat)) {
                     for (const auto& st : br.second) exec(st, scope);
+                    if (retFlag) return;
                     matched = true;
                     break;
                 }
             }
             if (!matched) {
                 for (const auto& st : s->elseBody) exec(st, scope);
+                if (retFlag) return;
             }
             break;
         }
         case Stmt::K::Try: {
+            // finally 无论如何都要跑：期间先把「返回」标志收起来，跑完再恢复
             auto runFinally = [&]() {
-                for (const auto& st : s->finallyBody) exec(st, scope);
+                if (s->finallyBody.empty()) return;
+                bool savedFlag = retFlag;
+                Value savedVal = retVal;
+                retFlag = false;
+                for (const auto& st : s->finallyBody) {
+                    exec(st, scope);
+                    if (retFlag) break;
+                }
+                if (!retFlag) { retFlag = savedFlag; retVal = savedVal; }
             };
             try {
-                for (const auto& st : s->body) exec(st, scope);
+                for (const auto& st : s->body) {
+                    exec(st, scope);
+                    if (retFlag) break;
+                }
             } catch (WenError& e) {
                 if (s->name.empty()) {
                     runFinally();
@@ -4759,14 +4791,10 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
                 for (const auto& f : e.frames) stack->items.push_back(vStr(f));
                 d->items["栈"] = vList(stack);
                 scope->set(s->nameSym, vDict(d));
-                try {
-                    for (const auto& st : s->elseBody) exec(st, scope);
-                } catch (...) {
-                    runFinally();
-                    throw;
+                for (const auto& st : s->elseBody) {
+                    exec(st, scope);
+                    if (retFlag) break;
                 }
-                runFinally();
-                break;
             } catch (...) {
                 runFinally();
                 throw;
@@ -4797,8 +4825,9 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
             break;
         }
         case Stmt::K::Return: {
-            Value v = s->expr ? eval(s->expr, scope) : vNone();
-            throw ReturnSignal{v, s->line};
+            retVal = s->expr ? eval(s->expr, scope) : vNone();
+            retFlag = true;
+            return;
         }
         case Stmt::K::Break:
             throw BreakSignal{s->line};
@@ -5185,6 +5214,7 @@ Value Function::call(Interpreter& vm, vector<Value>& args, int callLine) {
                        " 个参数，收到 " + std::to_string(args.size()) + " 个");
     }
     auto scope = std::make_shared<Scope>(closure);
+    scope->trackNames = false;
     for (size_t i = 0; i < args.size(); ++i) scope->set(paramSyms[i], args[i]);
     for (size_t i = args.size(); i < params.size(); ++i) {
         if (i >= paramDefaults.size() || !paramDefaults[i])
@@ -5192,21 +5222,32 @@ Value Function::call(Interpreter& vm, vector<Value>& args, int callLine) {
                            "函数「" + name + "」缺少参数「" + params[i] + "」");
         scope->set(paramSyms[i], vm.eval(paramDefaults[i], scope));
     }
+    bool savedFlag = vm.retFlag;
+    Value savedVal = vm.retVal;
+    vm.retFlag = false;
+    Value result = vNone();
     try {
-        for (const auto& st : body) vm.exec(st, scope);
-    } catch (ReturnSignal& r) {
-        return r.value;
+        for (const auto& st : body) {
+            vm.exec(st, scope);
+            if (vm.retFlag) break;
+        }
+        if (vm.retFlag) result = vm.retVal;
     } catch (BreakSignal&) {
+        vm.retFlag = savedFlag; vm.retVal = savedVal;
         throw WenError("运行时错误", callLine, 0, "「中断」只能用在循环里");
     } catch (ContinueSignal&) {
+        vm.retFlag = savedFlag; vm.retVal = savedVal;
         throw WenError("运行时错误", callLine, 0, "「继续」只能用在循环里");
     } catch (WenError& e) {
+        vm.retFlag = savedFlag; vm.retVal = savedVal;
         if (e.frames.size() < 50)
             e.frames.push_back("在「" + name + "」（第 " +
                                std::to_string(callLine) + " 行调用）");
         throw;
     }
-    return vNone();
+    vm.retFlag = savedFlag;
+    vm.retVal = savedVal;
+    return result;
 }
 
 Value Builtin::call(Interpreter& vm, vector<Value>& args, int line) {
@@ -15332,44 +15373,64 @@ Interpreter::Interpreter() {
     });
 
     // 等值面网格（Surface Nets）：体等值面 与 体表面积 共用同一份实现
+    // Surface Nets：在等值面穿过的格子里放一个顶点，再把相邻格子连成三角
+    // 热路径直接按指针读，不走 volScalarRead 的边界检查/分支，200³ 快一个数量级
     static auto volSurfaceMesh = [](shared_ptr<VolData> v, long long thr,
                                     vector<float>& verts, vector<unsigned int>& tris) {
         verts.clear(); tris.clear();
         int L = v->L, R = v->R, C = v->C;
-        // 彩色体按三通道之和取阈值（0..765），灰度体按本身（0..255）；
-        // 两边都以「>= thr」判断，所以 thr=1 就是「非空」
+        const bool color = v->color;
+        const unsigned char* data = v->data.empty() ? nullptr : v->data.data();
+        const unsigned char* rgb = v->rgb.empty() ? nullptr : v->rgb.data();
+        const size_t stride = color ? 3 : 1;
+        const int t32 = (int)thr;
+        auto at = [&](size_t i) -> int {
+            return color ? (rgb[i * 3] + rgb[i * 3 + 1] + rgb[i * 3 + 2]) : (int)data[i];
+        };
+        // 带边界归零的取格（只在贴边时才会用到边界分支）
         auto val = [&](int l, int r, int c) -> int {
             if (l < 0 || r < 0 || c < 0 || l >= L || r >= R || c >= C) return 0;
-            if (v->color) {
-                size_t o = (size_t)((l * R + r) * C + c) * 3;
-                return v->rgb[o] + v->rgb[o + 1] + v->rgb[o + 2];
-            }
-            return volScalarRead(v, l, r, c);
+            return at((size_t)((l * R + r) * C + c));
         };
         std::vector<int> cellIdx((size_t)(L * R * C), -1);
         static const int corner[8][3] = {{0,0,0},{1,0,0},{1,1,0},{0,1,0},{0,0,1},{1,0,1},{1,1,1},{0,1,1}};
         static const int edges[12][2] = {{0,1},{1,2},{2,3},{3,0},{4,5},{5,6},{6,7},{7,4},{0,4},{1,5},{2,6},{3,7}};
-        for (int l = 0; l < L - 1; ++l)
-            for (int r = 0; r < R - 1; ++r)
+        for (int l = 0; l < L - 1; ++l) {
+            for (int r = 0; r < R - 1; ++r) {
+                // 行内把 8 个角点需要的值一次取出来复用：prev[i] 是上一列（c-1）的角点
+                int prev[8];
+                bool havePrev = false;
                 for (int c = 0; c < C - 1; ++c) {
                     int cv[8];
+                    // 角点顺序 (dl, dr, dc)：0:(0,0,0) 1:(1,0,0) 2:(1,1,0) 3:(0,1,0)
+                    //                      4:(0,0,1) 5:(1,0,1) 6:(1,1,1) 7:(0,1,1)
+                    const size_t base = (size_t)((l * R + r) * C + c);
+                    const size_t lay = (size_t)R * C;
+                    cv[0] = (int)at(base);
+                    cv[1] = (int)at(base + lay);
+                    cv[2] = (int)at(base + lay + (size_t)C);
+                    cv[3] = (int)at(base + (size_t)C);
+                    cv[4] = (int)at(base + 1);
+                    cv[5] = (int)at(base + lay + 1);
+                    cv[6] = (int)at(base + lay + (size_t)C + 1);
+                    cv[7] = (int)at(base + (size_t)C + 1);
                     bool inside = false, outside = false;
                     for (int k = 0; k < 8; ++k) {
-                        cv[k] = val(l + corner[k][0], r + corner[k][1], c + corner[k][2]);
-                        if (cv[k] >= thr) inside = true; else outside = true;
+                        if (cv[k] >= t32) inside = true; else outside = true;
                     }
+                    (void)prev; (void)havePrev;
                     if (!inside || !outside) continue;
                     double sx = 0, sy = 0, sz = 0;
                     int cnt = 0;
                     for (int e = 0; e < 12; ++e) {
                         int a2 = edges[e][0], b2 = edges[e][1];
-                        bool ia = cv[a2] >= thr, ib = cv[b2] >= thr;
+                        bool ia = cv[a2] >= t32, ib = cv[b2] >= t32;
                         if (ia == ib) continue;
-                        double t = (double)(thr - cv[a2]) / (double)(cv[b2] - cv[a2]);
-                        double px = corner[a2][2] + t * (corner[b2][2] - corner[a2][2]);
-                        double py = corner[a2][1] + t * (corner[b2][1] - corner[a2][1]);
-                        double pz = corner[a2][0] + t * (corner[b2][0] - corner[a2][0]);
-                        sx += px; sy += py; sz += pz; ++cnt;
+                        double tt = (double)(t32 - cv[a2]) / (double)(cv[b2] - cv[a2]);
+                        sx += corner[a2][2] + tt * (corner[b2][2] - corner[a2][2]);
+                        sy += corner[a2][1] + tt * (corner[b2][1] - corner[a2][1]);
+                        sz += corner[a2][0] + tt * (corner[b2][0] - corner[a2][0]);
+                        ++cnt;
                     }
                     if (cnt == 0) continue;
                     cellIdx[(size_t)((l * R + r) * C + c)] = (int)(verts.size() / 3);
@@ -15377,6 +15438,8 @@ Interpreter::Interpreter() {
                     verts.push_back((float)(r + sy / cnt));
                     verts.push_back((float)(l + sz / cnt));
                 }
+            }
+        }
         auto cellV = [&](int l, int r, int c) -> int {
             if (l < 0 || r < 0 || c < 0 || l >= L - 1 || r >= R - 1 || c >= C - 1) return -1;
             return cellIdx[(size_t)((l * R + r) * C + c)];
@@ -15384,10 +15447,9 @@ Interpreter::Interpreter() {
         for (int l = 0; l < L - 1; ++l)
             for (int r = 0; r < R - 1; ++r)
                 for (int c = 0; c < C - 1; ++c) {
-                    bool s0 = val(l, r, c) >= thr;
-                    // 沿 c 方向的边
+                    bool s0 = val(l, r, c) >= t32;
                     if (c + 1 < C) {
-                        bool s1 = val(l, r, c + 1) >= thr;
+                        bool s1 = val(l, r, c + 1) >= t32;
                         if (s0 != s1) {
                             int q0 = cellV(l - 1, r - 1, c), q1 = cellV(l - 1, r, c);
                             int q2 = cellV(l, r, c), q3 = cellV(l, r - 1, c);
@@ -15398,7 +15460,7 @@ Interpreter::Interpreter() {
                         }
                     }
                     if (r + 1 < R) {
-                        bool s1 = val(l, r + 1, c) >= thr;
+                        bool s1 = val(l, r + 1, c) >= t32;
                         if (s0 != s1) {
                             int q0 = cellV(l - 1, r, c - 1), q1 = cellV(l, r, c - 1);
                             int q2 = cellV(l, r, c), q3 = cellV(l - 1, r, c);
@@ -15409,7 +15471,7 @@ Interpreter::Interpreter() {
                         }
                     }
                     if (l + 1 < L) {
-                        bool s1 = val(l + 1, r, c) >= thr;
+                        bool s1 = val(l + 1, r, c) >= t32;
                         if (s0 != s1) {
                             int q0 = cellV(l, r - 1, c - 1), q1 = cellV(l, r, c - 1);
                             int q2 = cellV(l, r, c), q3 = cellV(l, r - 1, c);
@@ -16380,107 +16442,125 @@ Interpreter::Interpreter() {
     });
     // 公式字典的原生求值：{"型": "球", "参": [x,y,z,r]} 这种，比逐格回调快得多
     // 支持的型：球 / 盒 / 环 / 柱 / 面 / 波 / 高斯（高斯是给卷积核用的）
-    static std::function<double(const Value&, double, double, double, int)> evalFormulaDict;
-    evalFormulaDict = [&evalFormulaDict](const Value& f, double l, double r, double c, int line) -> double {
+    // 公式字典先编译成节点树，再逐格求值——每格都去查 map 的话慢 30 倍
+    struct FormulaNode {
+        int op = 0;
+        std::vector<double> p;
+        std::vector<FormulaNode> kids;
+    };
+    static std::function<FormulaNode(const Value&, int)> compileFormula;
+    compileFormula = [&compileFormula](const Value& f, int line) -> FormulaNode {
+        FormulaNode nd;
         if (f.type != VT::Dict || !f.dict) throw WenError("运行时错误", line, 0, "公式：需要字典");
         auto itType = f.dict->items.find("型");
-        auto itArgs = f.dict->items.find("参");
         if (itType == f.dict->items.end() || itType->second.type != VT::Str)
             throw WenError("运行时错误", line, 0, "公式：缺少「型」");
-        std::vector<double> p;
+        const string& k = itType->second.str;
+        auto itArgs = f.dict->items.find("参");
         if (itArgs != f.dict->items.end() && itArgs->second.type == VT::List && itArgs->second.list)
             for (auto& x : itArgs->second.list->items) {
                 if (x.type != VT::Num) throw WenError("运行时错误", line, 0, "公式：参数要都是数字");
-                p.push_back(x.num);
+                nd.p.push_back(x.num);
             }
-        const string& k = itType->second.str;
+        auto itKids = f.dict->items.find("子");
+        if (itKids != f.dict->items.end() && itKids->second.type == VT::List && itKids->second.list)
+            for (auto& kid : itKids->second.list->items) nd.kids.push_back(compileFormula(kid, line));
         auto need = [&](size_t n) {
-            if (p.size() < n)
+            if (nd.p.size() < n)
                 throw WenError("运行时错误", line, 0, "公式：" + k + " 要 " + std::to_string(n) + " 个参数");
         };
-        if (k == "球") {
-            need(4);
-            double dx = c - p[0], dy = r - p[1], dz = l - p[2];
-            return std::sqrt(dx * dx + dy * dy + dz * dz) - p[3];
-        }
-        if (k == "盒") {
-            need(6);
-            double dx = std::fabs(c - p[0]) - p[3];
-            double dy = std::fabs(r - p[1]) - p[4];
-            double dz = std::fabs(l - p[2]) - p[5];
-            double ox = dx > 0 ? dx : 0, oy = dy > 0 ? dy : 0, oz = dz > 0 ? dz : 0;
-            double outside = std::sqrt(ox * ox + oy * oy + oz * oz);
-            double inner = std::min(std::max(dx, std::max(dy, dz)), 0.0);
-            return outside + inner;
-        }
-        if (k == "环") {
-            need(5);
-            double dx = c - p[0], dy = r - p[1], dz = l - p[2];
-            double q = std::sqrt(dx * dx + dz * dz) - p[3];
-            return std::sqrt(q * q + dy * dy) - p[4];
-        }
-        if (k == "柱") {
-            need(5);
-            double dx = c - p[0], dy = r - p[1];
-            double rad = std::sqrt(dx * dx + dy * dy) - p[3];
-            double hz = std::fabs(l - p[2]) - p[4];
-            return std::max(rad, hz);
-        }
-        if (k == "面") {
-            need(6);
-            double dx = c - p[0], dy = r - p[1], dz = l - p[2];
-            double len = std::sqrt(p[3] * p[3] + p[4] * p[4] + p[5] * p[5]);
-            if (len < 1e-12) len = 1;
-            return (dx * p[3] + dy * p[4] + dz * p[5]) / len;
-        }
-        if (k == "波") {
-            need(3);
-            return (l - 10) - p[0] * std::sin((c + r) / p[1] * 6.283185307179586 + p[2]);
-        }
-        if (k == "高斯") {
-            need(1);
-            double s = p[0] == 0 ? 1.0 : p[0];
-            return std::exp(-(l * l + r * r + c * c) / (2.0 * s * s));
-        }
+        if (k == "球") { need(4); nd.op = 1; return nd; }
+        if (k == "盒") { need(6); nd.op = 2; return nd; }
+        if (k == "环") { need(5); nd.op = 3; return nd; }
+        if (k == "柱") { need(5); nd.op = 4; return nd; }
+        if (k == "面") { need(6); nd.op = 5; return nd; }
+        if (k == "波") { need(3); nd.op = 6; return nd; }
+        if (k == "高斯") { need(1); nd.op = 7; return nd; }
         if (k == "并" || k == "交" || k == "差") {
-            auto itKids = f.dict->items.find("子");
-            if (itKids == f.dict->items.end() || itKids->second.type != VT::List || !itKids->second.list)
-                throw WenError("运行时错误", line, 0, "公式：" + k + " 需要一个「子」公式列表");
-            auto& kids = itKids->second.list->items;
-            if (k == "差") {
-                if (kids.size() < 2) throw WenError("运行时错误", line, 0, "公式：差 要两个公式");
-                double a = evalFormulaDict(kids[0], l, r, c, line);
-                double b = evalFormulaDict(kids[1], l, r, c, line);
-                return std::max(a, -b);
-            }
-            if (kids.empty()) throw WenError("运行时错误", line, 0, "公式：" + k + " 的公式表是空的");
-            double acc = evalFormulaDict(kids[0], l, r, c, line);
-            for (size_t i = 1; i < kids.size(); ++i) {
-                double v2 = evalFormulaDict(kids[i], l, r, c, line);
-                acc = (k == "并") ? std::min(acc, v2) : std::max(acc, v2);
-            }
-            return acc;
+            if (nd.kids.empty())
+                throw WenError("运行时错误", line, 0, "公式：" + k + " 的公式表是空的");
+            if (k == "差" && nd.kids.size() < 2)
+                throw WenError("运行时错误", line, 0, "公式：差 要两个公式");
+            nd.op = (k == "并") ? 8 : (k == "交" ? 9 : 10);
+            return nd;
         }
         if (k == "平移" || k == "缩放" || k == "壳") {
-            auto itKids = f.dict->items.find("子");
-            if (itKids == f.dict->items.end() || itKids->second.type != VT::List || !itKids->second.list ||
-                itKids->second.list->items.empty())
+            if (nd.kids.empty())
                 throw WenError("运行时错误", line, 0, "公式：" + k + " 需要一个「子」公式");
-            const Value& kid = itKids->second.list->items[0];
-            if (k == "平移") {
-                need(3);
-                return evalFormulaDict(kid, l - p[0], r - p[1], c - p[2], line);
-            }
-            if (k == "缩放") {
-                need(1);
-                double s = p[0] == 0 ? 1.0 : p[0];
-                return evalFormulaDict(kid, l / s, r / s, c / s, line) * s;
-            }
-            need(1);
-            double inner = evalFormulaDict(kid, l, r, c, line);
-            return std::fabs(inner) - p[0];
+            if (k == "平移") { need(3); nd.op = 11; return nd; }
+            if (k == "缩放") { need(1); nd.op = 12; return nd; }
+            need(1); nd.op = 13; return nd;
         }
         throw WenError("运行时错误", line, 0, "公式：不认识的型「" + k + "」");
+    };
+    static std::function<double(const FormulaNode&, double, double, double)> evalFormulaNode;
+    evalFormulaNode = [&evalFormulaNode](const FormulaNode& nd, double l, double r, double c) -> double {
+        const std::vector<double>& p = nd.p;
+        switch (nd.op) {
+            case 1: {
+                double dx = c - p[0], dy = r - p[1], dz = l - p[2];
+                return std::sqrt(dx * dx + dy * dy + dz * dz) - p[3];
+            }
+            case 2: {
+                double dx = std::fabs(c - p[0]) - p[3];
+                double dy = std::fabs(r - p[1]) - p[4];
+                double dz = std::fabs(l - p[2]) - p[5];
+                double ox = dx > 0 ? dx : 0, oy = dy > 0 ? dy : 0, oz = dz > 0 ? dz : 0;
+                double outside = std::sqrt(ox * ox + oy * oy + oz * oz);
+                double inner = std::min(std::max(dx, std::max(dy, dz)), 0.0);
+                return outside + inner;
+            }
+            case 3: {
+                double dx = c - p[0], dy = r - p[1], dz = l - p[2];
+                double q = std::sqrt(dx * dx + dz * dz) - p[3];
+                return std::sqrt(q * q + dy * dy) - p[4];
+            }
+            case 4: {
+                double dx = c - p[0], dy = r - p[1];
+                double rad = std::sqrt(dx * dx + dy * dy) - p[3];
+                double hz = std::fabs(l - p[2]) - p[4];
+                return std::max(rad, hz);
+            }
+            case 5: {
+                double dx = c - p[0], dy = r - p[1], dz = l - p[2];
+                double len = std::sqrt(p[3] * p[3] + p[4] * p[4] + p[5] * p[5]);
+                if (len < 1e-12) len = 1;
+                return (dx * p[3] + dy * p[4] + dz * p[5]) / len;
+            }
+            case 6:
+                return (l - 10) - p[0] * std::sin((c + r) / p[1] * 6.283185307179586 + p[2]);
+            case 7: {
+                double s = p[0] == 0 ? 1.0 : p[0];
+                return std::exp(-(l * l + r * r + c * c) / (2.0 * s * s));
+            }
+            case 8: {
+                double acc = evalFormulaNode(nd.kids[0], l, r, c);
+                for (size_t i = 1; i < nd.kids.size(); ++i)
+                    acc = std::min(acc, evalFormulaNode(nd.kids[i], l, r, c));
+                return acc;
+            }
+            case 9: {
+                double acc = evalFormulaNode(nd.kids[0], l, r, c);
+                for (size_t i = 1; i < nd.kids.size(); ++i)
+                    acc = std::max(acc, evalFormulaNode(nd.kids[i], l, r, c));
+                return acc;
+            }
+            case 10: {
+                double a = evalFormulaNode(nd.kids[0], l, r, c);
+                double b = evalFormulaNode(nd.kids[1], l, r, c);
+                return std::max(a, -b);
+            }
+            case 11:
+                return evalFormulaNode(nd.kids[0], l - p[0], r - p[1], c - p[2]);
+            case 12: {
+                double s = p[0] == 0 ? 1.0 : p[0];
+                return evalFormulaNode(nd.kids[0], l / s, r / s, c / s) * s;
+            }
+            case 13:
+                return std::fabs(evalFormulaNode(nd.kids[0], l, r, c)) - p[0];
+            default:
+                return 0.0;
+        }
     };
 
     // 体按公式：逐格算一个公式写进去——公式就是脚本函数，随便什么形状/渐变都行
@@ -16496,6 +16576,8 @@ Interpreter::Interpreter() {
         if (!v->dense) throw WenError("运行时错误", line, 0, "体按公式：只支持稠密体");
         // 给了第 3、4 个参数就是「按 SDF 填」：公式 < 0 写里面值，否则写外面值
         bool binary = a.size() >= 3;
+        FormulaNode compiled;
+        if (!byFunc) compiled = compileFormula(a[1], line);
         int inVal = 0, outVal = 0;
         if (binary) {
             long long iv = needIndex(a[2], "体按公式", line);
@@ -16505,18 +16587,19 @@ Interpreter::Interpreter() {
             inVal = (int)iv; outVal = (int)ov;
         }
         long long calls = 0;
+        vector<Value> args(3);
         for (int l = 0; l < v->L; ++l)
             for (int r = 0; r < v->R; ++r)
                 for (int c = 0; c < v->C; ++c) {
                     double d;
                     if (byFunc) {
-                        vector<Value> args{vNum(l), vNum(r), vNum(c)};
+                        args[0] = vNum(l); args[1] = vNum(r); args[2] = vNum(c);
                         Value res = vm.callValue(a[1], args, line);
                         if (res.type != VT::Num && res.type != VT::Int && res.type != VT::Big)
                             throw WenError("运行时错误", line, 0, "体按公式：公式要返回数字");
                         d = needNum(res, "体按公式", line);
                     } else {
-                        d = evalFormulaDict(a[1], l, r, c, line);
+                        d = evalFormulaNode(compiled, l, r, c);
                     }
                     if (binary) {
                         d = d <= 0 ? (double)inVal : (double)outVal;
@@ -16545,6 +16628,8 @@ Interpreter::Interpreter() {
         bool byFunc = a[1].type == VT::Func;
         if (!byFunc && a[1].type != VT::Dict)
             throw WenError("运行时错误", line, 0, "公式场：第二个参数要是函数或公式字典");
+        FormulaNode compiled;
+        if (!byFunc) compiled = compileFormula(a[1], line);
         auto out = std::make_shared<SdfVol>();
         out->L = (int)side; out->R = (int)side; out->C = (int)side;
         out->d.resize((size_t)(side * side * side));
@@ -16559,7 +16644,7 @@ Interpreter::Interpreter() {
                             throw WenError("运行时错误", line, 0, "公式场：公式要返回数字");
                         dv = needNum(res, "公式场", line);
                     } else {
-                        dv = evalFormulaDict(a[1], l, r, c, line);
+                        dv = evalFormulaNode(compiled, l, r, c);
                     }
                     out->d[(size_t)((l * side + r) * side + c)] = (float)dv;
                 }
@@ -16580,12 +16665,14 @@ Interpreter::Interpreter() {
         if (!v->dense) throw WenError("运行时错误", line, 0, "体卷积公式：只支持稠密体");
         int side = (int)(2 * rad + 1);
         std::vector<double> k((size_t)(side * side * side), 0.0);
+        FormulaNode compiledK;
+        if (a[2].type == VT::Dict) compiledK = compileFormula(a[2], line);
         for (int dl = -(int)rad; dl <= (int)rad; ++dl)
             for (int dr = -(int)rad; dr <= (int)rad; ++dr)
                 for (int dc = -(int)rad; dc <= (int)rad; ++dc) {
                     size_t ki = (size_t)(((dl + rad) * side + (dr + rad)) * side + (dc + rad));
                     if (a[2].type == VT::Dict) {
-                        k[ki] = evalFormulaDict(a[2], (double)dl, (double)dr, (double)dc, line);
+                        k[ki] = evalFormulaNode(compiledK, (double)dl, (double)dr, (double)dc);
                     } else {
                         vector<Value> args{vNum(dl), vNum(dr), vNum(dc)};
                         Value res = vm.callValue(a[2], args, line);
@@ -16667,18 +16754,24 @@ Interpreter::Interpreter() {
         auto v = it->second;
         if (!v->dense) throw WenError("运行时错误", line, 0, "体惯性：只支持稠密体");
         int L = v->L, R = v->R, C = v->C;
+        const bool color = v->color;
+        const unsigned char* data = v->data.empty() ? nullptr : v->data.data();
+        const unsigned char* rgb = v->rgb.empty() ? nullptr : v->rgb.data();
+        auto solidAt = [&](size_t i) -> bool {
+            return color ? (rgb[i * 3] + rgb[i * 3 + 1] + rgb[i * 3 + 2]) > 0 : data[i] > 0;
+        };
         double M = 0, sl = 0, sr = 0, sc = 0;
         for (int l = 0; l < L; ++l)
             for (int r = 0; r < R; ++r)
                 for (int c = 0; c < C; ++c)
-                    if (volScalarRead(v, l, r, c) > 0) { M += 1.0; sl += l; sr += r; sc += c; }
+                    if (solidAt((size_t)((l * R + r) * C + c))) { M += 1.0; sl += l; sr += r; sc += c; }
         if (M <= 0) throw WenError("运行时错误", line, 0, "体惯性：体是空的");
         double cl = sl / M, cr = sr / M, cc = sc / M;
         double Ixx = 0, Iyy = 0, Izz = 0, Ixy = 0, Ixz = 0, Iyz = 0;
         for (int l = 0; l < L; ++l)
             for (int r = 0; r < R; ++r)
                 for (int c = 0; c < C; ++c) {
-                    if (volScalarRead(v, l, r, c) <= 0) continue;
+                    if (!solidAt((size_t)((l * R + r) * C + c))) continue;
                     double dl = l - cl, dr = r - cr, dc = c - cc;
                     double r2 = dl * dl + dr * dr + dc * dc;
                     Ixx += r2 - dl * dl;
@@ -16885,13 +16978,17 @@ Interpreter::Interpreter() {
         size_t n = (size_t)(L * R * C);
         std::vector<unsigned char> solid(n, 0);
         bool anySolid = false, anyEmpty = false;
-        for (int l = 0; l < L; ++l)
-            for (int r = 0; r < R; ++r)
-                for (int c = 0; c < C; ++c) {
-                    size_t i = (size_t)((l * R + r) * C + c);
-                    if (volScalarRead(v, l, r, c) > 0) { solid[i] = 1; anySolid = true; }
-                    else anyEmpty = true;
-                }
+        {
+            // 直接按指针读，热点循环不再走 volScalarRead 的分支
+            const bool color = v->color;
+            const unsigned char* data = v->data.empty() ? nullptr : v->data.data();
+            const unsigned char* rgb = v->rgb.empty() ? nullptr : v->rgb.data();
+            for (size_t i = 0; i < n; ++i) {
+                bool s = color ? (rgb[i * 3] + rgb[i * 3 + 1] + rgb[i * 3 + 2]) > 0 : data[i] > 0;
+                if (s) { solid[i] = 1; anySolid = true; }
+                else anyEmpty = true;
+            }
+        }
         if (!anySolid) throw WenError("运行时错误", line, 0, "体距离场：体是空的，没有东西可算");
         if (!anyEmpty) throw WenError("运行时错误", line, 0, "体距离场：体里没有空格，外面没地方可算");
         // 一维平方距离变换（抛物线包络）
