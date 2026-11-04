@@ -3735,6 +3735,11 @@ static std::function<Value(const std::string&, const Value&, const Value&, int)>
         if (a.type == VT::Str && b.type == VT::Str) return vStr(a.str + b.str);
         if (a.type == VT::List && b.type == VT::List) {
             auto l = std::make_shared<List>();
+            // 一次把容量留够：否则「先拷左边、再插右边」会多扩一次容，
+            // 而每次扩容都要把已有的 200 字节 Value 全部搬一遍。
+            size_t na = a.list ? a.list->items.size() : 0;
+            size_t nb = b.list ? b.list->items.size() : 0;
+            l->items.reserve(na + nb);
             if (a.list) l->items = a.list->items;
             if (b.list) l->items.insert(l->items.end(), b.list->items.begin(), b.list->items.end());
             return vList(l);
