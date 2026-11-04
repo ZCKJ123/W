@@ -16025,7 +16025,8 @@ Interpreter::Interpreter() {
             size_t idx = (size_t)((l * R + r) * C + c);
             return color ? (int)v->rgb[idx * 3 + (size_t)ch] : (int)v->data[idx];
         };
-        for (int l = 0; l < L; ++l)
+        // 只读源体、只写自己的输出格：按层切开多线程，结果与线程数无关
+        auto doLayer = [&](int l) {
             for (int r = 0; r < R; ++r)
                 for (int c = 0; c < C; ++c)
                     for (int ch = 0; ch < chn; ++ch) {
@@ -16039,6 +16040,28 @@ Interpreter::Interpreter() {
                         if (color) out->rgb[idx * 3 + (size_t)ch] = val;
                         else out->data[idx] = val;
                     }
+        };
+        {
+            unsigned nt = std::thread::hardware_concurrency();
+            if (nt == 0) nt = 4;
+            if (nt > 16) nt = 16;
+            if (nt <= 1 || L < 8 || (size_t)L * R * C < 4000000) {
+                for (int l = 0; l < L; ++l) doLayer(l);
+            } else {
+                std::atomic<int> next{0};
+                auto worker = [&]() {
+                    for (;;) {
+                        int l = next.fetch_add(1);
+                        if (l >= L) break;
+                        doLayer(l);
+                    }
+                };
+                std::vector<std::thread> th;
+                th.reserve(nt);
+                for (unsigned i = 0; i < nt; ++i) th.emplace_back(worker);
+                for (auto& th1 : th) th1.join();
+            }
+        }
         long long nid = volNext++;
         volStore[nid] = out;
         return vVol(0, nid);
