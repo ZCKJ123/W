@@ -2188,7 +2188,8 @@ enum : unsigned char {
     BC_BOOL,         // 栈顶转成布尔
     BC_PUSHT,        // 压 真
     BC_PUSHF,        // 压 假
-    BC_PRINT         // 打印栈顶 a 个值，用空格分隔
+    BC_PRINT,        // 打印栈顶 a 个值，用空格分隔
+    BC_LOOPEND       // 循环体块结束：a=0 正常 / 1 继续 / 2 中断（把控制权交回 exec）
 };
 struct Instr { unsigned char op = 0; int a = 0; int b = 0; };
 
@@ -4121,6 +4122,8 @@ public:
     // 跑一段语句字节码；返回函数返回值（顶层循环返回 空）。
     Value runCode(const std::vector<Instr>& code, const std::vector<double>& kconst,
                   int vstack, shared_ptr<Scope> scope);
+    // 循环体块跑完时的控制码：0 正常 / 1 继续 / 2 中断
+    int vmCtl = 0;
     Value getIndex(const Value& obj, const Value& idx, int line);
     void setIndex(Value& obj, const Value& idx, const Value& val, int line);
 
@@ -4800,6 +4803,11 @@ struct WenAsm {
         std::vector<int> conts;
     };
     std::vector<Loop> loops;
+    // 「循环体块」模式：把 对于 的循环体单独编译，中断/继续 变成块尾标记，
+    // 由 exec 里的循环本体决定怎么处理——循环语义仍然只有 exec 一份。
+    bool blockMode = false;
+    std::vector<int> blkBrks;
+    std::vector<int> blkConts;
 
     int emit(unsigned char op, int a = 0, int b = 0) {
         code.push_back(Instr{op, a, b});
@@ -4993,12 +5001,22 @@ bool WenAsm::stmt(const StmtPtr& s) {
             return true;
         }
         case Stmt::K::Break: {
+            if (loops.empty() && blockMode) {
+                emit(BC_LINE, s->line);
+                blkBrks.push_back(emit(BC_JMP, 0));
+                return true;
+            }
             if (loops.empty()) return false;
             emit(BC_LINE, s->line);
             loops.back().brks.push_back(emit(BC_JMP, 0));
             return true;
         }
         case Stmt::K::Continue: {
+            if (loops.empty() && blockMode) {
+                emit(BC_LINE, s->line);
+                blkConts.push_back(emit(BC_JMP, 0));
+                return true;
+            }
             if (loops.empty()) return false;
             emit(BC_LINE, s->line);
             loops.back().conts.push_back(emit(BC_JMP, 0));
@@ -5028,6 +5046,34 @@ static bool compileBody(const std::vector<StmtPtr>& body, const std::vector<SymI
     return true;
 }
 
+// 把「一段循环体」编译成块：跑完返回，中断/继续 用块尾标记交回给 exec。
+// 循环本身的语义（遍历什么、怎么绑定变量）仍然只有 exec 一份。
+static bool compileBlock(const std::vector<StmtPtr>& body, bool topLevel,
+                         const shared_ptr<Scope>& globals,
+                         std::vector<Instr>& outCode, std::vector<double>& outK,
+                         int& outStack, bool& hasRet) {
+    hasRet = false;
+    if (body.empty()) return false;
+    WenAsm a;
+    a.topLevel = topLevel;
+    a.globals = globals;
+    a.blockMode = true;
+    if (!a.block(body)) return false;
+    a.emit(BC_LOOPEND, 0);
+    int lc = (int)a.code.size();
+    a.emit(BC_LOOPEND, 1);
+    int lb = (int)a.code.size();
+    a.emit(BC_LOOPEND, 2);
+    for (int c : a.blkConts) a.code[(size_t)c].a = lc;
+    for (int b : a.blkBrks) a.code[(size_t)b].a = lb;
+    for (const auto& ins : a.code)
+        if (ins.op == BC_RET || ins.op == BC_RETN) { hasRet = true; break; }
+    outCode.swap(a.code);
+    outK.swap(a.kconst);
+    outStack = a.maxDepth + 4;
+    return true;
+}
+
 // 表达式栈：按「深度指针」复用同一块内存，嵌套调用只是往上叠，不重新分配。
 static thread_local std::vector<Value> gVStack;
 static thread_local size_t gVSP = 0;
@@ -5049,6 +5095,8 @@ Value Interpreter::runCode(const std::vector<Instr>& code, const std::vector<dou
     if (gVStack.size() < base + (size_t)vstack) gVStack.resize(base + (size_t)vstack);
     gVSP = base + (size_t)vstack;
     struct Restore { size_t b; ~Restore() { gVSP = b; } } restore{base};
+    // -1 表示「没有碰到块尾标记」：也就是说这一趟是被 BC_RET 返回出去的
+    vmCtl = -1;
 
     size_t sp = 0;
     size_t pc = 0;
@@ -5248,6 +5296,9 @@ Value Interpreter::runCode(const std::vector<Instr>& code, const std::vector<dou
                 ++sp; ++pc;
                 break;
             }
+            case BC_LOOPEND:
+                vmCtl = in.a;
+                return vNone();
             default:
                 rtError(gLastLine, "内部错误：未知字节码指令");
         }
@@ -5330,9 +5381,27 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
         case Stmt::K::For: {
             Value iter = eval(s->expr, scope);
             bool two = !s->name2.empty();
+            // 循环体整体编译成字节码块；遍历与变量绑定仍然只在这里做
+            std::vector<Instr> bcode;
+            std::vector<double> bk;
+            int bstack = 0;
+            bool hasRet = false;
+            bool bodyCompiled = false;
+            if (!gNoBytecode) {
+                bool tl = (scope.get() == globals.get());
+                bodyCompiled = compileBlock(s->body, tl, globals, bcode, bk, bstack, hasRet);
+            }
             auto runOne = [&](const Value& k, const Value& v) -> bool {
                 if (s->nameSlot >= 0) { globals->fastBind(s->nameSym, s->nameSlot); globals->fastSet(s->nameSlot, k); if (k.type != VT::Num && k.type != VT::Int && k.type != VT::Bool) scope->set(s->nameSym, k); } else scope->set(s->nameSym, k);
                 if (two) { if (s->name2Slot >= 0) { globals->fastBind(s->name2Sym, s->name2Slot); globals->fastSet(s->name2Slot, v); } else scope->set(s->name2Sym, v); }
+                if (bodyCompiled) {
+                    int savedCtl = vmCtl;
+                    Value r = runCode(bcode, bk, bstack, scope);
+                    int ctl = vmCtl;
+                    vmCtl = savedCtl;
+                    if (hasRet && ctl < 0) { retVal = std::move(r); retFlag = true; return false; }
+                    return ctl != 2;
+                }
                 try {
                     for (const auto& st : s->body) {
                         exec(st, scope);
