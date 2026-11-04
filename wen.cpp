@@ -2189,7 +2189,11 @@ enum : unsigned char {
     BC_PUSHT,        // 压 真
     BC_PUSHF,        // 压 假
     BC_PRINT,        // 打印栈顶 a 个值，用空格分隔
-    BC_LOOPEND       // 循环体块结束：a=0 正常 / 1 继续 / 2 中断（把控制权交回 exec）
+    BC_LOOPEND,      // 循环体块结束：a=0 正常 / 1 继续 / 2 中断（把控制权交回 exec）
+    BC_FORCHECK,     // 范围循环：栈上 [当前,终点,步长]，越界则跳到 a（不弹栈）
+    BC_FORVAR,       // 把栈上「当前」写进循环变量 a=全局槽（-1 表示按名字写 b=SymId）
+    BC_FORSTEP,      // 「当前」+= 步长，跳回 a
+    BC_FORDROP       // 弹掉栈顶 a 个值（范围循环收尾）
 };
 struct Instr { unsigned char op = 0; int a = 0; int b = 0; };
 
@@ -4124,6 +4128,8 @@ public:
                   int vstack, shared_ptr<Scope> scope);
     // 循环体块跑完时的控制码：0 正常 / 1 继续 / 2 中断
     int vmCtl = 0;
+    // 这一段字节码有没有执行过「返回」（BC_RET）
+    int vmRetFlag = 0;
     Value getIndex(const Value& obj, const Value& idx, int line);
     void setIndex(Value& obj, const Value& idx, const Value& val, int line);
 
@@ -5074,6 +5080,48 @@ static bool compileBlock(const std::vector<StmtPtr>& body, bool topLevel,
     return true;
 }
 
+// 对于 … 在 范围(a, b, step) 中：整个循环编成一段字节码，一次 runCode 跑完。
+// 只有「单变量 + 迭代对象确实是范围」才走这里；其余情况由 exec 的通用循环兜底。
+static bool compileForRange(const StmtPtr& s, const Value& iter, bool topLevel,
+                            const shared_ptr<Scope>& globals,
+                            std::vector<Instr>& outCode, std::vector<double>& outK,
+                            int& outStack, bool& hasRet) {
+    hasRet = false;
+    if (!s || s->body.empty()) return false;
+    WenAsm a;
+    a.topLevel = topLevel;
+    a.globals = globals;
+    if (s->nameSlot >= 0 && globals) globals->fastBind(s->nameSym, s->nameSlot);
+    auto pushK = [&](double d) {
+        a.kconst.push_back(d);
+        a.emit(BC_K, (int)a.kconst.size() - 1);
+        a.push();
+    };
+    pushK(iter.rstart);
+    pushK(iter.rstop);
+    pushK(iter.rstep);
+    int ltop = (int)a.code.size();
+    int chk = a.emit(BC_FORCHECK, 0);
+    a.emit(BC_FORVAR, s->nameSlot, (int)s->nameSym);
+    a.loops.push_back(WenAsm::Loop{});
+    if (!a.block(s->body)) return false;
+    WenAsm::Loop L = a.loops.back();
+    a.loops.pop_back();
+    int lstep = (int)a.code.size();
+    a.emit(BC_FORSTEP, ltop);
+    int ldrop = (int)a.code.size();
+    a.emit(BC_FORDROP, 3);
+    for (int c : L.conts) a.code[(size_t)c].a = lstep;   // 继续 → 直接去 +步长
+    for (int b : L.brks) a.code[(size_t)b].a = ldrop;    // 中断 → 收尾
+    a.code[(size_t)chk].a = ldrop;
+    for (const auto& ins : a.code)
+        if (ins.op == BC_RET || ins.op == BC_RETN) { hasRet = true; break; }
+    outCode.swap(a.code);
+    outK.swap(a.kconst);
+    outStack = a.maxDepth + 4;
+    return true;
+}
+
 // 表达式栈：按「深度指针」复用同一块内存，嵌套调用只是往上叠，不重新分配。
 static thread_local std::vector<Value> gVStack;
 static thread_local size_t gVSP = 0;
@@ -5095,8 +5143,8 @@ Value Interpreter::runCode(const std::vector<Instr>& code, const std::vector<dou
     if (gVStack.size() < base + (size_t)vstack) gVStack.resize(base + (size_t)vstack);
     gVSP = base + (size_t)vstack;
     struct Restore { size_t b; ~Restore() { gVSP = b; } } restore{base};
-    // -1 表示「没有碰到块尾标记」：也就是说这一趟是被 BC_RET 返回出去的
-    vmCtl = -1;
+    vmCtl = 0;
+    vmRetFlag = 0;
 
     size_t sp = 0;
     size_t pc = 0;
@@ -5269,9 +5317,11 @@ Value Interpreter::runCode(const std::vector<Instr>& code, const std::vector<dou
             }
             case BC_RET: {
                 Value out = std::move(gVStack[base + sp - 1]);
+                vmRetFlag = 1;
                 return out;
             }
             case BC_RETN:
+                vmRetFlag = 1;
                 return vNone();
             case BC_LC: {
                 // 取「被调用者」的值：和 AST 的 Call 分支一样，不触发零参数自动调用
@@ -5299,6 +5349,30 @@ Value Interpreter::runCode(const std::vector<Instr>& code, const std::vector<dou
             case BC_LOOPEND:
                 vmCtl = in.a;
                 return vNone();
+            case BC_FORCHECK: {
+                Value& x = gVStack[base + sp - 3];
+                Value& stop = gVStack[base + sp - 2];
+                Value& step = gVStack[base + sp - 1];
+                bool go = step.num > 0 ? x.num < stop.num : x.num > stop.num;
+                pc = go ? pc + 1 : (size_t)in.a;
+                break;
+            }
+            case BC_FORVAR: {
+                Value v;
+                vmSetNum(v, gVStack[base + sp - 3].num);
+                if (in.a >= 0) globals->fastSet(in.a, std::move(v));
+                else scope->set((SymId)in.b, std::move(v));
+                ++pc;
+                break;
+            }
+            case BC_FORSTEP:
+                gVStack[base + sp - 3].num += gVStack[base + sp - 1].num;
+                pc = (size_t)in.a;
+                break;
+            case BC_FORDROP:
+                sp -= (size_t)in.a;
+                ++pc;
+                break;
             default:
                 rtError(gLastLine, "内部错误：未知字节码指令");
         }
@@ -5379,7 +5453,52 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
             break;
         }
         case Stmt::K::For: {
-            Value iter = eval(s->expr, scope);
+            // 「对于 x 在 范围(...) 中」不必真造一张表：直接按范围迭代（省一次整表构造）。
+            // 只在内建「范围」没被遮蔽、参数全是数字、元素数没超上限时走这条；
+            // 其余情况一律照原样调用，保证语义和报错一字不差。
+            Value iter;
+            bool made = false;
+            {
+                const ExprPtr& itExpr = s->expr;
+                if (!gNoBytecode && itExpr && itExpr->k == Expr::K::Call && !itExpr->commandCall &&
+                    itExpr->args.size() >= 2 && itExpr->args.size() <= 4 && itExpr->args[0] &&
+                    itExpr->args[0]->k == Expr::K::Var && itExpr->args[0]->text == "范围") {
+                    Value callee;
+                    std::shared_ptr<Builtin> b;
+                    if (scope->lookup(itExpr->args[0]->sym, callee) && callee.type == VT::Func)
+                        b = std::dynamic_pointer_cast<Builtin>(callee.callable);
+                    if (b && b->name == "范围") {
+                        std::vector<Value> av;
+                        for (size_t i = 1; i < itExpr->args.size(); ++i)
+                            av.push_back(eval(itExpr->args[i], scope));
+                        bool nums = true;
+                        for (const auto& v : av)
+                            if (v.type != VT::Num) { nums = false; break; }
+                        if (nums) {
+                            double start = 0, stop = 0, step = 1;
+                            if (av.size() == 1) stop = av[0].num;
+                            else {
+                                start = av[0].num; stop = av[1].num;
+                                if (av.size() == 3) step = av[2].num;
+                            }
+                            double span = step == 0 ? 0 : (stop - start) / step;
+                            long long n = span <= 0 ? 0 : (long long)std::ceil(span - 1e-12);
+                            // 只接整数步长：小数步长按表逐项相加与按范围累加会差最后一位，
+                            // 那种情况交给原来的「造表」路径，保证每个元素逐位相同。
+                            auto isIntv = [](double x) {
+                                return std::trunc(x) == x && std::fabs(x) < 9.0e15;
+                            };
+                            if (step != 0 && n <= 1000000 && isIntv(start) && isIntv(stop) &&
+                                isIntv(step)) {
+                                iter = vRange(start, stop, step);
+                                made = true;
+                            }
+                        }
+                        if (!made) iter = callValue(callee, av, s->line);
+                    }
+                }
+            }
+            if (!made) iter = eval(s->expr, scope);
             bool two = !s->name2.empty();
             // 循环体整体编译成字节码块；遍历与变量绑定仍然只在这里做
             std::vector<Instr> bcode;
@@ -5387,6 +5506,11 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
             int bstack = 0;
             bool hasRet = false;
             bool bodyCompiled = false;
+            std::vector<Instr> rcode;
+            std::vector<double> rk;
+            int rstack = 0;
+            bool rHasRet = false;
+            bool rangeCompiled = false;
             if (!gNoBytecode) {
                 bool tl = (scope.get() == globals.get());
                 bodyCompiled = compileBlock(s->body, tl, globals, bcode, bk, bstack, hasRet);
@@ -5394,13 +5518,20 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
             // 「名字 → 快槽」是幂等的，循环外记一次就够，不必每轮查表
             if (s->nameSlot >= 0) globals->fastBind(s->nameSym, s->nameSlot);
             if (two && s->name2Slot >= 0) globals->fastBind(s->name2Sym, s->name2Slot);
+            if (!gNoBytecode && !two && iter.type == VT::Range)
+                rangeCompiled = compileForRange(s, iter, (scope.get() == globals.get()),
+                                                globals, rcode, rk, rstack, rHasRet);
             auto runBody = [&]() -> bool {          // true 继续下一轮，false 结束循环
                 if (bodyCompiled) {
                     int savedCtl = vmCtl;
+                    int savedRet = vmRetFlag;
+                    vmRetFlag = 0;
                     Value r = runCode(bcode, bk, bstack, scope);
+                    bool didRet = vmRetFlag != 0;
                     int ctl = vmCtl;
                     vmCtl = savedCtl;
-                    if (hasRet && ctl < 0) { retVal = std::move(r); retFlag = true; return false; }
+                    vmRetFlag = savedRet;
+                    if (hasRet && didRet) { retVal = std::move(r); retFlag = true; return false; }
                     return ctl != 2;
                 }
                 try {
@@ -5455,12 +5586,23 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
                     if (!go) break;
                 }
             } else if (iter.type == VT::Range) {
-                long long n = 0;
-                for (double x = iter.rstart; iter.rstep > 0 ? x < iter.rstop : x > iter.rstop;
-                     x += iter.rstep) {
-                    bool go = two ? runTwo(vNum((double)n), vNum(x)) : runOne(vNum(x));
-                    ++n;
-                    if (!go) break;
+                if (rangeCompiled) {
+                    int savedCtl = vmCtl;
+                    int savedRet = vmRetFlag;
+                    vmRetFlag = 0;
+                    Value r = runCode(rcode, rk, rstack, scope);
+                    bool didRet = vmRetFlag != 0;
+                    vmCtl = savedCtl;
+                    vmRetFlag = savedRet;
+                    if (rHasRet && didRet) { retVal = std::move(r); retFlag = true; }
+                } else {
+                    long long n = 0;
+                    for (double x = iter.rstart; iter.rstep > 0 ? x < iter.rstop : x > iter.rstop;
+                         x += iter.rstep) {
+                        bool go = two ? runTwo(vNum((double)n), vNum(x)) : runOne(vNum(x));
+                        ++n;
+                        if (!go) break;
+                    }
                 }
             } else {
                 rtError(s->line, "「对于」只能遍历列表、文本、字典、集合或范围，收到" +
@@ -6040,6 +6182,13 @@ Value Function::call(Interpreter& vm, vector<Value>& args, int callLine) {
     bool savedFlag = vm.retFlag;
     Value savedVal = vm.retVal;
     vm.retFlag = false;
+    // 被调函数自己的「返回」标记不许漏到调用方（否则外层循环会误以为返回了）
+    struct VmRetGuard {
+        Interpreter& vm;
+        int old;
+        explicit VmRetGuard(Interpreter& v) : vm(v), old(v.vmRetFlag) { vm.vmRetFlag = 0; }
+        ~VmRetGuard() { vm.vmRetFlag = old; }
+    } vmRetGuard(vm);
     Value result = vNone();
     try {
         if (!code.empty()) {
