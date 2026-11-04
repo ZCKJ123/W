@@ -17243,11 +17243,19 @@ Interpreter::Interpreter() {
         // 哨兵不能用 1e18：抛物线求交时要算 (f + q²)，1e18 加几十就丢精度，
         // 交叉点会算成 0，包络就错了（球这类「离种子远」的数据最先露馅）。
         // 1e9 对 512 边长的体完全够（q² 最多二十万，和 1e9 相加仍是精确的）
-        const double BIG = 1e9;
-        auto dt1d = [&](std::vector<double>& f) {
+        // 用 float 存平方距离：512 边长的平方距离最大 78.6 万，float 的 24 位尾数
+        // 能精确表示 1670 万以内的整数，所以结果和 double 版逐位一致，内存流量减半。
+        const float BIG = 1e7f;
+        // 临时缓冲提到外面复用：200³ 要做 12 万条线的变换，
+        // 每条线都新建三个 vector 光分配就是几十万次
+        std::vector<int> vv;
+        std::vector<double> zz;
+        std::vector<float> outv;
+        auto dt1d = [&](std::vector<float>& f) {
             int len = (int)f.size();
-            std::vector<int> vv(len);
-            std::vector<double> zz(len + 1);
+            vv.resize(len);
+            zz.resize(len + 1);
+            outv.resize(len);
             int k = 0;
             vv[0] = 0; zz[0] = -BIG; zz[1] = BIG;
             for (int q = 1; q < len; ++q) {
@@ -17261,19 +17269,18 @@ Interpreter::Interpreter() {
             k = 0;
             // 必须写到独立的输出再拷回：v[k] 常常小于 q，就地写会把还没读的
             // f[v[k]] 覆盖掉，结果会偏小（球这类远离种子的格子最先错）
-            std::vector<double> outv(len);
             for (int q = 0; q < len; ++q) {
                 while (zz[k + 1] < q) ++k;
                 double dq = q - vv[k];
-                outv[q] = dq * dq + f[vv[k]];
+                outv[q] = (float)(dq * dq + (double)f[vv[k]]);
             }
             f.swap(outv);
         };
         // seeds 为真的格子是 0，其余求到最近种子的平方距离
-        auto edt = [&](const std::vector<unsigned char>& seeds) -> std::vector<double> {
-            std::vector<double> f(n);
-            for (size_t i = 0; i < n; ++i) f[i] = seeds[i] ? 0.0 : BIG;
-            std::vector<double> line;
+        auto edt = [&](const std::vector<unsigned char>& seeds) -> std::vector<float> {
+            std::vector<float> f(n);
+            for (size_t i = 0; i < n; ++i) f[i] = seeds[i] ? 0.0f : BIG;
+            std::vector<float> line;
             // 沿列（c）
             line.resize(C);
             for (int l = 0; l < L; ++l)
@@ -17302,13 +17309,13 @@ Interpreter::Interpreter() {
         };
         std::vector<unsigned char> emptySet(n, 0), solidSet(n, 0);
         for (size_t i = 0; i < n; ++i) { emptySet[i] = solid[i] ? 0 : 1; solidSet[i] = solid[i]; }
-        std::vector<double> dIn = edt(emptySet);    // 实格到最近空格
-        std::vector<double> dOut = edt(solidSet);   // 空格到最近实格
+        std::vector<float> dIn = edt(emptySet);    // 实格到最近空格
+        std::vector<float> dOut = edt(solidSet);   // 空格到最近实格
         auto out = std::make_shared<SdfVol>();
         out->L = L; out->R = R; out->C = C;
         out->d.resize(n);
         for (size_t i = 0; i < n; ++i) {
-            double dist = std::sqrt(solid[i] ? dIn[i] : dOut[i]);
+            double dist = std::sqrt((double)(solid[i] ? dIn[i] : dOut[i]));
             out->d[i] = (float)(solid[i] ? -dist : dist);   // 里面负、外面正
         }
         long long nid = sdfNext++;
