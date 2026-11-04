@@ -20275,6 +20275,55 @@ Interpreter::Interpreter() {
         gId3.insert(nid);
         return vVol(0, nid);
     });
+    // 内容包围盒（原生版）：一趟扫完，不用逐格构造字典
+    // 以前 体库.体包围盒 是 Wen 三重循环 + 体采样，10 万格要 370 ms，这里是 1 ms 级
+    registerBuiltin("体内容盒", 1, 2, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体内容盒", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体内容盒：体句柄无效");
+        auto v = it->second;
+        int L = v->L, R = v->R, C = v->C;
+        bool color = v->color;
+        long long th = a.size() >= 2 ? needIndex(a[1], "体内容盒", line) : 1;
+        if (th < 1) th = 1;
+        const unsigned char* data = v->data.empty() ? nullptr : v->data.data();
+        const unsigned char* rgb = v->rgb.empty() ? nullptr : v->rgb.data();
+        int ls = L, le = -1, rs = R, re = -1, cs = C, ce = -1;
+        for (int l = 0; l < L; ++l)
+            for (int r = 0; r < R; ++r) {
+                size_t base = ((size_t)l * (size_t)R + (size_t)r) * (size_t)C;
+                for (int c = 0; c < C; ++c) {
+                    long long val;
+                    if (color) {
+                        if (!rgb) continue;
+                        val = (long long)rgb[(base + (size_t)c) * 3] + rgb[(base + (size_t)c) * 3 + 1] +
+                              rgb[(base + (size_t)c) * 3 + 2];
+                    } else {
+                        if (!data) continue;
+                        val = data[base + (size_t)c];
+                    }
+                    if (val < th) continue;
+                    if (l < ls) ls = l;
+                    if (l > le) le = l;
+                    if (r < rs) rs = r;
+                    if (r > re) re = r;
+                    if (c < cs) cs = c;
+                    if (c > ce) ce = c;
+                }
+            }
+        auto d = std::make_shared<Dict>();
+        d->items["层起"] = vNum(ls);
+        d->items["层止"] = vNum(le);
+        d->items["行起"] = vNum(rs);
+        d->items["行止"] = vNum(re);
+        d->items["列起"] = vNum(cs);
+        d->items["列止"] = vNum(ce);
+        d->items["空"] = vBool(le < 0);
+        d->items["层数"] = vNum(le >= ls ? (double)(le - ls + 1) : 0.0);
+        d->items["行数"] = vNum(re >= rs ? (double)(re - rs + 1) : 0.0);
+        d->items["列数"] = vNum(ce >= cs ? (double)(ce - cs + 1) : 0.0);
+        return d ? [&]() -> Value { Value o; o.type = VT::Dict; o.dict = d; return o; }() : vNone();
+    });
     // 彩色照片 → 彩色高度场：亮度定高度，像素颜色定体素颜色
     registerBuiltin("体彩高度场", 4, 4, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         long long id = needIndex(a[0], "体彩高度场", line);
