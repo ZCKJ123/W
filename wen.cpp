@@ -17327,7 +17327,8 @@ Interpreter::Interpreter() {
         if (!V.empty()) memcpy(V.data(), vb->data(), vb->size());
         std::vector<unsigned> T(ib->size() / 4);
         if (!T.empty()) memcpy(T.data(), ib->data(), ib->size());
-        string s = "# 文语言导出的 OBJ\n";
+        // 来源水印：OBJ 的 # 是合法注释，任何软件都会忽略，但 strings 一扫就能看见
+        string s = "# 文语言/Wen v0.3.1 · 作者 Akm / 筑宸科技\n";
         char buf[96];
         for (size_t i = 0; i < nv; ++i) {
             // %.9g：float32 的 9 位有效数字能精确往返，读回来和写出去逐字节一样
