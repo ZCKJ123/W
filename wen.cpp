@@ -6180,9 +6180,12 @@ static shared_ptr<Scope> takeFrame(const shared_ptr<Scope>& closure) {
     return s;
 }
 
+// 帧的唯一持有者。收回条件看 use_count()==1：只有「除了它自己没人再引用」才进池。
+// 注意必须由它独占那一份 shared_ptr——如果外面还留一个局部变量指着，计数恒为 2，
+// 池就永远不会命中（上一版就是这么白忙一场的）。
 struct FrameHold {
-    shared_ptr<Scope>& s;
-    explicit FrameHold(shared_ptr<Scope>& x) : s(x) {}
+    shared_ptr<Scope> s;
+    explicit FrameHold(shared_ptr<Scope> x) : s(std::move(x)) {}
     ~FrameHold() {
         if (s && s.use_count() == 1 && gFramePool.size() < 64) {
             s->svars.clear();      // 容量留着，下次直接用
@@ -6227,20 +6230,22 @@ Value Function::callSpan(Interpreter& vm, const Value* a, int n, int callLine) {
             default: break;
         }
     }
-    auto scope = takeFrame(closure);
-    FrameHold frameHold(scope);
+    FrameHold frame(takeFrame(closure));
+    Scope& S = *frame.s;
     // 形参和局部通常只有几个：一次留够，省掉 push_back 扩容与 200 字节搬运
-    if (scope->svars.capacity() < argc + params.size() + 4)
-        scope->svars.reserve(argc + params.size() + 4);
-    for (size_t i = 0; i < argc; ++i) scope->set(paramSyms[i], a[i]);
+    if (S.svars.capacity() < argc + params.size() + 4)
+        S.svars.reserve(argc + params.size() + 4);
+    for (size_t i = 0; i < argc; ++i) S.set(paramSyms[i], a[i]);
     for (size_t i = argc; i < params.size(); ++i) {
         if (i >= paramDefaults.size() || !paramDefaults[i])
             throw WenError("运行时错误", callLine, 0,
                            "函数「" + name + "」缺少参数「" + params[i] + "」");
-        scope->set(paramSyms[i], vm.eval(paramDefaults[i], scope));
+        S.set(paramSyms[i], vm.eval(paramDefaults[i], frame.s));
     }
     bool savedFlag = vm.retFlag;
-    Value savedVal = vm.retVal;
+    Value savedVal;
+    // 绝大多数调用进来的时候调用方并没有挂起的返回值：这时一个字节都不用抄
+    if (savedFlag) savedVal = vm.retVal;
     vm.retFlag = false;
     // 被调函数自己的「返回」标记不许漏到调用方（否则外层循环会误以为返回了）
     struct VmRetGuard {
@@ -6253,10 +6258,10 @@ Value Function::callSpan(Interpreter& vm, const Value* a, int n, int callLine) {
     try {
         if (!code.empty()) {
             // 有字节码就跑字节码：不再逐条语句 switch + 递归求值
-            result = vm.runCode(code, kconst, vstack, scope);
+            result = vm.runCode(code, kconst, vstack, frame.s);
         } else {
             for (const auto& st : body) {
-                vm.exec(st, scope);
+                vm.exec(st, frame.s);
                 if (vm.retFlag) break;
             }
             if (vm.retFlag) result = vm.retVal;
@@ -6275,7 +6280,7 @@ Value Function::callSpan(Interpreter& vm, const Value* a, int n, int callLine) {
         throw;
     }
     vm.retFlag = savedFlag;
-    vm.retVal = savedVal;
+    if (savedFlag) vm.retVal = savedVal;
     return result;
 }
 
