@@ -2092,6 +2092,42 @@ struct Scope {
         if (parent) return parent->assign(id, std::move(v));
         return false;
     }
+    // 一次走链完成「查遮蔽 + 找绑定 + 写」：原来 lookup 和 assign 各走一遍，
+    // 这里合并成一遍。返回值 1=已写入，2=该退化成当前帧的局部变量，0=哪儿都没有。
+    int assignOnce(SymId id, Value& v, bool knownBuiltin) {
+        if (smallMode) {
+            for (auto& kv : svars)
+                if (kv.first == id) {
+                    if (knownBuiltin || kv.second.type == VT::Func) return 2;
+                    kv.second = std::move(v);
+                    return 1;
+                }
+            if (parent) return parent->assignOnce(id, v, false);
+            return 0;
+        }
+        auto sit = idSlot.find(id);
+        if (sit != idSlot.end()) {
+            Value cur;
+            if (knownBuiltin || (fastGet(sit->second, cur) && cur.type == VT::Func)) return 2;
+            set(id, v);
+            fastSet(sit->second, std::move(v));
+            return 1;
+        }
+        auto iv = idVars.find(id);
+        if (iv != idVars.end()) {
+            if (knownBuiltin || iv->second.type == VT::Func) return 2;
+            set(id, v);
+            return 1;
+        }
+        auto jt = vars.find(symbolName(id));
+        if (jt != vars.end()) {
+            if (knownBuiltin || jt->second.type == VT::Func) return 2;
+            set(id, v);
+            return 1;
+        }
+        if (parent) return parent->assignOnce(id, v, false);
+        return 0;
+    }
     int findSlot(SymId id) const {
         auto it = idSlot.find(id);
         return it == idSlot.end() ? -1 : it->second;
@@ -6067,18 +6103,13 @@ void Interpreter::assignVarSym(SymId sym, Value val, const shared_ptr<Scope>& sc
     // 名字现在绑定的是一个函数（内建或用户函数）时，也不能在函数里被普通赋值改掉：
     // 那会写到全局上，递归时所有层共用，还会把函数本身顶掉。
     // knownBuiltin 由字节码编译期算好（内建表启动后就不再变），省掉一次 690 项查表。
-    bool shadowMe = knownBuiltin;
-    if (!shadowMe) {
-        Value existing;
-        shadowMe = scope->lookup(sym, existing) && existing.type == VT::Func;
-    }
-    if (scope != globals && shadowMe) {
-        scope->set(sym, std::move(val));
+    // 顶层作用域没有「退化成本地」这一说，直接按原语义写。
+    if (scope.get() == globals.get()) {
+        if (!scope->assign(sym, val)) scope->set(sym, std::move(val));
         return;
     }
-    if (!scope->assign(sym, val)) {
-        scope->set(sym, std::move(val));
-    }
+    int r = scope->assignOnce(sym, val, knownBuiltin);
+    if (r != 1) scope->set(sym, std::move(val));
 }
 
 void Interpreter::assignTarget(const ExprPtr& target, Value val,
