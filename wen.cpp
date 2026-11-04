@@ -11289,15 +11289,17 @@ Interpreter::Interpreter() {
         double fps = 0;
         int sx = 1;              // 抽稀步长
         int W = 0, H = 0;        // 输出尺寸
+        bool nv12 = false;       // true = 拿 NV12 自己转（省掉 MF 的整帧 RGB 转换）
         ~VideoDecoder() { if (rd) rd->Release(); }
     };
     // 读取器建好后统一配成 RGB32、拿尺寸帧率、算抽稀步长（摄像头和文件共用这一段）
-    static auto vdSetup = [](VideoDecoder& d, int targetW, string& err) -> bool {
+    static auto vdSetup = [](VideoDecoder& d, int targetW, bool wantNV12, string& err) -> bool {
         HRESULT hr = S_OK;
         IMFMediaType* out = nullptr;
         MFCreateMediaType(&out);
         out->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-        out->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+        out->SetGUID(MF_MT_SUBTYPE, wantNV12 ? MFVideoFormat_NV12 : MFVideoFormat_RGB32);
+        d.nv12 = wantNV12;
         hr = d.rd->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, out);
         out->Release();
         if (FAILED(hr)) { err = "这个文件解不出 RGB32（没有视频轨？）"; return false; }
@@ -11319,7 +11321,8 @@ Interpreter::Interpreter() {
         return true;
     };
     // 从文件打开
-    static auto vdOpen = [](VideoDecoder& d, const string& full, int targetW, string& err) -> bool {
+    static auto vdOpen = [](VideoDecoder& d, const string& full, int targetW, bool wantNV12,
+                            string& err) -> bool {
         HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         (void)hr;
         if (FAILED(MFStartup(MF_VERSION))) { err = "MFStartup 失败"; return false; }
@@ -11329,7 +11332,7 @@ Interpreter::Interpreter() {
         hr = MFCreateSourceReaderFromURL(utf8ToWide(full).c_str(), attrs, &d.rd);
         if (attrs) attrs->Release();
         if (FAILED(hr) || !d.rd) { err = "打不开视频文件"; return false; }
-        return vdSetup(d, targetW, err);
+        return vdSetup(d, targetW, wantNV12, err);
     };
     // 按秒跳转再取一帧；跳转后读到的第一帧就是目标时间之后的那一帧
     static auto vdGrab = [](VideoDecoder& d, double seconds,
@@ -11360,22 +11363,56 @@ Interpreter::Interpreter() {
             if (SUCCEEDED(sm->ConvertToContiguousBuffer(&mb)) && mb) {
                 BYTE* data = nullptr;
                 DWORD len = 0;
-                if (SUCCEEDED(mb->Lock(&data, nullptr, &len)) &&
-                    len >= (size_t)d.nw * (size_t)d.nh * 4) {
+                size_t needBytes = d.nv12 ? ((size_t)d.nw * (size_t)d.nh * 3 / 2)
+                                          : ((size_t)d.nw * (size_t)d.nh * 4);
+                if (SUCCEEDED(mb->Lock(&data, nullptr, &len)) && len >= needBytes) {
                     rgb.assign((size_t)d.W * (size_t)d.H * 3, 0);
-                    size_t stride = (size_t)len / (size_t)d.nh;
-                    for (int y = 0; y < d.H; ++y) {
-                        UINT32 sy2 = (UINT32)y * (UINT32)d.sx;
-                        if (sy2 >= d.nh) sy2 = d.nh - 1;
-                        const BYTE* src = data + (size_t)sy2 * stride;
-                        unsigned char* dst = rgb.data() + (size_t)y * (size_t)d.W * 3;
-                        for (int x = 0; x < d.W; ++x) {
-                            UINT32 sx2 = (UINT32)x * (UINT32)d.sx;
-                            if (sx2 >= d.nw) sx2 = d.nw - 1;
-                            const BYTE* px = src + (size_t)sx2 * 4;
-                            dst[(size_t)x * 3] = px[2];
-                            dst[(size_t)x * 3 + 1] = px[1];
-                            dst[(size_t)x * 3 + 2] = px[0];
+                    if (d.nv12) {
+                        // NV12：Y 平面 + 交错 UV。只转我们要的那几个像素，
+                        // 定标用 BT.601 有限范围（摄像头/常见视频都是这个）
+                        size_t yStride = (size_t)len * 2 / (3 * (size_t)d.nh);
+                        if (yStride < (size_t)d.nw) yStride = (size_t)d.nw;
+                        const BYTE* uv = data + yStride * (size_t)d.nh;
+                        for (int y = 0; y < d.H; ++y) {
+                            UINT32 sy2 = (UINT32)y * (UINT32)d.sx;
+                            if (sy2 >= d.nh) sy2 = d.nh - 1;
+                            const BYTE* yrow = data + (size_t)sy2 * yStride;
+                            const BYTE* uvrow = uv + (size_t)(sy2 / 2) * yStride;
+                            unsigned char* dst = rgb.data() + (size_t)y * (size_t)d.W * 3;
+                            for (int x = 0; x < d.W; ++x) {
+                                UINT32 sx2 = (UINT32)x * (UINT32)d.sx;
+                                if (sx2 >= d.nw) sx2 = d.nw - 1;
+                                int Y = (int)yrow[sx2] - 16;
+                                if (Y < 0) Y = 0;
+                                size_t uvi = (size_t)(sx2 / 2) * 2;
+                                int D = (int)uvrow[uvi] - 128;
+                                int E = (int)uvrow[uvi + 1] - 128;
+                                int r = (298 * Y + 409 * E + 128) >> 8;
+                                int g = (298 * Y - 100 * D - 208 * E + 128) >> 8;
+                                int b = (298 * Y + 516 * D + 128) >> 8;
+                                if (r < 0) r = 0; else if (r > 255) r = 255;
+                                if (g < 0) g = 0; else if (g > 255) g = 255;
+                                if (b < 0) b = 0; else if (b > 255) b = 255;
+                                dst[(size_t)x * 3] = (unsigned char)r;
+                                dst[(size_t)x * 3 + 1] = (unsigned char)g;
+                                dst[(size_t)x * 3 + 2] = (unsigned char)b;
+                            }
+                        }
+                    } else {
+                        size_t stride = (size_t)len / (size_t)d.nh;
+                        for (int y = 0; y < d.H; ++y) {
+                            UINT32 sy2 = (UINT32)y * (UINT32)d.sx;
+                            if (sy2 >= d.nh) sy2 = d.nh - 1;
+                            const BYTE* src = data + (size_t)sy2 * stride;
+                            unsigned char* dst = rgb.data() + (size_t)y * (size_t)d.W * 3;
+                            for (int x = 0; x < d.W; ++x) {
+                                UINT32 sx2 = (UINT32)x * (UINT32)d.sx;
+                                if (sx2 >= d.nw) sx2 = d.nw - 1;
+                                const BYTE* px = src + (size_t)sx2 * 4;
+                                dst[(size_t)x * 3] = px[2];
+                                dst[(size_t)x * 3 + 1] = px[1];
+                                dst[(size_t)x * 3 + 2] = px[0];
+                            }
                         }
                     }
                     mb->Unlock();
@@ -11541,12 +11578,13 @@ Interpreter::Interpreter() {
     // 常开解码器：视频打开 → 反复 视频取帧 → 视频关闭，不用每帧重开
     static std::map<long long, std::shared_ptr<VideoDecoder>> vdStore;
     static long long vdNext = 1;
-    registerBuiltin("视频打开", 1, 2, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+    registerBuiltin("视频打开", 1, 3, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         string path = needStr(a[0], "视频打开", line);
         int targetW = a.size() >= 2 ? (int)needIndex(a[1], "视频打开", line) : 0;
+        bool useNV = a.size() >= 3 ? (needIndex(a[2], "视频打开", line) != 0) : false;
         auto d = std::make_shared<VideoDecoder>();
         string err;
-        if (!vdOpen(*d, path, targetW, err))
+        if (!vdOpen(*d, path, targetW, useNV, err))
             throw WenError("运行时错误", line, 0, "视频打开：" + err);
         long long id = vdNext++;
         vdStore[id] = d;
@@ -11664,7 +11702,7 @@ Interpreter::Interpreter() {
             throw WenError("运行时错误", line, 0, "相机打开：建读取器失败");
         }
         string err;
-        if (!vdSetup(*d, targetW, err)) {
+        if (!vdSetup(*d, targetW, true, err)) {
             MFShutdown();
             if (com) CoUninitialize();
             throw WenError("运行时错误", line, 0, "相机打开：" + err);
