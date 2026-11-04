@@ -4123,16 +4123,16 @@ public:
     string decompressMemoryText(const string& text, int line);
     void run(const string& src, const string& name);
     void execProgram(const vector<StmtPtr>& program);
-    void execProgram(const vector<StmtPtr>& program, shared_ptr<Scope> scope);
-    void exec(const StmtPtr& s, shared_ptr<Scope> scope);
-    Value eval(const ExprPtr& e, shared_ptr<Scope> scope);
+    void execProgram(const vector<StmtPtr>& program, const shared_ptr<Scope>& scope);
+    void exec(const StmtPtr& s, const shared_ptr<Scope>& scope);
+    Value eval(const ExprPtr& e, const shared_ptr<Scope>& scope);
     Value callValue(const Value& callee, vector<Value>& args, int line);
-    void assignTarget(const ExprPtr& target, Value val, shared_ptr<Scope> scope);
+    void assignTarget(const ExprPtr& target, Value val, const shared_ptr<Scope>& scope);
     // AST 路径和字节码路径共用的「给变量赋值」语义（gslot < 0 的那一支）。
-    void assignVarSym(SymId sym, Value val, shared_ptr<Scope> scope);
+    void assignVarSym(SymId sym, Value val, const shared_ptr<Scope>& scope);
     // 跑一段语句字节码；返回函数返回值（顶层循环返回 空）。
     Value runCode(const std::vector<Instr>& code, const std::vector<double>& kconst,
-                  int vstack, shared_ptr<Scope> scope);
+                  int vstack, const shared_ptr<Scope>& scope);
     // 循环体块跑完时的控制码：0 正常 / 1 继续 / 2 中断
     int vmCtl = 0;
     // 这一段字节码有没有执行过「返回」（BC_RET）
@@ -4602,7 +4602,7 @@ void Interpreter::execProgram(const vector<StmtPtr>& program) {
     execProgram(program, globals);
 }
 
-void Interpreter::execProgram(const vector<StmtPtr>& program, shared_ptr<Scope> scope) {
+void Interpreter::execProgram(const vector<StmtPtr>& program, const shared_ptr<Scope>& scope) {
     gTotal = std::max<long long>(gTotal, (long long)program.size());
     try {
         for (const auto& s : program) exec(s, scope);
@@ -5145,7 +5145,7 @@ static inline void vmSetBool(Value& v, bool x) {
 }
 
 Value Interpreter::runCode(const std::vector<Instr>& code, const std::vector<double>& kconst,
-                           int vstack, shared_ptr<Scope> scope) {
+                           int vstack, const shared_ptr<Scope>& scope) {
     size_t base = gVSP;
     if (gVStack.size() < base + (size_t)vstack) gVStack.resize(base + (size_t)vstack);
     gVSP = base + (size_t)vstack;
@@ -5393,7 +5393,7 @@ Value Interpreter::runCode(const std::vector<Instr>& code, const std::vector<dou
     }
 }
 
-void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
+void Interpreter::exec(const StmtPtr& s, const shared_ptr<Scope>& scope) {
     if (retFlag) return;
     ++gExecuted;
     gLastLine = s->line;
@@ -5808,7 +5808,7 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
     }
 }
 
-Value Interpreter::eval(const ExprPtr& e, shared_ptr<Scope> scope) {
+Value Interpreter::eval(const ExprPtr& e, const shared_ptr<Scope>& scope) {
     switch (e->k) {
         case Expr::K::Num: return vNum(e->num);
         case Expr::K::Str: return vStr(e->text);
@@ -6053,7 +6053,7 @@ Value Interpreter::callValue(const Value& callee, vector<Value>& args, int line)
     return callee.callable->call(*this, args, line);
 }
 
-void Interpreter::assignVarSym(SymId sym, Value val, shared_ptr<Scope> scope) {
+void Interpreter::assignVarSym(SymId sym, Value val, const shared_ptr<Scope>& scope) {
     // 内建名不能被函数里的普通赋值改掉：`值`、`长度` 这些名字同时是内建函数，
     // 直接 assign 会写进全局的内建槽，递归时所有层共用一个变量，循环会莫名退出。
     // 函数里碰到内建名就退化成局部变量（要改全局请显式用别的名字）。
@@ -6072,7 +6072,7 @@ void Interpreter::assignVarSym(SymId sym, Value val, shared_ptr<Scope> scope) {
 }
 
 void Interpreter::assignTarget(const ExprPtr& target, Value val,
-                               shared_ptr<Scope> scope) {
+                               const shared_ptr<Scope>& scope) {
     if (target->k == Expr::K::Var) {
         if (!target->sym) rtError(target->line, "内部符号缺失：" + target->text);
         if (target->gslot >= 0) {
