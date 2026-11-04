@@ -20161,6 +20161,81 @@ Interpreter::Interpreter() {
         d->items["像素"] = vBytes(std::make_shared<std::vector<unsigned char>>(px));
         Value o; o.type = VT::Dict; o.dict = d; return o;
     });
+    // ---------- 由明暗恢复高度（shape-from-shading）----------
+    // 相机拍下来的亮度就是被表面法线调制的光照：亮=朝向光源，暗=背光。
+    // 先用中心差分从亮度求出「法线斜率」p、q，再解泊松方程 ∇²Z = ∂p/∂x + ∂q/∂y
+    // 把斜率积分成高度。不需要模型文件，也不需要多张图。
+    registerBuiltin("明暗高度", 3, 4, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto buf = needBytes(a[0], "明暗高度", line);
+        long long W = needIndex(a[1], "明暗高度", line);
+        long long H = needIndex(a[2], "明暗高度", line);
+        long long iters = a.size() >= 4 ? needIndex(a[3], "明暗高度", line) : 400;
+        if (W < 3 || H < 3 || (long long)buf->size() < W * H * 3)
+            throw WenError("运行时错误", line, 0, "明暗高度：需要 RGB 像素缓冲和正确的宽高（至少 3x3）");
+        if (iters < 1) iters = 1;
+        if (iters > 5000) iters = 5000;
+        const auto& px = *buf;
+        std::vector<double> I((size_t)W * (size_t)H);
+        for (long long y = 0; y < H; ++y)
+            for (long long x = 0; x < W; ++x) {
+                size_t i = (size_t)(y * W + x) * 3;
+                I[(size_t)(y * W + x)] = (0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2]) / 255.0;
+            }
+        auto at = [&](long long x, long long y) -> double {
+            if (x < 0) x = 0;
+            if (y < 0) y = 0;
+            if (x >= W) x = W - 1;
+            if (y >= H) y = H - 1;
+            return I[(size_t)(y * W + x)];
+        };
+        // 斜率：亮的一侧法线更朝向光源。
+        // 光源默认从左上前方（照片里最常见的日照方向），符号取负号。
+        std::vector<double> P((size_t)W * (size_t)H, 0.0), Q((size_t)W * (size_t)H, 0.0);
+        for (long long y = 0; y < H; ++y)
+            for (long long x = 0; x < W; ++x) {
+                P[(size_t)(y * W + x)] = -(at(x + 1, y) - at(x - 1, y)) * 0.5;
+                Q[(size_t)(y * W + x)] = -(at(x, y + 1) - at(x, y - 1)) * 0.5;
+            }
+        // 泊松右端项：斜率场的散度
+        std::vector<double> div((size_t)W * (size_t)H, 0.0);
+        for (long long y = 0; y < H; ++y)
+            for (long long x = 0; x < W; ++x) {
+                double dpdx = 0, dqdy = 0;
+                if (x > 0 && x < W - 1) dpdx = (P[(size_t)(y * W + x + 1)] - P[(size_t)(y * W + x - 1)]) * 0.5;
+                if (y > 0 && y < H - 1) dqdy = (Q[(size_t)((y + 1) * W + x)] - Q[(size_t)((y - 1) * W + x)]) * 0.5;
+                div[(size_t)(y * W + x)] = dpdx + dqdy;
+            }
+        // Jacobi 迭代解 ∇²Z = div，边界取零梯度
+        std::vector<double> Z((size_t)W * (size_t)H, 0.0), Zn((size_t)W * (size_t)H, 0.0);
+        for (long long it = 0; it < iters; ++it) {
+            for (long long y = 0; y < H; ++y)
+                for (long long x = 0; x < W; ++x) {
+                    size_t i = (size_t)(y * W + x);
+                    double l = x > 0 ? Z[i - 1] : Z[i];
+                    double r = x + 1 < W ? Z[i + 1] : Z[i];
+                    double u = y > 0 ? Z[i - (size_t)W] : Z[i];
+                    double d2 = y + 1 < H ? Z[i + (size_t)W] : Z[i];
+                    Zn[i] = (l + r + u + d2 - div[i]) * 0.25;
+                }
+            Z.swap(Zn);
+        }
+        double mn = Z[0], mx = Z[0];
+        for (size_t i = 1; i < Z.size(); ++i) {
+            if (Z[i] < mn) mn = Z[i];
+            if (Z[i] > mx) mx = Z[i];
+        }
+        double span = mx - mn;
+        std::vector<unsigned char> out(Z.size(), 0);
+        for (size_t i = 0; i < Z.size(); ++i)
+            out[i] = span > 1e-12 ? (unsigned char)std::lround((Z[i] - mn) / span * 255.0) : 0;
+        auto d = std::make_shared<Dict>();
+        d->items["宽"] = vNum((double)W);
+        d->items["高"] = vNum((double)H);
+        d->items["深度"] = vBytes(std::make_shared<std::vector<unsigned char>>(out));
+        d->items["像素"] = vBytes(std::make_shared<std::vector<unsigned char>>(px));
+        d->items["落差"] = vNum(span);
+        Value o; o.type = VT::Dict; o.dict = d; return o;
+    });
     // 深度图 → 彩色体：每像素按它的深度决定从哪一层开始，往下填满到第 0 层。
     // 这样 三维网格(体) 出来的就是「近处高、远处低」的完整模型。
     registerBuiltin("体从深度", 2, 2, [&](Interpreter&, vector<Value>& a, int line) -> Value {
