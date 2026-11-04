@@ -11282,7 +11282,100 @@ Interpreter::Interpreter() {
         }
         return false;
     };
-    static auto decodeAudio = [](const string& full, WavInfo& w, string& err) -> bool {
+    // ---------- 视频帧：MF 源读取器取一帧，转 RGB24，返回和 图像读PNG 同构的字典 ----------
+    static auto readVideoFrame = [](const string& full, long long want, int& W, int& H,
+                                    std::vector<unsigned char>& rgb, string& err) -> bool {
+        HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        bool com = SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE;
+        if (FAILED(MFStartup(MF_VERSION))) { err = "MFStartup 失败"; return false; }
+        IMFSourceReader* reader = nullptr;
+        // 打开内建视频处理：H.264 之类的解码器不一定直接给 RGB32，
+        // 有了这个处理器，YUV → RGB32 的转换由 MF 自己做。
+        IMFAttributes* attrs = nullptr;
+        MFCreateAttributes(&attrs, 1);
+        if (attrs) attrs->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
+        hr = MFCreateSourceReaderFromURL(utf8ToWide(full).c_str(), attrs, &reader);
+        if (attrs) attrs->Release();
+        if (FAILED(hr) || !reader) { err = "打不开视频文件"; MFShutdown(); if (com) CoUninitialize(); return false; }
+        IMFMediaType* out = nullptr;
+        MFCreateMediaType(&out);
+        out->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        out->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+        hr = reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, out);
+        out->Release();
+        if (FAILED(hr)) {
+            err = "这个文件解不出 RGB32（没有视频轨？）";
+            reader->Release(); MFShutdown(); if (com) CoUninitialize(); return false;
+        }
+        IMFMediaType* cur = nullptr;
+        UINT32 w = 0, h = 0;
+        if (SUCCEEDED(reader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, &cur)) && cur) {
+            MFGetAttributeSize(cur, MF_MT_FRAME_SIZE, &w, &h);
+            cur->Release();
+        }
+        if (!w || !h) {
+            err = "拿不到视频尺寸";
+            reader->Release(); MFShutdown(); if (com) CoUninitialize(); return false;
+        }
+        long long seen = 0;
+        bool got = false;
+        while (true) {
+            DWORD flags = 0; LONGLONG ts = 0; IMFSample* sample = nullptr;
+            hr = reader->ReadSample(MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, nullptr, &flags, &ts, &sample);
+            if (FAILED(hr)) { if (sample) sample->Release(); err = "读视频帧失败"; break; }
+            if (flags & MF_SOURCE_READERF_ENDOFSTREAM) { if (sample) sample->Release(); break; }
+            if (!sample) continue;
+            if (seen == want) {
+                IMFMediaBuffer* buf = nullptr;
+                if (SUCCEEDED(sample->ConvertToContiguousBuffer(&buf)) && buf) {
+                    BYTE* data = nullptr; DWORD len = 0;
+                    if (SUCCEEDED(buf->Lock(&data, nullptr, &len)) && len >= (size_t)w * h * 4) {
+                        W = (int)w; H = (int)h;
+                        rgb.assign((size_t)W * (size_t)H * 3, 0);
+                        size_t stride = (size_t)len / (size_t)H;      // RGB32 是 B,G,R,X
+                        for (int y = 0; y < H; ++y) {
+                            const BYTE* src = data + (size_t)y * stride;
+                            unsigned char* dst = rgb.data() + (size_t)y * (size_t)W * 3;
+                            for (int x = 0; x < W; ++x) {
+                                dst[(size_t)x * 3] = src[(size_t)x * 4 + 2];
+                                dst[(size_t)x * 3 + 1] = src[(size_t)x * 4 + 1];
+                                dst[(size_t)x * 3 + 2] = src[(size_t)x * 4];
+                            }
+                        }
+                        got = true;
+                        buf->Unlock();
+                    }
+                    buf->Release();
+                }
+                sample->Release();
+                break;
+            }
+            ++seen;
+            sample->Release();
+        }
+        reader->Release();
+        MFShutdown();
+        if (com) CoUninitialize();
+        if (!got) { if (err.empty()) err = "没读到这一帧（帧号超出范围？）"; return false; }
+        return true;
+    };
+    registerBuiltin("视频帧", 2, 2, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        string path = needStr(a[0], "视频帧", line);
+        long long idx = needIndex(a[1], "视频帧", line);
+        if (idx < 0) idx = 0;
+        int W = 0, H = 0;
+        std::vector<unsigned char> rgb;
+        string err;
+        if (!readVideoFrame(path, idx, W, H, rgb, err))
+            throw WenError("运行时错误", line, 0, "视频帧：" + err);
+        auto buf = std::make_shared<std::vector<unsigned char>>(rgb);
+        auto d = std::make_shared<Dict>();
+        d->items["宽"] = vNum(W);
+        d->items["高"] = vNum(H);
+        d->items["通道"] = vNum(3);
+        d->items["像素"] = vBytes(buf);
+        Value vv2; vv2.type = VT::Dict; vv2.dict = d; return vv2;
+    });    static auto decodeAudio = [](const string& full, WavInfo& w, string& err) -> bool {
         HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         bool com = SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE;
         if (FAILED(MFStartup(MF_VERSION))) { err = "MFStartup 失败"; return false; }
