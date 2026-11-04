@@ -5391,9 +5391,10 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
                 bool tl = (scope.get() == globals.get());
                 bodyCompiled = compileBlock(s->body, tl, globals, bcode, bk, bstack, hasRet);
             }
-            auto runOne = [&](const Value& k, const Value& v) -> bool {
-                if (s->nameSlot >= 0) { globals->fastBind(s->nameSym, s->nameSlot); globals->fastSet(s->nameSlot, k); if (k.type != VT::Num && k.type != VT::Int && k.type != VT::Bool) scope->set(s->nameSym, k); } else scope->set(s->nameSym, k);
-                if (two) { if (s->name2Slot >= 0) { globals->fastBind(s->name2Sym, s->name2Slot); globals->fastSet(s->name2Slot, v); } else scope->set(s->name2Sym, v); }
+            // 「名字 → 快槽」是幂等的，循环外记一次就够，不必每轮查表
+            if (s->nameSlot >= 0) globals->fastBind(s->nameSym, s->nameSlot);
+            if (two && s->name2Slot >= 0) globals->fastBind(s->name2Sym, s->name2Slot);
+            auto runBody = [&]() -> bool {          // true 继续下一轮，false 结束循环
                 if (bodyCompiled) {
                     int savedCtl = vmCtl;
                     Value r = runCode(bcode, bk, bstack, scope);
@@ -5414,30 +5415,52 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
                 }
                 return true;
             };
+            auto runOne = [&](const Value& k) -> bool {
+                if (s->nameSlot >= 0) {
+                    globals->fastSet(s->nameSlot, k);
+                    if (k.type != VT::Num && k.type != VT::Int && k.type != VT::Bool)
+                        scope->set(s->nameSym, k);
+                } else {
+                    scope->set(s->nameSym, k);
+                }
+                return runBody();
+            };
+            auto runTwo = [&](const Value& k, const Value& v) -> bool {
+                if (s->nameSlot >= 0) {
+                    globals->fastSet(s->nameSlot, k);
+                    if (k.type != VT::Num && k.type != VT::Int && k.type != VT::Bool)
+                        scope->set(s->nameSym, k);
+                } else {
+                    scope->set(s->nameSym, k);
+                }
+                if (s->name2Slot >= 0) globals->fastSet(s->name2Slot, v);
+                else scope->set(s->name2Sym, v);
+                return runBody();
+            };
             if ((iter.type == VT::List || iter.type == VT::Set) && iter.list) {
                 for (size_t i = 0; i < iter.list->items.size(); ++i) {
-                    if (!runOne(two ? vNum((double)i) : iter.list->items[i],
-                                two ? iter.list->items[i] : vNone()))
-                        break;
+                    bool go = two ? runTwo(vNum((double)i), iter.list->items[i])
+                                  : runOne(iter.list->items[i]);
+                    if (!go) break;
                 }
             } else if (iter.type == VT::Str) {
                 auto chars = utf8Chars(iter.str);
                 for (size_t i = 0; i < chars.size(); ++i) {
-                    if (!runOne(two ? vNum((double)i) : vStr(chars[i]),
-                                two ? vStr(chars[i]) : vNone()))
-                        break;
+                    bool go = two ? runTwo(vNum((double)i), vStr(chars[i])) : runOne(vStr(chars[i]));
+                    if (!go) break;
                 }
             } else if (iter.type == VT::Dict && iter.dict) {
                 for (const auto& kv : iter.dict->items) {
-                    if (!runOne(vStr(kv.first), two ? kv.second : vNone())) break;
+                    bool go = two ? runTwo(vStr(kv.first), kv.second) : runOne(vStr(kv.first));
+                    if (!go) break;
                 }
             } else if (iter.type == VT::Range) {
                 long long n = 0;
                 for (double x = iter.rstart; iter.rstep > 0 ? x < iter.rstop : x > iter.rstop;
                      x += iter.rstep) {
-                    if (!runOne(two ? vNum((double)n) : vNum(x), two ? vNum(x) : vNone()))
-                        break;
+                    bool go = two ? runTwo(vNum((double)n), vNum(x)) : runOne(vNum(x));
                     ++n;
+                    if (!go) break;
                 }
             } else {
                 rtError(s->line, "「对于」只能遍历列表、文本、字典、集合或范围，收到" +
