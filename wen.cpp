@@ -4717,6 +4717,28 @@ void Interpreter::exec(const StmtPtr& s, shared_ptr<Scope> scope) {
 
     switch (s->k) {
         case Stmt::K::Assign: {
+            // 快路径：将 x 变成 x ± 常数 / x * 常数 —— 循环里最常见的累加/计数
+            // 不再走 eval(Binary) 的两层递归和临时 Value
+            if (s->target && s->target->k == Expr::K::Var && s->expr &&
+                s->expr->k == Expr::K::Binary && s->expr->args.size() == 2) {
+                ExprPtr L = s->expr->args[0], R = s->expr->args[1];
+                if (L && R && L->k == Expr::K::Var && L->sym == s->target->sym && R->k == Expr::K::Num) {
+                    Value cur;
+                    if (scope->lookup(s->target->sym, cur) && cur.type == VT::Num) {
+                        const string& o = s->expr->op;
+                        bool ok = true;
+                        double d = cur.num;
+                        if (o == "+") d += R->num;
+                        else if (o == "-") d -= R->num;
+                        else if (o == "*") d *= R->num;
+                        else ok = false;
+                        if (ok) {
+                            assignTarget(s->target, vNum(d), scope);
+                            break;
+                        }
+                    }
+                }
+            }
             Value v = eval(s->expr, scope);
             if (s->declareLocal && s->target && s->target->k == Expr::K::Var && s->target->gslot < 0) {
                 scope->set(s->target->sym, std::move(v));
