@@ -17805,6 +17805,48 @@ Interpreter::Interpreter() {
         if (pureFn && (!pureFn->pureExpr || pureFn->paramSyms.size() != 3)) pureFn = nullptr;
         const bool useBc = pureFn && !pureFn->pureOp.empty();
         double pv[3] = {0, 0, 0};
+        // 一格算完写进去：串行和并行两条路共用这一份，钳位/里面值/外面值的语义只有一处
+        auto put = [&](int l, int r, int c, double d) {
+            if (binary) {
+                d = d <= 0 ? (double)inVal : (double)outVal;
+            } else {
+                if (d < 0) d = 0;
+                if (d > 255) d = 255;
+            }
+            size_t idx = (size_t)((l * v->R + r) * v->C + c);
+            unsigned char b = (unsigned char)std::lround(d);
+            if (v->color) {
+                v->rgb[idx * 3] = b;
+                v->rgb[idx * 3 + 1] = b;
+                v->rgb[idx * 3 + 2] = b;
+            } else {
+                v->data[idx] = b;
+            }
+        };
+        // 纯公式字典（没有脚本回调）：每格都是纯数学，按层切开多线程跑。
+        // 有 byFunc 时不能并行——那要进解释器，解释器不是线程安全的。
+        if (!byFunc && (long long)v->L * v->R * v->C >= 4000000LL) {
+            unsigned nt = std::thread::hardware_concurrency();
+            if (nt == 0) nt = 4;
+            if (nt > 16) nt = 16;
+            if (v->L >= 8 && nt > 1) {
+                std::atomic<int> next{0};
+                auto worker = [&]() {
+                    for (;;) {
+                        int l = next.fetch_add(1);
+                        if (l >= v->L) break;
+                        for (int r = 0; r < v->R; ++r)
+                            for (int c = 0; c < v->C; ++c)
+                                put(l, r, c, evalFormulaNode(compiled, l, r, c));
+                    }
+                };
+                std::vector<std::thread> th;
+                th.reserve(nt);
+                for (unsigned i = 0; i < nt; ++i) th.emplace_back(worker);
+                for (auto& th1 : th) th1.join();
+                return vNum((double)v->L * (double)v->R * (double)v->C);
+            }
+        }
         for (int l = 0; l < v->L; ++l)
             for (int r = 0; r < v->R; ++r)
                 for (int c = 0; c < v->C; ++c) {
@@ -17861,22 +17903,9 @@ Interpreter::Interpreter() {
                     } else {
                         d = evalFormulaNode(compiled, l, r, c);
                     }
-                    if (binary) {
-                        d = d <= 0 ? (double)inVal : (double)outVal;
-                    } else {
-                        if (d < 0) d = 0;
-                        if (d > 255) d = 255;
-                    }
-                    size_t idx = (size_t)((l * v->R + r) * v->C + c);
-                    unsigned char b = (unsigned char)std::lround(d);
-                    if (v->color) {
-                        v->rgb[idx * 3] = b;
-                        v->rgb[idx * 3 + 1] = b;
-                        v->rgb[idx * 3 + 2] = b;
-                    } else {
-                        v->data[idx] = b;
-                    }
+                    put(l, r, c, d);
                     ++calls;
+
                 }
         return vNum((double)calls);
     });
