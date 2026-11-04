@@ -19920,9 +19920,16 @@ Interpreter::Interpreter() {
         long long W = needIndex(a[1], "图像存PNG", line);
         long long H = needIndex(a[2], "图像存PNG", line);
         auto px = needBytes(a[3], "图像存PNG", line);
-        if (W <= 0 || H <= 0 || (long long)px->size() < W * H)
-            throw WenError("运行时错误", line, 0, "图像存PNG：尺寸与像素数据不匹配");
-        return writePngFile(path, (int)W, (int)H, px->data(), 1, line);
+        if (W <= 0 || H <= 0)
+            throw WenError("运行时错误", line, 0, "图像存PNG：宽高必须大于 0");
+        // 按缓冲长度判灰度还是彩色。以前只查下界 W×H，
+        // 把 W×H×3 的 RGB 缓冲当灰度写出去，出来的就是条状花屏。
+        if ((long long)px->size() >= W * H * 3)
+            return writePngFile(path, (int)W, (int)H, px->data(), 3, line);
+        if ((long long)px->size() >= W * H)
+            return writePngFile(path, (int)W, (int)H, px->data(), 1, line);
+        throw WenError("运行时错误", line, 0,
+                       "图像存PNG：缓冲不够，需要 W×H（灰度）或 W×H×3（彩色）字节");
     });
     registerBuiltin("图像存PNG彩色", 4, 4, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         string path = needStr(a[0], "图像存PNG彩色", line);
