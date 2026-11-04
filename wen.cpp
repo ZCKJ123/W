@@ -2183,7 +2183,12 @@ enum : unsigned char {
     BC_LC,           // 取被调用者（不做零参数自动调用）a = SymId, b = 全局槽或 -1
     BC_CALL,         // a = 实参个数：栈上是 被调用者 + 实参，结果压回原处
     BC_GN,           // 运算位置读全局：只读 num，省掉整份 Value 拷贝 a = 槽号, b = SymId
-    BC_LN            // 运算位置按名字读：同上，a = SymId
+    BC_LN,           // 运算位置按名字读：同上，a = SymId
+    BC_JNZ,          // 真则跳（弹出栈顶）a = 目标
+    BC_BOOL,         // 栈顶转成布尔
+    BC_PUSHT,        // 压 真
+    BC_PUSHF,        // 压 假
+    BC_PRINT         // 打印栈顶 a 个值，用空格分隔
 };
 struct Instr { unsigned char op = 0; int a = 0; int b = 0; };
 
@@ -4849,6 +4854,23 @@ bool WenAsm::expr(const ExprPtr& e, bool numCtx) {
             if (e->args.size() != 2) return false;
             unsigned char op = 0;
             const string& o = e->op;
+            // 且/或：用跳转展开，保持短路语义（右边可能不执行）
+            if (o == "且" || o == "或") {
+                bool isAnd = (o == "且");
+                if (!expr(e->args[0])) return false;
+                drop();
+                int j = emit(isAnd ? BC_JZ : BC_JNZ, 0);
+                if (!expr(e->args[1])) return false;
+                drop();
+                emit(BC_BOOL);
+                push();
+                int jmp = emit(BC_JMP, 0);
+                code[(size_t)j].a = (int)code.size();
+                emit(isAnd ? BC_PUSHF : BC_PUSHT);
+                push();
+                code[(size_t)jmp].a = (int)code.size();
+                return true;
+            }
             bool arith = true;
             if (o == "+") op = BC_ADD;
             else if (o == "-") op = BC_SUB;
@@ -4915,6 +4937,16 @@ bool WenAsm::stmt(const StmtPtr& s) {
                 emit(BC_STL, (int)sym);           // 其余走作用域链，和 AST 同一套语义
             }
             drop();
+            return true;
+        }
+        case Stmt::K::Print: {
+            emit(BC_LINE, s->line);
+            for (const auto& a : s->args) {
+                if (!expr(a)) return false;
+                push();
+            }
+            emit(BC_PRINT, (int)s->args.size());
+            depth -= (int)s->args.size();
             return true;
         }
         case Stmt::K::Return: {
@@ -5148,6 +5180,39 @@ Value Interpreter::runCode(const std::vector<Instr>& code, const std::vector<dou
             case BC_JMP:
                 pc = (size_t)in.a;
                 break;
+            case BC_JNZ: {
+                bool t = truthy(gVStack[base + sp - 1]);
+                --sp;
+                pc = t ? (size_t)in.a : pc + 1;
+                break;
+            }
+            case BC_BOOL: {
+                Value& a = gVStack[base + sp - 1];
+                bool t = truthy(a);
+                vmSetBool(a, t);
+                ++pc;
+                break;
+            }
+            case BC_PUSHT:
+                vmSetBool(gVStack[base + sp], true);
+                ++sp; ++pc;
+                break;
+            case BC_PUSHF:
+                vmSetBool(gVStack[base + sp], false);
+                ++sp; ++pc;
+                break;
+            case BC_PRINT: {
+                int argc = in.a;
+                string out;
+                for (int i = 0; i < argc; ++i) {
+                    if (i) out += " ";
+                    out += toText(gVStack[base + sp - (size_t)argc + (size_t)i]);
+                }
+                std::cout << out << "\n";
+                sp -= (size_t)argc;
+                ++pc;
+                break;
+            }
             case BC_JZ: {
                 bool t = truthy(gVStack[base + sp - 1]);
                 --sp;
