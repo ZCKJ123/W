@@ -11291,16 +11291,9 @@ Interpreter::Interpreter() {
         int W = 0, H = 0;        // 输出尺寸
         ~VideoDecoder() { if (rd) rd->Release(); }
     };
-    static auto vdOpen = [](VideoDecoder& d, const string& full, int targetW, string& err) -> bool {
-        HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        (void)hr;
-        if (FAILED(MFStartup(MF_VERSION))) { err = "MFStartup 失败"; return false; }
-        IMFAttributes* attrs = nullptr;
-        MFCreateAttributes(&attrs, 1);
-        if (attrs) attrs->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
-        hr = MFCreateSourceReaderFromURL(utf8ToWide(full).c_str(), attrs, &d.rd);
-        if (attrs) attrs->Release();
-        if (FAILED(hr) || !d.rd) { err = "打不开视频文件"; return false; }
+    // 读取器建好后统一配成 RGB32、拿尺寸帧率、算抽稀步长（摄像头和文件共用这一段）
+    static auto vdSetup = [](VideoDecoder& d, int targetW, string& err) -> bool {
+        HRESULT hr = S_OK;
         IMFMediaType* out = nullptr;
         MFCreateMediaType(&out);
         out->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
@@ -11324,6 +11317,19 @@ Interpreter::Interpreter() {
         d.W = (int)((d.nw + (UINT32)d.sx - 1) / (UINT32)d.sx);
         d.H = (int)((d.nh + (UINT32)d.sx - 1) / (UINT32)d.sx);
         return true;
+    };
+    // 从文件打开
+    static auto vdOpen = [](VideoDecoder& d, const string& full, int targetW, string& err) -> bool {
+        HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        (void)hr;
+        if (FAILED(MFStartup(MF_VERSION))) { err = "MFStartup 失败"; return false; }
+        IMFAttributes* attrs = nullptr;
+        MFCreateAttributes(&attrs, 1);
+        if (attrs) attrs->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
+        hr = MFCreateSourceReaderFromURL(utf8ToWide(full).c_str(), attrs, &d.rd);
+        if (attrs) attrs->Release();
+        if (FAILED(hr) || !d.rd) { err = "打不开视频文件"; return false; }
+        return vdSetup(d, targetW, err);
     };
     // 按秒跳转再取一帧；跳转后读到的第一帧就是目标时间之后的那一帧
     static auto vdGrab = [](VideoDecoder& d, double seconds,
@@ -11569,6 +11575,123 @@ Interpreter::Interpreter() {
     registerBuiltin("视频关闭", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
         long long id = needIndex(a[0], "视频关闭", line);
         vdStore.erase(id);
+        return vNone();
+    });
+    // MinGW 的 mfplat 导入库没导出 MFEnumDeviceSources，这里运行时从 dll 取，链接一定过
+    typedef HRESULT(WINAPI* PFN_MFEnumDeviceSources)(IMFAttributes*, IMFActivate***, UINT32*);
+    static auto enumCameras = []() -> PFN_MFEnumDeviceSources {
+        static PFN_MFEnumDeviceSources fn = nullptr;
+        static bool tried = false;
+        if (!tried) {
+            tried = true;
+            HMODULE h = LoadLibraryW(L"mfplat.dll");
+            if (h) fn = (PFN_MFEnumDeviceSources)GetProcAddress(h, "MFEnumDeviceSources");
+        }
+        return fn;
+    };    // ---------- 摄像头：离线录制与实时取帧（复用同一个解码器）----------
+    // 相机列表 只枚举，不开采集；真正打开要显式 相机打开，用完必须 相机关闭。
+    static std::map<long long, std::shared_ptr<VideoDecoder>> camStore;
+    static long long camNext = 1;
+    registerBuiltin("相机列表", 0, 0, [&](Interpreter&, vector<Value>&, int line) -> Value {
+        auto out = std::make_shared<List>();
+        HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        bool com = SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE;
+        if (FAILED(MFStartup(MF_VERSION)))
+            throw WenError("运行时错误", line, 0, "相机列表：MFStartup 失败");
+        IMFAttributes* attr = nullptr;
+        MFCreateAttributes(&attr, 1);
+        IMFActivate** devs = nullptr;
+        UINT32 count = 0;
+        if (attr && SUCCEEDED(attr->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
+                                            MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID)) &&
+            (enumCameras() && SUCCEEDED(enumCameras()(attr, &devs, &count)))) {
+            for (UINT32 i = 0; i < count; ++i) {
+                WCHAR* nm = nullptr;
+                UINT32 len = 0;
+                if (SUCCEEDED(devs[i]->GetAllocatedString(MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, &nm, &len)) && nm) {
+                    out->items.push_back(vStr(wideToUtf8(std::wstring(nm, len))));
+                    CoTaskMemFree(nm);
+                } else {
+                    out->items.push_back(vStr("摄像头 " + std::to_string(i)));
+                }
+                devs[i]->Release();
+            }
+            CoTaskMemFree(devs);
+        }
+        if (attr) attr->Release();
+        MFShutdown();
+        if (com) CoUninitialize();
+        return vList(out);
+    });
+    registerBuiltin("相机打开", 1, 2, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long want = needIndex(a[0], "相机打开", line);
+        int targetW = a.size() >= 2 ? (int)needIndex(a[1], "相机打开", line) : 0;
+        HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        bool com = SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE;
+        if (FAILED(MFStartup(MF_VERSION)))
+            throw WenError("运行时错误", line, 0, "相机打开：MFStartup 失败");
+        IMFAttributes* attr = nullptr;
+        MFCreateAttributes(&attr, 1);
+        IMFActivate** devs = nullptr;
+        UINT32 count = 0;
+        if (!attr || FAILED(attr->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
+                                          MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID)) ||
+            !enumCameras() || FAILED(enumCameras()(attr, &devs, &count)) || count == 0) {
+            if (attr) attr->Release();
+            MFShutdown();
+            if (com) CoUninitialize();
+            throw WenError("运行时错误", line, 0,
+                           "相机打开：这台机器上没有可用的摄像头（先用 相机列表 看看）");
+        }
+        if (want < 0) want = 0;
+        if (want >= (long long)count) want = count - 1;
+        IMFMediaSource* src = nullptr;
+        hr = devs[want]->ActivateObject(IID_IMFMediaSource, (void**)&src);
+        for (UINT32 i = 0; i < count; ++i) devs[i]->Release();
+        CoTaskMemFree(devs);
+        attr->Release();
+        if (FAILED(hr) || !src) {
+            MFShutdown();
+            if (com) CoUninitialize();
+            throw WenError("运行时错误", line, 0, "相机打开：激活摄像头失败（可能被别的程序占用了）");
+        }
+        auto d = std::make_shared<VideoDecoder>();
+        hr = MFCreateSourceReaderFromMediaSource(src, nullptr, &d->rd);
+        src->Release();
+        if (FAILED(hr) || !d->rd) {
+            MFShutdown();
+            if (com) CoUninitialize();
+            throw WenError("运行时错误", line, 0, "相机打开：建读取器失败");
+        }
+        string err;
+        if (!vdSetup(*d, targetW, err)) {
+            MFShutdown();
+            if (com) CoUninitialize();
+            throw WenError("运行时错误", line, 0, "相机打开：" + err);
+        }
+        long long id = camNext++;
+        camStore[id] = d;
+        return vNum((double)id);
+    });
+    registerBuiltin("相机取帧", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "相机取帧", line);
+        auto it = camStore.find(id);
+        if (it == camStore.end()) throw WenError("运行时错误", line, 0, "相机取帧：相机句柄无效");
+        std::vector<unsigned char> rgb;
+        string err;
+        if (!vdGrab(*it->second, 0, rgb, err))   // 0 = 不跳转，直接取下一帧（实时）
+            throw WenError("运行时错误", line, 0, "相机取帧：" + err);
+        auto buf = std::make_shared<std::vector<unsigned char>>(std::move(rgb));
+        auto d = std::make_shared<Dict>();
+        d->items["宽"] = vNum(it->second->W);
+        d->items["高"] = vNum(it->second->H);
+        d->items["通道"] = vNum(3);
+        d->items["像素"] = vBytes(buf);
+        Value o; o.type = VT::Dict; o.dict = d; return o;
+    });
+    registerBuiltin("相机关闭", 1, 1, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "相机关闭", line);
+        camStore.erase(id);
         return vNone();
     });    static auto decodeAudio = [](const string& full, WavInfo& w, string& err) -> bool {
         HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
