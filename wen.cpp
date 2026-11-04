@@ -18289,10 +18289,9 @@ Interpreter::Interpreter() {
         const float BIG = 1e7f;
         // 临时缓冲提到外面复用：200³ 要做 12 万条线的变换，
         // 每条线都新建三个 vector 光分配就是几十万次
-        std::vector<int> vv;
-        std::vector<double> zz;
-        std::vector<float> outv;
-        auto dt1d = [&](std::vector<float>& f) {
+        // 每条线自带一份 scratch，多线程才不会互相踩
+        auto dt1d = [&](std::vector<float>& f, std::vector<int>& vv,
+                        std::vector<double>& zz, std::vector<float>& outv) {
             int len = (int)f.size();
             vv.resize(len);
             zz.resize(len + 1);
@@ -18321,31 +18320,46 @@ Interpreter::Interpreter() {
         auto edt = [&](const std::vector<unsigned char>& seeds) -> std::vector<float> {
             std::vector<float> f(n);
             for (size_t i = 0; i < n; ++i) f[i] = seeds[i] ? 0.0f : BIG;
-            std::vector<float> line;
+            // 三趟 1D 变换：每条线彼此独立，按线段分发到多线程。
+            // 行/列/层的索引差统一写成 base + k*stride，三种遍历共用一个 pass。
+            unsigned nt = std::thread::hardware_concurrency();
+            if (nt == 0) nt = 4;
+            if (nt > 16) nt = 16;
+            if (n < 4000000) nt = 1;
+            auto pass = [&](int count, int len, auto baseOf, size_t stride) {
+                auto work = [&](int from, int to) {
+                    std::vector<int> lvv;
+                    std::vector<double> lzz;
+                    std::vector<float> lout;
+                    std::vector<float> line((size_t)len);
+                    for (int li = from; li < to; ++li) {
+                        size_t base = baseOf(li);
+                        for (int k = 0; k < len; ++k) line[(size_t)k] = f[base + (size_t)k * stride];
+                        dt1d(line, lvv, lzz, lout);
+                        for (int k = 0; k < len; ++k) f[base + (size_t)k * stride] = line[(size_t)k];
+                    }
+                };
+                if (nt <= 1 || count < 64) { work(0, count); return; }
+                std::vector<std::thread> th;
+                int chunk = (count + (int)nt - 1) / (int)nt;
+                for (unsigned t = 0; t < nt; ++t) {
+                    int from = (int)t * chunk;
+                    int to = from + chunk;
+                    if (to > count) to = count;
+                    if (from >= to) break;
+                    th.emplace_back(work, from, to);
+                }
+                for (auto& th1 : th) th1.join();
+            };
             // 沿列（c）
-            line.resize(C);
-            for (int l = 0; l < L; ++l)
-                for (int r = 0; r < R; ++r) {
-                    for (int c = 0; c < C; ++c) line[c] = f[(size_t)((l * R + r) * C + c)];
-                    dt1d(line);
-                    for (int c = 0; c < C; ++c) f[(size_t)((l * R + r) * C + c)] = line[c];
-                }
+            pass(L * R, C, [C](int li) { return (size_t)li * (size_t)C; }, 1);
             // 沿行（r）
-            line.resize(R);
-            for (int l = 0; l < L; ++l)
-                for (int c = 0; c < C; ++c) {
-                    for (int r = 0; r < R; ++r) line[r] = f[(size_t)((l * R + r) * C + c)];
-                    dt1d(line);
-                    for (int r = 0; r < R; ++r) f[(size_t)((l * R + r) * C + c)] = line[r];
-                }
+            pass(L * C, R, [C, R](int li) {
+                size_t l = (size_t)(li / C), c = (size_t)(li % C);
+                return l * (size_t)R * (size_t)C + c;
+            }, (size_t)C);
             // 沿层（l）
-            line.resize(L);
-            for (int r = 0; r < R; ++r)
-                for (int c = 0; c < C; ++c) {
-                    for (int l = 0; l < L; ++l) line[l] = f[(size_t)((l * R + r) * C + c)];
-                    dt1d(line);
-                    for (int l = 0; l < L; ++l) f[(size_t)((l * R + r) * C + c)] = line[l];
-                }
+            pass(R * C, L, [](int li) { return (size_t)li; }, (size_t)R * (size_t)C);
             return f;
         };
         std::vector<unsigned char> emptySet(n, 0), solidSet(n, 0);
