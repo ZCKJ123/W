@@ -2108,6 +2108,25 @@ struct Scope {
         out = fast[(size_t)i];
         return true;
     }
+    // 只读快槽/本人帧里的那一份，不往上找：字节码用它省掉 200 字节的 Value 拷贝。
+    Value* fastPtr(int i) {
+        if (i < 0 || (size_t)i >= fast.size() || !fastDefined[(size_t)i]) return nullptr;
+        return &fast[(size_t)i];
+    }
+    Value* localPtr(SymId id) {
+        if (smallMode) {
+            for (auto& kv : svars)
+                if (kv.first == id) return &kv.second;
+            return nullptr;
+        }
+        auto it = idVars.find(id);
+        if (it != idVars.end()) return &it->second;
+        auto sit = idSlot.find(id);
+        if (sit != idSlot.end() && (size_t)sit->second < fast.size() &&
+            fastDefined[(size_t)sit->second])
+            return &fast[(size_t)sit->second];
+        return nullptr;
+    }
     void fastSet(int i, Value v) {
         if (i < 0) return;
         if ((size_t)i >= fast.size()) { fast.resize((size_t)i + 1); fastDefined.resize((size_t)i + 1, 0); }
@@ -2162,7 +2181,9 @@ enum : unsigned char {
     BC_RETN,         // 返回 空
     BC_LINE,         // a = 行号（只用于报错定位，顺便记语句数）
     BC_LC,           // 取被调用者（不做零参数自动调用）a = SymId, b = 全局槽或 -1
-    BC_CALL          // a = 实参个数：栈上是 被调用者 + 实参，结果压回原处
+    BC_CALL,         // a = 实参个数：栈上是 被调用者 + 实参，结果压回原处
+    BC_GN,           // 运算位置读全局：只读 num，省掉整份 Value 拷贝 a = 槽号, b = SymId
+    BC_LN            // 运算位置按名字读：同上，a = SymId
 };
 struct Instr { unsigned char op = 0; int a = 0; int b = 0; };
 
@@ -4785,7 +4806,7 @@ struct WenAsm {
         for (SymId p : params) if (p == id) return true;
         return false;
     }
-    bool expr(const ExprPtr& e);
+    bool expr(const ExprPtr& e, bool numCtx = false);
     bool stmt(const StmtPtr& s);
     bool block(const std::vector<StmtPtr>& b) {
         for (const auto& st : b) if (!stmt(st)) return false;
@@ -4793,7 +4814,7 @@ struct WenAsm {
     }
 };
 
-bool WenAsm::expr(const ExprPtr& e) {
+bool WenAsm::expr(const ExprPtr& e, bool numCtx) {
     if (!e) return false;
     switch (e->k) {
         case Expr::K::Num:
@@ -4803,15 +4824,22 @@ bool WenAsm::expr(const ExprPtr& e) {
             return true;
         case Expr::K::Var: {
             int gs = topLevel ? topSlotOf(e->sym) : -1;
-            if (gs >= 0) emit(BC_G, gs, (int)e->sym);
-            else emit(BC_L, (int)e->sym);
+            if (numCtx) {
+                // 运算位置：运行时只读 num，类型不是数字再退回完整读取
+                if (gs >= 0) emit(BC_GN, gs, (int)e->sym);
+                else emit(BC_LN, (int)e->sym);
+            } else if (gs >= 0) {
+                emit(BC_G, gs, (int)e->sym);
+            } else {
+                emit(BC_L, (int)e->sym);
+            }
             push();
             return true;
         }
         case Expr::K::Unary: {
             if (e->args.size() != 1) return false;
-            if (e->op == "+") return expr(e->args[0]);   // 正号不改值
-            if (!expr(e->args[0])) return false;
+            if (e->op == "+") return expr(e->args[0], numCtx);   // 正号不改值
+            if (!expr(e->args[0], true)) return false;
             drop();
             if (e->op == "-") { emit(BC_NEG); push(); return true; }
             if (e->op == "非") { emit(BC_NOT); push(); return true; }
@@ -4821,6 +4849,7 @@ bool WenAsm::expr(const ExprPtr& e) {
             if (e->args.size() != 2) return false;
             unsigned char op = 0;
             const string& o = e->op;
+            bool arith = true;
             if (o == "+") op = BC_ADD;
             else if (o == "-") op = BC_SUB;
             else if (o == "*") op = BC_MUL;
@@ -4830,11 +4859,11 @@ bool WenAsm::expr(const ExprPtr& e) {
             else if (o == "<=") op = BC_LE;
             else if (o == ">") op = BC_GT;
             else if (o == ">=") op = BC_GE;
-            else if (o == "==" || o == "=") op = BC_EQ;
-            else if (o == "!=") op = BC_NE;
+            else if (o == "==" || o == "=") { op = BC_EQ; arith = false; }
+            else if (o == "!=") { op = BC_NE; arith = false; }
             else return false;   // 且/或（短路）、整除、幂等先不编译
-            if (!expr(e->args[0])) return false;
-            if (!expr(e->args[1])) return false;
+            if (!expr(e->args[0], arith)) return false;
+            if (!expr(e->args[1], arith)) return false;
             drop();
             emit(op);
             return true;
@@ -4991,6 +5020,16 @@ Value Interpreter::runCode(const std::vector<Instr>& code, const std::vector<dou
 
     size_t sp = 0;
     size_t pc = 0;
+    // 完整读一个变量（带零参数自动调用），AST 的 Var 分支同语义
+    auto loadInto = [&](Value& d, bool useSlot, int slot, SymId sym) {
+        bool got = false;
+        if (useSlot && globals->fastGet(slot, d)) got = true;
+        if (!got && !scope->lookup(sym, d)) undefinedName(symbolName(sym), gLastLine);
+        if (d.type == VT::Func && d.callable && d.callable->zeroArgCall()) {
+            vector<Value> noArgs;
+            d = callValue(d, noArgs, gLastLine);
+        }
+    };
     for (;;) {
         if (pc >= code.size()) return vNone();
         const Instr& in = code[pc];
@@ -5007,16 +5046,22 @@ Value Interpreter::runCode(const std::vector<Instr>& code, const std::vector<dou
             case BC_L:
             case BC_G: {
                 Value& d = gVStack[base + sp];
-                bool got = false;
-                if (in.op == BC_G && globals->fastGet(in.a, d)) got = true;
-                if (!got && !scope->lookup((SymId)(in.op == BC_G ? in.b : in.a), d)) {
-                    SymId id = (SymId)(in.op == BC_G ? in.b : in.a);
-                    undefinedName(symbolName(id), gLastLine);
-                }
-                // 零参数函数/内置：名字后面没写括号也直接调用（同 AST 的 Var 分支）
-                if (d.type == VT::Func && d.callable && d.callable->zeroArgCall()) {
-                    vector<Value> noArgs;
-                    d = callValue(d, noArgs, gLastLine);
+                bool useSlot = (in.op == BC_G);
+                loadInto(d, useSlot, in.a, (SymId)(useSlot ? in.b : in.a));
+                ++sp; ++pc;
+                break;
+            }
+            case BC_GN:
+            case BC_LN: {
+                // 运算位置：快槽里是数字就直接取 num，省掉整份 200 字节拷贝
+                Value& d = gVStack[base + sp];
+                bool useSlot = (in.op == BC_GN);
+                SymId sym = (SymId)(useSlot ? in.b : in.a);
+                Value* p = useSlot ? globals->fastPtr(in.a) : scope->localPtr(sym);
+                if (p && p->type == VT::Num) {
+                    vmSetNum(d, p->num);
+                } else {
+                    loadInto(d, useSlot, in.a, sym);
                 }
                 ++sp; ++pc;
                 break;
