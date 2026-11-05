@@ -36,3 +36,8 @@ _*.txt
 
 # 本地截图，不上传
 截图/
+
+# scratch drafts and generated binaries (not for publishing)
+_*.鑴氭湰
+*.bin
+渚嬪瓙/_*.stl
