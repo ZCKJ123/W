@@ -12277,6 +12277,13 @@ Interpreter::Interpreter() {
         return vFunc(fn);
 #endif
     });
+    // 自举运行时槽位：自举库生成的码假定 PE 镜像 0x140000000 下 0x7F0xx 处是导入表槽位，
+    // 用 call [rip+disp] 间接调用。机器函数不在 PE 里，这里把那一页映射出来并填上等价实现，
+    // 让自举运行时（字符串/列表/浮点）能在机器函数里跑起来。
+    static void* (*const selfAllocFn)(size_t) =
+        +[](size_t n) -> void* { return std::malloc(n ? n : 1); };
+    static void* (*const selfZeroFn)(void*, int, size_t) =
+        +[](void* p, int, size_t n) -> void* { std::memset(p, 0, n); return p; };
     registerBuiltin("机器函数", 1, 2, [this](Interpreter&, vector<Value>& a, int line) -> Value {
 #if !defined(_WIN32) || !defined(_M_X64)
         throw WenError("运行时错误", line, 0, "机器函数只支持 Windows x64");
@@ -12295,9 +12302,14 @@ Interpreter::Interpreter() {
         }
         if (hi>=0) throw WenError("运行时错误", line, 0, "机器码十六进制位数必须是偶数");
         if (bytes.empty()) throw WenError("运行时错误", line, 0, "机器码为空");
-        void* mem=VirtualAlloc(nullptr, bytes.size(), MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        // 自举库按「码起点在镜像 0x1014 处」计算 call [rip+disp]，所以槽位的相对偏移是
+        // 0x7F060-0x1014 和 0x7F068-0x1014，机器函数里也要按这个相对位置摆放。
+        size_t total = bytes.size() + 0x80000;
+        void* mem=VirtualAlloc(nullptr, total, MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE);
         if(!mem) throw WenError("运行时错误", line, 0, "机器码分配失败");
         memcpy(mem,bytes.data(),bytes.size());
+        *(void**)((unsigned char*)mem + (0x7F060 - 0x1014)) = (void*)selfAllocFn;
+        *(void**)((unsigned char*)mem + (0x7F068 - 0x1014)) = (void*)selfZeroFn;
         FlushInstructionCache(GetCurrentProcess(),mem,bytes.size());
         auto fn=std::make_shared<NativeFunction>();
         fn->name="机器函数"; fn->code=mem; fn->codeSize=bytes.size(); fn->arity=arity;
