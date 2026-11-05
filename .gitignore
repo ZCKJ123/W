@@ -41,3 +41,6 @@ _*.txt
 _*.脚本
 *.bin
 例子/_*.stl
+
+# self-compile scratch artifacts
+工程/_*
