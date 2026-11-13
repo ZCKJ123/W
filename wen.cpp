@@ -9516,12 +9516,21 @@ static void bigGuard(long double digits, int line = 0) {
 static Value uiNew(Interpreter&, vector<Value>& a, int line);
 static Value uiClear(Interpreter&, vector<Value>& a, int line);
 static Value uiRect(Interpreter&, vector<Value>& a, int line);
+static Value uiBlit(Interpreter&, vector<Value>& a, int line);
+static Value vpSkyGradient(Interpreter&, vector<Value>& a, int line);
+static Value vpSkyRidge(Interpreter&, vector<Value>& a, int line);
+static Value vpSky(Interpreter&, vector<Value>& a, int line);
+static Value vpSun(Interpreter&, vector<Value>& a, int line);
 static Value uiLine(Interpreter&, vector<Value>& a, int line);
 static Value uiText(Interpreter&, vector<Value>& a, int line);
 static Value uiRefresh(Interpreter&, vector<Value>& a, int line);
 static Value uiEvent(Interpreter&, vector<Value>& a, int line);
 static Value uiClose(Interpreter&, vector<Value>& a, int line);
 static Value uiSize(Interpreter&, vector<Value>& a, int line);
+static Value uiLockMouse(Interpreter&, vector<Value>& a, int line);
+static Value uiMouseDelta(Interpreter&, vector<Value>& a, int line);
+static Value uiMouseLocked(Interpreter&, vector<Value>& a, int line);
+static Value detectVR(Interpreter&, vector<Value>& a, int line);
 
 static std::complex<double> needComplex(const Value& v, int line) {
     auto d = needDict(v, "复数", line);
@@ -9559,12 +9568,28 @@ Interpreter::Interpreter() {
     registerBuiltin("界面新建", 3, 3, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return uiNew(vm, a, line); });
     registerBuiltin("界面清屏", 1, 1, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return uiClear(vm, a, line); });
     registerBuiltin("界面矩形", 5, 5, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return uiRect(vm, a, line); });
+    registerBuiltin("界面贴视口", 4, 4, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return uiBlit(vm, a, line); });
+    registerBuiltin("视口竖渐变", 5, 5, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return vpSkyGradient(vm, a, line); });
+    registerBuiltin("视口远山", 8, 8, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return vpSkyRidge(vm, a, line); });
+    registerBuiltin("视口天空", 6, 6, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return vpSky(vm, a, line); });
+    extern Value vpCloud(Interpreter&, vector<Value>&, int);
+    extern Value vpCloudExp(Interpreter&, vector<Value>&, int);
+    extern Value vpCloudBody(Interpreter&, vector<Value>&, int);
+    registerBuiltin("视口太阳", 8, 8, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return vpSun(vm, a, line); });
+    registerBuiltin("视口云带", 8, 8, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return vpCloud(vm, a, line); });
+    registerBuiltin("视口云实验", 8, 8, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return vpCloudExp(vm, a, line); });
+    registerBuiltin("视口云体", 11, 11, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return vpCloudBody(vm, a, line); });
+    registerBuiltin("视口竖渐变", 5, 5, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return vpSkyGradient(vm, a, line); });
     registerBuiltin("界面线", 5, 5, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return uiLine(vm, a, line); });
     registerBuiltin("界面文本", 4, 5, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return uiText(vm, a, line); });
     registerBuiltin("界面刷新", 0, 0, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return uiRefresh(vm, a, line); });
     registerBuiltin("界面事件", 0, 0, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return uiEvent(vm, a, line); });
     registerBuiltin("界面关闭", 0, 0, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return uiClose(vm, a, line); });
     registerBuiltin("界面尺寸", 0, 0, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return uiSize(vm, a, line); });
+    registerBuiltin("界面锁定鼠标", 1, 1, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return uiLockMouse(vm, a, line); });
+    registerBuiltin("界面鼠标位移", 0, 0, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return uiMouseDelta(vm, a, line); });
+    registerBuiltin("界面鼠标锁定中", 0, 0, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return uiMouseLocked(vm, a, line); });
+    registerBuiltin("检测VR", 0, 0, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return detectVR(vm, a, line); });
 
     // ---------- 核心（不需要依赖）---------
     registerBuiltin("调用", 2, 2, [](Interpreter& vm, vector<Value>& a, int line) -> Value {
@@ -26618,9 +26643,18 @@ struct WenUiState {
     vector<WenUiText> texts;
     std::deque<WenUiEvent> events;
     bool closed = false;
+    bool mouseLock = false;
+    int mdx = 0, mdy = 0;
+    int lastX = -1, lastY = -1;
+    bool justCaptured = false;
+    /* 不捕获时的悬停跟随：只有窗口在前台才把鼠标移动算成视角增量。 */
+    bool hoverInit = false;
     void reset() {
+        /* 锁着鼠标直接退出会把系统光标留在隐藏状态，先还原再销毁 */
+        if (mouseLock) { ReleaseCapture(); ShowCursor(TRUE); mouseLock = false; }
         hwnd = nullptr; w = 0; h = 0;
         bgr.clear(); back.clear(); texts.clear(); events.clear(); closed = false;
+        mouseLock = false; mdx = mdy = 0; lastX = lastY = -1; justCaptured = false;
     }
 };
 static WenUiState gUi;
@@ -26706,6 +26740,50 @@ static LRESULT CALLBACK uiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
             }
             return 0;
+        case WM_MOUSEMOVE: {
+            int mx = (short)LOWORD(lp), my = (short)HIWORD(lp);
+            if (!gUi.mouseLock) {
+                /* 不抢光标也能转视角：窗口在前台时，用窗口内的绝对移动量算增量。
+                   一旦用户切到别的程序，立刻停止累加并清掉残留，鼠标想去哪就去哪。 */
+                if (GetForegroundWindow() == hwnd) {
+                    if (gUi.hoverInit) {
+                        gUi.mdx += mx - gUi.lastX;
+                        gUi.mdy += my - gUi.lastY;
+                    }
+                    gUi.lastX = mx; gUi.lastY = my; gUi.hoverInit = true;
+                } else {
+                    gUi.hoverInit = false; gUi.mdx = 0; gUi.mdy = 0;
+                }
+                return DefWindowProcW(hwnd, msg, wp, lp);
+            }
+            RECT cr; GetClientRect(hwnd, &cr);
+            POINT c{ (cr.left + cr.right) / 2, (cr.top + cr.bottom) / 2 };
+            ClientToScreen(hwnd, &c);
+            POINT p; GetCursorPos(&p);
+            if (gUi.justCaptured) {
+                gUi.justCaptured = false; gUi.mdx = 0; gUi.mdy = 0;
+                SetCursorPos(c.x, c.y); gUi.lastX = mx; gUi.lastY = my; return 0;
+            }
+            gUi.mdx += p.x - c.x; gUi.mdy += p.y - c.y;
+            SetCursorPos(c.x, c.y);
+            gUi.lastX = mx; gUi.lastY = my;
+            return 0;
+        }
+        case WM_RBUTTONDOWN: {
+            if (!gUi.mouseLock) {
+                SetCapture(hwnd); ShowCursor(FALSE);
+                gUi.mouseLock = true; gUi.justCaptured = true; gUi.mdx = gUi.mdy = 0;
+                RECT cr; GetClientRect(hwnd, &cr);
+                POINT c{ (cr.left + cr.right) / 2, (cr.top + cr.bottom) / 2 };
+                ClientToScreen(hwnd, &c); SetCursorPos(c.x, c.y);
+            } else { ReleaseCapture(); ShowCursor(TRUE); gUi.mouseLock = false; }
+            return 0;
+        }
+        case WM_KILLFOCUS: {
+            if (gUi.mouseLock) { ReleaseCapture(); ShowCursor(TRUE); gUi.mouseLock = false; }
+            gUi.hoverInit = false; gUi.mdx = 0; gUi.mdy = 0;
+            return DefWindowProcW(hwnd, msg, wp, lp);
+        }
         case WM_LBUTTONDOWN: {
             SetForegroundWindow(hwnd);
             SetFocus(hwnd);
@@ -26786,6 +26864,2522 @@ static Value uiRect(Interpreter&, vector<Value>& a, int line) {
             gUi.back[i + 1] = (unsigned char)((c >> 8) & 255);
             gUi.back[i + 2] = (unsigned char)((c >> 16) & 255);
         }
+    return vNone();
+}
+static Value uiBlit(Interpreter&, vector<Value>& a, int line) {
+    auto d = vpDict(a[0], line);
+    int sw = (int)needNum(d->items.at("宽"), "视口", line);
+    int sh = (int)needNum(d->items.at("高"), "视口", line);
+    int bei = (int)needNum(a[1], "界面贴视口", line);
+    if (bei < 1) bei = 1;
+    int ox = (int)needNum(a[2], "界面贴视口", line);
+    int oy = (int)needNum(a[3], "界面贴视口", line);
+    auto& sp = vpPixels(d);
+    if ((long long)gUi.back.size() != (long long)gUi.w * gUi.h * 3)
+        gUi.back.assign((size_t)((long long)gUi.w * gUi.h * 3), 0);
+    int dw = sw * bei, dh = sh * bei;
+    for (int yy = 0; yy < dh; ++yy) {
+        int ty = oy + yy;
+        if (ty < 0 || ty >= gUi.h) continue;
+        int sy = yy / bei;
+        if (sy >= sh) sy = sh - 1;
+        const unsigned char* src = &sp[(size_t)sy * sw * 3];
+        size_t row = (size_t)ty * gUi.w * 3;
+        for (int xx = 0; xx < dw; ++xx) {
+            int tx = ox + xx;
+            if (tx < 0 || tx >= gUi.w) continue;
+            int sx = xx / bei;
+            if (sx >= sw) sx = sw - 1;
+            const unsigned char* s = src + (size_t)sx * 3;
+            size_t ti = row + (size_t)tx * 3;
+            gUi.back[ti] = s[2];
+            gUi.back[ti + 1] = s[1];
+            gUi.back[ti + 2] = s[0];
+        }
+    }
+    return vNone();
+}
+static Value vpSky(Interpreter&, vector<Value>& a, int line) {
+    auto d = vpDict(a[0], line);
+    int w = (int)needNum(d->items.at("宽"), "视口", line);
+    int h = (int)needNum(d->items.at("高"), "视口", line);
+    double pitch = needNum(a[1], "视口天空", line);
+    double fov = needNum(a[2], "视口天空", line);
+    int cTop = vpColor(a[3], line), cHor = vpColor(a[4], line), cBot = vpColor(a[5], line);
+    if (fov < 0.02) fov = 0.02;
+    if (fov > 2.8) fov = 2.8;
+    auto& sp = vpPixels(d);
+    if ((long long)sp.size() != (long long)w * h * 3)
+        sp.assign((size_t)((long long)w * h * 3), 0);
+    int rt = (cTop >> 16) & 255, gt = (cTop >> 8) & 255, bt = cTop & 255;
+    int rh = (cHor >> 16) & 255, gh = (cHor >> 8) & 255, bh = cHor & 255;
+    int rb = (cBot >> 16) & 255, gb = (cBot >> 8) & 255, bb = cBot & 255;
+    double hp = 1.5707963;
+    for (int y = 0; y < h; ++y) {
+        double rel = 0.5 - (double)y / (double)(h > 1 ? h - 1 : 1);
+        double ang = pitch + rel * fov;
+        double k = ang / hp;
+        if (k > 1.0) k = 1.0;
+        if (k < -1.0) k = -1.0;
+        int r, g, b;
+        if (k >= 0.0) {
+            /* 11 次幂把地平色压缩在 10° 以内，抬头时一条窄带里从米黄跳到深蓝，
+               地平线上下读成两个半球。改成按仰角铺满可见范围：0° 全是地平色，
+               到 49° 才变成天顶色，上下一整片连续。 */
+            double u = ang / 0.85;
+            if (u > 1.0) u = 1.0;
+            if (u < 0.0) u = 0.0;
+            double t = 1.0 - u * u * (3.0 - 2.0 * u);
+            r = rt + (int)((rh - rt) * t);
+            g = gt + (int)((gh - gt) * t);
+            b = bt + (int)((bh - bt) * t);
+        } else {
+            double t = pow(-k, 0.55);
+            r = rh + (int)((rb - rh) * t);
+            g = gh + (int)((gb - gh) * t);
+            b = bh + (int)((bb - bh) * t);
+        }
+        unsigned char* row = &sp[(size_t)y * w * 3];
+        for (int x = 0; x < w; ++x) {
+            row[x * 3] = (unsigned char)(r < 0 ? 0 : (r > 255 ? 255 : r));
+            row[x * 3 + 1] = (unsigned char)(g < 0 ? 0 : (g > 255 ? 255 : g));
+            row[x * 3 + 2] = (unsigned char)(b < 0 ? 0 : (b > 255 ? 255 : b));
+        }
+    }
+    return vNone();
+}
+
+/* 视口太阳：在世界方向放一个日盘 + 光晕。
+   参数：视口, 相机偏航, 太阳方位, 太阳仰角, 相机俯仰, 垂直视场角, 角半径, 颜色
+   位置由视线角反算：y 看俯仰差，x 看方位差；半径按角径换算像素。 */
+
+/* 视口云带：在地平线以上一段仰角里铺一条带噪声的云层。
+   程序化、不占纹理，成本按列算：噪声每列一次，纵向只做带内的柔化混合。
+   亮度按太阳方位给：朝太阳那一侧被照亮（低太阳时连颜色一起暖起来），
+   背对侧只剩一层灰紫——夕阳把云染红是靠这一层，不是靠天空。 */
+/* 云型：实验台用它切换不同的三维场生成参数，游戏里始终是 0。
+   独立成一个量而不是写死在函数里，是为了能在同一个机位并排比较。 */
+int g_cloudVariant = 0;
+
+Value vpCloud(Interpreter&, vector<Value>& a, int line) {
+    auto d = vpDict(a[0], line);
+    int w = (int)needNum(d->items.at("宽"), "视口", line);
+    int h = (int)needNum(d->items.at("高"), "视口", line);
+    double yaw   = needNum(a[1], "视口云带", line);
+    double az2   = needNum(a[2], "视口云带", line);
+    double pitch = needNum(a[3], "视口云带", line);
+    double fov   = needNum(a[4], "视口云带", line);
+    double azSun = needNum(a[5], "视口云带", line);
+    double elSun = needNum(a[6], "视口云带", line);
+    int c = vpColor(a[7], line);
+    if (fov < 0.02) fov = 0.02;
+    auto& sp = vpPixels(d);
+    if ((long long)sp.size() != (long long)w * h * 3)
+        sp.assign((size_t)((long long)w * h * 3), 0);
+    double fovH = fov * (double)w / (double)(h > 0 ? h : 1);
+    const double PI = 3.14159265;
+
+    double warmT = 1.0 - (elSun > 0.0 ? elSun : 0.0) / 0.34;
+    if (warmT < 0.0) warmT = 0.0;
+    if (warmT > 1.0) warmT = 1.0;
+    int cr = (c >> 16) & 255, cg = (c >> 8) & 255, cb = c & 255;
+
+    const double ELMIN = 0.10;
+    const double ELMAX = 1.15;
+
+    /* 三维密度场：方位 x 仰角 x 沿视线深度。
+       前两维定云在世界哪个方向、长成什么形状，第三维是视线走过的距离。
+       有第三维，云才有迎光的前表面和背光的内腔——那才叫厚度。
+       只有两维时，所谓 ray-march 是在二维场里斜着走线，永远只有一张皮。 */
+    const int BA = 288;
+    const int BE = 64;
+    const int BR = 24;
+    static std::vector<double> c3;
+    static bool built3 = false;
+    static int builtVar = -100;
+    if (!built3 || builtVar != g_cloudVariant) {
+        built3 = true;
+        builtVar = g_cloudVariant;
+        c3.assign((size_t)BA * BE * BR, 0.0);
+        auto h3 = [](unsigned int x, unsigned int y, unsigned int z) -> double {
+            unsigned int n = x * 374761393u + y * 668265263u + z * 1442695041u;
+            n = (n ^ (n >> 13)) * 1274126177u;
+            n = (n ^ (n >> 16)) * 2246822519u;
+            n = n ^ (n >> 15);
+            return (double)(n & 0xffff) / 65535.0;
+        };
+        /* 三个轴必须等尺度：方位 1 格 = 2*PI/nca 弧度，仰角 1 格 = 1.03/nce 弧度，
+           深度 1 格 = 1.00/ncr 单位。三轴不等尺度，云团就是被压扁的饼，
+           屏幕上怎么看都只有横条。这是长期只出横片的真正原因。 */
+        /* 四档：最低频只负责“哪一整片立成一大坨”，中频给云瓣，高频只碰表面。
+           低频合进中频会让云全是 15° 上下的同尺寸块，看不到一大坨和正常大小的分级。 */
+        /* 三维大范围不规则计算：往整个盒子里散去一批“云核”，让它们的场互相重叠、
+           互相叠加，再做几轮三维扩散把接缝抹顺。这是加源项后扩散方程的定常形状——
+           本身就是三维的、大范围的、不规则的，不是往格子里塞噪声。
+           方位轴环绕 → 云沿一个方向循环时没有接缝。 */
+        int v = g_cloudVariant;
+        if (v < 0) v = 0;
+        if (v > 5) v = 5;
+        /* 云型：同一个生成器，只换几个决定“云长什么样”的量。
+           摆在一排比较，是为了分清到底是哪一项让云不像云，而不是继续瞎调。 */
+        int NSn = 52;
+        double rMul = 1.0, dMul = 1.0, detBase = 0.26, twoBand = 0.0;
+        if (v == 1) { NSn = 26; rMul = 1.60; }
+        if (v == 2) { NSn = 96; rMul = 0.60; }
+        if (v == 3) { NSn = 52; dMul = 2.10; }
+        if (v == 4) { NSn = 52; detBase = 0.04; }
+        if (v == 5) { NSn = 64; twoBand = 1.0; }
+        std::vector<double> kx(NSn), ky(NSn), kz(NSn), kr(NSn), kd(NSn);
+        {
+            unsigned int sd = 12345u;
+            auto rnd1 = [&]() -> double {
+                sd = sd * 1664525u + 1013904223u;
+                return (double)((sd >> 8) & 0xffffu) / 65535.0;
+            };
+            for (int k = 0; k < NSn; ++k) {
+                double big = rnd1();
+                double rr;
+                if (big < 0.10)       rr = 0.40 + rnd1() * 0.18;
+                else if (big < 0.40)  rr = 0.23 + rnd1() * 0.10;
+                else                  rr = 0.12 + rnd1() * 0.08;
+                rr *= rMul;
+                if (rr > 0.95) rr = 0.95;
+                kx[k] = rnd1();
+                if (twoBand > 0.0)
+                    ky[k] = (rnd1() < 0.5 ? 0.16 : 0.74) + rnd1() * 0.10;
+                else
+                    ky[k] = 0.10 + rnd1() * 0.90;
+                kz[k] = 0.12 + rnd1() * 0.72;
+                kr[k] = rr;
+                kd[k] = (0.12 + rnd1() * 0.15) * dMul;
+                if (kd[k] > 0.90) kd[k] = 0.90;
+            }
+        }
+        /* 第一步：大范围不规则核场。往整个三维盒子里散 52 个核，场在整个盒子里
+           互相重叠、叠加——这就是加源项后扩散方程的定常解，本身就是三维、大范围、
+           不规则的。方位轴环绕，云沿一个方向循环时没有接缝。 */
+        for (int ia = 0; ia < BA; ++ia) {
+            double fa = (double)ia / (double)BA;
+            for (int ie = 0; ie < BE; ++ie) {
+                double fe = (double)ie / (double)(BE - 1);
+                double elr = ELMIN + fe * (ELMAX - ELMIN);
+                for (int ir = 0; ir < BR; ++ir) {
+                    double fr = (double)ir / (double)(BR - 1);
+                    double vv = 0.0;
+                    for (size_t k = 0; k < kx.size(); ++k) {
+                        double da = fa - kx[k];
+                        da = da - floor(da + 0.5);
+                        double de = elr - (ELMIN + ky[k] * (ELMAX - ELMIN));
+                        double dr = fr - kz[k];
+                        double ax = da * 2.0 * PI * cos(elr);
+                        double d2 = (ax * ax + de * de) / (kr[k] * kr[k])
+                                  + (dr * dr) / (kd[k] * kd[k]);
+                        if (d2 < 1.0) {
+                            double t2 = 1.0 - d2;
+                            vv += t2 * t2;
+                        }
+                    }
+                    size_t idx = ((size_t)ir * (size_t)BA + (size_t)ia) * (size_t)BE + (size_t)ie;
+                    c3[idx] = vv;
+                }
+            }
+        }
+        /* 一轮三维扩散，抹顺核与核之间那道生硬的交界 */
+        {
+            std::vector<double> tmp(c3.size(), 0.0);
+            for (int ir = 0; ir < BR; ++ir) {
+                int rm = ir > 0 ? ir - 1 : 0;
+                int rp = ir < BR - 1 ? ir + 1 : BR - 1;
+                for (int ia = 0; ia < BA; ++ia) {
+                    int am = (ia - 1 + BA) % BA;
+                    int ap = (ia + 1) % BA;
+                    size_t rowc = (size_t)ir * (size_t)BA;
+                    size_t rowm = (size_t)rm * (size_t)BA;
+                    size_t rowp = (size_t)rp * (size_t)BA;
+                    for (int ie = 0; ie < BE; ++ie) {
+                        int em = ie > 0 ? ie - 1 : 0;
+                        int ep = ie < BE - 1 ? ie + 1 : BE - 1;
+                        size_t o = (rowc + (size_t)ia) * (size_t)BE + (size_t)ie;
+                        double s2 = c3[(rowc + (size_t)am) * BE + ie]
+                                  + c3[(rowc + (size_t)ap) * BE + ie]
+                                  + c3[(rowc + (size_t)ia) * BE + em]
+                                  + c3[(rowc + (size_t)ia) * BE + ep]
+                                  + c3[(rowm + (size_t)ia) * BE + ie]
+                                  + c3[(rowp + (size_t)ia) * BE + ie];
+                        tmp[o] = c3[o] + 0.22 * (s2 * 0.166667 - c3[o]);
+                    }
+                }
+            }
+            c3.swap(tmp);
+        }
+        {
+            double mxk = 1e-9;
+            for (size_t k = 0; k < c3.size(); ++k) if (c3[k] > mxk) mxk = c3[k];
+            double invk = 1.0 / mxk;
+            for (size_t k = 0; k < c3.size(); ++k) c3[k] *= invk;
+        }
+        /* 第二步：细节噪声。核场只决定“哪一大片有云”，不决定云长什么样——
+           只靠核场，每一朵都是标准圆盘，又变成球拼的。三档噪声负责边缘起伏。 */
+        int nca2[3] = { 17, 56, 140 };
+        int nce2[3] = { 5, 16, 40 };
+        int ncr2[3] = { 9, 26, 60 };
+        double amp2[3] = { 0.50, 0.34, 0.16 };
+        std::vector<double> det(c3.size(), 0.0);
+        for (int ia = 0; ia < BA; ++ia) {
+            double fa = (double)ia / (double)BA;
+            for (int ie = 0; ie < BE; ++ie) {
+                double fe = (double)ie / (double)(BE - 1);
+                for (int ir = 0; ir < BR; ++ir) {
+                    double fr = (double)ir / (double)(BR - 1);
+                    double v = 0.0;
+                    for (int q = 0; q < 3; ++q) {
+                        int na = nca2[q], ne = nce2[q], nr = ncr2[q];
+                        double xa = fa * (double)na, xe = fe * (double)ne, xr = fr * (double)nr;
+                        int e0 = (int)floor(xe), r0 = (int)floor(xr), a0i = (int)floor(xa);
+                        if (e0 > ne - 2) e0 = ne - 2;
+                        if (e0 < 0) e0 = 0;
+                        if (r0 > nr - 2) r0 = nr - 2;
+                        if (r0 < 0) r0 = 0;
+                        double ta = xa - floor(xa), te = xe - (double)e0, tr = xr - (double)r0;
+                        if (ta < 0.0) ta = 0.0;
+                        if (te < 0.0) te = 0.0;
+                        if (te > 1.0) te = 1.0;
+                        if (tr < 0.0) tr = 0.0;
+                        if (tr > 1.0) tr = 1.0;
+                        ta = ta * ta * (3.0 - 2.0 * ta);
+                        te = te * te * (3.0 - 2.0 * te);
+                        tr = tr * tr * (3.0 - 2.0 * tr);
+                        int a0w = ((a0i % na) + na) % na;
+                        int a1w = ((a0i + 1) % na + na) % na;
+                        int e1 = e0 + 1, r1 = r0 + 1;
+                        unsigned int sdq = (unsigned)(q * 7919 + 13);
+                        double h000 = h3((unsigned)a0w + sdq, (unsigned)e0, (unsigned)r0);
+                        double h100 = h3((unsigned)a1w + sdq, (unsigned)e0, (unsigned)r0);
+                        double h010 = h3((unsigned)a0w + sdq, (unsigned)e1, (unsigned)r0);
+                        double h110 = h3((unsigned)a1w + sdq, (unsigned)e1, (unsigned)r0);
+                        double h001 = h3((unsigned)a0w + sdq, (unsigned)e0, (unsigned)r1);
+                        double h101 = h3((unsigned)a1w + sdq, (unsigned)e0, (unsigned)r1);
+                        double h011 = h3((unsigned)a0w + sdq, (unsigned)e1, (unsigned)r1);
+                        double h111 = h3((unsigned)a1w + sdq, (unsigned)e1, (unsigned)r1);
+                        double u00 = h000 * (1.0 - ta) + h100 * ta;
+                        double u10 = h010 * (1.0 - ta) + h110 * ta;
+                        double u01 = h001 * (1.0 - ta) + h101 * ta;
+                        double u11 = h011 * (1.0 - ta) + h111 * ta;
+                        double q0 = u00 * (1.0 - te) + u10 * te;
+                        double q1 = u01 * (1.0 - te) + u11 * te;
+                        v += amp2[q] * (q0 * (1.0 - tr) + q1 * tr);
+                    }
+                    size_t idx = ((size_t)ir * (size_t)BA + (size_t)ia) * (size_t)BE + (size_t)ie;
+                    det[idx] = v;
+                }
+            }
+        }
+        {
+            double mnd = 1e9, mxd = -1e9;
+            for (size_t k = 0; k < det.size(); ++k) {
+                if (det[k] < mnd) mnd = det[k];
+                if (det[k] > mxd) mxd = det[k];
+            }
+            if (mxd - mnd > 1e-9) {
+                double invd = 1.0 / (mxd - mnd);
+                for (size_t k = 0; k < det.size(); ++k) det[k] = (det[k] - mnd) * invd;
+            }
+        }
+        /* 合成：核场定“在哪”，细节定“长什么样”。 */
+        for (size_t k = 0; k < c3.size(); ++k) c3[k] = c3[k] * (detBase + (1.0 - detBase) * det[k]);
+        /* 按分位数定标：阈值从此不受核数量、半径这些参数变动影响。 */
+        {
+            const int HB = 1024;
+            std::vector<int> hist(HB, 0);
+            double mn2 = 1e9, mx2 = -1e9;
+            for (size_t k = 0; k < c3.size(); ++k) {
+                if (c3[k] < mn2) mn2 = c3[k];
+                if (c3[k] > mx2) mx2 = c3[k];
+            }
+            if (mx2 - mn2 < 1e-9) mx2 = mn2 + 1e-9;
+            double sc = (double)(HB - 1) / (mx2 - mn2);
+            for (size_t k = 0; k < c3.size(); ++k) {
+                int q = (int)((c3[k] - mn2) * sc);
+                if (q < 0) q = 0;
+                if (q > HB - 1) q = HB - 1;
+                hist[q] += 1;
+            }
+            double total = (double)c3.size();
+            double vLo = mn2, vHi = mx2;
+            double acc2 = 0.0;
+            for (int q = 0; q < HB; ++q) {
+                acc2 += (double)hist[q];
+                if (acc2 >= total * 0.20) { vLo = mn2 + (double)q / sc; break; }
+            }
+            acc2 = 0.0;
+            for (int q = 0; q < HB; ++q) {
+                acc2 += (double)hist[q];
+                if (acc2 >= total * 0.985) { vHi = mn2 + (double)q / sc; break; }
+            }
+            if (vHi - vLo < 1e-6) vHi = vLo + 1e-6;
+            double inv2 = 1.0 / (vHi - vLo);
+            for (size_t k = 0; k < c3.size(); ++k) {
+                double t3 = (c3[k] - vLo) * inv2;
+                if (t3 < 0.0) t3 = 0.0;
+                if (t3 > 1.0) t3 = 1.0;
+                c3[k] = t3;
+            }
+        }
+    }
+
+    auto sample3 = [&](double fa, double fe, double fr) -> double {
+        double xa = fa * (double)BA;
+        double xe = fe * (double)(BE - 1);
+        double xr = fr * (double)(BR - 1);
+        int a0 = (int)floor(xa), e0 = (int)floor(xe), r0 = (int)floor(xr);
+        if (e0 > BE - 2) e0 = BE - 2;
+        if (e0 < 0) e0 = 0;
+        if (r0 > BR - 2) r0 = BR - 2;
+        if (r0 < 0) r0 = 0;
+        double ta = xa - floor(xa);
+        double te = xe - (double)e0;
+        double tr = xr - (double)r0;
+        if (ta < 0.0) ta = 0.0;
+        if (ta > 1.0) ta = 1.0;
+        if (te < 0.0) te = 0.0;
+        if (te > 1.0) te = 1.0;
+        if (tr < 0.0) tr = 0.0;
+        if (tr > 1.0) tr = 1.0;
+        int a0w = ((a0 % BA) + BA) % BA;
+        int a1w = ((a0 + 1) % BA + BA) % BA;
+        int e1 = e0 + 1, r1 = r0 + 1;
+        size_t o00 = ((size_t)r0 * (size_t)BA + (size_t)a0w) * (size_t)BE + (size_t)e0;
+        size_t o10 = ((size_t)r0 * (size_t)BA + (size_t)a1w) * (size_t)BE + (size_t)e0;
+        size_t o01 = ((size_t)r0 * (size_t)BA + (size_t)a0w) * (size_t)BE + (size_t)e1;
+        size_t o11 = ((size_t)r0 * (size_t)BA + (size_t)a1w) * (size_t)BE + (size_t)e1;
+        size_t p00 = ((size_t)r1 * (size_t)BA + (size_t)a0w) * (size_t)BE + (size_t)e0;
+        size_t p10 = ((size_t)r1 * (size_t)BA + (size_t)a1w) * (size_t)BE + (size_t)e0;
+        size_t p01 = ((size_t)r1 * (size_t)BA + (size_t)a0w) * (size_t)BE + (size_t)e1;
+        size_t p11 = ((size_t)r1 * (size_t)BA + (size_t)a1w) * (size_t)BE + (size_t)e1;
+        double u00 = c3[o00] * (1.0 - ta) + c3[o10] * ta;
+        double u10 = c3[o01] * (1.0 - ta) + c3[o11] * ta;
+        double u01 = c3[p00] * (1.0 - ta) + c3[p10] * ta;
+        double u11 = c3[p01] * (1.0 - ta) + c3[p11] * ta;
+        double q0 = u00 * (1.0 - te) + u10 * te;
+        double q1 = u01 * (1.0 - te) + u11 * te;
+        return q0 * (1.0 - tr) + q1 * tr;
+    };
+
+    /* 3/4 分辨率缓冲。原来用 1/2，云块只有 20~40px，放大后一律糊成色块，
+       看不出块与块的界；提到 3/4 才认得出形状。 */
+    const int SW = (w * 3 + 3) / 4;
+    const int SH = (h * 3 + 3) / 4;
+    static std::vector<double> rbuf, gbuf, bbuf, abuf;
+    static int rbufW = 0, rbufH = 0;
+    if (rbufW != SW || rbufH != SH) {
+        rbufW = SW; rbufH = SH;
+        rbuf.assign((size_t)SW * SH, 0.0);
+        gbuf.assign((size_t)SW * SH, 0.0);
+        bbuf.assign((size_t)SW * SH, 0.0);
+        abuf.assign((size_t)SW * SH, 0.0);
+    }
+    /* 沿视线穿过云层的层数。层数不够，云是纸；太多帧率塌。 */
+    const int NSTEP = 5;
+    const double R0 = 0.00;
+    const double R1 = 1.00;
+
+    for (int py = 0; py < SH; ++py) {
+        double el = pitch + (0.5 - (double)py / (double)(SH - 1)) * fov;
+        int base = py * SW;
+        for (int px = 0; px < SW; ++px) {
+            rbuf[base + px] = 0.0; gbuf[base + px] = 0.0;
+            bbuf[base + px] = 0.0; abuf[base + px] = 0.0;
+            double ey = (el - ELMIN) / (ELMAX - ELMIN);
+            if (ey <= 0.0 || ey >= 1.0) continue;
+            /* 云带下界不能一刀切：仰角在屏幕上正好是水平行，硬切就是一条横贯屏幕的边，
+               看上去像地平线上下两个半球。往下留一段过渡，云自己淡出去。 */
+            double edgeFade = 1.0;
+            if (ey < 0.05) edgeFade = ey / 0.05;
+            double az = yaw + ((double)px / (double)(SW - 1) - 0.5) * fovH;
+            double ex = az / (2.0 * PI);
+            ex = ex - floor(ex);
+
+            /* 真正的体积步进：视线方向 (ex, ey) 固定，只沿深度走。
+               每走到深处一层，就查一次三维场——所以穿过的是云体的前后两面。 */
+            double acc = 0.0;
+            double accLit = 0.0;
+            int hits = 0;
+            double firstHit = -1.0;
+            double lastHit = -1.0;
+            for (int st = 0; st < NSTEP; ++st) {
+                double tt = ((double)st + 0.5) / (double)NSTEP;
+                double rn = R0 + (R1 - R0) * tt;
+                double ds = sample3(ex, ey, rn);
+                ds = (ds - 0.42) / 0.20;
+                if (ds < 0.0) ds = 0.0;
+                if (ds > 1.0) ds = 1.0;
+                /* 云底最厚、云顶渐薄 */
+                double wgt = 1.02 - 0.34 * tt;
+                double dens = ds * wgt;
+                if (ds > 0.0) {
+                    if (firstHit < 0.0) firstHit = tt;
+                    lastHit = tt;
+                }
+                /* 每层只能吃掉自己那一小段：视线与云层近乎平行时会穿过很多层，
+                   穿得越久越不透明，这才是“厚度”。之前写成 (1-acc)*dens，dens 又是
+                   硬切的 0/1，第一层命中 acc 就冲到 1，后面四层的乘数全是 0，
+                   厚度对画面零影响——云永远只有一层皮。 */
+                double stepK = 3.6 / (double)NSTEP;
+                double op = dens * stepK;
+                if (op > 1.0) op = 1.0;
+                double prev = acc;
+                acc += (1.0 - acc) * op;
+                accLit += (1.0 - prev) * op * tt;
+                if (dens > 0.02) hits += 1;
+                if (acc > 0.98) break;
+            }
+            acc *= edgeFade;
+            if (acc <= 0.04) continue;
+            /* 厚的才推到近实心，压掉中间那层半透明灰雾 */
+            /* 保底推实，但保留厚薄差：穿 1 层 0.55→0.80，穿 3 层 0.91→0.96。
+               不做这一步，薄云会化成一层和天空混在一起的淡雾。 */
+            /* 硬切累积密度，切出真正的天空缝。五层一叠，任何地方都会攒出一点 acc，
+               不切的话云和云之间黏成一片灰纱，整幅画发灰、形状读不出来。 */
+            {
+                double ac = (acc - 0.34) / 0.42;
+                if (ac < 0.0) ac = 0.0;
+                if (ac > 1.0) ac = 1.0;
+                acc = ac;
+            }
+            if (acc <= 0.0) continue;
+            if (acc > 0.75) acc += (1.0 - acc) * 0.30;
+            double vRel = accLit / (acc > 1e-6 ? acc : 1e-6);
+            double depth = lastHit > firstHit ? (lastHit - firstHit) : 0.0;
+            double thick = (double)hits / (double)NSTEP;
+
+            double toSun = cos(az - azSun);
+            if (toSun < 0.0) toSun = 0.0;
+            double elC = elSun < 0.0 ? 0.0 : elSun;
+            /* 前表面迎光、内腔背光：视线穿得越深越暗。这一条是体积感的根，
+               二维场里没有深度，只能拿厚度冒充亮度，永远平。 */
+            /* 基础亮度不能顶到 clamp 上限：顶上去整片云过曝成纯白，
+               竖直梯度和凸起梯度全被截掉，画面只剩一层平白，读作“糊”。 */
+            double litK = 0.74 - 0.42 * vRel + 0.16 * acc;
+            /* 自遮挡：从这一点朝太阳方向探几步，看光走过来时被多少云挡住。
+               这是“厚度”真正吃进去的地方——云内部之所以暗，不是因为它厚，
+               是因为光到不了。之前只算了云有多厚、没算光能不能穿进来，
+               所以再厚的云也一律白，读作一片纸。 */
+            {
+                double daz = azSun - az;
+                double dexS = sin(daz + 0.0001) * 0.020;
+                double deyS = (elSun - el) / (ELMAX - ELMIN) * 0.055;
+                double occ = 0.0;
+                for (int q = 1; q <= 3; ++q) {
+                    double g = (double)q;
+                    double o1 = sample3(ex + dexS * g, ey + deyS * g, 0.50);
+                    o1 = (o1 - 0.38) / 0.34;
+                    if (o1 < 0.0) o1 = 0.0;
+                    if (o1 > 1.0) o1 = 1.0;
+                    occ += o1 * (1.0 - occ);
+                }
+                litK -= 1.40 * occ;
+            }
+            litK += 0.18 * depth * toSun * cos(elC);
+            /* 竖直径向梯度：仰角越高越接近云顶，云顶先受光、云底永远背光。
+               缺这一项，云在屏幕上只是一块有边界的形状，读不出高度。 */
+            litK += 0.30 * (ey - 0.30);
+            /* 凸起明暗：取云体中部密度，跟四邻域比。比邻域密的地方是凸出来的云瓣，
+               迎光；比邻域疏的是瓣与瓣之间的凹槽，背光。没有这一项，云只是一块
+               填平的轮廓，读不出“块”，只有“范围”。 */
+            {
+                /* 一阶梯度才是法线。平滑场上二阶差分恒等于零（试过，一点反应都没有），
+                   所以取“往上走密度变大还是变小”：上坡是云瓣的顶，迎光；下坡是瓣间的沟，背光。 */
+                /* 偏移必须跨过一格：BA 一格 0.0035、BE 一格 0.0159。小于一格时插值把差值
+                   抹平，算出来恒为 0，白花四次采样。 */
+                /* 差分必须落在“已经切过的硬密度”上。在原始平滑噪声上求差恒为零，
+                   因为插值把邻域抹成同一个数；切成 0/1 之后，块的边才有落差。 */
+                auto cut = [&](double v) -> double {
+                    double t = (v - 0.40) / 0.30;
+                    if (t < 0.0) t = 0.0;
+                    if (t > 1.0) t = 1.0;
+                    return t;
+                };
+                /* 半径要跨过“一朵云瓣”，不能只跨一个噪声格。一格只有 0.0035/0.0159，
+                   算出来的差只够描毛边；一朵云瓣在屏幕上约 5~10°，取 0.0105/0.048。
+                   这一项决定云块“上面亮、下面暗”，是块感的来源。 */
+                /* 半径要跨过“一朵云瓣”，不能只跨一个噪声格：一格只有 0.0035/0.0159，
+                   算出来的差只够描毛边。云瓣现在约 20°，取 0.012/0.035。 */
+                /* 半径跟着格子走：格子大了，半径也要大。nca 最低档 7 格 → 一格 0.14 ex、
+                   nce 最低档 2 格 → 一格 0.50 ey，所以取 0.060 / 0.160 才跨得过半朵云瓣。 */
+                double gx = cut(sample3(ex + 0.0600, ey, 0.50)) - cut(sample3(ex - 0.0600, ey, 0.50));
+                double gy = cut(sample3(ex, ey + 0.1600, 0.50)) - cut(sample3(ex, ey - 0.1600, 0.50));
+                /* 符号：gy = 上方密度 − 下方密度。站在云块上缘时上方是天空(0)、下方是云(1)，
+                   gy 为负——那正是“云顶”，必须最亮。所以是减，不是加。加号会把云顶算暗、
+                   云底算亮，把底下那项竖直梯度整个抵掉，云就永远是平的。 */
+                litK -= 1.9 * gy + 0.9 * gx * sin(azSun - az);
+            }
+            litK *= 0.92 + 0.10 * (sin(el) / sin(ELMAX));
+            if (litK > 1.08) litK = 1.08;
+            if (litK < 0.42) litK = 0.42;
+            double lr = (double)cr * litK, lg = (double)cg * litK, lb = (double)cb * litK;
+            double sh = 0.90 - litK;
+            if (sh > 0.0) {
+                lr += (145.0 - lr) * sh * 0.32;
+                lg += (168.0 - lg) * sh * 0.32;
+                lb += (212.0 - lb) * sh * 0.32;
+            }
+            if (warmT > 0.0) {
+                double deS = fabs(el - elSun) / 0.10;
+                if (deS > 1.0) deS = 1.0;
+                double kk = warmT * toSun * (1.0 - deS) * 0.26 * (0.30 + 0.70 * vRel);
+                if (kk > 0.0) {
+                    lr += (255.0 - lr) * kk;
+                    lg += (243.0 - lg) * kk;
+                    lb += (231.0 - lb) * kk;
+                }
+            }
+            double a2 = acc;
+            if (a2 > 1.0) a2 = 1.0;
+            rbuf[base + px] = lr;
+            gbuf[base + px] = lg;
+            bbuf[base + px] = lb;
+            abuf[base + px] = a2;
+        }
+    }
+
+    /* 放大回全分辨率，云边自带 1~2px 柔边 */
+    for (int py = 0; py < h; ++py) {
+        double fy2 = (double)py * 0.75;
+        int sy = (int)fy2;
+        if (sy > SH - 2) sy = SH - 2;
+        if (sy < 0) sy = 0;
+        double ty2 = fy2 - (double)sy;
+        unsigned char* row = &sp[(size_t)py * (size_t)w * 3];
+        int r0 = sy * SW, r1 = (sy + 1) * SW;
+        for (int px = 0; px < w; ++px) {
+            double fx2 = (double)px * 0.75;
+            int sx = (int)fx2;
+            if (sx > SW - 2) sx = SW - 2;
+            if (sx < 0) sx = 0;
+            double tx2 = fx2 - (double)sx;
+            double ai = (abuf[r0 + sx] * (1.0 - tx2) + abuf[r0 + sx + 1] * tx2) * (1.0 - ty2)
+                      + (abuf[r1 + sx] * (1.0 - tx2) + abuf[r1 + sx + 1] * tx2) * ty2;
+            if (ai <= 0.004) continue;
+            double ri = (rbuf[r0 + sx] * (1.0 - tx2) + rbuf[r0 + sx + 1] * tx2) * (1.0 - ty2)
+                      + (rbuf[r1 + sx] * (1.0 - tx2) + rbuf[r1 + sx + 1] * tx2) * ty2;
+            double gi = (gbuf[r0 + sx] * (1.0 - tx2) + gbuf[r0 + sx + 1] * tx2) * (1.0 - ty2)
+                      + (gbuf[r1 + sx] * (1.0 - tx2) + gbuf[r1 + sx + 1] * tx2) * ty2;
+            double bi = (bbuf[r0 + sx] * (1.0 - tx2) + bbuf[r0 + sx + 1] * tx2) * (1.0 - ty2)
+                      + (bbuf[r1 + sx] * (1.0 - tx2) + bbuf[r1 + sx + 1] * tx2) * ty2;
+            int o1 = (int)(row[px * 3]     + (ri - (double)row[px * 3])     * ai);
+            int o2 = (int)(row[px * 3 + 1] + (gi - (double)row[px * 3 + 1]) * ai);
+            int o3 = (int)(row[px * 3 + 2] + (bi - (double)row[px * 3 + 2]) * ai);
+            if (o1 < 0) o1 = 0; if (o1 > 255) o1 = 255;
+            if (o2 < 0) o2 = 0; if (o2 > 255) o2 = 255;
+            if (o3 < 0) o3 = 0; if (o3 > 255) o3 = 255;
+            row[px * 3] = (unsigned char)o1;
+            row[px * 3 + 1] = (unsigned char)o2;
+            row[px * 3 + 2] = (unsigned char)o3;
+        }
+    }
+
+    return vNone();
+}
+
+/* 视口云实验：实验台专用。参数：视口, 云型, 相机偏航, 相机俯仰, 垂直视场角,
+   太阳方位, 太阳仰角, 云色。只是把云型塞进同一个渲染器，不复制一份实现。
+   这样台子上看到的东西和游戏里逐像素一致，差别只在云型。 */
+Value vpCloudExp(Interpreter& vm, vector<Value>& a, int line) {
+    int v = (int)needNum(a[1], "视口云实验", line);
+    g_cloudVariant = v;
+    vector<Value> b;
+    b.push_back(a[0]);
+    b.push_back(a[2]);
+    b.push_back(a[5]);
+    b.push_back(a[3]);
+    b.push_back(a[4]);
+    b.push_back(a[5]);
+    b.push_back(a[6]);
+    b.push_back(a[7]);
+    return vpCloud(vm, b, line);
+}
+
+/* 视口云体：真正的三维场观察器。
+   相机有位置，也有朝向——可以从下面、上面、侧面、正面、里面看这块云体长成什么样。
+   场是一整块 (X,Y,Z) 密度体，视线穿过去逐步累积，所以每一层都是实体，
+   不是贴在天空上的一张皮。参数：视口, 云型, 相机X, 相机Y, 相机Z,
+   偏航, 俯仰, 垂直视场角, 太阳方位, 太阳仰角, 云色。 */
+Value vpCloudBody(Interpreter&, vector<Value>& a, int line) {
+    auto d = vpDict(a[0], line);
+    int w = (int)needNum(d->items.at("宽"), "视口", line);
+    int h = (int)needNum(d->items.at("高"), "视口", line);
+    int variant = (int)needNum(a[1], "视口云体", line);
+    double cx = needNum(a[2], "视口云体", line);
+    double cy = needNum(a[3], "视口云体", line);
+    double cz = needNum(a[4], "视口云体", line);
+    double yaw = needNum(a[5], "视口云体", line);
+    double pitch = needNum(a[6], "视口云体", line);
+    double fov = needNum(a[7], "视口云体", line);
+    double azSun = needNum(a[8], "视口云体", line);
+    double elSun = needNum(a[9], "视口云体", line);
+    int cc = vpColor(a[10], line);
+    if (fov < 0.06) fov = 0.06;
+    auto& sp = vpPixels(d);
+    if ((long long)sp.size() != (long long)w * h * 3)
+        sp.assign((size_t)((long long)w * h * 3), 0);
+    if (variant < 0) variant = 0;
+    if (variant > 26) variant = 26;
+        /* 23 = 中型云，用同一套随机分叉 + 凝结底面，只是整体比 20 小。
+           11 是旧的中型基准：没有平底、没有分叉，跟 20/21 放一起就明显不像云了。 */
+        bool tree11 = (variant > 19 && variant < 26);
+        /* 型26 的六朵云：中心与高程。树源按组复制，所以必须提到函数作用域。 */
+        const double P26X[6] = { -7.60,  7.40, -3.20,  8.80,  0.80, -10.40 };
+        const double P26Y[6] = {  2.60,  3.20,  6.00,  7.40,  9.40,  7.80 };
+        const double P26Z[6] = { -6.80, -9.20,  7.60,  6.60, -1.20,  3.60 };
+    double litb11 = 0.78;   /* 亮度基准在渲染循环里要用，必须在函数作用域声明 */
+    double litlo11 = 0.55;  /* 亮度下限：乌云能压到更暗 */
+    double lithm11 = 1.20;  /* 亮度上限：亮云能提到更亮 */
+    /* 密度缩放会被“归一化 + 分位定标”整段抹平（实测：乌云离得进去、亮不起来）。
+       所以云性只能落在**渲染端的色调系数**上：同一套几何，只换反射率。 */
+    double tone11 = 1.00;
+    int cr = (cc >> 16) & 255, cg = (cc >> 8) & 255, cb = cc & 255;
+
+    /* 云体所在的盒子。X/Z 是地面两个方向，Y 是高度——云就在这个盒子里长。 */
+    /* 盒子要近似立方。原来是 2.9 宽 × 0.92 高，云被这个比例摊成一张薄片，
+       怎么调都“没有高度”。改成 2.0 × 2.0 × 1.6，云才有地方竖起来。 */
+    /* 观察盒：水平 4.4 x 4.4（原来 2 x 2），竖直 0.30~2.60（原 0.30~1.90）。
+       盒子太小，巨型云塞满就成一面墙；扩盒之后巨型云才有地方摊开成一片云层。
+       单朵云的世界尺寸没变，所以型0~16 的成像不受影响，只有触到旧盒边的型会变。 */
+    const double BX0 = (variant == 26) ? -13.00 : -6.50, BX1 = (variant == 26) ? 13.00 : 6.50;
+    const double BY0 = 0.30,  BY1 = (variant == 26) ? 13.60 : 7.60;
+    const double BZ0 = (variant == 26) ? -13.00 : -6.50, BZ1 = (variant == 26) ? 13.00 : 6.50;
+    /* GY 决定了云在竖直方向有多少层。72 层时 y 层间距 0.022，
+       和颜色分离量同量级，表面就被量化成一圈圈横纹——那正是“片片”的来源。
+       提到 104 层，层间距 0.015，横纹落到看不出。渲染步数不变，只是场变细。 */
+    /* 体素 192 x 120 x 192 = 4.4M，各轴体素边长 0.019~0.019，等向。 */
+    const int GX = (variant == 26) ? 286 : 400, GY = (variant == 26) ? 208 : 234, GZ = (variant == 26) ? 286 : 400;
+
+    static std::vector<double> den;
+    static int builtVar3 = -999;
+    static bool haveDen = false;
+    if (!haveDen || builtVar3 != variant) {
+        haveDen = true;
+        builtVar3 = variant;
+        den.assign((size_t)GX * (size_t)GY * (size_t)GZ, 0.0);
+        unsigned int sd = 20240u + (unsigned int)variant * 7919u;
+        auto rnd = [&]() -> double {
+            sd = sd * 1664525u + 1013904223u;
+            return (double)((sd >> 8) & 0xffffu) / 65535.0;
+        };
+        /* 三维值噪声。云是体积，密度必须在 x/y/z 三个方向上都变化——
+           只要密度只随高度变，表面就一定是等高线，底就一定是平的。 */
+        auto hsh3 = [](int x, int y, int z) -> double {
+            unsigned int n = (unsigned int)(x + 4096) * 374761393u
+                           + (unsigned int)(y + 4096) * 668265263u
+                           + (unsigned int)(z + 4096) * 1442695041u;
+            n = (n ^ (n >> 13)) * 1274126177u;
+            n = (n ^ (n >> 16)) * 2246822519u;
+            n = n ^ (n >> 15);
+            return (double)(n & 0xffffu) / 65535.0;
+        };
+        auto vn3 = [&](double x, double y, double z) -> double {
+            double fx = floor(x), fy = floor(y), fz = floor(z);
+            int ix = (int)fx, iy = (int)fy, iz = (int)fz;
+            double tx = x - fx, ty = y - fy, tz = z - fz;
+            tx = tx * tx * (3.0 - 2.0 * tx);
+            ty = ty * ty * (3.0 - 2.0 * ty);
+            tz = tz * tz * (3.0 - 2.0 * tz);
+            double c000 = hsh3(ix, iy, iz),     c100 = hsh3(ix + 1, iy, iz);
+            double c010 = hsh3(ix, iy + 1, iz), c110 = hsh3(ix + 1, iy + 1, iz);
+            double c001 = hsh3(ix, iy, iz + 1), c101 = hsh3(ix + 1, iy, iz + 1);
+            double c011 = hsh3(ix, iy + 1, iz + 1), c111 = hsh3(ix + 1, iy + 1, iz + 1);
+            double aa = c000 + (c100 - c000) * tx;
+            double bb = c010 + (c110 - c010) * tx;
+            double cc2 = c001 + (c101 - c001) * tx;
+            double dd2 = c011 + (c111 - c011) * tx;
+            double ee = aa + (bb - aa) * ty;
+            double ff2 = cc2 + (dd2 - cc2) * ty;
+            return ee + (ff2 - ee) * tz;
+        };
+        auto fbm3 = [&](double x, double y, double z) -> double {
+            double sv = 0.0, amp = 0.52, tot = 0.0;
+            /* 只留 3 层。再往上加，格子就撑不住波长——采样点比噪声周期还稀，
+               结果不是细节，是别名噪点（表面看上去像撒了层碎屑）。 */
+            for (int o = 0; o < 3; ++o) {
+                sv += vn3(x, y, z) * amp;
+                tot += amp;
+                x = x * 2.17 + 7.7; y = y * 2.17 + 3.1; z = z * 2.17 + 11.3;
+                amp *= 0.5;
+            }
+            return sv / tot;
+        };
+
+        /* 每一型都从“随机撒在盒子里的云核”开始，剩下的差别只在怎么长。 */
+        int NS = 40;
+        if (variant == 3) NS = 14;    /* 少而大 */
+        if (variant == 4) NS = 110;   /* 多而小 */
+        if (variant == 5) NS = 0;     /* 高度场型：不用核 */
+        if (variant == 6) NS = 0;     /* 三维噪声场：不用核 */
+        if (variant == 7) NS = 0;     /* 积云外形 + 三维侵蚀 */
+        if (variant == 8) NS = 0;     /* 三合一：外形偏置 + 体密度 + 侵蚀 */
+        if (variant == 9) NS = 0;     /* 塔群并集：结构式生成 */
+        if (variant == 10) NS = 0;    /* 雾态密度场：没有核，只有密度 */
+        if (variant >= 11) NS = 0;    /* 11~16：同一套扩散源，按尺寸与云性分档 */
+        std::vector<double> ox(NS), oy(NS), oz(NS), orad(NS);
+        for (int k = 0; k < NS; ++k) {
+            ox[k] = BX0 + 0.62 + rnd() * (BX1 - BX0 - 1.24);
+            oz[k] = BZ0 + 0.62 + rnd() * (BZ1 - BZ0 - 1.24);
+            orad[k] = 0.20 + rnd() * 0.26;
+            if (variant == 3) orad[k] = 0.40 + rnd() * 0.34;
+            if (variant == 4) orad[k] = 0.13 + rnd() * 0.12;
+            if (variant == 2)
+                oy[k] = (rnd() < 0.5 ? (BY0 + 0.20) : (BY1 - 0.20)) + (rnd() - 0.5) * 0.10;
+            else
+                oy[k] = BY0 + 0.18 + rnd() * (BY1 - BY0 - 0.36);
+        }
+        /* 高度场型用的隆起 */
+        const int NB = 26;
+        std::vector<double> bx(NB), bz(NB), br(NB), bh(NB);
+        for (int k = 0; k < NB; ++k) {
+            bx[k] = BX0 + 0.45 + rnd() * (BX1 - BX0 - 0.90);
+            bz[k] = BZ0 + 0.45 + rnd() * (BZ1 - BZ0 - 0.90);
+            br[k] = 0.22 + rnd() * 0.34;
+            bh[k] = 0.18 + rnd() * 0.42;
+            if (variant == 7) { br[k] = 0.15 + rnd() * 0.20; bh[k] = 0.14 + rnd() * 0.26; }
+            if (variant == 8) { br[k] = 0.26 + rnd() * 0.26; bh[k] = 0.20 + rnd() * 0.40; }
+        }
+        /* 高频小隆起：真实积云的顶不是一个光滑拱，是一堆小泡挤在一起。
+           没有这一层，顶就是一个圆锥，看上去像沙丘或石林。 */
+        const int NFINE = 110;
+        std::vector<double> fx2(NFINE), fz2(NFINE), fr2(NFINE), fh2(NFINE);
+        for (int k = 0; k < NFINE; ++k) {
+            fx2[k] = BX0 + 0.50 + rnd() * (BX1 - BX0 - 1.00);
+            fz2[k] = BZ0 + 0.50 + rnd() * (BZ1 - BZ0 - 1.00);
+            fr2[k] = 0.09 + rnd() * 0.13;
+            fh2[k] = 0.05 + rnd() * 0.13;
+            if (variant == 7) { fr2[k] = 0.06 + rnd() * 0.09; fh2[k] = 0.03 + rnd() * 0.08; }
+            if (variant == 8) { fr2[k] = 0.08 + rnd() * 0.12; fh2[k] = 0.05 + rnd() * 0.12; }
+        }
+        std::vector<double> hfield((size_t)GX * (size_t)GZ, 0.0);
+        if (variant == 5 || variant == 7 || variant == 8) {
+            for (int iz = 0; iz < GZ; ++iz) {
+                double z = BZ0 + (BZ1 - BZ0) * ((double)iz + 0.5) / (double)GZ;
+                for (int ix = 0; ix < GX; ++ix) {
+                    double x = BX0 + (BX1 - BX0) * ((double)ix + 0.5) / (double)GX;
+                    double s4 = 0.0;
+                    double hmax = 0.0;
+                    for (int k = 0; k < NB; ++k) {
+                        double dx = x - bx[k], dz = z - bz[k];
+                        double d2 = (dx * dx + dz * dz) / (br[k] * br[k]);
+                        if (d2 < 1.0) {
+                            double q = 1.0 - d2;
+                            double hgt = bh[k] * sqrt(q);
+                            s4 += pow(hgt, 2.2);
+                            if (hgt > hmax) hmax = hgt;
+                        }
+                    }
+                    for (int k = 0; k < NFINE; ++k) {
+                        double dx = x - fx2[k], dz = z - fz2[k];
+                        double d2 = (dx * dx + dz * dz) / (fr2[k] * fr2[k]);
+                        if (d2 < 1.0) {
+                            double q = 1.0 - d2;
+                            double hgt = fh2[k] * sqrt(q);
+                            s4 += pow(hgt, 2.2);
+                            if (hgt > hmax) hmax = hgt;
+                        }
+                    }
+                    /* 型8 用“取最大值”融合：隆起与隆起之间会真的落到 0，
+                       云底就断成几块，而不是连成一张铺满的地毯。
+                       其余型保留原来的 p-范数融合（那是积云轮廓的来源）。 */
+                    if (variant == 8)
+                        hfield[(size_t)iz * (size_t)GX + (size_t)ix] = hmax;
+                    else
+                        hfield[(size_t)iz * (size_t)GX + (size_t)ix] = (s4 > 0.0) ? pow(s4, 1.0 / 2.2) : 0.0;
+                }
+            }
+        }
+
+        /* 型11 的云团表：尺度拉开（一团大坨 + 两团中等 + 四团小的），
+           每团有自己的中心高度和竖直半宽，所以云的上下沿不在同一个高度，
+           从下面看不会是一块平板。 */
+        /* 型11 的源表。**不建实体**：这里只放“源”，密度是源的扩散晕。
+           剖面按真实积云：**上矮、中粗、下大** —— 底部最宽最厚，中部鼓，
+           顶部窄小若干个塔瓣。分三个高度带，所以天然有了“高层 / 低层”的结构，
+           不是一坨圆疙瘩。 */
+        int NB11 = 112;  /* 容量：11~19 只用前 18；单朵树 56；型24 两朵共 112 */
+        int nuse11 = 18;
+        std::vector<double> b11x(NB11,0.0), b11y(NB11,0.0), b11z(NB11,0.0);
+        std::vector<double> r11x(NB11,0.0), r11y(NB11,0.0), r11z(NB11,0.0);
+        /* 11~16 是同一套扩散源的尺寸/云性分档：
+           11 基准 / 12 小云 / 13 大云 / 14 超大 / 15 乌云 / 16 亮云。
+           源的位置一模一样，只缩放半径和竖直高度——这样几档之间可以并排比较
+           “同一朵云在不同尺度下怎么长”。 */
+        double sc11 = 1.0;
+        if (variant == 12) sc11 = 0.52;
+        /* 大云不是把一朵放大——放大到盒外就被盒壁切成方片（已实测）。
+           大云换构建方式：单个团反而缩小，改用**多团并排**铺开，
+           2 团 = 一条云，4 团 = 一片云街。这才是“不同大小的不同构建方案”。 */
+        if (variant == 13) sc11 = 0.82;
+        if (variant == 14) sc11 = 0.62;
+        double cx11[13] = {0.0};
+        double cz11[13] = {0.0};
+        double cy11[13] = {0.0};
+        double rs11[13] = {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
+        int ncl11 = 1;
+        if (variant == 13) { cx11[0] = -0.44; cx11[1] = 0.44; ncl11 = 2; }
+        /* 四团 2×2 会互相咬死成一块方板。改成一排三团、中间那团抬高，
+           读出来是“云街/一排云”，而不是一块墙。 */
+        if (variant == 14) {
+            cx11[0] = -0.62; cz11[0] = 0.0;
+            cx11[1] =  0.00; cz11[1] = 0.0;
+            cx11[2] =  0.62; cz11[2] = 0.0;
+            ncl11 = 3;
+        }
+        /* 17 大型 / 18 巨型 / 19 超巨型：继续用“多团铺开”，数量上去、
+           单团缩小，密度靠扩散求和自然连成一片。 */
+        if (variant == 17) {
+            sc11 = 0.92;
+            cx11[0] = 0.0;    cz11[0] = 0.0;
+            cx11[1] = -1.02;  cz11[1] = -1.02;
+            cx11[2] =  1.02;  cz11[2] = -1.02;
+            cx11[3] = -1.02;  cz11[3] =  1.02;
+            cx11[4] =  1.02;  cz11[4] =  1.02;
+            /* 每团的中心高度错开，否则五团同高就排成一条平板。 */
+            cy11[1] = -0.16; cy11[2] = 0.22; cy11[3] = 0.10; cy11[4] = -0.10;
+            ncl11 = 5;
+        }
+        if (variant == 18) {
+            sc11 = 0.80;
+            cx11[0] = 0.0; cz11[0] = 0.0;
+            for (int k = 1; k < 7; ++k) {
+                double a = (double)(k - 1) * 1.047;
+                double rr = 1.20 + 0.24 * (double)((k * 17) % 5) / 4.0;
+                cx11[k] = cos(a) * rr;
+                cz11[k] = sin(a) * rr;
+            }
+            cy11[1] = 0.16; cy11[2] = -0.08; cy11[3] = 0.12;
+            cy11[4] = -0.14; cy11[5] = 0.08; cy11[6] = -0.04;
+            ncl11 = 7;
+        }
+        /* **20/21/22 是把型11 整朵等比放大，不是重新堆团。**
+           之前“放大 = 团更多、每团更小”出来的是一堆互相渗透的花椰菜，
+           也就是被判“大粪”的那几版。这里不增加团数，整个源表跟着 sc 一起放大，
+           所有相对几何（重叠、尾巴、剖面）完全不变——所以放大后仍是同一朵云。 */
+        if (tree11) {
+            sc11 = (variant == 26) ? 4.30 : ((variant == 20) ? 1.65 : ((variant == 21) ? 1.95 : ((variant == 22) ? 2.10 : ((variant == 23) ? 1.05 : 1.10))));
+        }
+        if (variant == 19) {
+            sc11 = 0.68;
+            int m19 = 0;
+            for (int iz = -1; iz <= 1; ++iz) {
+                for (int ix = -1; ix <= 1; ++ix) {
+                    if (m19 >= 12) break;
+                    /* 规则网格并排，俯视就是一格一格的瘤。位置加固定抖动打散。 */
+                    double jx = (double)(((m19 + 1) * 29 + variant * 7) % 13) / 13.0 - 0.5;
+                    double jz = (double)(((m19 + 1) * 41 + variant * 5) % 11) / 11.0 - 0.5;
+                    cx11[m19] = (double)ix * 1.16 + jx * 0.62;
+                    cz11[m19] = (double)iz * 1.16 + jz * 0.62;
+                    ++m19;
+                }
+            }
+            /* 再加三个抬高的团，让整片云有起伏，不是一层平板。 */
+            cx11[9] = -0.52; cz11[9] = 0.16;
+            cx11[10] = 0.60; cz11[10] = -0.24;
+            cx11[11] = 0.04; cz11[11] = 0.68;
+            cy11[0] = -0.10; cy11[1] = 0.08; cy11[2] = -0.04;
+            cy11[3] = 0.12;  cy11[4] = 0.00; cy11[5] = 0.14;
+            cy11[6] = -0.08; cy11[7] = 0.06; cy11[8] = -0.12;
+            cy11[9] = 0.18;  cy11[10] = 0.16; cy11[11] = 0.20;
+            ncl11 = 12;
+        }
+        double dens11 = 0.62;     /* 密度水平：乌云更厚、亮云更薄 */
+        litb11 = 0.78;            /* 亮度基准：乌云压暗、亮云提亮 */
+        /* 云的明暗不是“加一层灰”，是**遮挡深度**：厚云光进不去，整团压暗；
+           薄云光穿得透，整团发亮。所以乌云同时要 更高密度 + 更低亮度区间，
+           亮云反过来。只调基准会被 1.20 的钳位吃掉，看起来和基准一模一样。 */
+        if (variant == 15) { dens11 = 0.62; tone11 = 0.60; litlo11 = 0.34; lithm11 = 1.02; }
+
+                /* 型 25 的光照上限必须压到 1.0 以下。lit 顶到 1.20 时，255*1.20 已经
+                   越过 255，云的朝光面整片饱和成纯白，内部所有厚薄差异全部被削平 ——
+                   不管密度怎么调，看上去都是同一个白馒头。压到 0.98 才留得住层次。 */
+                if (variant == 25 || variant == 26) { litb11 = 1.12; litlo11 = 0.38; lithm11 = 1.16; }
+        if (variant == 16) { dens11 = 0.62; tone11 = 1.10; litlo11 = 0.66; lithm11 = 1.30; }
+        if (variant >= 11 && variant < 25) {
+            /* 下大：底层三团，宽而扁，铺到半个盒子，三团互相咬合成一整片底。 */
+            b11x[0] = -0.34; b11y[0] = 0.74; b11z[0] = -0.12;
+            r11x[0] = 0.62;  r11y[0] = 0.30; r11z[0] = 0.58;
+            b11x[1] =  0.30; b11y[1] = 0.78; b11z[1] =  0.14;
+            r11x[1] = 0.58;  r11y[1] = 0.28; r11z[1] = 0.54;
+            b11x[2] =  0.02; b11y[2] = 0.70; b11z[2] = -0.40;
+            r11x[2] = 0.50;  r11y[2] = 0.26; r11z[2] = 0.46;
+            /* 中粗：中层四团，比底层小但更“鼓”（竖直半宽更大），
+               这一段是云的腰，也是整个云最厚的一段。 */
+            for (int k = 3; k <= 6; ++k) {
+                double a = (double)(k - 3) * 1.571 + rnd() * 0.7;
+                double rr = 0.18 + rnd() * 0.30;
+                b11x[k] = cos(a) * rr;
+                b11z[k] = sin(a) * rr;
+                b11y[k] = 1.00 + rnd() * 0.18;
+                r11x[k] = 0.34 + rnd() * 0.14;
+                r11y[k] = 0.28 + rnd() * 0.08;
+                r11z[k] = 0.32 + rnd() * 0.14;
+            }
+            /* 上矮：高层三团，小而窄，就是云顶那几瓣。 */
+            for (int k = 7; k <= 9; ++k) {
+                double a = (double)(k - 7) * 2.094 + rnd() * 0.6;
+                double rr = 0.06 + rnd() * 0.24;
+                b11x[k] = cos(a) * rr;
+                b11z[k] = sin(a) * rr;
+                b11y[k] = 1.30 + rnd() * 0.16;
+                r11x[k] = 0.18 + rnd() * 0.08;
+                r11y[k] = 0.15 + rnd() * 0.05;
+                r11z[k] = 0.17 + rnd() * 0.08;
+            }
+            /* 顶塔：宽而矮，挂在腰和顶的团上，把云顶顶出几个瓣。 */
+            for (int k = 10; k < 18; ++k) {
+                int host = 3 + ((k - 10) % 3);
+                b11x[k] = b11x[host] + (rnd() - 0.5) * 0.30 * r11x[host];
+                b11z[k] = b11z[host] + (rnd() - 0.5) * 0.30 * r11z[host];
+                b11y[k] = b11y[host] + 0.42 * r11y[host] + 0.02;
+                r11x[k] = 0.15 + rnd() * 0.09;
+                r11z[k] = 0.14 + rnd() * 0.08;
+                r11y[k] = 0.10 + rnd() * 0.06;
+            }
+            /* 按档位缩放：半径乘 sc11，中心高度以 0.95 为轴向内收/外扩。
+               小云不是“把云缩小一点点”，是整个源场缩进去，所以小云也确实小一圈。 */
+            /* 大型/巨型/超巨型只压水平方向，竖直保持厚度——否则多团一缩就成一条横带。
+               这才是“又宽又高的一大片”，而不是“一排小云”。 */
+            /* 每个团给一个固定但互不相同的尺度：相同尺度的团并排，
+               会叠出竖直的重复条纹，读作一排柱子。 */
+            /* **随机分叉扩散**：四面八方都长，不是“三根柱子”。
+               10 个根撒在底部一圈（角度随机、半径随机），每根抽 2 枝、
+               每枝再抽 1~2 枝，一共 56 个节点。
+               物理限制只有三条：枝只能往上或多半往上（不会扎进地下）、
+               枝长不超过扩散尾巴的截断半径（否则断开成一颗颗球）、
+               每级半径按固定比例衰减。方向本身全是随机的。 */
+            if (tree11) {
+                /* 一朵云 = 一棵 56 节点的分叉树。型24 是两朵并排、中间相遇，
+                   用来验证“碰到就融合”：两棵树的源落在同一个密度场里，
+                   重叠处 sum 相加（不是取 max），所以边缘互相渗透、中间长出一段融合颈，
+                   而不是两个球贴在一起互相切一刀。 */
+                int nclu11 = (variant == 26) ? 6 : ((variant == 24) ? 2 : 1);
+                int per11 = 56;
+                nuse11 = per11 * nclu11;
+                for (int cl11 = 0; cl11 < nclu11; ++cl11) {
+                    int off11 = cl11 * per11;
+                    double ox11 = 0.0, oz11 = 0.0;
+                    /* 融合要真的融合：中心距必须明显小于两朵半径之和，
+                       否则只是两个球贴在一起、中间留一道缝。
+                       1.05 太远（缝很明显），压到 0.78。
+                       第二朵再低 0.12：真实云群总是高低错落的，
+                       等高并排会读成“一排柱子”。 */
+                    if (variant == 24) {
+                        /* 不是两朵等大并排（那会读成一排柱子/一条横带），
+                           而是一朵大云 + 一朵小的从侧边撞上去，
+                           小的在接触处被吸收，形成一段“肩”。 */
+                        /* 两朵完全沿 x 排开，正视就是 2.4:1 的横带（读作云街）。
+                           沿对角线摆：正视只看到一部分宽度，深度补回来，
+                           正视/侧视都不再是一条横带。 */
+                        ox11 = (cl11 == 0) ? -0.62 : 0.88;
+                        oz11 = (cl11 == 0) ? -0.66 : 0.34;
+                    }
+                    for (int rt11 = 0; rt11 < 10; ++rt11) {
+                        double a11 = rnd() * 6.283;
+                        double rr0 = 0.20 + rnd() * 0.60;
+                        b11x[off11 + rt11] = ox11 + cos(a11) * rr0;
+                        b11z[off11 + rt11] = oz11 + sin(a11) * rr0;
+                        /* 抬高第二朵失败：小云抬上去之后被顶面合并削顶，
+                           只剩一层雾壳，俯视叠成一片半透明“盖”，读作糊。
+                           回到侧撞（第二朵略低），让两朵在高度上有一点点错落。 */
+                        /* 顶面合并改成按簇各算一张之后，抬高那朵不会再被削平，
+                           第二朵可以真的往上堆一层。 */
+                        /* 往上堆这条路在这个管线里走不通：源团是 exp 球团，
+                           两朵上下叠起来读作“两个球叠着”，也就是肿瘤。
+                           回到侧撞（第二朵略低 0.10），用第二朵的大小体现融合。 */
+                        b11y[off11 + rt11] = 0.70 + rnd() * 0.10 - (cl11 == 1 ? 0.10 : 0.0);
+                        double csc11 = (cl11 == 1) ? 0.70 : 1.0;
+                        double rq = (0.30 + rnd() * 0.18) * csc11;
+                        r11x[off11 + rt11] = rq;
+                        r11z[off11 + rt11] = rq * (0.82 + rnd() * 0.30);
+                        r11y[off11 + rt11] = rq * (0.72 + rnd() * 0.28);
+                    }
+                    int lb11[4]; int le11[4];
+                    lb11[0] = 0; le11[0] = 10;
+                    int nb11 = 10;
+                    for (int L11 = 1; L11 <= 3; ++L11) {
+                        lb11[L11] = nb11;
+                        for (int q11 = lb11[L11-1]; q11 < le11[L11-1]; ++q11) {
+                            int kids11 = (L11 == 1) ? 2 : ((L11 == 2) ? 2 : 1);
+                            for (int c11 = 0; c11 < kids11; ++c11) {
+                                if (nb11 >= per11) break;
+                                double ang11 = rnd() * 6.283;
+                                double up11 = 0.16 + rnd() * 0.44 + 0.17 * (double)L11;
+                                if (up11 > 1.0) up11 = 1.0;
+                                double hor11 = sqrt(1.0 - up11 * up11);
+                                double qi = off11 + q11;
+                                double len11 = r11x[qi] * (1.85 - 0.30 * (double)L11 + rnd() * 0.25);
+                                double rr11 = r11x[qi] * (0.60 + rnd() * 0.12);
+                                int ni = off11 + nb11;
+                                b11x[ni] = b11x[qi] + cos(ang11) * hor11 * len11;
+                                b11z[ni] = b11z[qi] + sin(ang11) * hor11 * len11;
+                                b11y[ni] = b11y[qi] + up11 * len11;
+                                r11x[ni] = rr11;
+                                r11z[ni] = rr11 * (0.85 + rnd() * 0.30);
+                                r11y[ni] = rr11 * (0.80 + rnd() * 0.30);
+                                ++nb11;
+                            }
+                        }
+                        le11[L11] = nb11;
+                    }
+                }
+            }
+            rs11[0] = 1.00;
+            for (int nc = 1; nc < 13; ++nc) {
+                double v = (double)((nc * 37 + variant * 11) % 17) / 16.0;
+                rs11[nc] = 0.80 + 0.42 * v;
+            }
+            /* 巨型/超巨型：竖直压到 sc 的一半，读成“一整片有厚度的云层”，
+               不是“一排竖起来的柱子”。大型 17 保留较高，仍是单块大云。 */
+            double scy11 = sc11;
+            if (variant >= 17 && variant <= 19) scy11 = (variant >= 18) ? 0.86 : 0.92;
+            /* 竖直方向不能跟着水平一起放大：盒子只有 2.3 高，云会顶穿上下一齐被裁。
+               放大档的竖直只放 1.10~1.35，于是巨型云天然是“宽大于高”的一片，
+               这也正是真实大云的比例。 */
+            /* 放大档要把竖向层次拉开：底层更低、高层更高（1.55~2.00）。
+               原来是 1.10~1.35，压成一个“凸起一块”，只能算中型云。
+               竖向拉开之后才出现“下宽、中粗、上高”的三层结构。 */
+            /* 加了凝结底面之后，下半球被切掉，宽高比变成 2:1 的横片。
+               竖直补回来：真实积云的宽高比在 1.4~1.6，不是一条横带。 */
+            /* 23 中型：竖向只 1.15，1.45 会把它拉成一根竖条（那已经不是中型了）。 */
+            if (variant == 23) scy11 = 1.15;
+            /* 22 太高就读作圆墩，竖直收回到 1.88。 */
+            /* 22 必须跟 21 同构放大（scy/sc 比例一致），
+               压低竖向它就变成一座圆丘，跟 21 不是同一朵云。 */
+            /* 24 两朵并排，宽度天然翻倍；竖向若只 1.30 就读成一条 3:1 的横带，
+               必须补到 1.75 才回到“一片连着的云”而不是“一条云带”。 */
+            if (variant == 26) scy11 = 2.60;
+            if (tree11) scy11 = (variant == 20) ? 1.78 : ((variant == 21) ? 1.96 : ((variant == 22) ? 2.10 : ((variant == 23) ? 1.15 : 1.85)));
+            for (int k = 0; k < nuse11; ++k) {
+                r11x[k] *= sc11; r11y[k] *= scy11; r11z[k] *= sc11;
+                double base11 = 0.95;
+                if (variant >= 17 && variant <= 19) base11 = 1.35;
+                /* 实测：型22 底 0.35、顶 3.31，盒高 3.10 —— 上下都被裁平，
+                   所以读作“一坨”。盒子加高到 4.60 之后，底座要一起抬起来，
+                   云才落在一块完整的凝结面上，而不是贴在盒底。 */
+                if (tree11) base11 = (variant == 20) ? 1.70 : ((variant == 21) ? 1.80 : ((variant == 22) ? 1.95 : 1.70));
+                if (variant == 26) {
+                    /* 每朵一个中心、一个凝结高度，不再共用一条 1.52 的底。 */
+                    int gi26 = k / 56;
+                    b11x[k] = P26X[gi26] + b11x[k] * 2.70;
+                    b11z[k] = P26Z[gi26] + b11z[k] * 2.70;
+                    b11y[k] = P26Y[gi26] + (b11y[k] - 0.95) * scy11 * 0.82;
+                } else {
+                    b11y[k] = base11 + (b11y[k] - 0.95) * scy11;
+                }
+            }
+            /* 高层 + 顶塔（k>=7）：放大体量、向中心收。
+               原表的顶塔是“宽而矮的小角”，放在中型云上合适，
+               放到大云上就只是一点点凸起，读不出“高层结构”。 */
+        }
+
+        /* 型9 的塔表：结构式生成，不是随机撒隆起。
+           1 根主塔（最高最粗）+ 3 根副高塔 + 6 根中塔 + 8 个小凸起。
+           每根塔：柱身(t<0.70 半径略增) + 圆顶盖(t→1 半径收到 0) + 底落同一凝结面。 */
+        int NT9 = 18;
+        std::vector<double> t9x(NT9, 0.0), t9z(NT9, 0.0), t9r(NT9, 0.0), t9h(NT9, 0.0);
+        if (variant == 9) {
+            for (int k = 0; k < NT9; ++k) {
+                if (k == 0) {
+                    t9x[k] = 0.0; t9z[k] = 0.0; t9r[k] = 0.34; t9h[k] = 0.60;
+                } else if (k <= 3) {
+                    double a = (double)(k - 1) * 2.094 + rnd() * 0.5;
+                    double rr = 0.20 + rnd() * 0.12;
+                    t9x[k] = cos(a) * rr; t9z[k] = sin(a) * rr;
+                    t9r[k] = 0.24 + rnd() * 0.08; t9h[k] = 0.44 + rnd() * 0.13;
+                } else if (k <= 9) {
+                    double a = (double)(k - 4) * 1.047 + rnd() * 0.7;
+                    double rr = 0.26 + rnd() * 0.24;
+                    t9x[k] = cos(a) * rr; t9z[k] = sin(a) * rr;
+                    t9r[k] = 0.17 + rnd() * 0.08; t9h[k] = 0.24 + rnd() * 0.17;
+                } else {
+                    double a = rnd() * 6.283;
+                    double rr = 0.20 + rnd() * 0.34;
+                    t9x[k] = cos(a) * rr; t9z[k] = sin(a) * rr;
+                    t9r[k] = 0.10 + rnd() * 0.07; t9h[k] = 0.12 + rnd() * 0.15;
+                }
+            }
+        }
+
+        for (int iz = 0; iz < GZ; ++iz) {
+            double z = BZ0 + (BZ1 - BZ0) * ((double)iz + 0.5) / (double)GZ;
+            for (int iy = 0; iy < GY; ++iy) {
+                double y = BY0 + (BY1 - BY0) * ((double)iy + 0.5) / (double)GY;
+                for (int ix = 0; ix < GX; ++ix) {
+                    double x = BX0 + (BX1 - BX0) * ((double)ix + 0.5) / (double)GX;
+                    size_t idx = ((size_t)iz * (size_t)GY + (size_t)iy) * (size_t)GX + (size_t)ix;
+                    double vv = 0.0;
+                    for (int k = 0; k < NS; ++k) {
+                        double dx = x - ox[k], dy = y - oy[k], dz = z - oz[k];
+                        double d2 = (dx * dx + dy * dy + dz * dz) / (orad[k] * orad[k]);
+                        if (d2 < 1.0) {
+                            double t2 = 1.0 - d2;
+                            vv += t2 * t2;
+                        }
+                    }
+                    if (variant == 5) {
+                        /* 平底：云只在有隆起的地方才有，底是一条水平面——
+                           不是盒子地板。底以上立刻满密度、往上渐淡，这就是
+                           “平底 + 圆拱顶”的那个对比。 */
+                        double base = BY0 + 0.10;
+                        double hgt2 = hfield[(size_t)iz * (size_t)GX + (size_t)ix];
+                        vv = 0.0;
+                        if (y >= base && hgt2 > 0.001) {
+                            double top = base + hgt2;
+                            double t3 = (top - y) / 0.18;
+                            double t4 = (y - base) / 0.05;
+                            if (t3 > 1.0) t3 = 1.0;
+                            if (t3 < 0.0) t3 = 0.0;
+                            if (t4 > 1.0) t4 = 1.0;
+                            vv = t3 * t4;
+                        }
+                    }
+                    if (variant == 6) {
+                        /* 三维噪声场，三个方向的频率必须相当——只要 y 方向的频率明显
+                           低于 x/z，场在竖直方向就几乎不变，形状又退回“水平切片”。 */
+                        double cl = fbm3(x * 1.05, 0.40, z * 1.05);
+                        double yy = (y - BY0) / (BY1 - BY0);
+                        if (yy < 0.0) yy = 0.0;
+                        if (yy > 1.0) yy = 1.0;
+                        double lo = 1.0 - yy;
+                        double rn = sqrt(x * x + z * z) / 0.95;
+                        /* 阈值 = 中心最低、越往外越高。云不是切出来的，是“长”出来的：
+                           中间最密实，往上下、往四周都自然收敛成小团。 */
+                        /* 低频聚类：cl 高的地方阈值往下压，云就在那里聚成一朵；
+                           cl 低的地方阈值抬高，那里就是空的。这样出来的是一片
+                           “几朵独立的云”，而不是一条连续的碎云带。 */
+                        double th = 0.470 + 0.030 * yy * yy + 0.060 * lo * lo * lo;
+                        th += 0.080 * rn * rn * rn;
+                        th -= 0.200 * (cl - 0.50) * 2.0;
+                        double q6 = fbm3(x * 2.00 + cl * 0.60, y * 2.00, z * 2.00 + cl * 0.60) * 0.86
+                                  + fbm3(x * 3.60, y * 3.60, z * 3.60) * 0.14;
+                        double v6 = (q6 - th) / 0.180;
+                        if (v6 < 0.0) v6 = 0.0;
+                        if (v6 > 1.0) v6 = 1.0;
+                        /* 上下再套一层很宽的软包络。不加这层，云会在盒底被整块截断，
+                           底视下缘是一条带洞的平板；加了这层，底就是碎的一圈。 */
+                        double yb2 = (y - BY0) / 0.10;
+                        if (yb2 < 0.0) yb2 = 0.0;
+                        if (yb2 > 1.0) yb2 = 1.0;
+                        yb2 = yb2 * yb2 * (3.0 - 2.0 * yb2);
+                        double yt2 = ((BY1 - 0.02) - y) / 0.10;
+                        if (yt2 < 0.0) yt2 = 0.0;
+                        if (yt2 > 1.0) yt2 = 1.0;
+                        yt2 = yt2 * yt2 * (3.0 - 2.0 * yt2);
+                        /* 再乘一层离壁 0.24 就归零的包络。离壁不归零，云就会被盒面
+                           整块切平，屏幕上出现一条直边——那正是“看起来像贴图”的来源。 */
+                        double fwx = (x - BX0) / 0.24;
+                        double fwz = (z - BZ0) / 0.24;
+                        double fwx2 = (BX1 - x) / 0.24;
+                        double fwz2 = (BZ1 - z) / 0.24;
+                        double ftop = (BY1 - y) / 0.20;
+                        double fbot = (y - BY0) / 0.20;
+                        if (fwx > 1.0) fwx = 1.0;
+                        if (fwz > 1.0) fwz = 1.0;
+                        if (fwx2 > 1.0) fwx2 = 1.0;
+                        if (fwz2 > 1.0) fwz2 = 1.0;
+                        if (ftop > 1.0) ftop = 1.0;
+                        if (fbot > 1.0) fbot = 1.0;
+                        if (fwx < 0.0) fwx = 0.0;
+                        if (fwz < 0.0) fwz = 0.0;
+                        if (fwx2 < 0.0) fwx2 = 0.0;
+                        if (fwz2 < 0.0) fwz2 = 0.0;
+                        if (ftop < 0.0) ftop = 0.0;
+                        if (fbot < 0.0) fbot = 0.0;
+                        double env = fwx * fwz * fwx2 * fwz2 * ftop * fbot;
+                        env = env * env * (3.0 - 2.0 * env);
+                        vv = v6 * yb2 * yt2 * env;
+                    }
+                    if (variant == 7) {
+                        /* 积云外形（平底 + 圆拱顶）+ 三维侵蚀。
+                           外形决定它看起来是“一朵积云”；侵蚀负责把表面打碎，
+                           不让密度只随高度变——只随高度变就是等高线，就是馒头。 */
+                        double base7 = BY0 + 0.06;
+                        double hg = hfield[(size_t)iz * (size_t)GX + (size_t)ix];
+                        vv = 0.0;
+                        if (hg > 0.001) {
+                            double top7 = base7 + hg;
+                            double t3 = (top7 - y) / 0.16;
+                            double t4 = (y - base7) / 0.07;
+                            if (t3 > 1.0) t3 = 1.0;
+                            if (t3 < 0.0) t3 = 0.0;
+                            if (t4 > 1.0) t4 = 1.0;
+                            double core = t3 * t4;
+                            double er = fbm3(x * 3.00, y * 3.00, z * 3.00);
+                            core -= 0.52 * er * (0.30 + 0.70 * t3);
+                            if (core < 0.0) core = 0.0;
+                            double md = fbm3(x * 5.20, y * 4.40, z * 5.20);
+                            vv = core * (0.78 + 0.40 * md);
+                        }
+                    }
+                    if (variant == 8) {
+                        /* 三样合并。关键在“外形不当表面用”：
+                           - 型5 的拱顶/平底只用来抬降阈值（偏置），不直接当密度
+                             —— 直接当密度，等值面就是 top 的偏移面，必出等高线（型7 的死因）
+                           - 真正的表面由三维 fbm 决定，所以表面是碎的、三维的
+                           - 型7 的侵蚀叠上去修边，顶部侵蚀更狠
+                           ！三个方向的频率必须一样，y 低了就又退回水平切片。 */
+                        /* 云底不能是常数高度。常数高度 = 一张平地毯，
+                           正视图和底视图都是一条直线。让基底自己随位置起伏。 */
+                        /* 云底要碎成小块。单一个低频扰动在 2 单位的盒子里只有三个波长，
+                           整片还是平的；叠两个不同频率的才真的断开。 */
+                        double bj8 = fbm3(x * 3.00, 0.40, z * 3.00) - 0.50;
+                        double bj9 = fbm3(x * 1.40, 0.30, z * 1.40) - 0.50;
+                        double base8 = BY0 + 0.16 + 0.42 * bj8 + 0.30 * bj9;
+                        /* max 融合让相邻格跳变，读出来是一块块砖。
+                           读的时候就地做 3×3 平滑，接缝保住、砖块消掉。 */
+                        double hg8 = 0.0;
+                        {
+                            double s9 = 0.0, c9 = 0.0;
+                            for (int dz9 = -1; dz9 <= 1; ++dz9) {
+                                int zz9 = iz + dz9;
+                                if (zz9 < 0 || zz9 >= GZ) continue;
+                                for (int dx9 = -1; dx9 <= 1; ++dx9) {
+                                    int xx9 = ix + dx9;
+                                    if (xx9 < 0 || xx9 >= GX) continue;
+                                    s9 += hfield[(size_t)zz9 * (size_t)GX + (size_t)xx9];
+                                    c9 += 1.0;
+                                }
+                            }
+                            hg8 = (c9 > 0.0) ? s9 / c9 : 0.0;
+                        }
+                        /* 真实积云的顶会被逆温层压住，长不出尖峰。
+                           这里把最高的一段压扁：0.62 以上只保留 25% 增量。 */
+                        if (hg8 > 0.44) hg8 = 0.44 + (hg8 - 0.44) * 0.30;
+                        vv = 0.0;
+                        if (hg8 > 0.001) {
+                            /* 只让真正隆起来的地方长云。否则 hg 只要大于 0，
+                               云就从同一高度长出来，底面铺成一张地毯（底视那块薄板）。 */
+                            double foot = (hg8 - 0.07) / 0.12;
+                            if (foot < 0.0) foot = 0.0;
+                            if (foot > 1.0) foot = 1.0;
+                            foot = foot * foot * (3.0 - 2.0 * foot);
+                            /* 顶面必须被三维噪声打散。只按 hg8 起伏，
+                               mask 就沿穹顶等值面变化，屏幕上就是一圈圈同心弧
+                              （底视那张图下面那些弧线），也就是“片片”。 */
+                            double tt8 = fbm3(x * 2.60, y * 2.60, z * 2.60) - 0.50;
+                            double top8 = base8 + hg8 + 0.60 * tt8;
+                            double th8h = top8 - base8;
+                            double uy = (y - base8) / (th8h > 0.001 ? th8h : 0.001);
+                            double mask = 0.0;
+                            if (uy >= 0.0 && uy <= 1.0) mask = 1.0;
+                            /* 顶、底各留 0.30 的软边，不做硬切 */
+                            /* 云底不做渐变：渐变会在底面附近沿 top 的等值面结成一圈圈
+                               弧线加一块薄板（底视那两张图）。直接切在 base 上，
+                               配合 hg 的 3D 扰动，边缘是碎的，不是刀口。 */
+                            if (uy > 1.0) mask = 1.0 - (uy - 1.0) * 2.2;
+                            if (uy < 0.0) mask = 0.0;
+                            if (mask < 0.0) mask = 0.0;
+                            if (mask > 1.0) mask = 1.0;
+                            mask = mask * mask * (3.0 - 2.0 * mask);
+                            if (mask > 0.02) {
+                                double cl8 = fbm3(x * 0.80, 0.30, z * 0.80);
+                                double q8 = fbm3(x * 2.00 + cl8 * 0.8, y * 2.00, z * 2.00 + cl8 * 0.8) * 0.84
+                                          + fbm3(x * 3.80, y * 3.80, z * 3.80) * 0.16;
+                                double thin = 0.22 * (1.0 - mask);
+                                /* 基线压到 0.20：云是光学厚的介质，内部几乎实心，
+                                   洞只应该出现在大团之间的缝里，不能一片片挖空。 */
+                                double th8 = 0.20 + thin + 0.05 * cl8;
+                                double er8 = fbm3(x * 3.10, y * 3.10, z * 3.10);
+                                /* 侵蚀只修边：内部（mask≈1）基本不动，
+                                   否则云里会出现一个个溶洞。 */
+                                double edge = 1.0 - mask;
+                                double core8 = q8 - th8 - 0.10 * er8 * (0.25 + 0.75 * edge) * (0.4 + 0.6 * uy);
+                                core8 = core8 * (0.35 + 0.65 * foot);
+                                /* 分母是“密度从 0 到 1 要跨多远”。
+                                   0.18 太陡，表面一进去就不透明，读作雪坡；
+                                   0.34 才有云的软边和半透明。 */
+                                vv = core8 / 0.34;
+                            }
+                        }
+                    }
+                    if (variant == 9) {
+                        /* 塔群并集。密度不是“阈值切出来的”，是每根塔从自身的半径
+                           往外线性衰减——所以边缘天生是软的，不需要靠 alpha 补偿。 */
+                        double yb9 = BY0 + 0.18 + 0.06 * (fbm3(x * 1.50, 0.30, z * 1.50) - 0.50) * 2.0;
+                        double best = 0.0;
+                        for (int k = 0; k < NT9; ++k) {
+                            double t9 = (y - yb9) / t9h[k];
+                            if (t9 <= 0.0 || t9 >= 1.0) continue;
+                            double prof;
+                            if (t9 < 0.64) prof = 0.90 + 0.20 * t9;
+                            else {
+                                double u9 = (t9 - 0.64) / 0.36;
+                                prof = sqrt(1.0 - u9 * u9);
+                            }
+                            double R9 = t9r[k] * prof;
+                            double dx9 = x - t9x[k], dz9 = z - t9z[k];
+                            double dd9 = sqrt(dx9 * dx9 + dz9 * dz9);
+                            double c9 = (R9 - dd9) / (0.45 * R9 + 0.02);
+                            if (c9 > 1.0) c9 = 1.0;
+                            if (c9 > best) best = c9;
+                        }
+                        /* 侵蚀分两层：低频只轻修边缘（原来的 0.30 单层在塔身上
+                           形成竖向棱线），高频给表面加一点细碎。 */
+                        /* 云面是光滑的大瓣，不是砂纸。低频块状加深到 0.22，
+                           高频细节压到 0.025（之前 0.09 读作一层米粒/羊毛）。 */
+                        double er9 = fbm3(x * 1.90, y * 1.90, z * 1.90);
+                        double fi9 = fbm3(x * 5.60, y * 5.60, z * 5.60);
+                        double edge9 = 1.0 - best;
+                        double v9 = best - 0.22 * er9 * (0.20 + 0.80 * edge9) - 0.025 * fi9;
+                        if (v9 < 0.0) v9 = 0.0;
+                        vv = v9 / 0.30;
+                    }
+                    if (variant == 10) {
+                        /* 云是雾，不是雕塑。这一型里没有“表面”这个概念：
+                           - A 决定云在哪里、是成条还是成坨（水平拉长，所以能连成长条）
+                           - B 把云块内部切成瓣
+                           - C 是最小尺度的颗粒起伏，给雾态
+                           - vy 是高度的钟形分布，上下都渐隐，所以不会有硬顶硬底
+                           密度 0→1 连续，渲染靠累积，低密度处自然半透明。 */
+                        double wx = x + 0.10 * y;          /* 一点风切变，云被斜着拉 */
+                        /* 频率要够高才有“多朵、大小不一、能连成条”；
+                           0.80 时整盒只有一朵，看着就是个小云球。 */
+                        double A = fbm3(wx * 1.30, y * 1.60, z * 1.30);
+                        double B = fbm3(wx * 2.70, y * 2.70, z * 2.70);
+                        double C = fbm3(wx * 5.40, y * 5.40, z * 5.40);
+                        double cover = (A - 0.32) / 0.44;
+                        if (cover < 0.0) cover = 0.0;
+                        if (cover > 1.0) cover = 1.0;
+                        cover = cover * cover * (3.0 - 2.0 * cover);
+                        /* 云带要薄。0.62 的半宽让云从 0.4 堆到 1.5，竖直方向被切成上下两层，
+                           读作“一层一层”。0.36 的半宽 = 一条 0.72 厚的高空带，带内是团和塔。 */
+                        double vyc = (y - 1.00) / 0.36;
+                        double vy = 1.0 - vyc * vyc;
+                        if (vy < 0.0) vy = 0.0;
+                        vy = vy * vy * (3.0 - 2.0 * vy);
+                        /* 贴壁的云会被盒子切成直角硬边（型6 就是这么坏掉的）。
+                           这里在六面各留 0.22 的渐隐带，云自然收在盒子里。 */
+                        double fx = x - BX0; if (BX1 - x < fx) fx = BX1 - x;
+                        double fz = z - BZ0; if (BZ1 - z < fz) fz = BZ1 - z;
+                        double fy = y - BY0; if (BY1 - y < fy) fy = BY1 - y;
+                        fx = fx / 0.22; if (fx > 1.0) fx = 1.0;
+                        fz = fz / 0.22; if (fz > 1.0) fz = 1.0;
+                        fy = fy / 0.16; if (fy > 1.0) fy = 1.0;
+                        fx = fx * fx * (3.0 - 2.0 * fx);
+                        fz = fz * fz * (3.0 - 2.0 * fz);
+                        fy = fy * fy * (3.0 - 2.0 * fy);
+                        /* vy 只能当很弱的包络。之前 pow(vy,0.70) 让密度几乎只随高度变，
+                           等密度面就成了近水平的片，读作“一层一层”。
+                           改成 0.35+0.65*vy：形状交给三维噪声，高度只负责“大概集中在这一带”。 */
+                        double d10 = cover * (0.35 + 0.65 * vy)
+                                   * (0.38 + 0.62 * B) * (0.45 + 0.55 * C)
+                                   * fx * fz * fy;
+                        vv = d10;
+                    }
+                    if (variant >= 11) {
+                        /* 团只负责“云在哪、多大一坨、多厚”，形状交给颗粒噪声。
+                           团本身是平滑椭球，但它外面是 exp 尾巴而不是硬边，
+                           所以读起来是雾，不是几何体。 */
+                        /* 位移式细节：先把采样坐标用噪声扭一下，再拿去算团和颗粒。
+                           这等价于“沿法线偏移”——团外面的那层等值面被扭碎，
+                           侧面掠射角上的一圈圈层叠弧就没地方形成。
+                           成本是每体素多三次 fbm，只在生成时算一次，不进游戏帧。 */
+                        /* 三轴用同一频率，fbm 的三线性插值会在 45° 方向留下折痕。
+                           三轴频率错开，对称性被打散，折痕跟着散。 */
+                        /* 放大档要保证“细节的相对尺度”不变：噪声频率与云尺度反比，
+                           位移幅度与云尺度正比。否则放大后颗粒相对变细，云会碎成沙。 */
+                        double scn11 = (tree11) ? (1.0 / sc11) : 1.0;
+                        double amx11 = (tree11) ? (0.075 * sc11) : 0.075;
+                        double scyq = (variant == 20) ? 1.10 : ((variant == 21) ? 1.22 : 1.35);
+                        double amy11 = (tree11) ? (0.060 * scyq) : 0.060;
+                        double wxa = fbm3(x * (4.20 * scn11) + 3.30, y * (3.55 * scn11), z * (4.85 * scn11));
+                        double wya = fbm3(x * (3.75 * scn11), y * (4.35 * scn11) + 7.10, z * (4.10 * scn11));
+                        double wza = fbm3(x * (4.60 * scn11), y * (3.90 * scn11), z * (4.10 * scn11) + 5.70);
+                        double xs11 = x + amx11 * (wxa - 0.50) * 2.0;
+                        double ys11 = y + amy11 * (wya - 0.50) * 2.0;
+                        double zs11 = z + amx11 * (wza - 0.50) * 2.0;
+                        /* **扩散场是“和”，不是“最大”。** 取 max 时每个源自成一体，
+                           相邻两团只是互相切一刀，读作拼起来的两块；取和时密度按源的
+                           贡献叠加，重叠处自然更密，边缘自然互相渗透——这才是扩散。
+                           叠加后再做一次饱和（1-exp），防止多团重叠把密度顶爆。 */
+                        double sum11 = 0.0;
+                        for (int nc = 0; nc < ncl11; ++nc) {
+                            for (int k = 0; k < nuse11; ++k) {
+                                double rs = rs11[nc];
+                                double qx = (xs11 - cx11[nc] - b11x[k]) / (r11x[k] * rs);
+                                double qy = (ys11 - cy11[nc] - b11y[k]) / (r11y[k] * rs);
+                                double qz = (zs11 - cz11[nc] - b11z[k]) / (r11z[k] * rs);
+                                double q = qx * qx + qy * qy + qz * qz;
+                                /* exp 尾巴太宽，全云外面就套一层均匀薄壳，读作玻璃罩。
+                                   收紧到 1.85，尾巴短了，雾感靠颗粒噪声给。 */
+                                if (q > 3.4) continue;
+                                sum11 += exp(-q * 1.25);
+                            }
+                        }
+                        /* 放大档的源叠得更厚，2.20 会让重叠处直接饱和成一块纯白，
+                           周围又低一截，读作“白斑 + 灰斑”的补丁。
+                           降到 1.45，密度走宽平台，斑驳就没了。 */
+                        double ksat11 = (tree11) ? 1.45 : 2.20;
+                        double best11 = 1.0 - exp(-sum11 * ksat11);
+                        /* 竖向缩放（scy）小于水平（sc），频率若只按水平折算，
+                           竖向噪声的相对波长就偏短，云内部会织出竖向的灰斑。
+                           竖向频率按 scy 单独折算，三轴才是同一个相对尺度。 */
+                        double scny11 = (tree11) ? (1.0 / scyq) : 1.0;
+                        double g1 = fbm3(xs11 * (2.30 * scn11), ys11 * (2.30 * scny11), zs11 * (2.30 * scn11));
+                        double g2 = fbm3(xs11 * (5.20 * scn11), ys11 * (5.20 * scny11), zs11 * (5.20 * scn11));
+                        double g3 = fbm3(xs11 * (9.00 * scn11), ys11 * (9.00 * scny11), zs11 * (9.00 * scn11));
+                        /* 三层相乘的原始动态范围是 0.084~1.0，接近 12 倍。
+                           这个倍数落在团表面就是“撕成布片”的褶皱。
+                           压到 2 倍左右：颗粒的尺度留着，撕扯的幅度去掉。 */
+                        double graw = (0.26 + 0.74 * g1) * (0.52 + 0.48 * g2) * (0.62 + 0.38 * g3);
+                        /* 放大档动态范围再压一点：0.55~1.0。
+                           大云的面积大，同一处低值区会摊成看得见的一块灰斑。 */
+                        double gbase = (tree11) ? 0.55 : 0.45;
+                        double gampl = (tree11) ? 0.45 : 0.55;
+                        double gran = gbase + gampl * graw;
+                        /* 团的密度剖面是一条陡的 exp 曲线，等值面层层嵌套，
+                           叠起来就是“一层一层”的洋葱壳，而且读作实体的表皮。
+                           先把它压成宽平台（pow 0.55），形状交给细颗粒噪声，
+                           云才是“一团雾”，不是一颗有壳的东西。 */
+                        double v11 = best11;
+                        if (v11 > 1.0) v11 = 1.0;
+                        /* 0.55 把极小的密度也放大，位移噪声的缝会被放大成裂纹。
+                           0.70 平台已经够宽，缝留不下。 */
+                        if (v11 > 0.0) v11 = pow(v11, 0.70);
+                        /* 絮丝这条路撤销了：加丝会在表面切出细胞状的碎边，
+                           读作干裂的泥地，比实体更糟。雾不是“有丝”，是“没有清
+                           晰的边”——虚化靠密度场整体糊开，不靠往边界上加细节。 */
+                        /* 密度满格的云，光要走一百多步才饱和，内部必然读作一板实体。
+                           整体降到六成：每一步的 op 变小，光能一路穿到云心，
+                           累积出来是渐变的雾，不是一块白板。 */
+                        /* 六面渐隐：大档会把源铺到盒壁，没有渐隐就会被盒子切成方糖。 */
+                        double ex = x - BX0; if (BX1 - x < ex) ex = BX1 - x;
+                        double ez = z - BZ0; if (BZ1 - z < ez) ez = BZ1 - z;
+                        double ey2 = y - BY0; if (BY1 - y < ey2) ey2 = BY1 - y;
+                        double fw11 = (tree11) ? 0.30 : 0.22;
+                        ex = ex / fw11; if (ex > 1.0) ex = 1.0;
+                        ez = ez / fw11; if (ez > 1.0) ez = 1.0;
+                        ey2 = ey2 / 0.16; if (ey2 > 1.0) ey2 = 1.0;
+                        ex = ex * ex * (3.0 - 2.0 * ex);
+                        ez = ez * ez * (3.0 - 2.0 * ez);
+                        ey2 = ey2 * ey2 * (3.0 - 2.0 * ey2);
+                        vv = v11 * gran * dens11 * ex * ez * ey2;
+                        /* 凝结底面：真实积云不是球形收口，它落在一个凝结高度上，
+                           底是一片较平的面。没有这一条， 源的 exp 尾巴向下
+                           一路拖到盒底，底边就成了“圆球 + 一块被盒底切出来的平板”，
+                           读作悬浮的棉花球。 */
+                        if (tree11 && variant != 26) {
+                            double yfl11 = 1.52;
+                            if (y < yfl11) {
+                                double tf11 = (y - (yfl11 - 0.28)) / 0.28;
+                                if (tf11 < 0.0) tf11 = 0.0;
+                                if (tf11 > 1.0) tf11 = 1.0;
+                                vv *= tf11 * tf11 * (3.0 - 2.0 * tf11);
+                            }
+                        }
+                    }
+                    den[idx] = vv;
+                }
+            }
+        }
+
+        /* **型 25：纯噪声等值面**
+           形态由噪声的等值面决定，包络只负责三件事：底平、顶收、范围。
+           上一版直接把径向 exp 包络当密度来乘噪声 —— 剪影必然是规整的锥，
+           瓣被包络压平。这一版反过来：先由噪声定“哪里是云”，包络只做裁剪。 */
+                /* 型 26：天空多朵云。
+           型 25 再怎么散簇，都在同一个盒里，读出来仍然是“一朵”。
+           要“世界那么大有很多朵”，只能在一个更大的盒里放多朵彼此不相连的云：
+           每朵自己是一套噪声等值面剪影，云与云之间留真正的真空隙（不是压出来的浅缝）。
+           底平、顶收、底宽上窄，三件事和型 25 同一套做法。 */
+        if (variant == 26) {
+            /* 型26 = 型11 那一朵 × 6 份。
+               用户原话“还不如之前用的那个”，那个就是型11。
+               所以不重新发明形态：把型11 的 18 团结构原样搬过来——
+               底 3 团铺平底、腰 4 团做厚度、顶 3 团、8 个顶塔把云顶顶出瓣——
+               然后整朵复制六份，各在一个中心、各自缩放到同一尺度。
+               核取 max（并集），不取 sum：sum 会把六朵的尾巴连成一片。 */
+            const int NP26 = 18;
+            const double q26x[18] = { -0.34,  0.30,  0.02,  0.36, -0.30,  0.02,  0.20, -0.10,  0.16, -0.20,
+                                       0.42, -0.34,  0.06,  0.44, -0.26,  0.10,  0.30, -0.06 };
+            const double q26y[18] = {  0.74,  0.78,  0.70,  1.05,  1.10,  1.08,  1.02,  1.34,  1.38,  1.30,
+                                       1.24,  1.29,  1.27,  1.16,  1.21,  1.19,  1.12,  1.14 };
+            const double q26z[18] = { -0.12,  0.14, -0.40,  0.02,  0.28, -0.34,  0.36,  0.04, -0.16, -0.22,
+                                       0.06,  0.30, -0.38, -0.02,  0.20, -0.28,  0.30,  0.34 };
+            const double q26r[18] = {  0.50,  0.46,  0.40,  0.38,  0.34,  0.40,  0.32,  0.22,  0.20,  0.18,
+                                       0.20,  0.18,  0.19,  0.17,  0.20,  0.18,  0.16,  0.17 };
+            const double s26 = 2.60;
+            for (int iz = 0; iz < GZ; ++iz) {
+                double z = BZ0 + (BZ1 - BZ0) * ((double)iz + 0.5) / (double)GZ;
+                for (int iy = 0; iy < GY; ++iy) {
+                    double y = BY0 + (BY1 - BY0) * ((double)iy + 0.5) / (double)GY;
+                    for (int ix = 0; ix < GX; ++ix) {
+                        double x = BX0 + (BX1 - BX0) * ((double)ix + 0.5) / (double)GX;
+                        double best26 = 0.0;
+                        for (int ci = 0; ci < 6; ++ci) {
+                            double lx = (x - P26X[ci]) / s26;
+                            double lz = (z - P26Z[ci]) / s26;
+                            if (lx < -1.30 || lx > 1.30) continue;
+                            if (lz < -1.30 || lz > 1.30) continue;
+                            double ly = (y - (P26Y[ci] - 0.62 * s26)) / (s26 * 1.55);
+                            if (ly < 0.0 || ly > 1.0) continue;
+                            /* 型11 的团在归一化高度上占 0.58~1.50，映射到 ly 的 0~1。 */
+                            double g26 = 0.58 + ly * 0.92;
+                            double acc26 = 0.0;
+                            for (int k26 = 0; k26 < NP26; ++k26) {
+                                double dx = (lx - q26x[k26]) / q26r[k26];
+                                double dy = (g26 - q26y[k26]) / (q26r[k26] * 0.50);
+                                double dz = (lz - q26z[k26]) / q26r[k26];
+                                double d2 = dx * dx + dy * dy + dz * dz;
+                                if (d2 > 6.0) continue;
+                                /* 顶塔（k>=10）权重加大：它们只有 0.17~0.20 的半径，
+                                   在底团的尾巴里会被完全吞掉，云顶就只剩一个整圆顶。 */
+                                acc26 += ((k26 >= 10) ? 1.55 : 1.00) * exp(-d2 * 1.55);
+                            }
+                            if (acc26 <= 0.0) continue;
+                            /* 18 团叠加的高度就是型11 的雾态密度：有平台、不透明、有层次。 */
+                            /* 型11 的雾态靠的是 sum 之后的指数扩散，系数低了就退回 max：
+                               每朵只剩最大那个团的球面，读成一个馒头。 */
+                            /* 中心有 18 个团叠加，acc 能到 3~6。系数 2.6 时
+                               exp(-acc*2.6) 早就到底，整朵都饱和成 1，层次全没了。
+                               压到 0.60 才留得住“中心厚、边缘薄”的梯度。 */
+                            double v = 1.0 - exp(-acc26 * 0.60);
+                            /* 噪声只调厚薄，不参与塑形；一塑形就碎成雪花。 */
+                            double ph26 = (double)ci * 37.3 + 11.7;
+                            double n26 = fbm3(x * 0.60 + ph26, y * 0.70 + ph26 * 0.7, z * 0.60 + ph26 * 1.3);
+                            /* 三层颗粒：型11 的云之所以不像塑料球，就是表面有这层颗粒。 */
+                            double gr1 = fbm3(x * 2.40 + ph26 * 3.1, y * 2.60 + ph26 * 1.7, z * 2.40 + ph26 * 2.3);
+                            double gr2 = fbm3(x * 4.80 + ph26 * 5.2, y * 5.20 + ph26 * 2.9, z * 4.80 + ph26 * 4.1);
+                            double gran = 0.62 + 0.32 * (gr1 - 0.5) * 2.0 + 0.20 * (gr2 - 0.5) * 2.0;
+                            v *= (0.66 + 0.62 * n26) * gran;
+                            if (v > 1.0) v = 1.0;
+                            if (v > best26) best26 = v;
+                        }
+                        if (best26 > 0.0) {
+                            size_t idx = ((size_t)iz * (size_t)GY + (size_t)iy) * (size_t)GX + (size_t)ix;
+                            den[idx] = best26;
+                        }
+                    }
+                }
+            }
+        }
+if (variant == 25) {
+            const double yb25 = 1.50, yt25 = 6.00;
+            const double r025 = 8.60;
+            for (int iz = 0; iz < GZ; ++iz) {
+                double z = BZ0 + (BZ1 - BZ0) * ((double)iz + 0.5) / (double)GZ;
+                for (int iy = 0; iy < GY; ++iy) {
+                    double y = BY0 + (BY1 - BY0) * ((double)iy + 0.5) / (double)GY;
+                    double t25 = (y - yb25) / (yt25 - yb25);
+                    for (int ix = 0; ix < GX; ++ix) {
+                        size_t idx = ((size_t)iz * (size_t)GY + (size_t)iy) * (size_t)GX + (size_t)ix;
+                        if (t25 > 1.15) { den[idx] = 0.0; continue; }
+                        double x = BX0 + (BX1 - BX0) * ((double)ix + 0.5) / (double)GX;
+                        /* 底：凝结高度以下清 0，往上 0.57 过渡 */
+                        double hb25 = 1.0;
+                        if (y < yb25 + 0.60) {
+                            double u = (y - (yb25 - 0.10)) / 0.70;
+                            if (u < 0.0) u = 0.0; if (u > 1.0) u = 1.0;
+                            hb25 = u * u * (3.0 - 2.0 * u);
+                        }
+                        /* 顶：收口高度必须随水平方向起伏。原来所有方向都在同一个 yt25 收口，
+                           剪影的顶永远是一顶圆帽 —— 密度和阈值怎么调都改不了这个顶。
+                           顶高按方向差 ±0.95，才会长出塔和凹口。 */
+                        double ytv25 = yt25 + 0.95 * (fbm3(x * 0.38 + 3.1, 1.7, z * 0.38 + 8.2) - 0.5) * 2.0;
+                        double ht25 = 1.0;
+                        if (y > ytv25 - 0.95) {
+                            double u = (y - (ytv25 - 0.95)) / 0.95;
+                            if (u > 1.0) u = 1.0;
+                            ht25 = 1.0 - u * u * (3.0 - 2.0 * u);
+                        }
+                        /* 水平范围：半径随高度收缩，顶端侧倾，剪影不是一根对称的锥 */
+                        double tt25 = t25; if (tt25 < 0.0) tt25 = 0.0; if (tt25 > 1.0) tt25 = 1.0;
+                        /* 半径不能线性收：线性收出来是一个斜坡，读作土堆/台体。
+                           真实积云是“下段几乎不缩（直壁）+ 上段快速收（顶）”，
+                           再叠一层低频噪声让侧壁鼓出凹凸。 */
+                        double pt25 = (tt25 - 0.60) / 0.40;
+                        if (pt25 < 0.0) pt25 = 0.0; if (pt25 > 1.0) pt25 = 1.0;
+                        pt25 = pt25 * pt25 * (3.0 - 2.0 * pt25);
+                        /* 剪影必须是“半径随方向起伏”，而不是“固定半径的圆”。
+                       频率压到 0.55（盒宽 8.4，一圈上只有两三个周期），幅度拉到
+                       0.58~1.33：这样边缘才会出现两三个大瓣和缺口，而不是一个圆。 */
+                    double nl25 = 0.58 + 0.75 * fbm3(x * 0.55 + 6.3, y * 0.45 + 2.8, z * 0.55 + 5.5);
+                        double rr25 = r025 * (1.0 - 0.10 * tt25 - 0.55 * pt25) * nl25;
+                        double dx25 = x - 0.45 * tt25, dz25 = z - 0.15 * tt25;
+                        /* **剪影必须被噪声扭曲**：只在密度上乘噪声，外轮廓还是那个
+                           旋转体（圆台）。沿径向位移一个低频噪声，轮廓才会鼓出大瓣。 */
+                        double fw25 = fbm3(x * 0.82 + 21.7, y * 0.62 + 13.4, z * 0.82 + 9.8);
+                        double warp25 = (fw25 - 0.5) * 2.0;
+                        double d25 = sqrt(dx25 * dx25 + dz25 * dz25) + 1.10 * warp25;
+                        double hr25 = 1.0 - d25 / (rr25 + 1e-6);
+                        if (hr25 <= 0.0) { den[idx] = 0.0; continue; }
+                        /* 包络彻底退出塑形：内部一律给满。云的边界现在由 n25 的 0.41 等值面
+                       决定，也就是由噪声决定——这才是“噪声生成”。半径只留一个很宽的
+                       衰减，用来保证盒壁不会出现直角硬边。 */
+                    double env25 = (hr25 < 0.10) ? (hr25 / 0.10) : 1.0;
+                        /* 三层噪声：低频定大瓣，中频做褶，高频只加表面颗粒 */
+                        double f1 = fbm3(x * 0.72 + 11.3, y * 0.82 + 4.1, z * 0.72 + 7.9);
+                        double f2 = fbm3(x * 1.68 + 2.7,  y * 1.85 + 9.2, z * 1.68 + 1.4);
+                        double f3 = fbm3(x * 5.20 + 5.1,  y * 5.60 + 3.3, z * 5.20 + 6.6);
+                        /* 高频那一层（5.20）在表面留下的是一层碎斑，不是云块；
+                           只留低频大瓣 + 中频褶，表面才会是柔和的鼓包。 */
+                        double n25 = 0.76 * f1 + 0.24 * f2;
+                        /* **分瓣（多足）**：更低频、幅度更大的噪声直接位移等值面。
+                           只在密度上乘一个门限是不够的——剪影由 0.32 等值面决定，
+                           乘法只把表面往内缩，长不出凸起。必须把低频噪声加进 n25 本身。 */
+                        double lb25 = fbm3(x * 0.78 + 17.2, y * 0.62 + 5.4, z * 0.78 + 2.8);
+                        n25 += 0.52 * (lb25 - 0.5) * 2.0;
+                        /* **多朵**：一朵云的内部再花也没用，远看不还是一坨。
+                           这里在密度场里直接立三座团峰，让它们各自鼓起、彼此只连一部分，
+                           整片才读成“几朵云连在一起”的云海，而不是一颗卤蛋。 */
+                        /* 八簇：一簇一簇各自立起来，簇与簇之间留空，远看是一片云海，
+                           近看是一团一团的花椰菜。簇心铺满 8.4 的盒，间距 2.6~3.0，
+                           半径做到 1.5 左右才分得开（团半径大于间距就一定粘成一坨）。 */
+                        double pk25 = 0.0;
+                        pk25 = std::max(pk25, exp(-((x + 4.03) * (x + 4.03) + (y - 2.60) * (y - 2.60) + (z + 4.03) * (z + 4.03)) / 5.80));
+                        pk25 = std::max(pk25, exp(-((x + 0.16) * (x + 0.16) + (y - 3.47) * (y - 3.47) + (z + 4.81) * (z + 4.81)) / 6.40));
+                        pk25 = std::max(pk25, exp(-((x - 4.19) * (x - 4.19) + (y - 2.81) * (y - 2.81) + (z - 0.62) * (z - 0.62)) / 7.30));
+                        pk25 = std::max(pk25, exp(-((x - 3.41) * (x - 3.41) + (y - 3.76) * (y - 3.76) + (z + 4.34) * (z + 4.34)) / 6.10));
+                        pk25 = std::max(pk25, exp(-((x + 1.40) * (x + 1.40) + (y - 2.45) * (y - 2.45) + (z + 0.78) * (z + 0.78)) / 8.00));
+                        pk25 = std::max(pk25, exp(-((x - 4.65) * (x - 4.65) + (y - 3.25) * (y - 3.25) + (z + 1.71) * (z + 1.71)) / 5.90));
+                        pk25 = std::max(pk25, exp(-((x - 1.40) * (x - 1.40) + (y - 2.96) * (y - 2.96) + (z - 2.48) * (z - 2.48)) / 6.70));
+                        pk25 = std::max(pk25, exp(-((x - 2.64) * (x - 2.64) + (y - 3.61) * (y - 3.61) + (z + 4.81) * (z + 4.81)) / 5.80));
+                        /* 第九簇专门补中心那道透天的缝：八簇的几何中心正好是空腔，
+                           仰视时光会从这条缝里穿过去，屏幕上就是一个小洞。 */
+                        pk25 = std::max(pk25, exp(-((x + 0.90) * (x + 0.90) + (y - 3.00) * (y - 3.00) + (z + 1.00) * (z + 1.00)) / 7.00));
+                        /* 簇与簇之间的“墙”必须彻底拆掉：只要还留基础噪声项（0.30*(0.76f1+0.24f2)），
+                           它就会在阈值上下把八个簇之间的空腔填满，远看又是一整坨。
+                           这里只留八簇，噪声改成乘在簇上，只负责把簇面搅出凹凸。 */
+                        double ne25 = fbm3(x * 1.30 + 3.7, y * 1.45 + 6.2, z * 1.30 + 8.1);
+                        /* 位移也必须乘进簇里。写成 +0.22*(lb25-0.5)*2 这种“外加项”，
+                           它会在簇与簇的空腔里把密度抬到阈值之上，八个簇又一次连成一整面。
+                           空腔必须保持绝对为零，凹凸只能长在簇自己身上。 */
+                        n25 = 1.18 * pk25 * (0.70 + 0.60 * ne25) * (0.86 + 0.28 * (lb25 - 0.5) * 2.0);
+                        /* 阈值提取：这就是“哪里是云”的判据。
+                           n25 均值约 0.5；0.40 起、0.60 满，得到一片有瓣的团块，
+                           而不是一层薄雾裹着整个包络。 */
+                        double q25 = (n25 - 0.31) / 0.13;
+                        if (q25 < 0.0) q25 = 0.0; if (q25 > 1.0) q25 = 1.0;
+                        /* 不再做 smoothstep 饱和：云内部要留住厚薄层次，否则整团都是 1，读作实心石头。 */
+                        /* **芯必须实**：阈值提取只在边缘 0.22~0.52 那一圈起作用，
+                           深处直接补满。不做这一步，低频噪声的低谷会在云心开出
+                           一个能看见天的洞，整朵读作“破的雪堆”。 */
+                        double in25 = 1.0 - hr25;
+                        /* core25 原来是 (in25-0.05)/0.18：半径一半以内全部补满 1.0。
+                           那等于把噪声剪影整块抹掉，任何形状都被填成一个实心整体，
+                           远看就是一坨卤蛋。现在只补最中心（内 45% 起），且只补到
+                           0.72，让噪声的谷能在云里真的断开，读成几团而不是一块。 */
+                        double core25 = (in25 - 0.55) / 0.28;
+                        if (core25 < 0.0) core25 = 0.0; if (core25 > 1.0) core25 = 1.0;
+                        core25 = core25 * core25 * (3.0 - 2.0 * core25) * 0.55;
+                        /* 簇已经各自成实体，再补芯就会把八簇之间填平、重新粘成一坨，所以这里不再补。 */
+                        /* 侵蚀：高频噪声在边缘啃缺口 */
+                        /* 侵蚀必须是**乘法**，不能做减法：0.32*env 那种减法会在云内部
+                           （不是边缘）挖出一堆凹坑，表面读作“被凿过的石灰/蜂窝”。
+                           乘法只整体调密度，坑不会出现。 */
+                        double er25 = fbm3(x * 1.10 + 8.8, y * 1.20 + 1.7, z * 1.10 + 4.4);
+                        /* **雾化**：密度整体压到 0.58。
+                           云不是实体，密度低到光能穿过去，边缘才会虚成雾；
+                           密度满格时每步消光就吃掉光，读出来是一块石头。 */
+                        /* **多足**：云面不能是一个光溜的整球。用中低频噪声做一道门限，
+                           把密度在几个团处抬起来、在团间压下去，剪影才会长出
+                           一丛一丛的凸起（云的那种“花椰菜”感）。
+                           必须用乘法：减法会在体内挖坑，读作蜂窝。 */
+                        double ub25 = (lb25 - 0.30) / 0.32;
+                        if (ub25 < 0.0) ub25 = 0.0; if (ub25 > 1.0) ub25 = 1.0;
+                        double bm25 = 0.58 + 0.72 * (ub25 * ub25 * (3.0 - 2.0 * ub25));
+                        /* **层次**：垂直方向频繁、水平方向拉伸的噪声，
+                           给出“一层一层”的云带结构（平流层的读法）。 */
+                        double ly25 = fbm3(x * 1.70 + 4.4, y * 3.40 + 9.1, z * 1.70 + 6.6);
+                        double v25 = q25 * env25 * hb25 * ht25 * (0.70 + 0.60 * er25)
+                                     * bm25 * (0.72 + 0.52 * ly25) * 0.72;
+                        den[idx] = v25;
+                    }
+                }
+            }
+        }
+
+        /* **顶面合并（只在融合档）**：两棵树的顶塔各自留一个峰，
+           一排峰摆在一起就读作“花椰菜”。平滑只能压不能并，
+           因为平滑是局部平均，峰的位置没变。
+           真正的办法是先求每列（x,z）的顶高，对这个“顶面高度场”做横向平均，
+           再把高于平均顶的部分削掉 —— 顶从“一排峰”变成“一条脊”。 */
+        if (variant == 24) {
+    
+        /* **顶面合并（按簇各算一张）**
+               全场一张高度场：抬高的那朵会被邻居的低顶拉下来、整朵削掉。
+               硬分区（按最近中心打标签）：交界处出现一条直线状的断崖，俯视能看到斜线。
+               所以用软权重：每列对两朵各有一个权重，两朵各算一张“加权平滑顶面”，
+               再按权重合成。交界因此是渐变的，没有那条线。 */
+            const double c27x0 = -0.62, c27z0 = -0.66;
+            const double c27x1 = 0.88,  c27z1 = 0.34;
+            std::vector<double> w27((size_t)GX * (size_t)GZ, 0.0);
+            for (int iz = 0; iz < GZ; ++iz) {
+                double z = BZ0 + (BZ1 - BZ0) * ((double)iz + 0.5) / (double)GZ;
+                for (int ix = 0; ix < GX; ++ix) {
+                    double x = BX0 + (BX1 - BX0) * ((double)ix + 0.5) / (double)GX;
+                    double d0 = (x - c27x0) * (x - c27x0) + (z - c27z0) * (z - c27z0);
+                    double d1 = (x - c27x1) * (x - c27x1) + (z - c27z1) * (z - c27z1);
+                    w27[(size_t)iz * (size_t)GX + (size_t)ix] = 1.0 / (1.0 + exp((d0 - d1) / 2.5));
+                }
+            }
+            std::vector<double> tp27((size_t)GX * (size_t)GZ, 0.0);
+            for (int iz = 0; iz < GZ; ++iz) {
+                for (int ix = 0; ix < GX; ++ix) {
+                    double top = 0.0;
+                    for (int iy = GY - 1; iy >= 0; --iy) {
+                        size_t id = ((size_t)iz * (size_t)GY + (size_t)iy) * (size_t)GX + (size_t)ix;
+                        if (den[id] >= 0.30) {
+                            top = BY0 + (BY1 - BY0) * ((double)iy + 0.5) / (double)GY;
+                            break;
+                        }
+                    }
+                    tp27[(size_t)iz * (size_t)GX + (size_t)ix] = top;
+                }
+            }
+            std::vector<double> ts0((size_t)GX * (size_t)GZ, 0.0);
+            std::vector<double> ts1((size_t)GX * (size_t)GZ, 0.0);
+            for (int iz = 0; iz < GZ; ++iz) {
+                for (int ix = 0; ix < GX; ++ix) {
+                    double a0 = 0.0, b0 = 0.0, a1 = 0.0, b1 = 0.0;
+                    /* 邻域 4 格时右侧还留了一根孤立细尖，放大到 7 格才够。 */
+                    for (int dz = -7; dz <= 7; ++dz) {
+                        for (int dx = -7; dx <= 7; ++dx) {
+                            int jz = iz + dz, jx = ix + dx;
+                            if (jz < 0 || jz >= GZ || jx < 0 || jx >= GX) continue;
+                            size_t jc = (size_t)jz * (size_t)GX + (size_t)jx;
+                            double v = tp27[jc];
+                            if (v <= 0.0) continue;
+                            double wj = w27[jc];
+                            a0 += v * wj;       b0 += wj;
+                            a1 += v * (1.0 - wj); b1 += 1.0 - wj;
+                        }
+                    }
+                    size_t cc = (size_t)iz * (size_t)GX + (size_t)ix;
+                    ts0[cc] = (b0 > 1e-6) ? a0 / b0 : 0.0;
+                    ts1[cc] = (b1 > 1e-6) ? a1 / b1 : 0.0;
+                }
+            }
+            for (int iz = 0; iz < GZ; ++iz) {
+                for (int iy = 0; iy < GY; ++iy) {
+                    double y = BY0 + (BY1 - BY0) * ((double)iy + 0.5) / (double)GY;
+                    for (int ix = 0; ix < GX; ++ix) {
+                        size_t idx = ((size_t)iz * (size_t)GY + (size_t)iy) * (size_t)GX + (size_t)ix;
+                        double d = den[idx];
+                        if (d <= 0.0) continue;
+                        size_t cc = (size_t)iz * (size_t)GX + (size_t)ix;
+                        double wc = w27[cc];
+                        double st = 0.0;
+                        double s0 = ts0[cc], s1 = ts1[cc];
+                        if (s0 > 0.0 && s1 > 0.0) st = wc * s0 + (1.0 - wc) * s1;
+                        else if (s0 > 0.0) st = s0;
+                        else if (s1 > 0.0) st = s1;
+                        if (st <= 0.0) continue;
+                        if (y > st) {
+                            /* 0.16 会把抬高的一整朵削平；0.45 削得不够，顶上低密度层叠成半透明“盖”。
+                               0.28 两头都能接受。乘性衰减还会留碎密度 → 渲染成一层薄纱，
+                               所以低于 0.18 的直接清空。 */
+                            double kk = (y - st) / 0.28;
+                            if (kk > 1.0) kk = 1.0;
+                            double dv27 = d * (1.0 - kk);
+                            if (kk > 0.90 || dv27 < 0.18) den[idx] = 0.0;
+                            else den[idx] = dv27;
+                        }
+                    }
+                }
+            }
+        }
+
+        /* 真的往下扩散：一遍一遍取邻域平均，把挨着的核并成一团、把接缝抹平。
+           这是无源扩散，稳态是一片常数——所以要限量，扩散过头云会缩水成圆球。 */
+        /* 6 型不能再扩散，一扩散细节就磨回球；25 是纯噪声场，扩散一次就等于白算。 */
+        const int NIT = ((variant >= 6 && variant <= 19)) ? 0 : ((variant == 25 || variant == 26) ? 2 : 5);
+        for (int it = 0; it < NIT; ++it) {
+            std::vector<double> tv = den;
+            for (int iz = 0; iz < GZ; ++iz) {
+                for (int iy = 0; iy < GY; ++iy) {
+                    for (int ix = 0; ix < GX; ++ix) {
+                        size_t idx = ((size_t)iz * (size_t)GY + (size_t)iy) * (size_t)GX + (size_t)ix;
+                        double s6 = 0.0;
+                        int cnt = 0;
+                        if (ix > 0)      { s6 += tv[idx - 1]; ++cnt; }
+                        if (ix < GX - 1) { s6 += tv[idx + 1]; ++cnt; }
+                        if (iy > 0)      { s6 += tv[idx - GX]; ++cnt; }
+                        if (iy < GY - 1) { s6 += tv[idx + GX]; ++cnt; }
+                        if (iz > 0)      { s6 += tv[idx - GX * GY]; ++cnt; }
+                        if (iz < GZ - 1) { s6 += tv[idx + GX * GY]; ++cnt; }
+                        double avg = (cnt > 0) ? (s6 / (double)cnt) : tv[idx];
+                        den[idx] = tv[idx] + 0.26 * (avg - tv[idx]);
+                    }
+                }
+            }
+        }
+
+        /* 体素格会在等密度面上留下台阶，从侧面看就是一圈圈等距细纹（“指纹”）。
+           这里对 9/10/11 做一次全三维 3×3×3 平滑把台阶抹掉。
+           只做一次：多轮会把云的瓣也磨平（无源扩散的稳态是常数）。 */
+        /* 注意：这个块原来只覆盖 9~19，20~24 从来没有被平滑过，
+           所以之前给 tree11 写的 npass/ksm 全是死代码。型24 需要它。 */
+        if ((variant >= 9 && variant <= 19) || variant == 24) {
+          int npass27 = (variant >= 18) ? 5 : 3;
+        /* 7 轮把顶层那些瓣全磨平了，读作一个圆顶帽。
+           回到 4 轮：底座连续的疙瘩已经被压掉，不需要再靠平滑取胜。 */
+        if (tree11) npass27 = 4;
+        /* 型24 是两棵树的源叠在同一场里，交界处会出现一排小鼓包（读作花椰菜）。
+           融合档额外平滑：把交界的凸起抹成一整片，只留“肩”的走向。 */
+        if (variant == 24) npass27 = 6;
+        for (int pass27 = 0; pass27 < npass27; ++pass27) {
+            std::vector<double> sm = den;
+            for (int iz = 0; iz < GZ; ++iz) {
+                for (int iy = 0; iy < GY; ++iy) {
+                    for (int ix = 0; ix < GX; ++ix) {
+                        size_t idx = ((size_t)iz * (size_t)GY + (size_t)iy) * (size_t)GX + (size_t)ix;
+                        double s27 = 0.0;
+                        int c27 = 0;
+                        for (int dz3 = -1; dz3 <= 1; ++dz3) {
+                            int z3 = iz + dz3;
+                            if (z3 < 0 || z3 >= GZ) continue;
+                            for (int dy3 = -1; dy3 <= 1; ++dy3) {
+                                int y3 = iy + dy3;
+                                if (y3 < 0 || y3 >= GY) continue;
+                                size_t base3 = ((size_t)z3 * (size_t)GY + (size_t)y3) * (size_t)GX;
+                                for (int dx3 = -1; dx3 <= 1; ++dx3) {
+                                    int x3 = ix + dx3;
+                                    if (x3 < 0 || x3 >= GX) continue;
+                                    s27 += sm[base3 + (size_t)x3];
+                                    c27 += 1;
+                                }
+                            }
+                        }
+                        double av27 = (c27 > 0) ? s27 / (double)c27 : sm[idx];
+                        /* 0.45 只抹掉了体素台阶，边界仍然是“一条线”。
+                           0.80 会把整个场糊开：密度从 0 到 1 要跨好几个格子，
+                           边界自然变成模糊过渡带——这才是雾的边。
+                           代价是瓣会被磨软，雾态本来就不该有硬瓣。 */
+                        double ksm27 = 0.80;
+            if (variant >= 18) ksm27 = 0.88;
+            if (tree11) ksm27 = 0.86;
+            if (variant == 24) ksm27 = 0.92;
+            den[idx] = sm[idx] + ksm27 * (av27 - sm[idx]);
+                    }
+                }
+            }
+          }
+        }
+
+        /* 诊断：把密度场的实际包围盒量出来打印。
+           “有没有偏大”不能靠眼睛，要看世界尺寸跟盒子（5.6 x 5.6 x 3.1）的比例。 */
+        {
+            double mx0 = 1e9, mx1 = -1e9, my0 = 1e9, my1 = -1e9, mz0 = 1e9, mz1 = -1e9;
+            long cnt = 0;
+            for (int iz = 0; iz < GZ; ++iz)
+                for (int iy = 0; iy < GY; ++iy)
+                    for (int ix = 0; ix < GX; ++ix) {
+                        size_t idx = ((size_t)iz * (size_t)GY + (size_t)iy) * (size_t)GX + (size_t)ix;
+                        if (den[idx] < 0.04) continue;
+                        ++cnt;
+                        double x = BX0 + (BX1 - BX0) * ((double)ix + 0.5) / (double)GX;
+                        double y = BY0 + (BY1 - BY0) * ((double)iy + 0.5) / (double)GY;
+                        double z = BZ0 + (BZ1 - BZ0) * ((double)iz + 0.5) / (double)GZ;
+                        if (x < mx0) mx0 = x; if (x > mx1) mx1 = x;
+                        if (y < my0) my0 = y; if (y > my1) my1 = y;
+                        if (z < mz0) mz0 = z; if (z > mz1) mz1 = z;
+                    }
+            if (cnt > 0)
+                printf("BBOX 型%d 宽=%.2f 厚=%.2f 高=%.2f 低=%.2f 顶=%.2f 体素=%ld  盒宽=%.2f 盒高=%.2f\n",
+                       variant, mx1 - mx0, mz1 - mz0, my1 - my0, my0, my1, cnt,
+                       BX1 - BX0, BY1 - BY0);
+            fflush(stdout);
+        }
+
+        /* 型1：扩散之后再给表面加一层高频细节，看细节能不能把球变成菜花。 */
+        if (variant == 1) {
+            auto hf = [](unsigned int x, unsigned int y, unsigned int z) -> double {
+                unsigned int n = x * 374761393u + y * 668265263u + z * 1442695041u;
+                n = (n ^ (n >> 13)) * 1274126177u;
+                n = (n ^ (n >> 16)) * 2246822519u;
+                n = n ^ (n >> 15);
+                return (double)(n & 0xffff) / 65535.0;
+            };
+            for (int iz = 0; iz < GZ; ++iz)
+                for (int iy = 0; iy < GY; ++iy)
+                    for (int ix = 0; ix < GX; ++ix) {
+                        size_t idx = ((size_t)iz * (size_t)GY + (size_t)iy) * (size_t)GX + (size_t)ix;
+                        double n = hf((unsigned int)ix, (unsigned int)iy, (unsigned int)iz) * 0.65
+                                 + hf((unsigned int)(ix / 2), (unsigned int)(iy / 2), (unsigned int)(iz / 2)) * 0.35;
+                        den[idx] = den[idx] * (0.70 + 0.60 * n);
+                    }
+        }
+
+        /* 定标：按分位数，不按最大值。最大值归一会让“单独一个核”被阈值直接切掉，
+           只剩几处重叠最密的地方活下来——看上去就是几颗孤零零的珠子。 */
+        double mx = 0.0;
+        for (size_t i = 0; i < den.size(); ++i) if (den[i] > mx) mx = den[i];
+        if (mx < 1e-6) mx = 1.0;
+        int hist[128];
+        for (int i = 0; i < 128; ++i) hist[i] = 0;
+        for (size_t i = 0; i < den.size(); ++i) {
+            int b = (int)(den[i] / mx * 127.0);
+            if (b < 0) b = 0;
+            if (b > 127) b = 127;
+            hist[b] += 1;
+        }
+        double total = (double)den.size();
+        double pLo = 0.0, pHi = mx;
+        double cum = 0.0;
+        for (int i = 0; i < 128; ++i) {
+            cum += (double)hist[i];
+            if (cum >= total * (((variant == 25 || variant == 26)) ? 0.04 : 0.18)) { pLo = mx * (double)i / 127.0; break; }
+        }
+        cum = 0.0;
+        for (int i = 0; i < 128; ++i) {
+            cum += (double)hist[i];
+            if (cum >= total * (((variant == 25 || variant == 26)) ? 0.995 : 0.90)) { pHi = mx * (double)i / 127.0; break; }
+        }
+        if (pHi < pLo + 1e-6) pHi = pLo + 1e-6;
+        for (size_t i = 0; i < den.size(); ++i) {
+            double q = (den[i] - pLo) / (pHi - pLo);
+            if (q < 0.0) q = 0.0;
+            if (q > 1.0) q = 1.0;
+            den[i] = q;
+        }
+        /* 盒子边界必须渐隐：不渐隐，云就被盒壁一刀切成直角边——
+           转台里那几条竖着的硬边就是这么来的。 */
+        for (int iz = 0; iz < GZ; ++iz) {
+            for (int iy = 0; iy < GY; ++iy) {
+                for (int ix = 0; ix < GX; ++ix) {
+                    double nx = (double)ix / (double)(GX - 1);
+                    double ny = (double)iy / (double)(GY - 1);
+                    double nz = (double)iz / (double)(GZ - 1);
+                    double ex = nx;
+                    if (1.0 - nx < ex) ex = 1.0 - nx;
+                    double ez = nz;
+                    if (1.0 - nz < ez) ez = 1.0 - nz;
+                    double ey2 = 1.0 - ny;
+                    double ff = ex;
+                    if (ez < ff) ff = ez;
+                    if (ey2 < ff) ff = ey2;
+                    if (ff < 0.10) {
+                        size_t idx = ((size_t)iz * (size_t)GY + (size_t)iy) * (size_t)GX + (size_t)ix;
+                        den[idx] *= ff / 0.10;
+                    }
+                }
+            }
+        }
+    }
+
+    auto smp = [&](double gx, double gy, double gz) -> double {
+        if (gx < 0.0) gx = 0.0; if (gx > (double)(GX - 1)) gx = (double)(GX - 1);
+        if (gy < 0.0) gy = 0.0; if (gy > (double)(GY - 1)) gy = (double)(GY - 1);
+        if (gz < 0.0) gz = 0.0; if (gz > (double)(GZ - 1)) gz = (double)(GZ - 1);
+        int ix = (int)gx, iy = (int)gy, iz = (int)gz;
+        if (ix > GX - 2) ix = GX - 2;
+        if (iy > GY - 2) iy = GY - 2;
+        if (iz > GZ - 2) iz = GZ - 2;
+        double tx = gx - (double)ix, ty = gy - (double)iy, tz = gz - (double)iz;
+        size_t i000 = ((size_t)iz * (size_t)GY + (size_t)iy) * (size_t)GX + (size_t)ix;
+        size_t sy = (size_t)GX, sz = (size_t)GX * (size_t)GY;
+        double a00 = den[i000]        * (1.0 - tx) + den[i000 + 1]        * tx;
+        double a10 = den[i000 + sy]   * (1.0 - tx) + den[i000 + sy + 1]   * tx;
+        double a01 = den[i000 + sz]   * (1.0 - tx) + den[i000 + sz + 1]   * tx;
+        double a11 = den[i000 + sz+sy]* (1.0 - tx) + den[i000 + sz + sy + 1] * tx;
+        double b0 = a00 * (1.0 - ty) + a10 * ty;
+        double b1 = a01 * (1.0 - ty) + a11 * ty;
+        return b0 * (1.0 - tz) + b1 * tz;
+    };
+
+    /* 相机基：yaw 绕竖轴、pitch 抬头，和游戏里的视角同一个约定。 */
+    double cpp = cos(pitch), spp2 = sin(pitch);
+    double cyw = cos(yaw), syw = sin(yaw);
+    double fx = cpp * syw, fy = spp2, fz = cpp * cyw;
+    double rxg = -fz, rzg = fx;
+    double rl = sqrt(rxg * rxg + rzg * rzg);
+    if (rl < 1e-6) { rxg = 1.0; rzg = 0.0; rl = 1.0; }
+    rxg /= rl; rzg /= rl;
+    double ux = -rzg * fy, uy = rzg * fx - rxg * fz, uz = rxg * fy;
+    double fovH = fov * (double)w / (double)(h > 0 ? h : 1);
+    double tanH = tan(fovH * 0.5), tanV = tan(fov * 0.5);
+    double sx3 = cos(elSun) * sin(azSun), sy3 = sin(elSun), sz3 = cos(elSun) * cos(azSun);
+
+    /* 步长必须小于一个体素格子，否则采样点老是跨格，累积出来的 alpha 会在
+       格子边界上打结，表面出现一道道斜向细纹。 */
+    /* 步长必须明显小于一个体素格子，否则密度累积在格子边界上打结，
+       屏幕上就出现一圈圈等距细线（看起来像“片片”）。0.0156 的格子，
+       步长要压到 0.007 以下，所以 480 步。 */
+    const int NST = 480;
+    for (int py = 0; py < h; ++py) {
+        double sy = (0.5 - (double)py / (double)(h - 1)) * 2.0;
+        for (int px = 0; px < w; ++px) {
+            double sx = ((double)px / (double)(w - 1) - 0.5) * 2.0;
+            double dx = fx + rxg * sx * tanH + ux * sy * tanV;
+            double dy = fy + uy * sy * tanV;
+            double dz = fz + rzg * sx * tanH + uz * sy * tanV;
+            double dl = sqrt(dx * dx + dy * dy + dz * dz);
+            if (dl < 1e-9) continue;
+            dx /= dl; dy /= dl; dz /= dl;
+            /* 视线与盒子求交 */
+            double t0 = 0.0, t1 = 1e9;
+            if (fabs(dx) < 1e-9) {
+                if (cx < BX0 || cx > BX1) continue;
+            } else {
+                double ta = (BX0 - cx) / dx, tb = (BX1 - cx) / dx;
+                if (ta > tb) { double tt = ta; ta = tb; tb = tt; }
+                if (ta > t0) t0 = ta;
+                if (tb < t1) t1 = tb;
+            }
+            if (fabs(dy) < 1e-9) {
+                if (cy < BY0 || cy > BY1) continue;
+            } else {
+                double ta = (BY0 - cy) / dy, tb = (BY1 - cy) / dy;
+                if (ta > tb) { double tt = ta; ta = tb; tb = tt; }
+                if (ta > t0) t0 = ta;
+                if (tb < t1) t1 = tb;
+            }
+            if (fabs(dz) < 1e-9) {
+                if (cz < BZ0 || cz > BZ1) continue;
+            } else {
+                double ta = (BZ0 - cz) / dz, tb = (BZ1 - cz) / dz;
+                if (ta > tb) { double tt = ta; ta = tb; tb = tt; }
+                if (ta > t0) t0 = ta;
+                if (tb < t1) t1 = tb;
+            }
+            if (t1 <= t0) continue;
+            double dt = (t1 - t0) / (double)NST;
+            /* 固定步进会在密度阈值上切出一圈圈阶梯。每个像素把起点错开半格，
+               台阶就被打散成细噪声，看不出格。 */
+            /* 这里的抖动必须是真的散列。原来 px*7919 + py*104729 & 1023 是线性同余，
+               在屏幕上是规则的斜条纹——那些“指纹”“同心弧”就是它画出来的。
+               先打散位再取低位，才是每像素独立的相位。 */
+            unsigned int hj = (unsigned int)(px) * 7919u + (unsigned int)(py) * 104729u;
+            hj ^= hj >> 13; hj *= 1274126177u;
+            hj ^= hj >> 16; hj *= 2246822519u;
+            hj ^= hj >> 15;
+            double jit = (double)(hj & 1023u) / 1023.0;
+            double tst = t0 + dt * jit;
+            double acc = 0.0, ar = 0.0, ag = 0.0, ab = 0.0;
+            double lit = 1.0;
+            bool gotLit = false;
+            for (int st = 0; st < NST; ++st) {
+                double t = tst + dt * (double)st;
+                double x = cx + dx * t, y = cy + dy * t, z = cz + dz * t;
+                double gx = (x - BX0) / (BX1 - BX0) * (double)(GX - 1);
+                double gy = (y - BY0) / (BY1 - BY0) * (double)(GY - 1);
+                double gz = (z - BZ0) / (BZ1 - BZ0) * (double)(GZ - 1);
+                double dv = smp(gx, gy, gz);
+                /* 型 25 的场被分位定标压到 [0,1]，平均值只有 0.3 左右。
+                   直接拿它做消光，整朵云会一直停在“半透明一层”，
+                   acc 到不了封顶，dk/lit 怎么调都被这层半透明吞掉。
+                   这里按型号补一个密度增益，让厚处真能积到不透明。 */
+                if ((variant == 25 || variant == 26)) dv *= 3.2;
+                /* 不能在密度上硬切一个 0.012 的门槛：那样“看得见的表面”就正好落在
+                   网格层上，球面上会结出一圈圈水平条纹。改成直接累积，表面位置
+                   变成连续的，条纹消失。 */
+                if (dv <= 0.002) continue;
+                if (!gotLit && dv > 0.06) {
+                    gotLit = true;
+                    /* 法线 = 密度下降方向。密度的梯度朝里，所以取负号。 */
+                    /* 法线的差分跨度必须比体素格子大。只差一格时，表面位置的
+                       半格抖动会被放大成法线跳变，云面就结出一层米粒状的砂。 */
+                    /* 跨度 2.6 格仍太窄：掠射角上表面位置的半格抖动被放大，
+                       画面会出现斜向的折痕。拉到 4.2 格，法线够钝，折痕消失。 */
+                    double nx, ny, nz;
+                    if ((variant == 25 || variant == 26)) {
+                        /* 盒放大到 8.4 之后，每格 0.03，4.2 格的密度差分跨不到云的
+                           结构尺度上，梯度几乎为零 -> 法线拿不到 -> 整团云只有
+                           一个 lit 值，读出来就是“天上一块均匀的米色光斑”。
+                           型 25 的云是凸体，直接用“云心指向表面”的方向做法线。 */
+                        nx = x;
+                        ny = y - 3.80;
+                        nz = z;
+                    } else {
+                        nx = -(smp(gx + 4.2, gy, gz) - smp(gx - 4.2, gy, gz));
+                        ny = -(smp(gx, gy + 4.2, gz) - smp(gx, gy - 4.2, gz));
+                        nz = -(smp(gx, gy, gz + 4.2) - smp(gx, gy, gz - 4.2));
+                    }
+                    double nl = sqrt(nx * nx + ny * ny + nz * nz);
+                    if (nl < 1e-9) { lit = 0.85; }
+                    else {
+                        nx /= nl; ny /= nl; nz /= nl;
+                        double dn = nx * sx3 + ny * sy3 + nz * sz3;
+                        /* 只 clamp 到 0 的话，背光面（法线朝下、朝背阳）拿到的
+                           永远是 0，整朵云就被抬到同一个亮度上，读作一块平色。
+                           型 25 保留负值：云底才能真的暗下去。 */
+                        if (!((variant == 25 || variant == 26) || variant == 26) && dn < 0.0) dn = 0.0;
+                        /* 云的 albedo 很高：朝光的顶面该是接近纯白。
+                           遮挡交给 dn（法线朝光的分量）和 dk（进入云内的深度），
+                           而不是把整团一起压灰。 */
+                        if ((variant == 25 || variant == 26)) {
+                            lit = litb11 + 0.62 * dn + 0.18 * dv - 0.08;
+                        } else {
+                            lit = litb11 + (0.52 + (0.78 - litb11) * 0.60) * dn + 0.25 * dv;
+                        }
+                        if (lit < litlo11) lit = litlo11;
+                        if (lit > lithm11) lit = lithm11;
+                    }
+                }
+                /* 消光再降一档：云边缘要软，不能像雪坡那样一刀切。 */
+                /* 消光 2.6 太强：光走进去十几步就饱和，剩下的全是“实心表面”。
+                   雾态云要光能穿过去，能看到内部结构，才会读作雾而不是石头。 */
+                /* 密度降了，消光要补回来，否则整团会淡成看不见。 */
+                double op = 1.0 - exp(-dv * dt * (((variant == 25 || variant == 26)) ? 5.00 : 1.85));
+                if (op > 1.0) op = 1.0;
+                double wgt = (1.0 - acc) * op;
+                /* 厚度的读法来自内部暗部：光越往里越出不来，深处必须压暗，
+                   否则一层体积云看上去就是一张白纸片。 */
+                /* 云内部靠多次散射把光揉开，暗部主要是云底与背光面。
+                   压到 0.28：再深就会读成岩石的阴影，而不是云的厚度。 */
+                /* 深度衰减是“雾里有遮挡”的唯一来源：云顶近光、云底深暗。
+                   0.38 太浅，整团读作一块均匀的灰；0.48 才有底部的暗。 */
+                /* 大云里累积的不透明度高，0.30 会把云心压成一大块灰斑。
+                   放大档降到 0.15：厚的地方仍然暗，但不会出现灰洞。 */
+                /* tree11 = (variant > 19) 把型 25 一起圈进去了，所以型 25 的判断必须写在它前面，
+                   否则永远拿到 0.15 —— 云心完全不压暗，整团就是一块均匀的米色。 */
+                double kdk = ((variant == 25 || variant == 26)) ? 0.46 : ((tree11) ? 0.15 : 0.30);
+                double dk = 1.0 - kdk * acc;
+                /* 云性（亮云/乌云）在合成处按型号直接算：写在这里不经过任何块作用域，
+                   一定生效。乌云 = 降低反射率（云整体压灰），亮云 = 略微提亮。 */
+                double tn11 = 1.0;
+                if (variant == 15) tn11 = 0.62;
+                if (variant == 16) tn11 = 1.10;
+                ar += wgt * (double)cr * lit * dk * tn11;
+                ag += wgt * (double)cg * lit * dk * tn11;
+                ab += wgt * (double)cb * lit * dk * tn11;
+                acc += wgt;
+                /* 不透明度封顶：云不能再“实”。0.80 之后停，剩下的背景透进来，
+                   这一层才是雾。 */
+                if (acc > (((variant == 25 || variant == 26)) ? 0.975 : 0.88)) break;
+            }
+            if (acc < 0.004) continue;
+            int o = (py * w + px) * 3;
+            double rr2 = (double)sp[o]     * (1.0 - acc) + ar;
+            double gg2 = (double)sp[o + 1] * (1.0 - acc) + ag;
+            double bb2 = (double)sp[o + 2] * (1.0 - acc) + ab;
+            if (rr2 < 0.0) rr2 = 0.0; if (rr2 > 255.0) rr2 = 255.0;
+            if (gg2 < 0.0) gg2 = 0.0; if (gg2 > 255.0) gg2 = 255.0;
+            if (bb2 < 0.0) bb2 = 0.0; if (bb2 > 255.0) bb2 = 255.0;
+            sp[o]     = (unsigned char)rr2;
+            sp[o + 1] = (unsigned char)gg2;
+            sp[o + 2] = (unsigned char)bb2;
+        }
+    }
+    return vNone();
+}
+
+
+static Value vpSun(Interpreter&, vector<Value>& a, int line) {
+    auto d = vpDict(a[0], line);
+    int w = (int)needNum(d->items.at("宽"), "视口", line);
+    int h = (int)needNum(d->items.at("高"), "视口", line);
+    double yaw   = needNum(a[1], "视口太阳", line);
+    double az    = needNum(a[2], "视口太阳", line);
+    double el    = needNum(a[3], "视口太阳", line);
+    double pitch = needNum(a[4], "视口太阳", line);
+    double fov   = needNum(a[5], "视口太阳", line);
+    double rAng  = needNum(a[6], "视口太阳", line);
+    int c = vpColor(a[7], line);
+    int cr = (c >> 16) & 255, cg = (c >> 8) & 255, cb = c & 255;
+    /* 低空暖化：真实太阳贴地平时光穿过更厚的大气，红绿衰减差被拉开，读作橙红。
+       仰角 0 时最暖，0.34 rad(19°) 以上按本色。 */
+    double warmT = 0.0;
+    if (el < 0.34) {
+        warmT = 1.0 - (el > 0.0 ? el : 0.0) / 0.34;
+        if (warmT > 1.0) warmT = 1.0;
+    }
+    double rr = cr, rg = cg, rb = cb;
+    rg = cg + (188.0 - cg) * warmT * 0.85;
+    rb = cb + (120.0 - cb) * warmT * 0.85;
+    if (fov < 0.02) fov = 0.02;
+    if (rAng < 0.002) rAng = 0.002;
+    auto& sp = vpPixels(d);
+    if ((long long)sp.size() != (long long)w * h * 3)
+        sp.assign((size_t)((long long)w * h * 3), 0);
+    double fovH = fov * (double)w / (double)(h > 0 ? h : 1);
+    /* 用 fmod 归一化，不要用 while 抬减：偏航一旦累计到很大（鼠标转了半圈），
+       减法循环会把单帧拖到秒级。 */
+    double dx = az - yaw;
+    if (!(dx == dx)) dx = 0.0;
+    dx = fmod(dx + 3.14159265, 6.28318531);
+    if (dx < 0.0) dx += 6.28318531;
+    dx -= 3.14159265;
+    /* 日辉：太阳照亮的那半个天空。
+       真实天空里太阳周围几十度的天光被前向散射抬亮，靠近日盘近白、45° 还看得见、
+       90° 之外几乎归零，背面那半边保持原色——所以它不是"日盘周围画一圈白"，
+       而是逐像素按「视线方向与太阳方向的夹角」算。这样转头时整块辉光跟着世界转，
+       不会烧成一条横带，也不会因为日盘小就只剩一个小亮斑。
+       cos(夹角) = sin(仰)sin(日仰) + cos(仰)cos(日仰)cos(方位差)，列方向余弦预先算好，
+       内层只剩乘加，256k 像素不会拖帧。 */
+    if (el > -0.12) {
+        std::vector<double> colCos((size_t)(w > 0 ? w : 1));
+        for (int x = 0; x < w; ++x) {
+            double off = ((double)x / (double)(w > 1 ? w - 1 : 1) - 0.5) * fovH;
+            colCos[(size_t)x] = cos(dx - off);
+        }
+        double se = sin(el), ce = cos(el);
+        /* 辉光要推到近白：留太多蓝会混出一层雾霾灰，看着脏。 */
+        /* 日辉的目标色不能是纯白。真实天光带一层很淡的黄：高空太阳时约
+           (255,250,226)，太阳压低后短波被拉走，依次往黄、橙走。紫出现在另一个
+           位置——背对太阳的低空那一圈（暮光的紫），所以它不能按整体色调给，
+           要按「低太阳 + 远离太阳」两个条件同时成立才上，放在像素循环里算。 */
+        /* 先在 1/2 网格上算 k，再逐像素双线性插值。
+           早前是 2×2 块复制：块内 k 差在近太阳处其实很大，2px 一道台阶连着看，
+           就沿日盘拉开一条断续的弧——用户读成"一圈虚线标出的范围"。插值则处处
+           一阶连续，台阶消失，代价比逐像素算三角函数低得多。 */
+        int hw = (w > 3 ? (w + 3) / 4 : 1) + 1;
+        int hh = (h > 3 ? (h + 3) / 4 : 1) + 1;
+        std::vector<double> kg((size_t)hw * (size_t)hh, 0.0);
+        for (int gj = 0; gj < hh; ++gj) {
+            int yy = gj * 4;
+            if (yy > h - 1) yy = h - 1;
+            double rel = 0.5 - (double)yy / (double)(h > 1 ? h - 1 : 1);
+            double ang = pitch + rel * fov;
+            double sa = sin(ang), ca = cos(ang);
+            /* 地平线以下不再一刀切——切了会留一条硬边。但也不能给足量：七成半
+               时云海被抬到和天空一样亮，整条地平线就没了。云海是被照亮的**地表**，
+               靠下的法线收到的散射本来就少，所以只留四成，并在 2° 内过渡。这样
+               两侧各自连续、又保持"天比地亮"这一层关系，地平线靠亮度差读出来。 */
+            /* 地平线以下完全不给。云海是被照亮的**地表**，它的亮度该由场景光照定，
+               往上叠一层天空散射在物理上就是错的；更实际的问题是：给了量之后天空和
+               云海一起被抬到同一级，整条地平线就没了。不给量时天空(186)与云海(158)
+               差二十八级，那正好是一条读得出、又不生硬的地平线。 */
+            /* 地平线以下不是不给，而是另给一份"云海受光"。给零的时候，上方有太阳的
+               渐变、下方是一块完全不理太阳的平板，上下就真的成了两个东西。这里让
+               云海在四度六内从零升到三成五、再往下递减归零：地平线处两侧仍是同一个
+               值，接得上；往下几度的亮带正好是逆光时云海边缘被照亮的那圈。 */
+            double below = 1.0;
+            if (ang < 0.0) {
+                double t = -ang / 0.025;
+                if (t > 1.0) t = 1.0;
+                double u = -ang / 0.55;
+                if (u > 1.0) u = 1.0;
+                below = 0.35 * t * (1.0 - u);
+            }
+            for (int gi = 0; gi < hw; ++gi) {
+                int xx = gi * 4;
+                if (xx > w - 1) xx = w - 1;
+                double cA = sa * se + ca * ce * colCos[(size_t)xx];
+                if (cA > 1.0) cA = 1.0;
+                if (cA < -1.0) cA = -1.0;
+                /* e = cos(夹角)：前向 1、正侧 0、背向折回 0。
+                   幂 12 收白核（15° 内近白），幂 2 的尾巴撑到 45°，90° 归零——
+                   那半边归零就是"太阳照不到的地方"。 */
+                double e = 0.5 + 0.5 * cA;
+                double e2 = e * e, e4 = e2 * e2, e8 = e4 * e4;
+                double e12 = e8 * e4, e24 = e12 * e12;
+                /* 宽带基底。早先全靠 e¹²，那是个很陡的核：三十度就掉到三成，
+                   亮区只剩日盘周围一点，看着"露出来了才照亮一小块"。真实的前向
+                   散射没这么陡——视线与太阳夹角到九十度（正是半球边界）仍有相当
+                   亮度，只有背对太阳那侧才暗。所以改成「宽带 + 紧核」两段：
+                   e^1.15 铺满半球，e²⁴ 单独把日盘周围推到近白。 */
+                /* 指数 0.85 铺得太宽，整片天空一起被推成灰白，深蓝没了。2.2 让
+                   中段收得快些：四十五度约 0.44、九十度才 0.14，可见视场五十度以内
+                   仍全域有辉光（"照亮整个世界"），天顶那一段则落回深蓝。 */
+                double eB = pow(e, 2.2);
+                /* 尾巴的权重必须压住：e² 在低空还很强，权重 0.20 时太阳正下方的
+                   天空被抬到 228，而云海仍是 158，地平线上就跳 85 级——那正是"上下
+                   不是同一个东西"的观感。0.10 之后低空只比云海亮三十来级，读作
+                   "地平处的天更亮"，而不是一道断口。 */
+                /* 亮区要占半球，这是用户的物理口径：太阳一露头，整个世界就都亮了，
+                   只有在背对太阳的那一侧才暗下去，能看到"边界"的角度很窄。0.50 的
+                   权重下九十度（正是半球边界）只剩 0.22，一百二十度几乎归零，读起来
+                   就是"照亮了三分之一"。抬到 0.56、同时把基底指数放到 0.85，九十度
+                   到 0.32、一百二十度到 0.18，e²⁴ 那项继续保证日盘周围近白。 */
+                double k = 0.62 * eB + 0.16 * e24;
+                if (k > 0.78) k = 0.78;
+                /* 地平线前后三度四收束到零。不加这一档时，地平线上方还留着满额辉光、
+                   正下方被 continue 砍成零，光线上下就跳七十二级——这才是那道断口的
+                   最后一截。收束之后 ang=0 处 k=0，与天空自身的地平色接上，整条地平
+                   线是连续的；太阳仰角六度六，正对太阳处不受影响。 */
+                /* 收束窗收到一度。原来是三度四，压掉了地平线以上一大截辉光，
+                   纵向扫下来 y=100 的 169 到 y=140 只剩 135，掉三十四级——那是一条
+                   暗带，读起来跟断口是同一种毛病。一度只值十几像素，接得上又不显。 */
+                double ww = (ang > 0.018) ? 1.0 : (ang > 0.0 ? (ang / 0.018) : 1.0);
+                k *= ww;
+                k *= below;
+                kg[(size_t)gj * hw + gi] = k;
+            }
+        }
+        for (int y = 0; y < h; ++y) {
+            double fy = (double)y * 0.25;
+            int j0 = (int)fy;
+            if (j0 > hh - 1) j0 = hh - 1;
+            int j1 = (j0 + 1 < hh) ? j0 + 1 : j0;
+            double wy = fy - (double)j0;
+            const double* r0 = &kg[(size_t)j0 * hw];
+            const double* r1 = &kg[(size_t)j1 * hw];
+            unsigned char* row = &sp[(size_t)y * w * 3];
+            for (int x = 0; x < w; ++x) {
+                double fx = (double)x * 0.25;
+                int i0 = (int)fx;
+                if (i0 > hw - 1) i0 = hw - 1;
+                int i1 = (i0 + 1 < hw) ? i0 + 1 : i0;
+                double wx = fx - (double)i0;
+                double k = (1.0 - wy) * ((1.0 - wx) * r0[i0] + wx * r0[i1])
+                         + wy * ((1.0 - wx) * r1[i0] + wx * r1[i1]);
+                if (k <= 0.004) continue;
+                int ir = row[x * 3], ig = row[x * 3 + 1], ib = row[x * 3 + 2];
+                /* 目标色：淡黄打底，warmT 把黄往橙压。 */
+                double tg = 250.0 - 58.0 * warmT;
+                double tb = 226.0 - 100.0 * warmT;
+                /* 暮光紫：只在「太阳贴地平 + 远离太阳」时上。k 越小说明离太阳越远，
+                   低太阳时那一圈天光里蓝比绿衰减得慢，读出来就是偏紫的粉灰。 */
+                double pw = warmT * (1.0 - k);
+                if (pw > 0.52) {
+                    double q = (pw - 0.52) / 0.48;
+                    if (q > 1.0) q = 1.0;
+                    tg = tg + (152.0 - tg) * q;
+                    tb = tb + (206.0 - tb) * q;
+                }
+                row[x * 3]     = (unsigned char)(ir + (255.0 - ir) * k);
+                row[x * 3 + 1] = (unsigned char)(ig + (tg - ig) * k);
+                row[x * 3 + 2] = (unsigned char)(ib + (tb - ib) * k);
+            }
+        }
+    }
+    /* 符号：偏航增大是右转，世界固定的太阳必须左滑（x 减小）。写成减号会让太阳
+       跟着视线同向跑，看起来像黏在屏幕上。 */
+    double sx = (double)w * (0.5 + dx / fovH);
+    double sy = (double)h * (0.5 - (el - pitch) / fov);
+    double rp = rAng / (fov * 0.5) * (double)h * 0.5;
+    if (rp < 1.5) rp = 1.5;
+    /* 两级高斯：窄核给「这是个圆」的印象，宽尾负责把边界化开。两个都从 d=0 处
+       取 1，按权重相加，所以中心没有平台、交接处也没有台阶。 */
+    /* 大范围提亮交给天空日辉，这里只留贴着日盘的近晕。但绘制框必须留够余量：
+       框边上尾项还没衰减完（alpha 三成多），到框就停会被切出一个方角，放大看
+       是一个白方块。取 3.2rp、并保证最小 12px，框边 alpha 已低于 1%。 */
+    double glow = rp * 3.2;
+    if (glow < 12.0) glow = 12.0;
+
+    int x0 = (int)floor(sx - glow), x1 = (int)ceil(sx + glow);
+    int y0 = (int)floor(sy - glow), y1 = (int)ceil(sy + glow);
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > w - 1) x1 = w - 1;
+    if (y1 > h - 1) y1 = h - 1;
+    if (x1 < x0 || y1 < y0) return vNone();
+    for (int y = y0; y <= y1; ++y) {
+        unsigned char* row = &sp[(size_t)y * w * 3];
+        for (int x = x0; x <= x1; ++x) {
+            double ddx = (double)x - sx, ddy = (double)y - sy;
+            double dist = sqrt(ddx * ddx + ddy * ddy);
+            /* 全程没有一个 alpha=1 的硬平台、也没有任何段界。之前是「盘内硬切 1.0、
+               盘外直接掉到 0.58」，那一步跳变就是眼睛读到的那圈边——所以它看起来
+               是一枚贴上去的亮圆片，而不是一团光。核和尾都是高斯，中心导数都为 0，
+               核让人读出「圆」，尾把圆边化进天空。 */
+            /* 核用四次超高斯：p=2 的高斯在 0.5rp 处已经掉到 0.94、1rp 处只剩 0.37，
+               读出来是一团模糊（"一个点"）。四次幂能把 alpha>=0.9 的饱和区撑到
+               0.6rp、1rp 处还有 0.56，有实心的读感；而它的转折是 exp 曲线自带的
+               平滑过渡，不是硬切，所以撑出来的边是渐隐的，不会画出几何圆。 */
+            double tn = dist / (rp * 1.15);
+            double tw = dist / (rp * 1.6);
+            double t2 = tn * tn;
+            double aCore = exp(-t2 * t2);
+            double aWide = exp(-tw * tw);
+            double alpha = 0.98 * (0.55 * aCore + 0.45 * aWide);
+            if (alpha <= 0.004) continue;
+            int ir = row[x * 3], ig = row[x * 3 + 1], ib = row[x * 3 + 2];
+            /* 本体给到接近过曝白，越靠外越退回本色，避免一个死板的纯色圆 */
+            /* 本体一律纯白过曝（真实相机里的太阳永远是过曝的），只让色温随高度偏暖：
+               贴地平时偏橙白，抬高后回中性白。压亮度会把它压成一块灰盘。 */
+            /* 色温也得内白外橙：真实日出是核心过曝成白、边缘才吃成橙，
+               整块同色会读成一块染色玻璃。 */
+            double cw = warmT * (1.0 - 0.7 * (dist < rp * 1.6 ? dist / (rp * 1.6) : 1.0));
+            double sr = 255.0;
+            double sg = 255.0 - 42.0 * cw;
+            double sb = 255.0 - 112.0 * cw;
+            row[x * 3]     = (unsigned char)(ir + (sr - ir) * alpha);
+            row[x * 3 + 1] = (unsigned char)(ig + (sg - ig) * alpha);
+            row[x * 3 + 2] = (unsigned char)(ib + (sb - ib) * alpha);
+        }
+    }
+    return vNone();
+}
+static Value vpSkyRidge(Interpreter&, vector<Value>& a, int line) {
+    auto d = vpDict(a[0], line);
+    int w = (int)needNum(d->items.at("宽"), "视口", line);
+    int h = (int)needNum(d->items.at("高"), "视口", line);
+    double yaw = needNum(a[1], "视口远山", line);
+    double gr = needNum(a[2], "视口远山", line);
+    double base = needNum(a[3], "视口远山", line);
+    double peak = needNum(a[4], "视口远山", line);
+    int c = vpColor(a[5], line);
+    double span = needNum(a[6], "视口远山", line);
+    int c2 = vpColor(a[7], line);
+    if (gr < 0.0) gr = 0.0;
+    if (gr > 1.0) gr = 1.0;
+    if (span < 8.0) span = 8.0;
+    auto& sp = vpPixels(d);
+    if ((long long)sp.size() != (long long)w * h * 3)
+        sp.assign((size_t)((long long)w * h * 3), 0);
+    int gy = (int)(h * gr);
+    double shift = yaw * w * 0.30;
+    static const double prof[8] = {0.55, 0.74, 0.58, 0.92, 0.68, 1.00, 0.48, 0.80};
+    int r1 = (c >> 16) & 255, g1 = (c >> 8) & 255, b1 = c & 255;
+    int r2 = (c2 >> 16) & 255, g2 = (c2 >> 8) & 255, b2 = c2 & 255;
+    double half = span * 0.42;
+    for (int x = 0; x < w; ++x) {
+        double best = -1.0e9;
+        for (int k = -2; k < 11; ++k) {
+            double cx = (double)k * span + shift;
+            double dx = (double)x - cx;
+            if (dx < -half || dx > half) continue;
+            double q = 1.0 - (dx < 0 ? -dx : dx) / half;
+            double ratio = q * sqrt(sqrt(q));
+            double top = base + peak * prof[(k + 80) % 8] * ratio;
+            if (top > best) best = top;
+        }
+        if (best <= 0.0) continue;
+        int ty = (int)(gy - best);
+        if (ty < 0) ty = 0;
+        if (ty >= gy) continue;
+        int tall = gy - ty;
+        for (int y = ty; y < gy; ++y) {
+            double k = (double)(y - ty) / (double)tall;
+            double t2 = k < 0.30 ? 0.0 : (k - 0.30) / 0.70;
+            t2 = t2 * t2 * (3.0 - 2.0 * t2);
+            k = t2;
+            int rr = r1 + (int)((r2 - r1) * k);
+            int gg = g1 + (int)((g2 - g1) * k);
+            int bb = b1 + (int)((b2 - b1) * k);
+            size_t i = ((size_t)y * w + x) * 3;
+            sp[i] = (unsigned char)(rr < 0 ? 0 : (rr > 255 ? 255 : rr));
+            sp[i + 1] = (unsigned char)(gg < 0 ? 0 : (gg > 255 ? 255 : gg));
+            sp[i + 2] = (unsigned char)(bb < 0 ? 0 : (bb > 255 ? 255 : bb));
+        }
+    }
+    return vNone();
+}
+static Value vpSkyGradient(Interpreter&, vector<Value>& a, int line) {
+    auto d = vpDict(a[0], line);
+    int w = (int)needNum(d->items.at("宽"), "视口", line);
+    int h = (int)needNum(d->items.at("高"), "视口", line);
+    int cT = vpColor(a[1], line), cM = vpColor(a[2], line), cB = vpColor(a[3], line);
+    double hor = needNum(a[4], "视口竖渐变", line);
+    if (hor < 0.0) hor = 0.0;
+    if (hor > 1.0) hor = 1.0;
+    auto& sp = vpPixels(d);
+    if ((long long)sp.size() != (long long)w * h * 3)
+        sp.assign((size_t)((long long)w * h * 3), 0);
+    int rt = (cT >> 16) & 255, gt = (cT >> 8) & 255, bt = cT & 255;
+    int rm = (cM >> 16) & 255, gm = (cM >> 8) & 255, bm = cM & 255;
+    int rb = (cB >> 16) & 255, gb = (cB >> 8) & 255, bb = cB & 255;
+    int hy = (int)(h * hor);
+    for (int y = 0; y < h; ++y) {
+        double k;
+        int r, g, b;
+        if (hy > 0 && y <= hy) {
+            k = (double)y / (double)hy;
+            r = (int)(rt + (rm - rt) * k);
+            g = (int)(gt + (gm - gt) * k);
+            b = (int)(bt + (bm - bt) * k);
+        } else {
+            int span = h - hy;
+            k = span > 0 ? (double)(y - hy) / (double)span : 0.0;
+            r = (int)(rm + (rb - rm) * k);
+            g = (int)(gm + (gb - gm) * k);
+            b = (int)(bm + (bb - bm) * k);
+        }
+        unsigned char* row = &sp[(size_t)y * w * 3];
+        for (int x = 0; x < w; ++x) {
+            row[x * 3] = (unsigned char)(r < 0 ? 0 : (r > 255 ? 255 : r));
+            row[x * 3 + 1] = (unsigned char)(g < 0 ? 0 : (g > 255 ? 255 : g));
+            row[x * 3 + 2] = (unsigned char)(b < 0 ? 0 : (b > 255 ? 255 : b));
+        }
+    }
     return vNone();
 }
 static Value uiLine(Interpreter&, vector<Value>& a, int line) {
@@ -26889,8 +29483,7 @@ static Value uiEvent(Interpreter&, vector<Value>&, int line) {
         DispatchMessageW(&msg);
         if (!gUi.events.empty()) break;
     }
-    if (gUi.events.empty()) std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    auto d = std::make_shared<Dict>();
+    /* 队列空就不睡：每帧白等 1ms 在 30FPS 上是 3% 帧预算 */    auto d = std::make_shared<Dict>();
     if (gUi.events.empty()) {
         d->items["类型"] = vStr("无");
         d->items["值"] = vStr("");
@@ -26900,6 +29493,63 @@ static Value uiEvent(Interpreter&, vector<Value>&, int line) {
         d->items["类型"] = vStr(e.type);
         d->items["值"] = vStr(e.value);
     }
+    return vDict(d);
+}
+static Value uiLockMouse(Interpreter&, vector<Value>& a, int line) {
+    if (!gUi.hwnd) return vNone();
+    if (truthy(a[0])) {
+        SetForegroundWindow(gUi.hwnd); SetFocus(gUi.hwnd);
+        SetCapture(gUi.hwnd); ShowCursor(FALSE);
+        gUi.mouseLock = true; gUi.justCaptured = true; gUi.mdx = gUi.mdy = 0;
+        RECT cr; GetClientRect(gUi.hwnd, &cr);
+        POINT c{ (cr.left + cr.right) / 2, (cr.top + cr.bottom) / 2 };
+        ClientToScreen(gUi.hwnd, &c); SetCursorPos(c.x, c.y);
+    } else {
+        ReleaseCapture(); ShowCursor(TRUE); gUi.mouseLock = false;
+    }
+    return vNone();
+}
+static Value uiMouseDelta(Interpreter&, vector<Value>&, int) {
+    /* 刚捕获那一下，光标从窗口外被搬到中心，系统会补一次 WM_MOUSEMOVE，
+       实测 dy 能有一两百像素，直接把相机掀到天上。单帧超过半屏就丢掉。 */
+    if (gUi.mdx > 320 || gUi.mdx < -320) gUi.mdx = 0;
+    if (gUi.mdy > 320 || gUi.mdy < -320) gUi.mdy = 0;
+    auto l = std::make_shared<List>();
+    l->items.push_back(vNum(gUi.mdx));
+    l->items.push_back(vNum(gUi.mdy));
+    gUi.mdx = 0; gUi.mdy = 0;
+    return vList(l);
+}
+static Value uiMouseLocked(Interpreter&, vector<Value>&, int) {
+    return vBool(gUi.mouseLock);
+}
+static Value detectVR(Interpreter&, vector<Value>&, int) {
+    std::string runtime;
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Khronos\\OpenXR\\1", 0, KEY_READ, &key) == ERROR_SUCCESS) {
+        wchar_t buf[1024]{}; DWORD sz = (DWORD)(sizeof(buf) - sizeof(wchar_t)); DWORD type = 0;
+        if (RegQueryValueExW(key, L"ActiveRuntime", nullptr, &type, (LPBYTE)buf, &sz) == ERROR_SUCCESS && type == REG_SZ)
+            runtime = wideToUtf8(buf);
+        RegCloseKey(key);
+    }
+    bool hmd = false; std::string devName;
+    DISPLAY_DEVICEW dd{}; dd.cb = sizeof(dd);
+    for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &dd, 0); ++i) {
+        std::wstring name = dd.DeviceString, low = dd.DeviceString;
+        for (auto& ch : low) ch = (wchar_t)towlower(ch);
+        static const wchar_t* kws[] = { L"oculus", L"rift", L"quest", L"valve", L"index",
+                                        L"htc", L"vive", L"varjo", L"pimax", L"mixed reality", L"reverb" };
+        for (const wchar_t* kw : kws)
+            if (low.find(kw) != std::wstring::npos) { hmd = true; devName = wideToUtf8(name); break; }
+        dd = DISPLAY_DEVICEW{}; dd.cb = sizeof(dd);
+        if (hmd) break;
+    }
+    auto d = std::make_shared<Dict>();
+    d->items["有运行时"] = vBool(!runtime.empty());
+    d->items["运行时"] = vStr(runtime);
+    d->items["有头显"] = vBool(hmd);
+    d->items["头显"] = vStr(devName);
+    d->items["模式"] = vStr(hmd ? "VR" : "PC");
     return vDict(d);
 }
 static Value uiSize(Interpreter&, vector<Value>&, int) {
@@ -26928,6 +29578,78 @@ static Value uiRect(Interpreter&, vector<Value>& a, int line) {
         }
     return vNone();
 }
+static Value uiBlit(Interpreter&, vector<Value>& a, int line) {
+    auto d = vpDict(a[0], line);
+    int sw = (int)needNum(d->items.at("宽"), "视口", line);
+    int sh = (int)needNum(d->items.at("高"), "视口", line);
+    int bei = (int)needNum(a[1], "界面贴视口", line);
+    if (bei < 1) bei = 1;
+    int ox = (int)needNum(a[2], "界面贴视口", line);
+    int oy = (int)needNum(a[3], "界面贴视口", line);
+    auto& sp = vpPixels(d);
+    if ((long long)gUi.back.size() != (long long)gUi.w * gUi.h * 3)
+        gUi.back.assign((size_t)((long long)gUi.w * gUi.h * 3), 0);
+    int dw = sw * bei, dh = sh * bei;
+    for (int yy = 0; yy < dh; ++yy) {
+        int ty = oy + yy;
+        if (ty < 0 || ty >= gUi.h) continue;
+        int sy = yy / bei;
+        if (sy >= sh) sy = sh - 1;
+        const unsigned char* src = &sp[(size_t)sy * sw * 3];
+        size_t row = (size_t)ty * gUi.w * 3;
+        for (int xx = 0; xx < dw; ++xx) {
+            int tx = ox + xx;
+            if (tx < 0 || tx >= gUi.w) continue;
+            int sx = xx / bei;
+            if (sx >= sw) sx = sw - 1;
+            const unsigned char* s = src + (size_t)sx * 3;
+            size_t ti = row + (size_t)tx * 3;
+            gUi.back[ti] = s[2];
+            gUi.back[ti + 1] = s[1];
+            gUi.back[ti + 2] = s[0];
+        }
+    }
+    return vNone();
+}
+static Value vpSkyGradient(Interpreter&, vector<Value>& a, int line) {
+    auto d = vpDict(a[0], line);
+    int w = (int)needNum(d->items.at("宽"), "视口", line);
+    int h = (int)needNum(d->items.at("高"), "视口", line);
+    int cT = vpColor(a[1], line), cM = vpColor(a[2], line), cB = vpColor(a[3], line);
+    double hor = needNum(a[4], "视口竖渐变", line);
+    if (hor < 0.0) hor = 0.0;
+    if (hor > 1.0) hor = 1.0;
+    auto& sp = vpPixels(d);
+    if ((long long)sp.size() != (long long)w * h * 3)
+        sp.assign((size_t)((long long)w * h * 3), 0);
+    int rt = (cT >> 16) & 255, gt = (cT >> 8) & 255, bt = cT & 255;
+    int rm = (cM >> 16) & 255, gm = (cM >> 8) & 255, bm = cM & 255;
+    int rb = (cB >> 16) & 255, gb = (cB >> 8) & 255, bb = cB & 255;
+    int hy = (int)(h * hor);
+    for (int y = 0; y < h; ++y) {
+        double k;
+        int r, g, b;
+        if (hy > 0 && y <= hy) {
+            k = (double)y / (double)hy;
+            r = (int)(rt + (rm - rt) * k);
+            g = (int)(gt + (gm - gt) * k);
+            b = (int)(bt + (bm - bt) * k);
+        } else {
+            int span = h - hy;
+            k = span > 0 ? (double)(y - hy) / (double)span : 0.0;
+            r = (int)(rm + (rb - rm) * k);
+            g = (int)(gm + (gb - gm) * k);
+            b = (int)(bm + (bb - bm) * k);
+        }
+        unsigned char* row = &sp[(size_t)y * w * 3];
+        for (int x = 0; x < w; ++x) {
+            row[x * 3] = (unsigned char)(r < 0 ? 0 : (r > 255 ? 255 : r));
+            row[x * 3 + 1] = (unsigned char)(g < 0 ? 0 : (g > 255 ? 255 : g));
+            row[x * 3 + 2] = (unsigned char)(b < 0 ? 0 : (b > 255 ? 255 : b));
+        }
+    }
+    return vNone();
+}
 static Value uiLine(Interpreter&, vector<Value>& a, int line) {
     int x0 = (int)needNum(a[0], "界面线", line), y0 = (int)needNum(a[1], "界面线", line);
     int x1 = (int)needNum(a[2], "界面线", line), y1 = (int)needNum(a[3], "界面线", line);
@@ -26950,6 +29672,10 @@ static Value uiLine(Interpreter&, vector<Value>& a, int line) {
     return vNone();
 }
 static Value uiText(Interpreter&, vector<Value>&, int) { return vNone(); }
+static Value uiLockMouse(Interpreter&, vector<Value>&, int) { return vNone(); }
+static Value uiMouseDelta(Interpreter&, vector<Value>&, int) { return vList(std::make_shared<List>()); }
+static Value uiMouseLocked(Interpreter&, vector<Value>&, int) { return vBool(false); }
+static Value detectVR(Interpreter&, vector<Value>&, int) { return vDict(std::make_shared<Dict>()); }
 static Value uiRefresh(Interpreter&, vector<Value>&, int) { return vNone(); }
 static Value uiEvent(Interpreter&, vector<Value>&, int) { return vDict(std::make_shared<Dict>()); }
 static Value uiSize(Interpreter&, vector<Value>&, int) {

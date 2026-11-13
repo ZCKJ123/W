@@ -34,8 +34,8 @@ _*.txt
 # 本地隔离快照
 隔离备份/
 
-# ���ؽ�ͼ�����ϴ�
-��ͼ/
+# ���ؽ�ͼ�����ϴ�
+��ͼ/
 
 # scratch drafts and generated binaries (not for publishing)
 _*.脚本
@@ -44,3 +44,9 @@ _*.脚本
 
 # self-compile scratch artifacts
 工程/_*
+
+# 历史备份与三维素材
+*.bak
+*.bak*
+例子/*.stl
+例子/*.obj

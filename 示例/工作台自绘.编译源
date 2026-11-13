@@ -1,0 +1,8 @@
+依赖 PE库
+
+函数 主 则
+    打包窗口PE("C:/Temp/wen_selfhost/自绘工作台.exe")
+    写文件("C:/Temp/wen_selfhost/自绘说明.txt", "窗口 PE 已由文语言生成")
+结束
+
+主()

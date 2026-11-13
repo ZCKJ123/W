@@ -1,0 +1,781 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>文语言工作台</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%231e1e1e'/%3E%3Ctext x='16' y='23' font-size='20' text-anchor='middle' fill='%236aa6a1'%3E文%3C/text%3E%3C/svg%3E">
+<style>
+  :root{
+    --bg:#191a1c; --panel:#202123; --panel2:#252629; --line:#33353a;
+    --fg:#d7dae0; --fg2:#9498a1; --accent:#6aa6a1; --warn:#d8a657; --err:#e06c75;
+    --sel:#2d4f4c;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0;background:var(--bg);color:var(--fg);
+    font-family:"Sarasa Mono SC","Microsoft YaHei UI",Consolas,monospace;
+    font-size:13px;overflow:hidden;
+  }
+  #app{display:grid;grid-template-columns:240px 1fr;grid-template-rows:38px 1fr 22px;height:100vh}
+  /* 顶栏 */
+  #bar{grid-column:1/3;display:flex;align-items:center;gap:8px;padding:0 10px;
+    background:var(--panel2);border-bottom:1px solid var(--line)}
+  #bar .brand{font-weight:700;letter-spacing:.5px;color:var(--accent);margin-right:6px}
+  #bar button{
+    background:var(--panel);color:var(--fg);border:1px solid var(--line);
+    border-radius:4px;padding:4px 10px;cursor:pointer;font-size:12px;font-family:inherit;
+  }
+  #bar button:hover{background:#2e3034;border-color:#4a4d53}
+  #bar button.primary{background:var(--sel);border-color:var(--accent);color:#dff}
+  #bar .spacer{flex:1}
+  #bar .hint{color:var(--fg2);font-size:11px}
+  /* 左侧 */
+  #side{background:var(--panel);border-right:1px solid var(--line);overflow:auto;display:flex;flex-direction:column}
+  #side .head{display:flex;align-items:center;justify-content:space-between;
+    padding:8px 10px;color:var(--fg2);font-size:11px;letter-spacing:1px;border-bottom:1px solid var(--line)}
+  #side .tools{display:flex;gap:6px}
+  #side .tools button{background:none;border:none;color:var(--fg2);cursor:pointer;padding:2px 4px;font-size:13px;border-radius:3px}
+  #side .tools button:hover{background:#2e3034;color:var(--fg)}
+  #tree{padding:6px 0;flex:1}
+  #fsearch{margin:6px 10px 0;background:var(--bg);border:1px solid var(--line);color:var(--fg);
+    border-radius:4px;padding:5px 8px;font-family:inherit;font-size:12px;outline:none}
+  #fsearch:focus{border-color:var(--accent)}
+  .node{display:flex;align-items:center;gap:6px;padding:4px 10px;cursor:pointer;user-select:none;white-space:nowrap}
+  .node:hover{background:#26282b}
+  .node.active{background:var(--sel)}
+  .node .ic{width:14px;text-align:center;color:var(--fg2);font-size:11px}
+  .node.dir{color:var(--accent)}
+  .node .nm{overflow:hidden;text-overflow:ellipsis}
+  .node.depth1{padding-left:26px}
+  .node.depth2{padding-left:42px}
+  .node .x{margin-left:auto;color:#6b7078;font-size:11px;visibility:hidden}
+  .node:hover .x{visibility:visible}
+  .node .x:hover{color:var(--err)}
+  /* 编辑区 */
+  #main{display:grid;grid-template-rows:34px 1fr 190px;min-width:0}
+  #tabs{display:flex;background:var(--panel2);border-bottom:1px solid var(--line);overflow-x:auto}
+  .tab{display:flex;align-items:center;gap:8px;padding:0 12px;border-right:1px solid var(--line);
+    color:var(--fg2);cursor:pointer;white-space:nowrap;font-size:12px}
+  .tab.active{background:var(--bg);color:var(--fg);box-shadow:inset 0 -2px 0 var(--accent)}
+  .tab .x{color:#6b7078}
+  .tab .x:hover{color:var(--err)}
+  .tab .dot{width:6px;height:6px;border-radius:50%;background:var(--warn)}
+  #editorWrap{display:grid;grid-template-columns:60px 1fr;overflow:auto;background:var(--bg);min-height:0}
+  #gutter{padding:8px 0 40px;text-align:right;color:#5b6068;user-select:none;
+    border-right:1px solid #2a2c2f;font-size:12px;box-sizing:border-box;min-width:0}
+  #gutter div{height:20px;line-height:20px;padding-right:12px;font-variant-numeric:tabular-nums;letter-spacing:.5px}
+  #gutter div.cur{color:var(--accent);background:#22292a}
+  #code{padding:8px 12px 40px;outline:none;line-height:20px;white-space:pre;tab-size:4;
+    color:var(--fg);caret-color:var(--accent);min-width:max-content;min-height:100%;font-size:13px}
+  #code .kw{color:#c678dd}
+  #code .str{color:#98c379}
+  #code .num{color:#d19a66}
+  #code .cmt{color:#5c6370;font-style:italic}
+  #code .bad{background:#4a2226;border-bottom:1px dashed var(--err)}
+  /* 下方面板 */
+  #bottom{border-top:1px solid var(--line);background:var(--panel);display:grid;grid-template-rows:30px 1fr;min-height:0}
+  #ptabs{display:flex;gap:2px;align-items:center;padding:0 6px;border-bottom:1px solid var(--line)}
+  #ptabs button{background:none;border:none;color:var(--fg2);padding:6px 10px;cursor:pointer;font-size:12px;
+    border-bottom:2px solid transparent;font-family:inherit}
+  #ptabs button.on{color:var(--fg);border-bottom-color:var(--accent)}
+  #ptabs .cnt{margin-left:auto;color:var(--fg2);font-size:11px}
+  #panes{overflow:auto;padding:8px 12px}
+  .pane{display:none}
+  .pane.on{display:block}
+  .issue{display:flex;gap:10px;padding:3px 0;cursor:pointer}
+  .issue:hover{background:#26282b}
+  .issue .loc{color:var(--accent);min-width:88px}
+  .issue .msg{color:var(--fg)}
+  .issue.e .loc{color:var(--err)}
+  .issue.w .loc{color:var(--warn)}
+  #out{white-space:pre-wrap;color:#b8bcc4;line-height:1.7}
+  #term{white-space:pre-wrap;font-size:12px;color:#9fb0a8;line-height:1.7}
+  /* 状态栏 */
+  #status{grid-column:1/3;display:flex;align-items:center;gap:14px;padding:0 10px;
+    background:var(--accent);color:#0e1a19;font-size:11px}
+  #status .spacer{flex:1}
+  /* 弹层 */
+  #mask{position:fixed;inset:0;background:#000a;display:none;align-items:center;justify-content:center;z-index:9}
+  #mask.on{display:flex}
+  #dlg{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:16px;width:340px}
+  #dlg h3{margin:0 0 12px;font-size:13px;color:var(--accent);font-weight:600}
+  #dlg label{display:block;font-size:12px;color:var(--fg2);margin-bottom:5px}
+  #dlg input{width:100%;background:var(--bg);border:1px solid var(--line);color:var(--fg);
+    padding:7px 9px;border-radius:4px;font-family:inherit;font-size:13px;outline:none}
+  #dlg input:focus{border-color:var(--accent)}
+  #dlg .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
+  #dlg button{background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:4px;
+    padding:6px 14px;cursor:pointer;font-family:inherit;font-size:12px}
+  #dlg button.primary{background:var(--sel);border-color:var(--accent)}
+  @media (max-width:760px){
+    #app{grid-template-columns:1fr;grid-template-rows:38px 150px 1fr 22px}
+    #side{grid-row:2;border-right:none;border-bottom:1px solid var(--line)}
+    #main{grid-row:3;grid-template-rows:34px 1fr 150px}
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="bar">
+    <span class="brand">文 · 工作台</span>
+    <button id="btnNew">新建文件</button>
+    <button id="btnNewDir">新建文件夹</button>
+    <button id="btnImport">导入文件</button>
+    <button id="btnExport">导出文件</button>
+    <span class="spacer"></span>
+    <span class="hint" id="pathHint"></span>
+    <button id="btnCheck">检查</button>
+    <button id="btnRun" class="primary">编译</button>
+  </div>
+
+  <div id="side">
+    <div class="head"><span>资源管理器</span>
+      <span class="tools">
+        <button id="btnLoadDemo" title="载入示例">示例</button>
+        <button id="btnReset" title="清空全部">清空</button>
+      </span>
+    </div>
+    <input id="fsearch" placeholder="筛选文件（双击名称可重命名）" autocomplete="off">
+    <div id="tree"></div>
+  </div>
+
+  <div id="main">
+    <div id="tabs"></div>
+    <div id="editorWrap">
+      <div id="gutter">1</div>
+      <div id="code" contenteditable="true" spellcheck="false"></div>
+    </div>
+    <div id="bottom">
+      <div id="ptabs">
+        <button data-p="p-issue" class="on">问题 <span id="issueCnt"></span></button>
+        <button data-p="p-out">输出</button>
+        <button data-p="p-term">终端</button>
+        <span class="cnt" id="statCnt"></span>
+      </div>
+      <div id="panes">
+        <div class="pane on" id="p-issue"></div>
+        <div class="pane" id="p-out"></div>
+        <div class="pane" id="p-term"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="status">
+    <span id="stFile">未打开文件</span>
+    <span id="stPos">行 1, 列 1</span>
+    <span class="spacer"></span>
+    <span id="stLang">文语言 · .编译源</span>
+    <span id="stSize">0 B</span>
+  </div>
+</div>
+
+<div id="mask"><div id="dlg">
+  <h3 id="dlgTitle">新建文件</h3>
+  <label for="dlgInput">名称</label>
+  <input id="dlgInput" autocomplete="off">
+  <div class="row">
+    <button id="dlgCancel">取消</button>
+    <button id="dlgOk" class="primary">确定</button>
+  </div>
+</div></div>
+
+<input type="file" id="importInput" accept=".编译源,.wen,.txt" style="display:none" multiple>
+
+<script>
+'use strict';
+/* ===== 数据层：文件树持久化在 localStorage ===== */
+const KEY = 'wen_workbench_v2';
+const DEFAULT_FILES = {
+  '主.编译源': `依赖 文件库
+
+函数 主 则
+    将 数 变成 45
+    将 幂 变成 3
+    打印 "开始"
+    打印 文本(数) + " 的 " + 文本(幂) + " 次方"
+结束
+`,
+  '示例\\问候.编译源': `依赖 文件库
+
+函数 问候 名字 则
+    打印 "你好，" + 名字
+结束
+
+函数 主 则
+    问候("世界")
+结束
+`
+};
+let store = load();
+function load(){
+  try{
+    const raw = localStorage.getItem(KEY);
+    if(raw){ const o = JSON.parse(raw); if(o && o.files) return o; }
+  }catch(e){}
+  return { files: JSON.parse(JSON.stringify(DEFAULT_FILES)), dirs:['示例'] };
+}
+function save(){ try{ localStorage.setItem(KEY, JSON.stringify(store)); }catch(e){} }
+
+/* ===== 状态 ===== */
+let openTabs = [];        // [{path, dirty}]
+let active = null;
+let editing = null;       // 正在改名/新建的目标
+let dlgMode = 'file';
+let collapsed = {};       // 目录折叠
+
+/* ===== 工具 ===== */
+function el(id){ return document.getElementById(id); }
+function bytes(s){ let n=0; for(const c of s){ n += c.charCodeAt(0) < 128 ? 1 : 3; } return n; }
+function fmtSize(s){
+  const n = bytes(s);
+  if(n < 1024) return n + ' B';
+  return (n/1024).toFixed(1) + ' KB';
+}
+function isDir(p){ return store.dirs.includes(p); }
+function parentOf(p){ const i = p.lastIndexOf('\\'); return i<0 ? '' : p.slice(0,i); }
+function baseName(p){ const i = p.lastIndexOf('\\'); return i<0 ? p : p.slice(i+1); }
+function extOf(p){ const b = baseName(p); const i = b.lastIndexOf('.'); return i<0 ? '' : b.slice(i); }
+
+/* ===== 文件树渲染 ===== */
+function paths(){
+  const all = Object.keys(store.files).concat(store.dirs);
+  const roots = new Set();
+  all.forEach(p => { const r = p.split('\\')[0]; roots.add(isDirPath(r)? r : p); });
+  return { all, roots:[...roots] };
+}
+function isDirPath(p){
+  if(isDir(p)) return true;
+  const prefix = p + '\\';
+  return Object.keys(store.files).some(k => k.startsWith(prefix));
+}
+function renderTree(){
+  const tree = el('tree');
+  tree.innerHTML = '';
+  const q = (el('fsearch').value || '').trim();
+  const { roots } = paths();
+  roots.forEach(r => {
+    if(q && !Object.keys(store.files).some(k => k.indexOf(q) >= 0 || baseName(k).indexOf(q) >= 0)){
+      if(!isDirPath(r)) return;
+    }
+    renderNode(r, '', 0, tree, q);
+  });
+}
+function renderNode(p, prefix, depth, host, q){
+  const full = prefix ? prefix + '\\' + p : p;
+  const dir = isDirPath(full);
+  if(q && !dir && baseName(full).indexOf(q) < 0 && full.indexOf(q) < 0) return;
+  const row = document.createElement('div');
+  row.className = 'node' + (dir ? ' dir' : '') + (depth===1? ' depth1':'') + (depth===2?' depth2':'') +
+    (full === active ? ' active' : '');
+  row.dataset.path = full;
+  const ic = document.createElement('span');
+  ic.className = 'ic';
+  ic.textContent = dir ? (collapsed[full] ? '▸' : '▾') : '·';
+  const nm = document.createElement('span');
+  nm.className = 'nm';
+  nm.textContent = baseName(full);
+  row.append(ic, nm);
+
+  const x = document.createElement('span');
+  x.className = 'x';
+  x.textContent = '✕';
+  x.title = '删除';
+  x.addEventListener('click', ev => { ev.stopPropagation(); del(full, dir); });
+  row.appendChild(x);
+
+  row.addEventListener('click', () => {
+    if(dir){
+      collapsed[full] = !collapsed[full];
+      renderTree();
+    }else{
+      open(full);
+    }
+  });
+  row.addEventListener('dblclick', ev => {
+    ev.preventDefault();
+    askDialog('重命名', full, dir ? 'dir' : 'file', name2 => {
+      if(name2 === full) return;
+      if(dir){
+        const moved = {};
+        Object.keys(store.files).forEach(k => {
+          if(k.startsWith(full + '\\')){ moved[name2 + k.slice(full.length)] = store.files[k]; delete store.files[k]; }
+        });
+        Object.assign(store.files, moved);
+        store.dirs = store.dirs.map(d => d === full || d.startsWith(full + '\\')
+          ? name2 + d.slice(full.length) : d);
+        openTabs.forEach(t => { if(t.path === full || t.path.startsWith(full + '\\'))
+          t.path = name2 + t.path.slice(full.length); });
+        if(active === full || active.startsWith(full + '\\')) active = name2 + active.slice(full.length);
+      }else{
+        if(store.files[name2]){ pushOut('已存在：' + name2); return; }
+        store.files[name2] = store.files[full];
+        delete store.files[full];
+        openTabs.forEach(t => { if(t.path === full) t.path = name2; });
+        if(active === full) active = name2;
+      }
+      const par = parentOf(name2);
+      if(par && !store.dirs.includes(par)) store.dirs.push(par);
+      save(); renderTree(); renderTabs(); loadDoc();
+      pushOut('已重命名：' + full + ' → ' + name2);
+    });
+  });
+  host.appendChild(row);
+
+  if(dir && !collapsed[full]){
+    const kids = new Set();
+    Object.keys(store.files).forEach(k => {
+      if(k.startsWith(full + '\\')){
+        const rest = k.slice(full.length + 1);
+        const first = rest.split('\\')[0];
+        kids.add(first);
+      }
+    });
+    store.dirs.forEach(d => {
+      if(d.startsWith(full + '\\')){
+        const rest = d.slice(full.length + 1);
+        const first = rest.split('\\')[0];
+        kids.add(first);
+      }
+    });
+    [...kids].sort((a,b) => {
+      const da = isDirPath(full + '\\' + a), db = isDirPath(full + '\\' + b);
+      return (db?1:0) - (da?1:0) || a.localeCompare(b,'zh');
+    }).forEach(k => renderNode(k, full, depth+1, host));
+  }
+}
+
+/* ===== 打开 / 关闭 ===== */
+function open(p){
+  if(!openTabs.find(t => t.path === p)) openTabs.push({ path:p, dirty:false });
+  active = p;
+  renderTree(); renderTabs(); loadDoc();
+}
+function closeTab(p){
+  openTabs = openTabs.filter(t => t.path !== p);
+  if(active === p) active = openTabs.length ? openTabs[openTabs.length-1].path : null;
+  renderTabs(); renderTree(); loadDoc();
+}
+function renderTabs(){
+  const tabs = el('tabs');
+  tabs.innerHTML = '';
+  if(!openTabs.length){
+    const e = document.createElement('div');
+    e.className = 'tab';
+    e.style.cursor = 'default';
+    e.textContent = '未打开文件';
+    tabs.appendChild(e);
+  }
+  openTabs.forEach(t => {
+    const d = document.createElement('div');
+    d.className = 'tab' + (t.path === active ? ' active' : '');
+    const n = document.createElement('span'); n.textContent = baseName(t.path);
+    d.appendChild(n);
+    if(t.dirty){ const dot = document.createElement('span'); dot.className='dot'; d.appendChild(dot); }
+    const x = document.createElement('span'); x.className='x'; x.textContent='✕';
+    x.addEventListener('click', ev => { ev.stopPropagation(); closeTab(t.path); });
+    d.appendChild(x);
+    d.addEventListener('click', () => { active = t.path; renderTree(); renderTabs(); loadDoc(); });
+    tabs.appendChild(d);
+  });
+}
+
+/* ===== 编辑器：纯文本 + 高亮 ===== */
+const code = el('code');
+const gutter = el('gutter');
+let plain = '';      // 当前纯文本
+
+function loadDoc(){
+  if(!active){
+    plain = '';
+    padding();
+    el('stFile').textContent = '未打开文件';
+    el('pathHint').textContent = '';
+    el('stSize').textContent = '0 B';
+    return;
+  }
+  plain = store.files[active] || '';
+  el('stFile').textContent = baseName(active);
+  el('pathHint').textContent = active;
+  el('stSize').textContent = fmtSize(plain);
+  paint();
+}
+function escapeHtml(s){
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+const KWS = ['函数','结束','如果','否则','当','对于','在','中','则','变成','将','打印','复印','返回',
+             '依赖','继续','中断','尝试','捕获','概率分配','集合','点阵','频道'];
+const FUNCS = ['长度','文本','数字串','追加','删除','向下取整','向上取整','类型','切片','列表新建',
+               '写文件','读文件','输入值','注入值','范围','相等','元素'];
+function highlight(src){
+  const reg = /("(?:[^"\\]|\\.)*")|(#\s*[^\n]*)|([\u4e00-\u9fa5A-Za-z_][\u4e00-\u9fa5A-Za-z0-9_]*)|([0-9]+(?:\.[0-9]+)?)/g;
+  let out = '', last = 0, m;
+  while((m = reg.exec(src))){
+    out += escapeHtml(src.slice(last, m.index));
+    const t = m[0];
+    if(m[1]) out += '<span class="str">' + escapeHtml(t) + '</span>';
+    else if(m[2]) out += '<span class="cmt">' + escapeHtml(t) + '</span>';
+    else if(m[4]) out += '<span class="num">' + t + '</span>';
+    else if(KWS.includes(t)) out += '<span class="kw">' + t + '</span>';
+    else if(FUNCS.includes(t)) out += '<span class="str">' + t + '</span>';
+    else out += escapeHtml(t);
+    last = m.index + t.length;
+  }
+  out += escapeHtml(src.slice(last));
+  return out;
+}
+function paint(){
+  const html = highlight(plain);
+  code.innerHTML = html === '' ? '<br>' : html;
+  paintGutter();
+  el('stSize').textContent = fmtSize(plain);
+  el('statCnt').textContent = plain.split('\n').length + ' 行';
+}
+function paintGutter(){
+  const n = plain.split('\n').length;
+  const curLine = (el('stPos').textContent.match(/行\s+(\d+)/) || [])[1];
+  let html = '';
+  for(let i=1;i<=n;i++){
+    html += '<div class="' + (String(i) === curLine ? 'cur' : '') + '">' + i + '</div>';
+  }
+  gutter.innerHTML = html;
+}
+function padding(){ code.innerHTML = '<br>'; gutter.innerHTML = '<div>1</div>'; el('statCnt').textContent='0 行'; }
+
+/* 输入同步：保留光标位置 */
+code.addEventListener('input', () => {
+  if(!active) return;
+  plain = code.innerText.replace(/\u00a0/g,' ');
+  store.files[active] = plain;
+  const t = openTabs.find(x => x.path === active);
+  if(t) t.dirty = true;
+  save(); renderTabs();
+  el('stSize').textContent = fmtSize(plain);
+  paintGutter();
+  el('statCnt').textContent = plain.split('\n').length + ' 行';
+  updatePos();
+  debounceCheck();
+});
+code.addEventListener('keydown', ev => {
+  if((ev.ctrlKey||ev.metaKey) && ev.key === 's'){ ev.preventDefault(); commit(); }
+  if(ev.key === 'Tab'){ ev.preventDefault(); document.execCommand('insertText', false, '    '); }
+});
+code.addEventListener('keyup', updatePos);
+code.addEventListener('click', updatePos);
+function updatePos(){
+  const sel = window.getSelection();
+  if(!sel.rangeCount) return;
+  const before = sel.getRangeAt(0).cloneRange();
+  before.selectNodeContents(code);
+  before.setEnd(sel.getRangeAt(0).startContainer, sel.getRangeAt(0).startOffset);
+  const lines = before.toString().split('\n');
+  el('stPos').textContent = '行 ' + lines.length + ', 列 ' + (lines[lines.length-1].length + 1);
+  markCurrentLine(lines.length);
+}
+function markCurrentLine(n){
+  if(gutter.childElementCount !== plain.split('\n').length){ paintGutter(); return; }
+  for(let i=0;i<gutter.childElementCount;i++){
+    gutter.children[i].classList.toggle('cur', i+1 === n);
+  }
+}
+
+/* 保存：内容已实时写进 store，这里只清 dirty 标记 */
+function commit(){
+  const t = openTabs.find(x => x.path === active);
+  if(t) t.dirty = false;
+  save(); renderTabs();
+  pushOut('已保存：' + active + '（' + fmtSize(plain) + '）');
+}
+
+/* ===== 检查：块级配对 + 未定义调用 ===== */
+let checkTimer = null;
+function debounceCheck(){ clearTimeout(checkTimer); checkTimer = setTimeout(() => checkSilent(), 400); }
+
+function analyze(src){
+  const issues = [];
+  const lines = src.split('\n');
+  const funcs = new Set();
+  const stack = [];
+  const openers = {'函数':1,'如果':1,'当':1,'对于':1,'尝试':1,'概率分配':1};
+  lines.forEach((line, i) => {
+    const s = line.replace(/#.*$/,'');
+    const tok = s.trim().split(/\s+/).filter(Boolean);
+    if(!tok.length) return;
+    if(tok[0] === '函数' && tok.length>1) funcs.add(tok[1]);
+    if(/^函数\s/.test(s)) stack.push({k:'函数', line:i+1});
+    else if(/^(如果|当|对于|尝试|概率分配)/.test(tok[0])) stack.push({k:tok[0], line:i+1});
+    else if(tok[0] === '否则'){ /* 同一层 */ }
+    else if(tok[0] === '结束'){
+      if(stack.length) stack.pop();
+      else issues.push({line:i+1, col:1, lv:'e', msg:'多余的「结束」，当前没有未闭合的块'});
+    }
+  });
+  stack.forEach(b => issues.push({line:b.line, col:1, lv:'e', msg:'「' + b.k + '」没有配对的「结束」'}));
+
+  /* 运算符/关键字误当名字 */
+  const badNames = {'乘':'运算符','除':'运算符','加':'运算符','中':'关键字','在':'关键字','则':'关键字'};
+  lines.forEach((line,i) => {
+    const m = line.match(/函数\s+([\u4e00-\u9fa5A-Za-z_][^\s（(]*)/);
+    if(m && badNames[m[1]]) issues.push({line:i+1, col:3, lv:'e',
+      msg:'「' + m[1] + '」是' + badNames[m[1]] + '，不能当函数名'});
+  });
+
+  /* 未定义的调用（只看 中文名( 形式） */
+  const builtin = new Set(FUNCS.concat(['函数','打印','复印','返回','如果','当','对于','尝试','结束',
+    '列表设','列表取','列表长','列表容量','列表新建','列表设长','字符串连接','数值化','文本化',
+    '小数','位或','数加','数等','数不等','算术','除法']));
+  lines.forEach((line,i) => {
+    const re = /([\u4e00-\u9fa5A-Za-z_][\u4e00-\u9fa5A-Za-z0-9_]*)\s*(?=\()/g;
+    let m;
+    while((m = re.exec(line))){
+      const n = m[1];
+      if(KWS.includes(n) || builtin.has(n) || funcs.has(n)) continue;
+      issues.push({line:i+1, col:m.index+1, lv:'w', msg:'调用了未见定义的「' + n + '」'});
+    }
+  });
+  return { issues, funcs };
+}
+
+function checkSilent(){ /* 编辑时的静默检查，不刷面板 */ }
+
+function doCheck(show){
+  const issues = analyze(plain || '').issues;
+  const p = el('p-issue');
+  if(!issues.length){
+    p.innerHTML = '<div class="issue"><span class="loc">✓</span><span class="msg">没有发现问题</span></div>';
+    el('issueCnt').textContent = '';
+  }else{
+    p.innerHTML = '';
+    issues.forEach(it => {
+      const d = document.createElement('div');
+      d.className = 'issue ' + it.lv;
+      const l = document.createElement('span'); l.className='loc';
+      l.textContent = '行 ' + it.line + ':' + it.col;
+      const m = document.createElement('span'); m.className='msg'; m.textContent = it.msg;
+      d.append(l, m);
+      d.addEventListener('click', () => jumpTo(it.line));
+      p.appendChild(d);
+    });
+    el('issueCnt').textContent = '(' + issues.length + ')';
+  }
+  if(show) showPane('p-issue');
+  return issues;
+}
+function jumpTo(line){
+  const ls = plain.split('\n');
+  let off = 0;
+  for(let i=0;i<line-1 && i<ls.length;i++) off += ls[i].length + 1;
+  const range = document.createRange();
+  const node = code.firstChild;
+  /* 简化：直接按行号定位到编辑器第 line 行文本节点 */
+  const walker = document.createTreeWalker(code, NodeFilter.SHOW_TEXT);
+  let pos = 0, target = null;
+  while(walker.nextNode()){
+    const t = walker.currentNode;
+    if(pos + t.length >= off){ target = {node:t, off: off - pos}; break; }
+    pos += t.length;
+  }
+  if(target){
+    range.setStart(target.node, Math.min(target.off, target.node.length));
+    range.collapse(true);
+    const sel = window.getSelection();
+    sel.removeAllRanges(); sel.addRange(range);
+    el('stPos').textContent = '行 ' + line + ', 列 1';
+  }
+}
+
+/* ===== 面板 ===== */
+function showPane(id){
+  document.querySelectorAll('#ptabs button').forEach(b => b.classList.toggle('on', b.dataset.p === id));
+  document.querySelectorAll('.pane').forEach(p => p.classList.toggle('on', p.id === id));
+}
+document.querySelectorAll('#ptabs button').forEach(b => {
+  b.addEventListener('click', () => showPane(b.dataset.p));
+});
+function pushOut(s){
+  const o = el('p-out');
+  o.textContent += (o.textContent ? '\n' : '') + s;
+}
+function pushTerm(s){
+  const t = el('p-term');
+  t.textContent += (t.textContent ? '\n' : '') + s;
+}
+
+/* ===== 编译（前端：检查 + 统计，不接后端） ===== */
+function compile(){
+  if(!active){ pushOut('没有打开文件，先选中一个 .编译源'); showPane('p-out'); return; }
+  const t0 = performance.now();
+  const issues = doCheck(false);
+  const errs = issues.filter(i => i.lv === 'e').length;
+  const lines = plain.split('\n').filter(l => l.trim()).length;
+  const size = bytes(plain);
+  const ms = (performance.now() - t0).toFixed(1);
+  el('p-out').textContent = '';
+  el('p-term').textContent = '';
+  pushOut('文件：' + active);
+  pushOut('行数：' + lines + '　字节：' + size);
+  pushOut('检查耗时：' + ms + ' ms');
+  if(errs){
+    pushOut('结果：' + errs + ' 个错误，未进入代码生成');
+    pushTerm('$ 编译  ' + baseName(active));
+    pushTerm('✗ 语法检查未通过：' + errs + ' 个错误');
+    showPane('p-issue');
+  }else{
+    pushOut('结果：语法检查通过');
+    pushOut('下一步（尚未接通）：交给 库\\自举库.wen 直线编译出 x86-64，再由 库\\自举PE库.wen 拼 PE');
+    pushTerm('$ 编译  ' + baseName(active));
+    pushTerm('✓ 语法检查通过　尚未接入机器码后端');
+    showPane('p-out');
+  }
+}
+
+/* ===== 新建 / 导入 / 导出 / 删除 ===== */
+const mask = el('mask'), dlgInput = el('dlgInput');
+function askDialog(title, def, mode, cb){
+  dlgMode = mode;
+  el('dlgTitle').textContent = title;
+  dlgInput.value = def || '';
+  mask.classList.add('on');
+  dlgInput.focus();
+  dlgInput.select();
+  askDialog.cb = cb;
+}
+el('dlgCancel').addEventListener('click', () => mask.classList.remove('on'));
+el('dlgOk').addEventListener('click', () => {
+  const v = dlgInput.value.trim();
+  mask.classList.remove('on');
+  if(v && askDialog.cb) askDialog.cb(v);
+});
+dlgInput.addEventListener('keydown', ev => { if(ev.key === 'Enter') el('dlgOk').click(); });
+
+el('btnNew').addEventListener('click', () => {
+  const base = active ? parentOf(active) : '';
+  askDialog('新建文件', base ? base + '\\新文件.编译源' : '新文件.编译源', 'file', name => {
+    const p = name.endsWith('.编译源') || name.includes('.') ? name : name + '.编译源';
+    if(store.files[p]){ pushOut('已存在：' + p); return; }
+    store.files[p] = '';
+    const par = parentOf(p);
+    if(par && !store.dirs.includes(par)) store.dirs.push(par);
+    save(); renderTree(); open(p);
+    pushOut('已新建：' + p);
+  });
+});
+el('btnNewDir').addEventListener('click', () => {
+  const base = active ? parentOf(active) : '';
+  askDialog('新建文件夹', base ? base + '\\新目录' : '新目录', 'dir', name => {
+    if(!store.dirs.includes(name)) store.dirs.push(name);
+    save(); renderTree();
+    pushOut('已新建文件夹：' + name);
+  });
+});
+el('btnImport').addEventListener('click', () => el('importInput').click());
+el('importInput').addEventListener('change', ev => {
+  const files = [...ev.target.files];
+  if(!files.length) return;
+  let done = 0;
+  files.forEach(f => {
+    const r = new FileReader();
+    r.onload = () => {
+      const p = f.name;
+      store.files[p] = String(r.result);
+      const par = parentOf(p);
+      if(par && !store.dirs.includes(par)) store.dirs.push(par);
+      save(); renderTree(); open(p);
+      pushOut('已导入：' + p + '（' + fmtSize(String(r.result)) + '）');
+      if(++done === files.length) showPane('p-out');
+    };
+    r.readAsText(f, 'utf-8');
+  });
+  ev.target.value = '';
+});
+el('btnExport').addEventListener('click', () => {
+  if(!active){ pushOut('没有打开文件'); showPane('p-out'); return; }
+  const blob = new Blob([plain], { type:'text/plain;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = baseName(active);
+  document.body.appendChild(a); a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+  pushOut('已导出到下载目录：' + baseName(active));
+  showPane('p-out');
+});
+function del(p, dir){
+  if(dir){
+    Object.keys(store.files).forEach(k => { if(k.startsWith(p + '\\')) delete store.files[k]; });
+    store.dirs = store.dirs.filter(d => !(d === p || d.startsWith(p + '\\')));
+    openTabs = openTabs.filter(t => !(t.path === p || t.path.startsWith(p + '\\')));
+  }else{
+    delete store.files[p];
+    openTabs = openTabs.filter(t => t.path !== p);
+  }
+  if(active && !store.files[active]) active = openTabs.length ? openTabs[0].path : null;
+  save(); renderTree(); renderTabs(); loadDoc();
+  pushOut('已删除：' + p);
+}
+el('btnReset').addEventListener('click', () => {
+  store = { files: JSON.parse(JSON.stringify(DEFAULT_FILES)), dirs:['示例'] };
+  openTabs = []; active = null;
+  save(); renderTree(); renderTabs(); loadDoc();
+  pushOut('已恢复为初始示例');
+});
+el('btnLoadDemo').addEventListener('click', () => {
+  const p = '示例\\大数幂.编译源';
+  store.files[p] = `依赖 文件库
+
+函数 造零 数 则
+    将 果 变成 []
+    将 序 变成 0
+    当 序 < 数 则
+        追加(果, 0)
+        将 序 变成 序 + 1
+    结束
+    返回 果
+结束
+
+函数 相乘 甲 乙 则
+    将 长甲 变成 长度(甲)
+    将 长乙 变成 长度(乙)
+    将 果 变成 造零(长甲 + 长乙)
+    将 i 变成 0
+    当 i < 长甲 则
+        将 进 变成 0
+        将 j 变成 0
+        当 j < 长乙 则
+            将 值 变成 果[i + j] + 甲[i] * 乙[j] + 进
+            将 果[i + j] 变成 值 % 10
+            将 进 变成 向下取整(值 / 10)
+            将 j 变成 j + 1
+        结束
+        将 i 变成 i + 1
+    结束
+    返回 果
+结束
+
+函数 主 则
+    将 四十五 变成 [5, 4]
+    将 结果 变成 求幂(四十五, 45)
+    打印 "45^45 = " + 数字串(结果)
+结束
+`;
+  if(!store.dirs.includes('示例')) store.dirs.push('示例');
+  save(); renderTree(); open(p);
+  pushOut('已载入示例：' + p);
+});
+el('btnCheck').addEventListener('click', () => {
+  doCheck(true);
+  pushTerm('$ 检查  ' + (active ? baseName(active) : '—'));
+});
+el('btnRun').addEventListener('click', compile);
+
+/* ===== 启动 ===== */
+el('fsearch').addEventListener('input', renderTree);
+renderTree(); renderTabs();
+const first = Object.keys(store.files).sort((a,b)=>a.localeCompare(b,'zh'))[0];
+if(first) open(first);
+pushOut('工作台就绪：文件存在浏览器本地存储，可新建 / 编辑 / 导入 / 导出');
+pushOut('编译按钮目前只做语法检查；接真实后端需要 库\\自举库.wen 生成机器码');
+pushTerm('$ 文语言工作台');
+</script>
+</body>
+</html>

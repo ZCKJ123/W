@@ -1,0 +1,9 @@
+依赖 文件库
+依赖 工作台PE库
+
+函数 主 则
+    打包工作台PE("C:/Temp/wen_selfhost/工作台.exe", 假)
+    写文件("C:/Temp/wen_selfhost/工作台.txt", "已生成")
+结束
+
+主()
