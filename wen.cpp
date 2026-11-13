@@ -28910,7 +28910,20 @@ if (variant == 25) {
     /* 步长必须明显小于一个体素格子，否则密度累积在格子边界上打结，
        屏幕上就出现一圈圈等距细线（看起来像“片片”）。0.0156 的格子，
        步长要压到 0.007 以下，所以 480 步。 */
-    const int NST = 480;
+    /* 渐进采样：视角一动，先用 32 步把画面立刻画出来；不动时每帧把步数翻倍，
+       几帧内收敛到 480 步的清晰度。密度场 den 已经是静态缓存（只按型号重建一次），
+       所以每帧真正的成本就是「像素 × 步数」，这一步直接把它降 15 倍。
+       渲染慢不该拖住玩家：玩家按真实时间走，画面先糊后清。 */
+    static int progN = 32;
+    static double lcx = 1e18, lcy = 1e18, lcz = 1e18, lyaw = 1e18, lpt = 1e18;
+    bool camMoved = (fabs(cx - lcx) > 0.02) || (fabs(cy - lcy) > 0.02) ||
+                    (fabs(cz - lcz) > 0.02) || (fabs(yaw - lyaw) > 0.004) ||
+                    (fabs(pitch - lpt) > 0.004);
+    if (camMoved) progN = 32;
+    else if (progN < 480) progN = progN * 2;
+    if (progN > 480) progN = 480;
+    lcx = cx; lcy = cy; lcz = cz; lyaw = yaw; lpt = pitch;
+    const int NST = (variant == 26) ? progN : 480;
     for (int py = 0; py < h; ++py) {
         double sy = (0.5 - (double)py / (double)(h - 1)) * 2.0;
         for (int px = 0; px < w; ++px) {
