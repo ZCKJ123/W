@@ -27528,9 +27528,14 @@ Value vpCloudBody(Interpreter&, vector<Value>& a, int line) {
            11 是旧的中型基准：没有平底、没有分叉，跟 20/21 放一起就明显不像云了。 */
         bool tree11 = (variant > 19 && variant < 26);
         /* 型26 的六朵云：中心与高程。树源按组复制，所以必须提到函数作用域。 */
-        const double P26X[6] = { -7.60,  7.40, -3.20,  8.80,  0.80, -10.40 };
-        const double P26Y[6] = {  2.60,  3.20,  6.00,  7.40,  9.40,  7.80 };
-        const double P26Z[6] = { -6.80, -9.20,  7.60,  6.60, -1.20,  3.60 };
+        /* 前两朵是近处的大云（20 宽），后面四朵是远处的小云。
+           六朵一样大并排 = 画面被平分成六小颗；真实天空是有纵深的：
+           近处一大朵占掉半个视野，远处几朵小的衬托。 */
+        /* 两大朵靠拢到相切，核的 exp 尾巴会在中间搭桥 —— 读成一整片，
+           而不是两块棉花并排。远四朵抬高，从大云顶上露出来。 */
+        const double P26X[6] = { -4.60,  4.90, -11.20,  11.40,  0.60, -2.60 };
+        const double P26Y[6] = {  4.20,  4.90, 11.40, 11.00, 10.20, 11.60 };
+        const double P26Z[6] = { -2.40, -3.20, -12.00, -11.00, -13.00,  2.20 };
     double litb11 = 0.78;   /* 亮度基准在渲染循环里要用，必须在函数作用域声明 */
     double litlo11 = 0.55;  /* 亮度下限：乌云能压到更暗 */
     double lithm11 = 1.20;  /* 亮度上限：亮云能提到更亮 */
@@ -28403,7 +28408,8 @@ Value vpCloudBody(Interpreter&, vector<Value>& a, int line) {
                                        0.06,  0.30, -0.38, -0.02,  0.20, -0.28,  0.30,  0.34 };
             const double q26r[18] = {  0.50,  0.46,  0.40,  0.38,  0.34,  0.40,  0.32,  0.22,  0.20,  0.18,
                                        0.20,  0.18,  0.19,  0.17,  0.20,  0.18,  0.16,  0.17 };
-            const double s26 = 2.60;
+            /* 每朵 12 宽。之前 2.60 只有 7 宽，塞在 26 的盒里就是“一小颗一小颗”。 */
+            const double s26a[6] = { 9.20, 8.40, 4.30, 4.10, 3.70, 3.90 };
             for (int iz = 0; iz < GZ; ++iz) {
                 double z = BZ0 + (BZ1 - BZ0) * ((double)iz + 0.5) / (double)GZ;
                 for (int iy = 0; iy < GY; ++iy) {
@@ -28412,6 +28418,7 @@ Value vpCloudBody(Interpreter&, vector<Value>& a, int line) {
                         double x = BX0 + (BX1 - BX0) * ((double)ix + 0.5) / (double)GX;
                         double best26 = 0.0;
                         for (int ci = 0; ci < 6; ++ci) {
+                            double s26 = s26a[ci];
                             double lx = (x - P26X[ci]) / s26;
                             double lz = (z - P26Z[ci]) / s26;
                             if (lx < -1.30 || lx > 1.30) continue;
