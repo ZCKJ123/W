@@ -1,7 +1,0 @@
-依赖 文件库
-
-函数 主 则
-    写文件("C:\Temp\wen_selfhost\nl.txt", "\n")
-结束
-
-主()

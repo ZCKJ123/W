@@ -28824,12 +28824,12 @@ if (variant == 25) {
         double cum = 0.0;
         for (int i = 0; i < 128; ++i) {
             cum += (double)hist[i];
-            if (cum >= total * (((variant == 25 || variant == 26)) ? 0.04 : 0.18)) { pLo = mx * (double)i / 127.0; break; }
+            if (cum >= total * ((variant == 26) ? 0.001 : (((variant == 25 || variant == 26)) ? 0.04 : 0.18))) { pLo = mx * (double)i / 127.0; break; }
         }
         cum = 0.0;
         for (int i = 0; i < 128; ++i) {
             cum += (double)hist[i];
-            if (cum >= total * (((variant == 25 || variant == 26)) ? 0.995 : 0.90)) { pHi = mx * (double)i / 127.0; break; }
+            if (cum >= total * ((variant == 26) ? 1.000 : (((variant == 25 || variant == 26)) ? 0.995 : 0.90))) { pHi = mx * (double)i / 127.0; break; }
         }
         if (pHi < pLo + 1e-6) pHi = pLo + 1e-6;
         for (size_t i = 0; i < den.size(); ++i) {
