@@ -1,0 +1,13 @@
+wen.cpp: In constructor 'Interpreter::Interpreter()':
+wen.cpp:18351:24: warning: capture of variable 'compileFormula' with non-automatic storage duration
+18351 |     compileFormula = [&compileFormula](const Value& f, int line) -> FormulaNode {
+      |                        ^~~~~~~~~~~~~~
+wen.cpp:18350:58: note: 'std::function<Interpreter::Interpreter()::FormulaNode(const Value&, int)> compileFormula' declared here
+18350 |     static std::function<FormulaNode(const Value&, int)> compileFormula;
+      |                                                          ^~~~~~~~~~~~~~
+wen.cpp:18396:25: warning: capture of variable 'evalFormulaNode' with non-automatic storage duration
+18396 |     evalFormulaNode = [&evalFormulaNode](const FormulaNode& nd, double l, double r, double c) -> double {
+      |                         ^~~~~~~~~~~~~~~
+wen.cpp:18395:78: note: 'std::function<double(const Interpreter::Interpreter()::FormulaNode&, double, double, double)> evalFormulaNode' declared here
+18395 |     static std::function<double(const FormulaNode&, double, double, double)> evalFormulaNode;
+      |                                                                              ^~~~~~~~~~~~~~~

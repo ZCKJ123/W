@@ -127,10 +127,40 @@ static bool startsWith(const string& s, size_t pos, const string& lit) {
     return pos + lit.size() <= s.size() && s.compare(pos, lit.size(), lit) == 0;
 }
 
+// 字面量版本：长度在编译期就知道，不构造临时 string。
+// 词法主循环里上百次前缀匹配全靠它，省下的就是纯解析时间。
+template <size_t N>
+static bool startsWith(const string& s, size_t pos, const char (&lit)[N]) {
+    const size_t n = N - 1;
+    return pos + n <= s.size() && s.compare(pos, n, lit, n) == 0;
+}
+
+// 多字节符号（全角标点、数学符号、引号）的 UTF-8 首字节只有这五种。
+// 汉字首字节是 0xE4–0xE9，正好落在这个集合外——于是每个中文标识符
+// 不必白白跑上百次前缀匹配，这是词法提速的主要来源。
+static bool isSymHeadByte(unsigned char c) {
+    return c == 0xC2 || c == 0xC3 || c == 0xE2 || c == 0xE3 || c == 0xEF;
+}
+
+static bool startsLit(const string& s, size_t pos, const char* lit, size_t n) {
+    return pos + n <= s.size() && s.compare(pos, n, lit, n) == 0;
+}
+
+// 一次性把字面量长度算好存表，之后每次匹配不再 strlen。
+struct PrefixLit { const char* lit; size_t n; };
+static std::vector<PrefixLit> buildPrefixTable(const char* const* raw, size_t count) {
+    std::vector<PrefixLit> v;
+    v.reserve(count);
+    for (size_t i = 0; i < count; ++i) v.push_back({raw[i], string(raw[i]).size()});
+    return v;
+}
+
 // 中文标点/数学符号不能算进标识符里。
 // 否则「打印（…）」会被整个当成一个名字，中文代码看起来“语法通过”，其实没执行。
 static bool isMultiByteDelimiter(const string& s, size_t pos) {
-    static const char* lits[] = {
+    // 先看首字节：不是多字节符号首字节就直接否定，省掉后面 49 次前缀匹配
+    if (pos >= s.size() || !isSymHeadByte((unsigned char)s[pos])) return false;
+    static const char* const raw[] = {
         "，", "：", "；", "（", "）", "【", "】", "。",
         "＋", "－", "＊", "／", "％", "＝", "＜", "＞", "！",
         "｛", "｝", "［", "］",
@@ -139,8 +169,10 @@ static bool isMultiByteDelimiter(const string& s, size_t pos) {
         "⁰", "¹", "²", "³", "⁴", "⁵", "⁶", "⁷", "⁸", "⁹",
         "＆", "｜"
     };
-    for (const char* lit : lits) {
-        if (startsWith(s, pos, lit)) return true;
+    static const std::vector<PrefixLit> lits =
+        buildPrefixTable(raw, sizeof(raw) / sizeof(raw[0]));
+    for (const auto& it : lits) {
+        if (pos + it.n <= s.size() && s.compare(pos, it.n, it.lit, it.n) == 0) return true;
     }
     return false;
 }
@@ -227,11 +259,16 @@ static const std::set<string>& keywords() {
 }
 
 static bool isIdentStart(unsigned char c) {
-    return std::isalpha(c) || c == '_' || c >= 0x80;
+    // 直接比较代替 std::isalpha：后者在部分实现里要过一次 locale 判定，
+    // 而这里每个标识符的每个字节都要用一次。
+    if (c >= 0x80) return true;
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
 }
 
 static bool isIdentCont(unsigned char c) {
-    return std::isalnum(c) || c == '_' || c >= 0x80;
+    if (c >= 0x80) return true;
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_';
 }
 
 // 全角逗号「，」和顿号「、」在 UTF-8 里各占三字节，不能写成单字符字面量比较
@@ -397,32 +434,41 @@ private:
     }
 
     bool tryUnicodeMath() {
-        struct Map { const char* lit; const char* op; };
-        static const Map maps[] = {
-            {"×", "*"}, {"÷", "/"}, {"·", "*"}, {"⋅", "*"}, {"−", "-"},
-            {"≤", "<="}, {"≥", ">="}, {"≠", "!="},
-            {"√", "√"}, {"°", "°"},
-            {"⁰", "⁰"}, {"¹", "¹"}, {"²", "²"}, {"³", "³"},
-            {"⁴", "⁴"}, {"⁵", "⁵"}, {"⁶", "⁶"}, {"⁷", "⁷"},
-            {"⁸", "⁸"}, {"⁹", "⁹"},
-        };
+        // 首字节不是多字节符号首字节，整张表都不必试
+        if (pos_ >= src_.size() || !isSymHeadByte((unsigned char)src_[pos_])) return false;
+        struct Map { const char* lit; size_t n; const char* op; };
+        static const std::vector<Map> maps = [] {
+            static const char* const raw[][2] = {
+                {"×", "*"}, {"÷", "/"}, {"·", "*"}, {"⋅", "*"}, {"−", "-"},
+                {"≤", "<="}, {"≥", ">="}, {"≠", "!="},
+                {"√", "√"}, {"°", "°"},
+                {"⁰", "⁰"}, {"¹", "¹"}, {"²", "²"}, {"³", "³"},
+                {"⁴", "⁴"}, {"⁵", "⁵"}, {"⁶", "⁶"}, {"⁷", "⁷"},
+                {"⁸", "⁸"}, {"⁹", "⁹"},
+            };
+            std::vector<Map> v;
+            const size_t count = sizeof(raw) / sizeof(raw[0]);
+            for (size_t i = 0; i < count; ++i)
+                v.push_back({raw[i][0], string(raw[i][0]).size(), raw[i][1]});
+            return v;
+        }();
         for (const auto& m : maps) {
-            if (startsWith(src_, pos_, m.lit)) {
+            if (src_[pos_] == m.lit[0] && src_.compare(pos_, m.n, m.lit, m.n) == 0) {
                 add(TT::Op, m.op, line_, col_);
-                pos_ += string(m.lit).size();
+                pos_ += m.n;
                 ++col_;
                 return true;
             }
         }
         if (startsWith(src_, pos_, "＆＆")) {
             add(TT::Op, "&&", line_, col_);
-            pos_ += string("＆＆").size();
+            pos_ += 6;   // 「＆＆」两个全角字符共 6 字节
             col_ += 2;
             return true;
         }
         if (startsWith(src_, pos_, "｜｜")) {
             add(TT::Op, "||", line_, col_);
-            pos_ += string("｜｜").size();
+            pos_ += 6;
             col_ += 2;
             return true;
         }
@@ -430,20 +476,28 @@ private:
     }
 
     bool tryFullWidth() {
-        struct Map { const char* lit; const char* op; };
-        static const Map maps[] = {
-            {"，", ","}, {"：", ":"}, {"；", ";"},
-            {"（", "("}, {"）", ")"},
-            {"【", "["}, {"】", "]"},
-            {"＋", "+"}, {"－", "-"}, {"＊", "*"}, {"／", "/"}, {"％", "%"},
-            {"＝", "="}, {"＜", "<"}, {"＞", ">"}, {"！", "!"},
-            {"｛", "{"}, {"｝", "}"}, {"［", "["}, {"］", "]"},
-        };
+        if (pos_ >= src_.size() || !isSymHeadByte((unsigned char)src_[pos_])) return false;
+        struct Map { const char* lit; size_t n; const char* op; };
+        static const std::vector<Map> maps = [] {
+            static const char* const raw[][2] = {
+                {"，", ","}, {"：", ":"}, {"；", ";"},
+                {"（", "("}, {"）", ")"},
+                {"【", "["}, {"】", "]"},
+                {"＋", "+"}, {"－", "-"}, {"＊", "*"}, {"／", "/"}, {"％", "%"},
+                {"＝", "="}, {"＜", "<"}, {"＞", ">"}, {"！", "!"},
+                {"｛", "{"}, {"｝", "}"}, {"［", "["}, {"］", "]"},
+            };
+            std::vector<Map> v;
+            const size_t count = sizeof(raw) / sizeof(raw[0]);
+            for (size_t i = 0; i < count; ++i)
+                v.push_back({raw[i][0], string(raw[i][0]).size(), raw[i][1]});
+            return v;
+        }();
         for (const auto& m : maps) {
-            if (startsWith(src_, pos_, m.lit)) {
+            if (src_[pos_] == m.lit[0] && src_.compare(pos_, m.n, m.lit, m.n) == 0) {
                 string op = m.op;
                 add(TT::Op, op, line_, col_);
-                pos_ += string(m.lit).size();
+                pos_ += m.n;
                 ++col_;
                 if (op == "(" || op == "[" || op == "{") ++depth_;
                 else if (op == ")" || op == "]" || op == "}") depth_ = std::max(0, depth_ - 1);
@@ -453,7 +507,7 @@ private:
         if (startsWith(src_, pos_, "。")) {
             int ln = line_, cl = col_;
             add(TT::Op, ";", ln, cl);
-            pos_ += string("。").size();
+            pos_ += 3;   // 「。」三字节
             ++col_;
             return true;
         }
@@ -477,9 +531,21 @@ private:
     }
 
     bool scanOperator() {
+        char c = src_[pos_];
+        // 运算符的首字符只有这一小组：中文名字、数字进来就直接否掉，
+        // 省下每个 token 17 次前缀匹配（原来每次还会临时构造 std::string）。
+        switch (c) {
+            case '+': case '-': case '*': case '/': case '%':
+            case '=': case '<': case '>': case '!':
+            case '(': case ')': case '[': case ']': case '{': case '}':
+            case ',': case ':': case ';': case '&': case '|':
+                break;
+            default:
+                return false;
+        }
         static const char* three[] = {"//=", "**="};
         for (const char* op : three) {
-            if (startsWith(src_, pos_, op)) {
+            if (startsLit(src_, pos_, op, 3)) {
                 add(TT::Op, op, line_, col_);
                 pos_ += 3;
                 col_ += 3;
@@ -489,7 +555,7 @@ private:
         static const char* two[] = {"+=", "-=", "*=", "/=", "%=",
                                     "**", "//", "==", "!=", "<=", ">=", "&&", "||"};
         for (const char* op : two) {
-            if (startsWith(src_, pos_, op)) {
+            if (startsLit(src_, pos_, op, 2)) {
                 add(TT::Op, op, line_, col_);
                 pos_ += 2;
                 col_ += 2;
@@ -497,7 +563,6 @@ private:
             }
         }
         static const string one = "+-*/%=<>!()[]{},:;";
-        char c = src_[pos_];
         if (one.find(c) != string::npos) {
             string op(1, c);
             add(TT::Op, op, line_, col_);
@@ -2019,12 +2084,51 @@ struct Scope {
     // 线性扫比哈希表快，也完全不做堆分配（消除每次调用的 map 节点分配）。
     bool smallMode = false;
     vector<std::pair<SymId, Value>> svars;
+    // 函数帧的「局部数字快槽」：编译期给形参/局部变量编号，纯数字读写只碰 8 字节，
+    // 省掉 200 字节 Value 的搬动和 SymId 线性扫描。
+    // 约定：lnumDef[k] 为真时 lnum[k] 是唯一真相，svars 里那一份已经过期，不许读。
+    // 任何写 svars 的老路径（exec/闭包/未编译语句）写完后必须清掉对应的 def。
+    vector<double> lnum;
+    vector<char> lnumDef;
+    // 槽号 → 变量名（编译期定的顺序）。数量是个位数，线性扫比哈希表省分配。
+    vector<SymId> lorder;
+
+    bool lnumHit(SymId id, double& d) const {
+        if (lorder.empty()) return false;
+        for (size_t k = 0; k < lorder.size(); ++k) {
+            if (lorder[k] != id) continue;
+            if (k < lnumDef.size() && lnumDef[k]) { d = lnum[k]; return true; }
+            return false;
+        }
+        return false;
+    }
+    void lnumPut(int k, double d) {
+        if (k < 0) return;
+        if ((size_t)k >= lnum.size()) {
+            lnum.resize((size_t)k + 1);
+            lnumDef.resize((size_t)k + 1, 0);
+        }
+        lnum[(size_t)k] = d;
+        lnumDef[(size_t)k] = 1;
+    }
+    void lnumClr(SymId id) {
+        if (lorder.empty()) return;
+        for (size_t k = 0; k < lorder.size(); ++k) {
+            if (lorder[k] != id) continue;
+            if (k < lnumDef.size()) lnumDef[k] = 0;
+            return;
+        }
+    }
 
     Scope() = default;
     explicit Scope(shared_ptr<Scope> p) : parent(std::move(p)) {}
 
     bool lookup(const string& name, Value& out) const {
         SymId sid = internSymbol(name);
+        if (smallMode) {
+            double dq = 0;
+            if (lnumHit(sid, dq)) { out = Value(); out.type = VT::Num; out.num = dq; out.width = 32; return true; }
+        }
         auto sit = idSlot.find(sid);
         if (sit != idSlot.end() && fastGet(sit->second, out)) return true;
         if (smallMode) {
@@ -2040,6 +2144,10 @@ struct Scope {
     }
     bool lookup(SymId id, Value& out) const {
         if (smallMode) {
+            double dq = 0;
+            if (lnumHit(id, dq)) { out = Value(); out.type = VT::Num; out.num = dq; out.width = 32; return true; }
+        }
+        if (smallMode) {
             for (const auto& kv : svars)
                 if (kv.first == id) { out = kv.second; return true; }
         }
@@ -2054,6 +2162,7 @@ struct Scope {
         return false;
     }
     void set(SymId id, Value v) {
+        if (smallMode) lnumClr(id);   // 写了完整 Value，数字快槽失效（顶层帧没有槽，跳过）
         if (smallMode) {
             for (auto& kv : svars)
                 if (kv.first == id) { kv.second = std::move(v); return; }
@@ -2073,10 +2182,11 @@ struct Scope {
     bool assign(SymId id, Value v) {
         if (smallMode) {
             for (auto& kv : svars)
-                if (kv.first == id) { kv.second = std::move(v); return true; }
+                if (kv.first == id) { kv.second = std::move(v); lnumClr(id); return true; }
             // 自己帧里没有：先按原语义往外层找，找不到才建局部
             if (parent && parent->assign(id, v)) return true;
             svars.emplace_back(id, std::move(v));
+            lnumClr(id);
             return true;
         }
         auto sit = idSlot.find(id);
@@ -2100,6 +2210,7 @@ struct Scope {
                 if (kv.first == id) {
                     if (knownBuiltin || kv.second.type == VT::Func) return 2;
                     kv.second = std::move(v);
+                    lnumClr(id);
                     return 1;
                 }
             if (parent) return parent->assignOnce(id, v, false);
@@ -2232,9 +2343,36 @@ enum : unsigned char {
     BC_FORVAR,       // 把栈上「当前」写进循环变量 a=全局槽（-1 表示按名字写 b=SymId）
     BC_FORSTEP,      // 「当前」+= 步长，跳回 a
     BC_FORDROP,      // 弹掉栈顶 a 个值（范围循环收尾）
-    BC_EXECSTMT      // 这条语句交给 exec 原样执行 a = 慢语句表下标
+    BC_EXECSTMT,     // 这条语句交给 exec 原样执行 a = 慢语句表下标
+    // ---- 融合指令（「合并一起跑」）----
+    // 把「读全局槽 → 压常数 → 加/减 → 写回该槽」四条合成一条：
+    // 省掉 3 次 dispatch 和两次 200 字节 Value 搬运，语义与那四条逐条执行完全一致。
+    // 后面被吞掉的三条原地改写为 BC_NOP：不删指令，所以所有跳转目标下标都不动。
+    BC_ADDGK,        // a=全局槽 b=常数下标 c=SymId（回退用）
+    BC_SUBGK,        // 同上，减法
+    BC_ADDGG,        // a=目标槽 b=源槽 c=目标SymId d=源SymId
+    BC_SUBGG,        // 同上，减法
+    BC_NOP,          // 占位：已经不执行的指令槽
+    // ---- 批执行（同一行里同形的若干赋值一次走完）----
+    // 一行写「将 a 变成 1; 将 b 变成 2; 将 c 变成 3」时，三条语句各自
+    // 「压常数→写槽」要走三次 dispatch。这里合成一条：a=批下标、b=本段占用
+    // 的指令条数、c=批内条数。段内其余指令原样留在原地（不删），只是不再执行。
+    BC_BATCH,
+    // ---- 局部数字快槽（函数帧内编译期定槽）----
+    // 函数帧的形参/局部变量在编译期就排好槽号，纯数字读写只碰 8 字节的 lnum[k]，
+    // 不再搬 200 字节的 Value、也不扫 svars 找 SymId。
+    BC_LNQ,          // 读运算位置：a=帧内槽号 b=SymId（槽里没数字就退回按名字读）
+    BC_STLN          // 写当前帧：a=帧内槽号 b=SymId
 };
-struct Instr { unsigned char op = 0; int a = 0; int b = 0; };
+
+// 一批赋值（同形或混形都收）。只收「写全局快槽」的形态，槽里是不是数字由运行时判。
+struct Batch {
+    std::vector<signed char> kinds;  // 每条的形态：0=设常数 1=加常数 2=减常数
+    std::vector<int> slots;          // 目标槽
+    std::vector<int> ks;             // kconst 下标（常数本体仍在 kconst 里共用）
+    std::vector<int> syms;           // 非数字回退时用的名字
+};
+struct Instr { unsigned char op = 0; int a = 0; int b = 0; int c = 0; int d = 0; };
 
 struct Callable {
     string name;
@@ -2271,6 +2409,8 @@ struct Function : Callable {
     std::vector<double> pureVal;
     // 语句级字节码：编译成功时 body 仍保留（兜底/对拍用），运行时只跑 code。
     std::vector<Instr> code;
+    std::vector<Batch> batch;    // BC_BATCH 用的批表
+    std::vector<SymId> localOrder;  // 帧内局部槽顺序（槽号 → 变量名）
     std::vector<double> kconst;
     std::vector<StmtPtr> slow;   // 编译不了的语句，运行时交给 exec
     int vstack = 0;   // 表达式栈的最大深度
@@ -4178,6 +4318,7 @@ public:
                        bool knownBuiltin = false);
     // 跑一段语句字节码；返回函数返回值（顶层循环返回 空）。
     Value runCode(const std::vector<Instr>& code, const std::vector<double>& kconst,
+                  const std::vector<Batch>& batches,
                   const std::vector<StmtPtr>& slow, int vstack, const shared_ptr<Scope>& scope);
     // 循环体块跑完时的控制码：0 正常 / 1 继续 / 2 中断
     int vmCtl = 0;
@@ -4240,14 +4381,23 @@ static void checkStmtNames(const vector<StmtPtr>&, const std::set<string>&,
                            const std::map<string,int>&, vector<WenError>&, bool);
 
 vector<StmtPtr> Interpreter::parseSource(const string& src) {
+    // 分阶段计时：设 WEN_PROFILE=1 时把解析各段耗时打到 stderr，平时零开销。
+    const bool prof = std::getenv("WEN_PROFILE") != nullptr;
+    auto ms = []() { return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    double m0 = prof ? ms() : 0, m1 = 0, m2 = 0, m3 = 0, m4 = 0;
+
     Lexer lex(src);
     auto toks = lex.scan();
+    if (prof) { m1 = ms(); }
     Parser p(std::move(toks));
     auto ast = p.parseProgram();
+    if (prof) { m2 = ms(); }
     std::set<string> callables = gCallableNames;
     collectCallables(ast, callables);
     vector<WenError> errs;
     checkStmtStatic(ast, callables, errs);
+    if (prof) { m3 = ms(); }
     if (!gNoNameCheck) {
         std::set<string> vars;
         std::map<string,int> funcs;
@@ -4255,6 +4405,13 @@ vector<StmtPtr> Interpreter::parseSource(const string& src) {
         checkStmtNames(ast, vars, funcs, errs,
                        src.find("依赖") != string::npos || src.find("别名") != string::npos ||
                        src.find("后缀") != string::npos);
+    }
+    if (prof) {
+        m4 = ms();
+        std::fprintf(stderr,
+                     "[解析计时] 词法 %.1f ms ｜ 语法 %.1f ms ｜ collect+静态 %.1f ms ｜ 名字检查 %.1f ms ｜ 合计 %.1f ms（%zu 字节 %zu 行）\n",
+                     m1 - m0, m2 - m1, m3 - m2, m4 - m3, m4 - m0,
+                     src.size(), (size_t)std::count(src.begin(), src.end(), '\n') + 1);
     }
     if (!errs.empty()) throw errs.front();
     return ast;
@@ -4874,6 +5031,7 @@ static bool hasFreeLoopControl(const StmtPtr& s) {
 
 struct WenAsm {
     std::vector<Instr> code;
+    std::vector<Batch> batch;
     std::vector<double> kconst;
     int depth = 0;
     int maxDepth = 0;
@@ -4893,6 +5051,24 @@ struct WenAsm {
     // 编译不了的语句（对于/尝试/匹配/嵌套函数…）不放弃整个函数，
     // 记在这里，运行时用 BC_EXECSTMT 交给 exec 原样执行——语义和 AST 路径一模一样。
     std::vector<StmtPtr> slow;
+    // 局部数字快槽：只在 compileBody 整段编译（函数体）时打开。
+    // 运行时临时编块的地方（compileBlock/compileForRange）不能开——那些块用的帧
+    // 是函数对象那边定的，这里再排一遍槽号会跟运行时帧对不上。
+    bool useLocalSlots = false;
+    std::vector<SymId> localOrder;
+    std::unordered_map<SymId, int> localSlot;
+    int localSlotOf(SymId id) {
+        auto it = localSlot.find(id);
+        if (it != localSlot.end()) return it->second;
+        int k = (int)localOrder.size();
+        localSlot.emplace(id, k);
+        localOrder.push_back(id);
+        return k;
+    }
+    int localSlotIfAny(SymId id) const {
+        auto it = localSlot.find(id);
+        return it == localSlot.end() ? -1 : it->second;
+    }
 
     int emit(unsigned char op, int a = 0, int b = 0) {
         code.push_back(Instr{op, a, b});
@@ -4933,8 +5109,114 @@ struct WenAsm {
         emit(BC_EXECSTMT, (int)slow.size() - 1);
         return true;
     }
+    // 一行里连着几条赋值时打包成一条 BC_BATCH：一次 dispatch 跑完全部。
+    // 段内指令原样留在 code 里（改成 BC_NOP 也不删），跳转目标下标一个都不动。
+    // 顶层认「全局快槽」的形态，函数里认「当前帧」的形态：
+    //   A  [BC_LINE, BC_K, BC_STG]                将 x 变成 常数         (顶层)
+    //   B  [BC_LINE, BC_ADDGK/SUBGK, NOP, NOP]    将 x 变成 x ± 常数     (顶层)
+    //   C  [BC_LINE, BC_K, BC_STLL]               将 x 变成 常数         (形参/局部)
+    //   D  [BC_LINE, BC_LN, BC_K, ADD/SUB, BC_STLL]  将 x 变成 x ± 常数  (形参/局部)
+    bool packBatch(const std::vector<StmtPtr>& b, size_t from, size_t to) {
+        if (!globals) return false;
+        size_t start = code.size();
+        size_t slowMark = slow.size();
+        int depthMark = depth;
+        for (size_t i = from; i < to; ++i) {
+            if (!stmt(b[i])) {
+                code.resize(start);
+                slow.resize(slowMark);
+                depth = depthMark;
+                return false;
+            }
+        }
+        std::vector<signed char> kinds;
+        std::vector<int> slots, ks, syms;
+        size_t p = start;
+        while (p < code.size()) {
+            if (code[p].op != BC_LINE || p + 2 >= code.size()) break;
+            const Instr& i1 = code[p + 1];
+            if (i1.op == BC_K && code[p + 2].op == BC_STG) {
+                kinds.push_back(0);
+                ks.push_back(i1.a);
+                slots.push_back(code[p + 2].a);
+                syms.push_back(code[p + 2].b);
+                p += 3;
+                continue;
+            }
+            if (i1.op == BC_K && code[p + 2].op == BC_STLL) {
+                kinds.push_back(3);
+                ks.push_back(i1.a);
+                slots.push_back(-1);
+                syms.push_back(code[p + 2].a);
+                p += 3;
+                continue;
+            }
+            if (i1.op == BC_K && code[p + 2].op == BC_STLN) {
+                kinds.push_back(6);
+                ks.push_back(i1.a);
+                slots.push_back(code[p + 2].a);
+                syms.push_back(code[p + 2].b);
+                p += 3;
+                continue;
+            }
+            if (i1.op == BC_LNQ && p + 4 < code.size() && code[p + 2].op == BC_K &&
+                (code[p + 3].op == BC_ADD || code[p + 3].op == BC_SUB) &&
+                code[p + 4].op == BC_STLN && code[p + 4].a == i1.a) {
+                kinds.push_back((code[p + 3].op == BC_ADD) ? 7 : 8);
+                ks.push_back(code[p + 2].a);
+                slots.push_back(code[p + 4].a);
+                syms.push_back(i1.b);
+                p += 5;
+                continue;
+            }
+            if ((i1.op == BC_ADDGK || i1.op == BC_SUBGK) && p + 3 < code.size()) {
+                kinds.push_back((i1.op == BC_ADDGK) ? 1 : 2);
+                ks.push_back(i1.b);
+                slots.push_back(i1.a);
+                syms.push_back(i1.c);
+                p += 4;
+                continue;
+            }
+            if (i1.op == BC_LN && p + 4 < code.size() && code[p + 2].op == BC_K &&
+                (code[p + 3].op == BC_ADD || code[p + 3].op == BC_SUB) &&
+                code[p + 4].op == BC_STLL && code[p + 4].a == i1.a) {
+                kinds.push_back((code[p + 3].op == BC_ADD) ? 4 : 5);
+                ks.push_back(code[p + 2].a);
+                slots.push_back(-1);
+                syms.push_back(i1.a);
+                p += 5;
+                continue;
+            }
+            break;
+        }
+        if (p != code.size() || slots.size() < 2) {
+            code.resize(start);
+            slow.resize(slowMark);
+            depth = depthMark;
+            return false;
+        }
+        Batch bt;
+        bt.kinds.swap(kinds);
+        bt.slots.swap(slots);
+        bt.ks.swap(ks);
+        bt.syms.swap(syms);
+        batch.push_back(bt);
+        int len = (int)(code.size() - start);
+        code[start] = Instr{BC_BATCH, (int)batch.size() - 1, len, (int)bt.slots.size()};
+        for (size_t q = start + 1; q < code.size(); ++q) code[q].op = BC_NOP;
+        return true;
+    }
     bool block(const std::vector<StmtPtr>& b) {
-        for (const auto& st : b) if (!tryStmt(st)) return false;
+        size_t i = 0;
+        while (i < b.size()) {
+            if (b[i]->k == Stmt::K::Assign) {
+                size_t j = i + 1;
+                while (j < b.size() && b[j]->k == Stmt::K::Assign) ++j;
+                if (j - i >= 2 && packBatch(b, i, j)) { i = j; continue; }
+            }
+            if (!tryStmt(b[i])) return false;
+            ++i;
+        }
         return true;
     }
 };
@@ -4956,7 +5238,11 @@ bool WenAsm::expr(const ExprPtr& e, bool numCtx) {
             if (numCtx) {
                 // 运算位置：运行时只读 num，类型不是数字再退回完整读取
                 if (gs >= 0) emit(BC_GN, gs, (int)e->sym);
-                else emit(BC_LN, (int)e->sym);
+                else {
+                    int lk = useLocalSlots ? localSlotIfAny(e->sym) : -1;
+                    if (lk >= 0) emit(BC_LNQ, lk, (int)e->sym);   // 帧内定槽：只读 8 字节
+                    else emit(BC_LN, (int)e->sym);
+                }
             } else if (gs >= 0) {
                 emit(BC_G, gs, (int)e->sym);
             } else {
@@ -5046,13 +5332,54 @@ bool WenAsm::stmt(const StmtPtr& s) {
         case Stmt::K::Assign: {
             if (!s->target || s->target->k != Expr::K::Var || !s->target->sym) return false;
             emit(BC_LINE, s->line);
+            SymId symA = s->target->sym;
+            int gsA = topLevel ? topSlotOf(symA) : -1;
+            // 槽号要在编译右边表达式之前定好：`将 x 变成 x + 1` 里的读得能命中同一个槽。
+            // 「局部」首次声明、形参、以及前面已经排过槽的局部变量，写回都走槽。
+            int lkA = -1;
+            if (gsA < 0 && useLocalSlots &&
+                (s->declareLocal || isParam(symA) || localSlotIfAny(symA) >= 0))
+                lkA = localSlotOf(symA);
+            int exprMark = (int)code.size();
             if (!expr(s->expr)) return false;
             SymId sym = s->target->sym;
             int gs = topLevel ? topSlotOf(sym) : -1;
             if (gs >= 0) {
                 // 顶层快槽：顺手把「名字 → 槽」记上（等价的 fastBind 本来在第一次赋值时做）
                 if (globals) globals->fastBind(sym, gs);
+                // 「合并一起跑」：`将 x 变成 x + 常数` 是循环里最常见的一句，
+                // 这四条指令（读同槽→常数→加/减→写回）融成一条。
+                // 被吞的三条原地改成 BC_NOP，指令下标不动，跳转目标全部保持有效。
+                if ((int)code.size() - exprMark == 3) {
+                    Instr& i0 = code[(size_t)exprMark];
+                    Instr& i1 = code[(size_t)exprMark + 1];
+                    Instr& i2 = code[(size_t)exprMark + 2];
+                    if (i0.op == BC_GN && i0.a == gs && i1.op == BC_K &&
+                        (i2.op == BC_ADD || i2.op == BC_SUB)) {
+                        i0.op = (i2.op == BC_ADD) ? BC_ADDGK : BC_SUBGK;
+                        i0.b = i1.a;          // 常数下标
+                        i0.c = (int)sym;      // 非数字回退时要用的名字
+                        i1.op = BC_NOP;
+                        i2.op = BC_NOP;
+                        drop();
+                        return true;          // 写回已经由融合指令完成，不再发 BC_STG
+                    }
+                    // `将 x 变成 x + y`（两边都是全局快槽）同样融成一条
+                    if (i0.op == BC_GN && i0.a == gs && i1.op == BC_GN &&
+                        (i2.op == BC_ADD || i2.op == BC_SUB)) {
+                        i0.op = (i2.op == BC_ADD) ? BC_ADDGG : BC_SUBGG;
+                        i0.b = i1.a;          // 源槽
+                        i0.c = (int)sym;      // 目标名字
+                        i0.d = i1.b;          // 源名字
+                        i1.op = BC_NOP;
+                        i2.op = BC_NOP;
+                        drop();
+                        return true;
+                    }
+                }
                 emit(BC_STG, gs, (int)sym);
+            } else if (lkA >= 0) {
+                emit(BC_STLN, lkA, (int)symA);    // 帧内定槽：数字直接进 8 字节快槽
             } else if (s->declareLocal) {
                 emit(BC_STLL, (int)sym);          // 「局部」：强制写当前帧
             } else if (!topLevel && isParam(sym)) {
@@ -5156,15 +5483,28 @@ bool WenAsm::stmt(const StmtPtr& s) {
 // 把一段语句编译成字节码；失败返回 false，调用方继续用 AST。
 static bool compileBody(const std::vector<StmtPtr>& body, const std::vector<SymId>& params,
                         bool topLevel, const shared_ptr<Scope>& globals,
-                        std::vector<Instr>& outCode, std::vector<double>& outK,
-                        std::vector<StmtPtr>& outSlow, int& outStack) {
+                        std::vector<Instr>& outCode, std::vector<Batch>& outBatch,
+                        std::vector<SymId>& outLocal,
+                        std::vector<double>& outK,
+                        std::vector<StmtPtr>& outSlow, int& outStack,
+                        bool allowLocalSlots) {
     if (body.empty()) return false;
     WenAsm a;
     a.topLevel = topLevel;
     a.globals = globals;
     a.params = params;
+    if (allowLocalSlots) {
+        // 形参先占 0..n-1，和运行时帧里 svars 的前 n 项一一对应
+        a.useLocalSlots = true;
+        for (size_t i = 0; i < params.size(); ++i) {
+            a.localSlot.emplace(params[i], (int)i);
+            a.localOrder.push_back(params[i]);
+        }
+    }
     if (!a.block(body)) return false;
     outCode.swap(a.code);
+    outBatch.swap(a.batch);
+    if (allowLocalSlots) outLocal.swap(a.localOrder);
     outK.swap(a.kconst);
     outSlow.swap(a.slow);
     outStack = a.maxDepth + 4;
@@ -5175,7 +5515,8 @@ static bool compileBody(const std::vector<StmtPtr>& body, const std::vector<SymI
 // 循环本身的语义（遍历什么、怎么绑定变量）仍然只有 exec 一份。
 static bool compileBlock(const std::vector<StmtPtr>& body, bool topLevel,
                          const shared_ptr<Scope>& globals,
-                         std::vector<Instr>& outCode, std::vector<double>& outK,
+                         std::vector<Instr>& outCode, std::vector<Batch>& outBatch,
+                         std::vector<double>& outK,
                          std::vector<StmtPtr>& outSlow, int& outStack, bool& hasRet) {
     hasRet = false;
     if (body.empty()) return false;
@@ -5194,6 +5535,7 @@ static bool compileBlock(const std::vector<StmtPtr>& body, bool topLevel,
     for (const auto& ins : a.code)
         if (ins.op == BC_RET || ins.op == BC_RETN) { hasRet = true; break; }
     outCode.swap(a.code);
+    outBatch.swap(a.batch);
     outK.swap(a.kconst);
     outSlow.swap(a.slow);
     outStack = a.maxDepth + 4;
@@ -5204,7 +5546,8 @@ static bool compileBlock(const std::vector<StmtPtr>& body, bool topLevel,
 // 只有「单变量 + 迭代对象确实是范围」才走这里；其余情况由 exec 的通用循环兜底。
 static bool compileForRange(const StmtPtr& s, const Value& iter, bool topLevel,
                             const shared_ptr<Scope>& globals,
-                            std::vector<Instr>& outCode, std::vector<double>& outK,
+                            std::vector<Instr>& outCode, std::vector<Batch>& outBatch,
+                            std::vector<double>& outK,
                             std::vector<StmtPtr>& outSlow, int& outStack, bool& hasRet) {
     hasRet = false;
     if (!s || s->body.empty()) return false;
@@ -5237,6 +5580,7 @@ static bool compileForRange(const StmtPtr& s, const Value& iter, bool topLevel,
     for (const auto& ins : a.code)
         if (ins.op == BC_RET || ins.op == BC_RETN) { hasRet = true; break; }
     outCode.swap(a.code);
+    outBatch.swap(a.batch);
     outK.swap(a.kconst);
     outSlow.swap(a.slow);
     outStack = a.maxDepth + 4;
@@ -5259,6 +5603,7 @@ static inline void vmSetBool(Value& v, bool x) {
 }
 
 Value Interpreter::runCode(const std::vector<Instr>& code, const std::vector<double>& kconst,
+                           const std::vector<Batch>& batches,
                            const std::vector<StmtPtr>& slow, int vstack,
                            const shared_ptr<Scope>& scope) {
     size_t base = gVSP;
@@ -5333,6 +5678,34 @@ Value Interpreter::runCode(const std::vector<Instr>& code, const std::vector<dou
             }
             case BC_STLL: {
                 scope->set((SymId)in.a, std::move(gVStack[base + sp - 1]));
+                --sp; ++pc;
+                break;
+            }
+            case BC_LNQ: {
+                // 帧内定槽的读：槽里是数字就直接取 8 字节，否则按名字完整读
+                Value& d = gVStack[base + sp];
+                const int k = in.a;
+                if (k >= 0 && (size_t)k < scope->lnumDef.size() && scope->lnumDef[(size_t)k])
+                    vmSetNum(d, scope->lnum[(size_t)k]);
+                else
+                    loadInto(d, false, -1, (SymId)in.b);
+                ++sp; ++pc;
+                break;
+            }
+            case BC_STLN: {
+                // 帧内定槽的写：数字只进快槽（svars 那一份由 lnumDef 标成过期）
+                Value& s0 = gVStack[base + sp - 1];
+                if (s0.type == VT::Num) {
+                    scope->lnumPut(in.a, s0.num);
+                } else {
+                    scope->set((SymId)in.b, std::move(s0));
+                    // 非数字值写进 svars 后必须让这个槽的「数字有效」标记失效，
+                    // 否则同一槽后面的读还会拿到快槽里的旧数字。
+                    // 这里直接用槽号清，不走 lnumClr 的名字查找——名字查找一旦
+                    // 和运行时帧的 lorder 对不上（例如同名全局已存在），就会漏清。
+                    if (in.a >= 0 && (size_t)in.a < scope->lnumDef.size())
+                        scope->lnumDef[(size_t)in.a] = 0;
+                }
                 --sp; ++pc;
                 break;
             }
@@ -5521,6 +5894,136 @@ Value Interpreter::runCode(const std::vector<Instr>& code, const std::vector<dou
                 ++pc;
                 break;
             }
+            case BC_NOP:
+                // 已被融合指令吞掉的原始指令，正常执行流不会走到这里；
+                // 万一有跳转落在中间，照原样空转即可。
+                ++pc;
+                break;
+            case BC_ADDGK:
+            case BC_SUBGK: {
+                // 等价于：BC_GN 槽 → BC_K 常数 → BC_ADD/SUB → BC_STG 槽。
+                // 数字快路径直接拿 num 算，不构造 Value；非数字仍然走原语义
+                // （loadInto 会处理零参自动调用，applyBinary 会处理文本拼接）。
+                const double k = kconst[(size_t)in.b];
+                Value v;
+                Value* p = globals->fastPtr(in.a);
+                if (p && p->type == VT::Num) {
+                    v.type = VT::Num;
+                    v.num = (in.op == BC_ADDGK) ? p->num + k : p->num - k;
+                } else {
+                    loadInto(v, true, in.a, (SymId)in.c);
+                    if (v.type == VT::Num) {
+                        v.num = (in.op == BC_ADDGK) ? v.num + k : v.num - k;
+                    } else {
+                        Value kv;
+                        vmSetNum(kv, k);
+                        v = applyBinary(in.op == BC_ADDGK ? "+" : "-", v, kv, gLastLine);
+                    }
+                }
+                if (v.type != VT::Num && v.type != VT::Int && v.type != VT::Bool)
+                    scope->set((SymId)in.c, v);      // 非数字：名字表里也要留一份（同 BC_STG）
+                globals->fastSet(in.a, std::move(v));
+                pc += 3;                             // 跳过融合指令后面的两条 NOP（不是 3 条：第 4 条 STG 根本没发射）
+                break;
+            }
+            case BC_ADDGG:
+            case BC_SUBGG: {
+                // 等价于：BC_GN 目标 → BC_GN 源 → BC_ADD/SUB → BC_STG 目标。
+                Value v, s;
+                Value* p = globals->fastPtr(in.a);
+                bool fastL = p && p->type == VT::Num;
+                if (fastL) { v.type = VT::Num; v.num = p->num; }
+                else loadInto(v, true, in.a, (SymId)in.c);
+                Value* q = globals->fastPtr(in.b);
+                if (q && q->type == VT::Num) { s.type = VT::Num; s.num = q->num; }
+                else loadInto(s, true, in.b, (SymId)in.d);
+                Value res;
+                if (v.type == VT::Num && s.type == VT::Num) {
+                    res.type = VT::Num;
+                    res.num = (in.op == BC_ADDGG) ? v.num + s.num : v.num - s.num;
+                } else {
+                    res = applyBinary(in.op == BC_ADDGG ? "+" : "-", v, s, gLastLine);
+                }
+                if (res.type != VT::Num && res.type != VT::Int && res.type != VT::Bool)
+                    scope->set((SymId)in.c, res);
+                globals->fastSet(in.a, std::move(res));
+                pc += 3;
+                break;
+            }
+            case BC_BATCH: {
+                // 一条指令跑完整行：批表里是若干个赋值，按原顺序逐个落到快槽。
+                // 语义与「各自 BC_K+BC_STG」或「各自 BC_ADDGK」逐条执行完全一致。
+                const Batch& bt = batches[(size_t)in.a];
+                const int n = in.c;
+                for (int i = 0; i < n; ++i) {
+                    const signed char kd = bt.kinds[(size_t)i];
+                    const double k = kconst[(size_t)bt.ks[(size_t)i]];
+                    const int slot = bt.slots[(size_t)i];
+                    const SymId sym = (SymId)bt.syms[(size_t)i];
+                    if (kd == 0 || kd == 3) {
+                        Value v;
+                        vmSetNum(v, k);
+                        if (slot >= 0) {
+                            if (Value* p = globals->fastPtr(slot))
+                                vmSetNum(*p, k);     // 槽已存在：原地换数字，不走 fastSet
+                            else
+                                globals->fastSet(slot, std::move(v));
+                        } else {
+                            scope->set(sym, std::move(v));   // 形参/局部：写当前帧
+                        }
+                        continue;
+                    }
+                    if (kd == 6) {
+                        scope->lnumPut(slot, k);         // 帧内定槽：只写 8 字节
+                        continue;
+                    }
+                    if (kd == 7 || kd == 8) {
+                        const bool qadd = (kd == 7);
+                        if (slot >= 0 && (size_t)slot < scope->lnumDef.size() &&
+                            scope->lnumDef[(size_t)slot]) {
+                            double& d = scope->lnum[(size_t)slot];
+                            d = qadd ? d + k : d - k;
+                            continue;
+                        }
+                        Value v;
+                        loadInto(v, false, -1, sym);
+                        if (v.type == VT::Num) {
+                            v.num = qadd ? v.num + k : v.num - k;
+                        } else {
+                            Value kv;
+                            vmSetNum(kv, k);
+                            v = applyBinary(qadd ? "+" : "-", v, kv, gLastLine);
+                        }
+                        if (v.type == VT::Num) scope->lnumPut(slot, v.num);
+                        else scope->set(sym, std::move(v));
+                        continue;
+                    }
+                    const bool add = (kd == 1 || kd == 4);
+                    Value* p = slot >= 0 ? globals->fastPtr(slot) : nullptr;
+                    if (p && p->type == VT::Num) {
+                        p->num = add ? p->num + k : p->num - k;
+                        continue;
+                    }
+                    Value v;
+                    loadInto(v, slot >= 0, slot, sym);
+                    if (v.type == VT::Num) {
+                        v.num = add ? v.num + k : v.num - k;
+                    } else {
+                        Value kv;
+                        vmSetNum(kv, k);
+                        v = applyBinary(add ? "+" : "-", v, kv, gLastLine);
+                    }
+                    if (slot >= 0) {
+                        if (v.type != VT::Num && v.type != VT::Int && v.type != VT::Bool)
+                            scope->set(sym, v);
+                        globals->fastSet(slot, std::move(v));
+                    } else {
+                        scope->set(sym, std::move(v));
+                    }
+                }
+                pc += (size_t)in.b;    // 跳过整段（含本指令自己的那一条）
+                break;
+            }
             default:
                 rtError(gLastLine, "内部错误：未知字节码指令");
         }
@@ -5574,12 +6077,14 @@ void Interpreter::exec(const StmtPtr& s, const shared_ptr<Scope>& scope) {
             // 整个循环编译成字节码，一次 runCode 跑完（编译不了就往下走 AST）
             if (!gNoBytecode && !delegating) {
                 std::vector<Instr> lcode;
+                std::vector<Batch> lbatch;
+                std::vector<SymId> llocal;
                 std::vector<double> lk;
                 std::vector<StmtPtr> lslow;
                 int lstack = 0;
                 bool tl = (scope.get() == globals.get());
-                if (compileBody(std::vector<StmtPtr>{s}, {}, tl, globals, lcode, lk, lslow, lstack)) {
-                    Value r = runCode(lcode, lk, lslow, lstack, scope);
+                if (compileBody(std::vector<StmtPtr>{s}, {}, tl, globals, lcode, lbatch, llocal, lk, lslow, lstack, false)) {
+                    Value r = runCode(lcode, lk, lbatch, lslow, lstack, scope);
                     if (vmRetFlag) { retVal = std::move(r); retFlag = true; }
                     break;
                 }
@@ -5648,12 +6153,14 @@ void Interpreter::exec(const StmtPtr& s, const shared_ptr<Scope>& scope) {
             bool two = !s->name2.empty();
             // 循环体整体编译成字节码块；遍历与变量绑定仍然只在这里做
             std::vector<Instr> bcode;
+            std::vector<Batch> bbatch;
             std::vector<double> bk;
             std::vector<StmtPtr> bslow;
             int bstack = 0;
             bool hasRet = false;
             bool bodyCompiled = false;
             std::vector<Instr> rcode;
+            std::vector<Batch> rbatch;
             std::vector<double> rk;
             std::vector<StmtPtr> rslow;
             int rstack = 0;
@@ -5661,20 +6168,20 @@ void Interpreter::exec(const StmtPtr& s, const shared_ptr<Scope>& scope) {
             bool rangeCompiled = false;
             if (!gNoBytecode) {
                 bool tl = (scope.get() == globals.get());
-                bodyCompiled = compileBlock(s->body, tl, globals, bcode, bk, bslow, bstack, hasRet);
+                bodyCompiled = compileBlock(s->body, tl, globals, bcode, bbatch, bk, bslow, bstack, hasRet);
             }
             // 「名字 → 快槽」是幂等的，循环外记一次就够，不必每轮查表
             if (s->nameSlot >= 0) globals->fastBind(s->nameSym, s->nameSlot);
             if (two && s->name2Slot >= 0) globals->fastBind(s->name2Sym, s->name2Slot);
             if (!gNoBytecode && !two && iter.type == VT::Range)
                 rangeCompiled = compileForRange(s, iter, (scope.get() == globals.get()),
-                                                globals, rcode, rk, rslow, rstack, rHasRet);
+                                                globals, rcode, rbatch, rk, rslow, rstack, rHasRet);
             auto runBody = [&]() -> bool {          // true 继续下一轮，false 结束循环
                 if (bodyCompiled) {
                     int savedCtl = vmCtl;
                     int savedRet = vmRetFlag;
                     vmRetFlag = 0;
-                    Value r = runCode(bcode, bk, bslow, bstack, scope);
+                    Value r = runCode(bcode, bk, bbatch, bslow, bstack, scope);
                     bool didRet = vmRetFlag != 0;
                     int ctl = vmCtl;
                     vmCtl = savedCtl;
@@ -5738,7 +6245,7 @@ void Interpreter::exec(const StmtPtr& s, const shared_ptr<Scope>& scope) {
                     int savedCtl = vmCtl;
                     int savedRet = vmRetFlag;
                     vmRetFlag = 0;
-                    Value r = runCode(rcode, rk, rslow, rstack, scope);
+                    Value r = runCode(rcode, rk, rbatch, rslow, rstack, scope);
                     bool didRet = vmRetFlag != 0;
                     vmCtl = savedCtl;
                     vmRetFlag = savedRet;
@@ -5831,7 +6338,7 @@ void Interpreter::exec(const StmtPtr& s, const shared_ptr<Scope>& scope) {
             // 纯数值函数编译成语句字节码；编译不了就继续走 AST（两条路语义等价）。
             if (!gNoBytecode)
                 compileBody(s->body, s->paramSyms, false, globals,
-                            fn->code, fn->kconst, fn->slow, fn->vstack);
+                            fn->code, fn->batch, fn->localOrder, fn->kconst, fn->slow, fn->vstack, true);
             fn->closure = scope;
             fn->line = s->line;
             // 纯表达式体：返回 <数字/参数/四则/比较/逻辑> 组成的表达式
@@ -6307,6 +6814,9 @@ static shared_ptr<Scope> takeFrame(const shared_ptr<Scope>& closure) {
         s->fast.clear();
         s->fastDefined.clear();
         s->idSlot.clear();
+        s->lnum.clear();
+        s->lnumDef.clear();
+        s->lorder.clear();
         s->parent = closure;
     }
     s->trackNames = false;
@@ -6366,6 +6876,12 @@ Value Function::callSpan(Interpreter& vm, const Value* a, int n, int callLine) {
     }
     FrameHold frame(takeFrame(closure));
     Scope& S = *frame.s;
+    // 帧内局部槽：把编译期排好的槽表灌进来，函数体里的数字读写就只碰 8 字节。
+    if (!localOrder.empty()) {
+        S.lorder.assign(localOrder.begin(), localOrder.end());
+        S.lnum.assign(localOrder.size(), 0.0);
+        S.lnumDef.assign(localOrder.size(), 0);
+    }
     // 形参和局部通常只有几个：一次留够，省掉 push_back 扩容与 200 字节搬运
     if (S.svars.capacity() < argc + params.size() + 4)
         S.svars.reserve(argc + params.size() + 4);
@@ -6392,7 +6908,7 @@ Value Function::callSpan(Interpreter& vm, const Value* a, int n, int callLine) {
     try {
         if (!code.empty()) {
             // 有字节码就跑字节码：不再逐条语句 switch + 递归求值
-            result = vm.runCode(code, kconst, slow, vstack, frame.s);
+            result = vm.runCode(code, kconst, batch, slow, vstack, frame.s);
         } else {
             for (const auto& st : body) {
                 vm.exec(st, frame.s);
@@ -25584,15 +26100,22 @@ static void checkStmtNames(const vector<StmtPtr>& ps, const std::set<string>& va
 }
 
 static vector<StmtPtr> parseDiagnostic(const string& src, vector<WenError>& errors) {
+    const bool prof = std::getenv("WEN_PROFILE") != nullptr;
+    auto ms = []() { return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    double m0 = prof ? ms() : 0, m1 = 0, m2 = 0, m3 = 0, m4 = 0;
     try {
         Lexer lex(src);
         Parser parser(lex.scan(), true);
+        if (prof) m1 = ms();
         auto ast = parser.parseProgram();
+        if (prof) m2 = ms();
         errors = parser.errors();
         if (errors.empty()) {
             std::set<string> callables = gCallableNames;
             collectCallables(ast, callables);
             checkStmtStatic(ast, callables, errors);
+            if (prof) m3 = ms();
             if (!gNoNameCheck) {
                 std::set<string> vars;
                 std::map<string,int> funcs;
@@ -25600,6 +26123,12 @@ static vector<StmtPtr> parseDiagnostic(const string& src, vector<WenError>& erro
                 checkStmtNames(ast, vars, funcs, errors,
                                src.find("依赖") != string::npos || src.find("别名") != string::npos ||
                                src.find("后缀") != string::npos);
+            }
+            if (prof) {
+                m4 = ms();
+                std::fprintf(stderr,
+                             "[解析计时] 词法 %.1f ｜ 语法 %.1f ｜ collect+静态 %.1f ｜ 名字检查 %.1f ｜ 合计 %.1f ms（%zu 字节）\n",
+                             m1 - m0, m2 - m1, m3 - m2, m4 - m3, m4 - m0, src.size());
             }
         }
         return ast;
@@ -25779,19 +26308,33 @@ static int runFile(const string& path) {
 static int checkFile(const string& path) {
     vector<string> lines;
     Interpreter vm;  // 初始化内置名字表，供静态负数参数检查
+    const bool prof = std::getenv("WEN_PROFILE") != nullptr;
+    auto ms = []() { return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    double c0 = prof ? ms() : 0, c1 = 0, c2 = 0, c3 = 0, c4 = 0, c5 = 0;
     try {
         string src = readWholeFile(resolveWenPath(path));
+        c1 = prof ? ms() : 0;
         src = normalizeWenSource(src);
         vector<WenError> errors;
         string expanded;
         processSaveBlocks(src, false, expanded, errors);
+        c2 = prof ? ms() : 0;
         if (!errors.empty()) {
             lines = splitLines(src);
             printDiagnostics(errors, path, lines);
             return 1;
         }
+        c3 = prof ? ms() : 0;
         auto program = parseDiagnostic(expanded, errors);
+        c4 = prof ? ms() : 0;
         lines = splitLines(expanded);
+        c5 = prof ? ms() : 0;
+        if (prof) {
+            std::fprintf(stderr,
+                         "[检查计时] 读文件 %.1f ｜ 归一+保存块 %.1f ｜ 解析 %.1f ｜ 分行 %.1f ｜ 合计 %.1f ms\n",
+                         c1 - c0, c2 - c1, c4 - c3, c5 - c4, c5 - c0);
+        }
         if (!errors.empty()) {
             printDiagnostics(errors, path, lines);
             return 1;
@@ -27523,7 +28066,7 @@ Value vpCloudBody(Interpreter&, vector<Value>& a, int line) {
     if ((long long)sp.size() != (long long)w * h * 3)
         sp.assign((size_t)((long long)w * h * 3), 0);
     if (variant < 0) variant = 0;
-    if (variant > 26) variant = 26;
+    if (variant > 27) variant = 27;
         /* 23 = 中型云，用同一套随机分叉 + 凝结底面，只是整体比 20 小。
            11 是旧的中型基准：没有平底、没有分叉，跟 20/21 放一起就明显不像云了。 */
         bool tree11 = (variant > 19 && variant < 26);
@@ -27536,7 +28079,9 @@ Value vpCloudBody(Interpreter&, vector<Value>& a, int line) {
         /* 云在真正的天空高度：云底 y≈14，云心 y≈26，离玩家 40 单位。
            之前盒底 0.3、云心 4，离眼睛只有 11 —— 张角 84°，只能糊满整屏。 */
         const double P26X[6] = { -14.00,  15.00, -24.00,  24.00,   2.00,  -6.00 };
-        const double P26Y[6] = {  26.00,  27.00,  31.00,  29.00,  27.00,  32.00 };
+        /* 云底必须齐：P26Y = 20 + 0.62*s26，六朵的 ly=0 全压在 y=20 这一层。
+               真实的积云就是这样 —— 底是一条平线，因为它压在同一个凝结高度。 */
+        const double P26Y[6] = {  27.44,  26.82,  24.46,  24.28,  23.97,  24.09 };
         const double P26Z[6] = {  18.00,  22.00,  26.00,  30.00,  34.00,  14.00 };
     double litb11 = 0.78;   /* 亮度基准在渲染循环里要用，必须在函数作用域声明 */
     double litlo11 = 0.55;  /* 亮度下限：乌云能压到更暗 */
@@ -27554,17 +28099,20 @@ Value vpCloudBody(Interpreter&, vector<Value>& a, int line) {
        单朵云的世界尺寸没变，所以型0~16 的成像不受影响，只有触到旧盒边的型会变。 */
     const double BX0 = (variant == 26) ? -30.00 : -6.50, BX1 = (variant == 26) ? 30.00 : 6.50;
     const double BY0 = (variant == 26) ? 13.00 : 0.30,  BY1 = (variant == 26) ? 38.00 : 7.60;
-    const double BZ0 = (variant == 26) ? -13.00 : -6.50, BZ1 = (variant == 26) ? 13.00 : 6.50;
+    const double BZ0 = (variant == 26) ? -14.00 : -6.50, BZ1 = (variant == 26) ? 40.00 : 6.50;
     /* GY 决定了云在竖直方向有多少层。72 层时 y 层间距 0.022，
        和颜色分离量同量级，表面就被量化成一圈圈横纹——那正是“片片”的来源。
        提到 104 层，层间距 0.015，横纹落到看不出。渲染步数不变，只是场变细。 */
     /* 体素 192 x 120 x 192 = 4.4M，各轴体素边长 0.019~0.019，等向。 */
     const int GX = (variant == 26) ? 240 : 400, GY = (variant == 26) ? 140 : 234, GZ = (variant == 26) ? 240 : 400;
 
-    static std::vector<double> den;
+    /* 密度场用 float 存：8M 格，double 要 138MB，缓存根本装不下，
+       每步三线性插值的 8 次随机访问全部打到内存 —— 这是渲染侧最大的一笔浪费。
+       float 减半，同样的缓存能装下两倍的场。精度对小数值足够。 */
+static std::vector<float> den;
     static int builtVar3 = -999;
     static bool haveDen = false;
-    if (!haveDen || builtVar3 != variant) {
+    if ((!haveDen || builtVar3 != variant) && variant != 27) {
         haveDen = true;
         builtVar3 = variant;
         den.assign((size_t)GX * (size_t)GY * (size_t)GZ, 0.0);
@@ -27805,6 +28353,10 @@ Value vpCloudBody(Interpreter&, vector<Value>& a, int line) {
                    越过 255，云的朝光面整片饱和成纯白，内部所有厚薄差异全部被削平 ——
                    不管密度怎么调，看上去都是同一个白馒头。压到 0.98 才留得住层次。 */
                 if (variant == 25) { litb11 = 1.12; litlo11 = 0.38; lithm11 = 1.16; }
+        /* 型26 要的是真积云那种强对比：顶几乎纯白，底压到灰。
+           之前 0.78/0.55 的区间太窄，整朵云都落在同一个米色上 ——
+           看着像旧棉花，不像被太阳直射的云。 */
+        if (variant == 26) { litb11 = 0.99; litlo11 = 0.34; lithm11 = 1.26; }
         if (variant == 16) { dens11 = 0.62; tone11 = 1.10; litlo11 = 0.66; lithm11 = 1.30; }
         if (variant >= 11 && variant < 25) {
             /* 下大：底层三团，宽而扁，铺到半个盒子，三团互相咬合成一整片底。 */
@@ -28408,8 +28960,12 @@ Value vpCloudBody(Interpreter&, vector<Value>& a, int line) {
                                        1.24,  1.29,  1.27,  1.16,  1.21,  1.19,  1.12,  1.14 };
             const double q26z[18] = { -0.12,  0.14, -0.40,  0.02,  0.28, -0.34,  0.36,  0.04, -0.16, -0.22,
                                        0.06,  0.30, -0.38, -0.02,  0.20, -0.28,  0.30,  0.34 };
-            const double q26r[18] = {  0.50,  0.46,  0.40,  0.38,  0.34,  0.40,  0.32,  0.22,  0.20,  0.18,
-                                       0.20,  0.18,  0.19,  0.17,  0.20,  0.18,  0.16,  0.17 };
+            /* 团半径 / 团间距 决定“分瓣”还是“一坨”。老表半径 0.50，
+               而相邻团只差 0.2~0.4 —— 半径是间距的 1.3 到 2.5 倍，
+               相邻两团完全重叠，十八团就被高斯尾并成一个大球，表面读不出瓣。
+               砍到 0.45 倍后，半径/间距 ≈ 0.75：还是一体的，但每团顶出一个小鼓包。 */
+            const double q26r[18] = {  0.325, 0.299, 0.260, 0.247, 0.221, 0.260, 0.208, 0.143, 0.130, 0.117,
+                                        0.130, 0.117, 0.124, 0.111, 0.130, 0.117, 0.104, 0.111 };
             /* 每朵 12 宽。之前 2.60 只有 7 宽，塞在 26 的盒里就是“一小颗一小颗”。 */
             const double s26a[6] = { 12.00, 11.00, 7.20, 6.90, 6.40, 6.60 };
             for (int iz = 0; iz < GZ; ++iz) {
@@ -28426,6 +28982,7 @@ Value vpCloudBody(Interpreter&, vector<Value>& a, int line) {
                             if (lx < -1.30 || lx > 1.30) continue;
                             if (lz < -1.30 || lz > 1.30) continue;
                             double ly = (y - (P26Y[ci] - 0.62 * s26)) / (s26 * 1.55);
+                            if (ly < 0.0) continue;   /* 底平切，不再往地下长 */
                             if (ly < 0.0 || ly > 1.0) continue;
                             /* 型11 的团在归一化高度上占 0.58~1.50，映射到 ly 的 0~1。 */
                             double g26 = 0.58 + ly * 0.92;
@@ -28438,7 +28995,10 @@ Value vpCloudBody(Interpreter&, vector<Value>& a, int line) {
                                 if (d2 > 6.0) continue;
                                 /* 顶塔（k>=10）权重加大：它们只有 0.17~0.20 的半径，
                                    在底团的尾巴里会被完全吞掉，云顶就只剩一个整圆顶。 */
-                                acc26 += ((k26 >= 10) ? 1.55 : 1.00) * exp(-d2 * 1.55);
+                                /* 衰减系数 1.55 -> 2.90：团与团之间的高斯尾巴越短，越不容易靠尾部
+                               互相搭桥。尾巴一搭桥，十八个团就并成一个大球，
+                               分瓣全消失 —— 那就是“不像云”的来源。 */
+                                acc26 += ((k26 >= 10) ? 1.55 : 1.00) * exp(-d2 * 2.90);
                             }
                             if (acc26 <= 0.0) continue;
                             /* 18 团叠加的高度就是型11 的雾态密度：有平台、不透明、有层次。 */
@@ -28447,7 +29007,7 @@ Value vpCloudBody(Interpreter&, vector<Value>& a, int line) {
                             /* 中心有 18 个团叠加，acc 能到 3~6。系数 2.6 时
                                exp(-acc*2.6) 早就到底，整朵都饱和成 1，层次全没了。
                                压到 0.60 才留得住“中心厚、边缘薄”的梯度。 */
-                            double v = 1.0 - exp(-acc26 * 0.60);
+                            double v = 1.0 - exp(-acc26 * 1.10);
                             /* 噪声只调厚薄，不参与塑形；一塑形就碎成雪花。 */
                             double ph26 = (double)ci * 37.3 + 11.7;
                             double n26 = fbm3(x * 0.60 + ph26, y * 0.70 + ph26 * 0.7, z * 0.60 + ph26 * 1.3);
@@ -28699,7 +29259,7 @@ if (variant == 25) {
         /* 6 型不能再扩散，一扩散细节就磨回球；25 是纯噪声场，扩散一次就等于白算。 */
         const int NIT = ((variant >= 6 && variant <= 19)) ? 0 : ((variant == 25 || variant == 26) ? 2 : 5);
         for (int it = 0; it < NIT; ++it) {
-            std::vector<double> tv = den;
+            std::vector<float> tv = den;
             for (int iz = 0; iz < GZ; ++iz) {
                 for (int iy = 0; iy < GY; ++iy) {
                     for (int ix = 0; ix < GX; ++ix) {
@@ -28733,7 +29293,7 @@ if (variant == 25) {
            融合档额外平滑：把交界的凸起抹成一整片，只留“肩”的走向。 */
         if (variant == 24) npass27 = 6;
         for (int pass27 = 0; pass27 < npass27; ++pass27) {
-            std::vector<double> sm = den;
+            std::vector<float> sm = den;
             for (int iz = 0; iz < GZ; ++iz) {
                 for (int iy = 0; iy < GY; ++iy) {
                     for (int ix = 0; ix < GX; ++ix) {
@@ -28916,17 +29476,28 @@ if (variant == 25) {
        渲染慢不该拖住玩家：玩家按真实时间走，画面先糊后清。 */
     static int progN = 32;
     static double lcx = 1e18, lcy = 1e18, lcz = 1e18, lyaw = 1e18, lpt = 1e18;
-    bool camMoved = (fabs(cx - lcx) > 0.02) || (fabs(cy - lcy) > 0.02) ||
-                    (fabs(cz - lcz) > 0.02) || (fabs(yaw - lyaw) > 0.004) ||
-                    (fabs(pitch - lpt) > 0.004);
+    /* 阈值不能太紧：脚高每帧有一点点抖动，0.02 会让“静止”永远判成“在动”，
+       步数永远停在 32 —— 那就是一直糊的原因。 */
+    bool camMoved = (fabs(cx - lcx) > 0.15) || (fabs(cy - lcy) > 0.15) ||
+                    (fabs(cz - lcz) > 0.15) || (fabs(yaw - lyaw) > 0.020) ||
+                    (fabs(pitch - lpt) > 0.020);
     if (camMoved) progN = 32;
     else if (progN < 480) progN = progN * 2;
     if (progN > 480) progN = 480;
     lcx = cx; lcy = cy; lcz = cz; lyaw = yaw; lpt = pitch;
-    const int NST = (variant == 26) ? progN : 480;
+    const int NST = (variant == 26) ? (progN < 160 ? progN : 160) : 480;
+    /* 2x2 块采样：四个像素共用一次 ray-march。云的边缘本来就被雾化抹平，
+       块状在画面上读不出来，但成本直接降到 1/4。
+       和渐进步数合起来：视角一动 32 步 × 1/4 = 几毫秒（立刻能走），
+       站住不动再逐帧加密到 480 步（清晰）。 */
+    int stepPix = 1;
+    /* 像素之间没有任何依赖：每一行自己查自己的表、写自己的像素。
+       按行动态切给各核 —— 云占屏少，行与行的工作量差很大，
+       静态均分会让有的核早早空转，dynamic 才摊得平。 */
+#pragma omp parallel for schedule(dynamic, 4)
     for (int py = 0; py < h; ++py) {
         double sy = (0.5 - (double)py / (double)(h - 1)) * 2.0;
-        for (int px = 0; px < w; ++px) {
+        for (int px = 0; px < w; px += stepPix) {
             double sx = ((double)px / (double)(w - 1) - 0.5) * 2.0;
             double dx = fx + rxg * sx * tanH + ux * sy * tanV;
             double dy = fy + uy * sy * tanV;
@@ -28934,6 +29505,191 @@ if (variant == 25) {
             double dl = sqrt(dx * dx + dy * dy + dz * dz);
             if (dl < 1e-9) continue;
             dx /= dl; dy /= dl; dz /= dl;
+            if (variant == 27) {
+                /* ============ 型27：平面渲染，不算体积 ============
+                   渲染只发生在眼睛这一点。这条视线只回答一个问题：这个方向
+                   有多厚的雾、什么颜色。世界本身不渲染，也不需要一张三维表。
+                   所以这里没有 den、没有步进、没有盒求交 —— 视线直接和云的
+                   参数求交（一个椭球一次二次方程），命中就按远近叠起来。
+                   好处：成本是常量，与画面里云的大小无关；也没有“隔着格子
+                   采样”的糊。 */
+                static const double t27x[18] = { -0.34,  0.30,  0.02,  0.36, -0.30,  0.02,  0.20, -0.10,  0.16, -0.20,
+                                                  0.42, -0.34,  0.06,  0.44, -0.26,  0.10,  0.30, -0.06 };
+                static const double t27y[18] = {  0.74,  0.78,  0.70,  1.05,  1.10,  1.08,  1.02,  1.34,  1.38,  1.30,
+                                                  1.24,  1.29,  1.27,  1.16,  1.21,  1.19,  1.12,  1.14 };
+                static const double t27z[18] = { -0.12,  0.14, -0.40,  0.02,  0.28, -0.34,  0.36,  0.04, -0.16, -0.22,
+                                                  0.06,  0.30, -0.38, -0.02,  0.20, -0.28,  0.30,  0.34 };
+                static const double t27r[18] = {  0.50,  0.46,  0.40,  0.38,  0.34,  0.40,  0.32,  0.22,  0.20,  0.18,
+                                                  0.20,  0.18,  0.19,  0.17,  0.20,  0.18,  0.16,  0.17 };
+                static const double t27s[6]  = { 12.00, 11.00, 7.20, 6.90, 6.40, 6.60 };
+                /* 团表是照型11 抄的固定值，排布太规整 —— 并集边界就是一组
+                   同心的球面，读出来是“球拼的”。这里给每颗团加一点位置、
+                   半径、密度上的确定性抖动（只算一次，不进帧），
+                   球面缝线就被打散成不规则的瓣。 */
+                /* 型27 分支自带噪声：它不依赖上面那些 lambda 的作用域。
+                   格点哈希 + smoothstep 双线性，三层叠加。 */
+                auto h27 = [](int ix3, int iy3, int iz3) -> double {
+                    unsigned int n = (unsigned int)(ix3 * 73856093) ^ (unsigned int)(iy3 * 19349663) ^ (unsigned int)(iz3 * 83492791);
+                    n = (n << 13) ^ n;
+                    n = n * (n * n * 15731u + 789221u) + 1376312589u;
+                    return (double)(n & 0x7fffffffu) / 2147483647.0;
+                };
+                auto fbm27 = [&h27](double x3, double y3, double z3) -> double {
+                    double sum = 0.0, amp = 0.52, tot = 0.0;
+                    for (int o3 = 0; o3 < 3; ++o3) {
+                        double fx3 = floor(x3), fy3 = floor(y3), fz3 = floor(z3);
+                        int ix3 = (int)fx3, iy3 = (int)fy3, iz3 = (int)fz3;
+                        double tx3 = x3 - fx3, ty3 = y3 - fy3, tz3 = z3 - fz3;
+                        tx3 = tx3 * tx3 * (3.0 - 2.0 * tx3);
+                        ty3 = ty3 * ty3 * (3.0 - 2.0 * ty3);
+                        tz3 = tz3 * tz3 * (3.0 - 2.0 * tz3);
+                        double v000 = h27(ix3, iy3, iz3),       v100 = h27(ix3 + 1, iy3, iz3);
+                        double v010 = h27(ix3, iy3 + 1, iz3),   v110 = h27(ix3 + 1, iy3 + 1, iz3);
+                        double v001 = h27(ix3, iy3, iz3 + 1),   v101 = h27(ix3 + 1, iy3, iz3 + 1);
+                        double v011 = h27(ix3, iy3 + 1, iz3 + 1), v111 = h27(ix3 + 1, iy3 + 1, iz3 + 1);
+                        double aa3 = v000 + (v100 - v000) * tx3;
+                        double bb3 = v010 + (v110 - v010) * tx3;
+                        double cc3 = v001 + (v101 - v001) * tx3;
+                        double dd3 = v011 + (v111 - v011) * tx3;
+                        double ee3 = aa3 + (bb3 - aa3) * ty3;
+                        double ff3 = cc3 + (dd3 - cc3) * ty3;
+                        sum += (ee3 + (ff3 - ee3) * tz3) * amp;
+                        tot += amp;
+                        x3 = x3 * 2.17 + 7.7; y3 = y3 * 2.17 + 3.1; z3 = z3 * 2.17 + 11.3;
+                    }
+                    return sum / tot;
+                };
+                static double t27ax[18], t27ay[18], t27az[18], t27ar[18], t27dn[18];
+                static bool t27init = false;
+                if (!t27init) {
+                    for (int kk = 0; kk < 18; ++kk) {
+                        double h1 = sin((double)kk * 12.9898 + 4.1) * 43758.5453; h1 -= floor(h1);
+                        double h2 = sin((double)kk * 39.3467 + 11.7) * 24634.6345; h2 -= floor(h2);
+                        double h3 = sin((double)kk * 73.1561 + 21.3) * 17432.1978; h3 -= floor(h3);
+                        double h4 = sin((double)kk * 17.4231 + 31.9) * 28117.3211; h4 -= floor(h4);
+                        double h5 = sin((double)kk * 57.6651 + 43.2) * 19321.7717; h5 -= floor(h5);
+                        t27ax[kk] = (h1 - 0.5) * 0.34;
+                        t27ay[kk] = (h2 - 0.5) * 0.26;
+                        t27az[kk] = (h3 - 0.5) * 0.34;
+                        t27ar[kk] = 0.78 + h4 * 0.58;
+                        t27dn[kk] = 0.70 + h5 * 0.66;
+                    }
+                    t27init = true;
+                }
+                double hT[14], hL[14], hD[14];
+                int hC[14];
+                int nh = 0;
+                for (int ci = 0; ci < 6; ++ci) {
+                    double sc = t27s[ci];
+                    double ox = P26X[ci], oy = P26Y[ci], oz = P26Z[ci];
+                    for (int k = 0; k < 18; ++k) {
+                        double rk = t27r[k] * t27ar[k];
+                        double rx = rk * sc;
+                        double ry = rk * sc * 1.30;
+                        double rz2 = rk * sc;
+                        double ccx = ox + (t27x[k] + t27ax[k]) * sc;
+                        double ccy = (oy - 0.62 * sc) + (t27y[k] + t27ay[k]) * sc * 1.30;
+                        double ccz = oz + (t27z[k] + t27az[k]) * sc;
+                        /* 先把射线搬进椭球的单位球坐标，再解二次方程 */
+                        double qx = (cx - ccx) / rx, qy = (cy - ccy) / ry, qz = (cz - ccz) / rz2;
+                        double vx = dx / rx, vy = dy / ry, vz = dz / rz2;
+                        double A = vx * vx + vy * vy + vz * vz;
+                        if (A < 1e-12) continue;
+                        double B = 2.0 * (qx * vx + qy * vy + qz * vz);
+                        double C = qx * qx + qy * qy + qz * qz - 1.0;
+                        double disc = B * B - 4.0 * A * C;
+                        if (disc <= 0.0) continue;
+                        double sq = sqrt(disc);
+                        double ta = (-B - sq) / (2.0 * A);
+                        double tb = (-B + sq) / (2.0 * A);
+                        if (tb <= 0.0) continue;
+                        if (ta < 0.0) ta = 0.0;
+                        double chord = tb - ta;
+                        if (chord < 0.05) continue;
+                        if (chord > 60.0) chord = 60.0;
+                        if (nh < 14) {
+                            int m = nh;
+                            while (m > 0 && hT[m - 1] > ta) {
+                                hT[m] = hT[m - 1]; hL[m] = hL[m - 1]; hD[m] = hD[m - 1]; hC[m] = hC[m - 1];
+                                --m;
+                            }
+                            hT[m] = ta;
+                            hL[m] = chord;
+                            hD[m] = ((k >= 10) ? 1.45 : 1.00) * t27dn[k];
+                            hC[m] = ci * 18 + k;
+                            ++nh;
+                        }
+                    }
+                }
+                if (nh == 0) continue;
+                /* 椭球只给“这一段大概有东西”，形状不归它管。
+                   把每一段的头尾各放开 18%，边界外面也能被噪声长出去或咬掉；
+                   轮廓就不再由椭球并集决定 —— 球面缝线那个病根在这。 */
+                for (int h = 0; h < nh; ++h) {
+                    double back = hL[h] * 0.18;
+                    hT[h] -= back;
+                    if (hT[h] < 0.0) hT[h] = 0.0;
+                    hL[h] += back * 1.36;
+                }
+                /* 段内只取 4 个点：形状靠噪声，厚度靠解析弦长，两头都不浪费。 */
+                const int NS27 = 4;
+                double acc27 = 0.0, ar27 = 0.0, ag27 = 0.0, ab27 = 0.0;
+                for (int h = 0; h < nh; ++h) {
+                    if (acc27 > 0.88) break;
+                    double segL = hL[h] / (double)NS27;
+                    double sv = 0.0;
+                    for (int s27 = 0; s27 < NS27; ++s27) {
+                        double tt = hT[h] + hL[h] * ((double)s27 + 0.5) / (double)NS27;
+                        double ix27 = cx + dx * tt;
+                        double iy27 = cy + dy * tt;
+                        double iz27 = cz + dz * tt;
+                        /* 低频决定大瓣，中频咬碎边缘。两轴频率不同 => 不结网纹。 */
+                        double nla = fbm27(ix27 * 0.40 + 19.3, iy27 * 0.44 + 5.7, iz27 * 0.38 + 11.1);
+                        double nmb = fbm27(ix27 * 1.25 + 3.7, iy27 * 1.35 + 22.1, iz27 * 1.18 + 7.9);
+                        double dv27 = nla * 1.45 + nmb * 0.42 - 0.78;
+                        if (dv27 < 0.0) dv27 = 0.0;
+                        sv += dv27 * segL;
+                    }
+                    if (sv <= 0.0) continue;
+                    double op = 1.0 - exp(-hD[h] * sv * 0.62);
+                    if (op <= 0.0) continue;
+                    /* 法线用“整朵云的云心 -> 入射点”，不是每颗团各算各的。
+                       每团独立法线时，相邻两颗球各自亮各自暗，接缝处必然
+                       跳一格 —— 那就是“网球”的缝线。一朵云只能有一个朝向。 */
+                    double ci2 = hC[h] / 18.0;
+                    double ccx = P26X[(int)ci2];
+                    double ccy = P26Y[(int)ci2] - 0.62 * t27s[(int)ci2];
+                    double ccz = P26Z[(int)ci2];
+                    double ix2 = cx + dx * hT[h];
+                    double iy2 = cy + dy * hT[h];
+                    double iz2 = cz + dz * hT[h];
+                    double nx2 = ix2 - ccx, ny2 = iy2 - ccy, nz2 = iz2 - ccz;
+                    if (ny2 < 0.0) ny2 = -ny2 * 0.6;
+                    double nl2 = sqrt(nx2 * nx2 + ny2 * ny2 + nz2 * nz2);
+                    if (nl2 < 1e-6) { nx2 = 0.0; ny2 = 1.0; nz2 = 0.0; nl2 = 1.0; }
+                    nx2 /= nl2; ny2 /= nl2; nz2 /= nl2;
+                    double dn2 = nx2 * sx3 + ny2 * sy3 + nz2 * sz3;
+                    if (dn2 < 0.0) dn2 = 0.0;
+                    double lit2 = 0.68 + 0.62 * dn2;
+                    double ws = (1.0 - acc27) * op;
+                    ar27 += ws * (double)cr * lit2;
+                    ag27 += ws * (double)cg * lit2;
+                    ab27 += ws * (double)cb * lit2;
+                    acc27 += ws;
+                }
+                if (acc27 < 0.004) continue;
+                int o27 = (py * w + px) * 3;
+                double r2 = (double)sp[o27]     * (1.0 - acc27) + ar27;
+                double g2 = (double)sp[o27 + 1] * (1.0 - acc27) + ag27;
+                double b2 = (double)sp[o27 + 2] * (1.0 - acc27) + ab27;
+                if (r2 < 0.0) r2 = 0.0; if (r2 > 255.0) r2 = 255.0;
+                if (g2 < 0.0) g2 = 0.0; if (g2 > 255.0) g2 = 255.0;
+                if (b2 < 0.0) b2 = 0.0; if (b2 > 255.0) b2 = 255.0;
+                sp[o27]     = (unsigned char)r2;
+                sp[o27 + 1] = (unsigned char)g2;
+                sp[o27 + 2] = (unsigned char)b2;
+                continue;
+            }
             /* 视线与盒子求交 */
             double t0 = 0.0, t1 = 1e9;
             if (fabs(dx) < 1e-9) {
@@ -28961,7 +29717,72 @@ if (variant == 25) {
                 if (tb < t1) t1 = tb;
             }
             if (t1 <= t0) continue;
-            double dt = (t1 - t0) / (double)NST;
+            if (variant == 26) {
+                /* 世界不动：den 就是“已经算过并记载下来的 3D 场”，这里一格都不改。
+                   要省的只是“眼睛找云”这一步 —— 不再靠走路试探，直接解方程。
+                   椭球包络是云的外包，解出视线穿过它的整段范围，
+                   t0/t1 就被收紧到“真的有云的那一截”，后面的步数全落在这上面。 */
+                static const double e26x[18] = { -0.34,  0.30,  0.02,  0.36, -0.30,  0.02,  0.20, -0.10,  0.16, -0.20,
+                                                  0.42, -0.34,  0.06,  0.44, -0.26,  0.10,  0.30, -0.06 };
+                static const double e26y[18] = {  0.74,  0.78,  0.70,  1.05,  1.10,  1.08,  1.02,  1.34,  1.38,  1.30,
+                                                  1.24,  1.29,  1.27,  1.16,  1.21,  1.19,  1.12,  1.14 };
+                static const double e26z[18] = { -0.12,  0.14, -0.40,  0.02,  0.28, -0.34,  0.36,  0.04, -0.16, -0.22,
+                                                  0.06,  0.30, -0.38, -0.02,  0.20, -0.28,  0.30,  0.34 };
+                static const double e26r[18] = {  0.50,  0.46,  0.40,  0.38,  0.34,  0.40,  0.32,  0.22,  0.20,  0.18,
+                                                  0.20,  0.18,  0.19,  0.17,  0.20,  0.18,  0.16,  0.17 };
+                static const double e26s[6]  = { 12.00, 11.00, 7.20, 6.90, 6.40, 6.60 };
+                double eT0 = 1e9, eT1 = -1e9;
+                for (int ci5 = 0; ci5 < 6; ++ci5) {
+                    double sc5 = e26s[ci5];
+                    double ox5 = P26X[ci5], oy5 = P26Y[ci5], oz5 = P26Z[ci5];
+                    for (int k5 = 0; k5 < 18; ++k5) {
+                        double rx5 = e26r[k5] * sc5 * 1.10;
+                        double ry5 = e26r[k5] * sc5 * 1.45;
+                        double rz5 = rx5;
+                        double cx5 = ox5 + e26x[k5] * sc5;
+                        double cy5 = (oy5 - 0.62 * sc5) + e26y[k5] * sc5 * 1.30;
+                        double cz5 = oz5 + e26z[k5] * sc5;
+                        double qx5 = (cx - cx5) / rx5, qy5 = (cy - cy5) / ry5, qz5 = (cz - cz5) / rz5;
+                        double vx5 = dx / rx5, vy5 = dy / ry5, vz5 = dz / rz5;
+                        double A5 = vx5 * vx5 + vy5 * vy5 + vz5 * vz5;
+                        if (A5 < 1e-12) continue;
+                        double B5 = 2.0 * (qx5 * vx5 + qy5 * vy5 + qz5 * vz5);
+                        double C5 = qx5 * qx5 + qy5 * qy5 + qz5 * qz5 - 1.0;
+                        double D5 = B5 * B5 - 4.0 * A5 * C5;
+                        if (D5 <= 0.0) continue;
+                        double sq5 = sqrt(D5);
+                        double ta5 = (-B5 - sq5) / (2.0 * A5);
+                        double tb5 = (-B5 + sq5) / (2.0 * A5);
+                        if (tb5 <= 0.0) continue;
+                        if (ta5 < eT0) eT0 = ta5;
+                        if (tb5 > eT1) eT1 = tb5;
+                    }
+                }
+                if (eT1 <= eT0) continue;
+                if (eT0 > t0) t0 = eT0;
+                if (eT1 < t1) t1 = eT1;
+                if (t1 <= t0) continue;
+            }
+            /* 空域剔除：整条视线根本没穿过云的像素，占画面绝大多数。
+               先用 24 步粗扫找“入射点”，找不到就整条跳过 ——
+               天空像素的成本从 NST 步直接降到 24 步。
+               云里面的那一段照旧细扫，外观一点不损失。 */
+            double tEnter = -1.0;
+            {
+                double dtr = (t1 - t0) / 24.0;
+                for (int i = 0; i < 24; ++i) {
+                    double tr = t0 + dtr * ((double)i + 0.5);
+                    double gxa = (cx + dx * tr - BX0) / (BX1 - BX0) * (double)(GX - 1);
+                    double gya = (cy + dy * tr - BY0) / (BY1 - BY0) * (double)(GY - 1);
+                    double gza = (cz + dz * tr - BZ0) / (BZ1 - BZ0) * (double)(GZ - 1);
+                    if (smp(gxa, gya, gza) > 0.02) {
+                        tEnter = t0 + dtr * (double)i;
+                        break;
+                    }
+                }
+            }
+            if (tEnter < 0.0) continue;
+            double dt = (t1 - tEnter) / (double)NST;
             /* 固定步进会在密度阈值上切出一圈圈阶梯。每个像素把起点错开半格，
                台阶就被打散成细噪声，看不出格。 */
             /* 这里的抖动必须是真的散列。原来 px*7919 + py*104729 & 1023 是线性同余，
@@ -28972,7 +29793,7 @@ if (variant == 25) {
             hj ^= hj >> 16; hj *= 2246822519u;
             hj ^= hj >> 15;
             double jit = (double)(hj & 1023u) / 1023.0;
-            double tst = t0 + dt * jit;
+            double tst = tEnter + dt * jit;
             double acc = 0.0, ar = 0.0, ag = 0.0, ab = 0.0;
             double lit = 1.0;
             bool gotLit = false;
@@ -29009,9 +29830,9 @@ if (variant == 25) {
                         ny = y - 3.80;
                         nz = z;
                     } else {
-                        nx = -(smp(gx + 4.2, gy, gz) - smp(gx - 4.2, gy, gz));
-                        ny = -(smp(gx, gy + 4.2, gz) - smp(gx, gy - 4.2, gz));
-                        nz = -(smp(gx, gy, gz + 4.2) - smp(gx, gy, gz - 4.2));
+                        nx = -(smp(gx + 0.75, gy, gz) - smp(gx - 0.75, gy, gz));
+                        ny = -(smp(gx, gy + 0.75, gz) - smp(gx, gy - 0.75, gz));
+                        nz = -(smp(gx, gy, gz + 0.75) - smp(gx, gy, gz - 0.75));
                     }
                     double nl = sqrt(nx * nx + ny * ny + nz * nz);
                     if (nl < 1e-9) { lit = 0.85; }
@@ -29038,7 +29859,7 @@ if (variant == 25) {
                 /* 消光 2.6 太强：光走进去十几步就饱和，剩下的全是“实心表面”。
                    雾态云要光能穿过去，能看到内部结构，才会读作雾而不是石头。 */
                 /* 密度降了，消光要补回来，否则整团会淡成看不见。 */
-                double op = 1.0 - exp(-dv * dt * ((variant == 25) ? 5.00 : 1.85));
+                double op = 1.0 - exp(-dv * dt * ((variant == 25) ? 5.00 : ((variant == 26) ? 1.90 : 1.85)));
                 if (op > 1.0) op = 1.0;
                 double wgt = (1.0 - acc) * op;
                 /* 厚度的读法来自内部暗部：光越往里越出不来，深处必须压暗，
@@ -29064,7 +29885,10 @@ if (variant == 25) {
                 acc += wgt;
                 /* 不透明度封顶：云不能再“实”。0.80 之后停，剩下的背景透进来，
                    这一层才是雾。 */
-                if (acc > ((variant == 25) ? 0.975 : 0.88)) break;
+                /* 内核遮挡剔除：云心密度早就饱和，光进不去也穿不过来，
+                   后面的步数全是白算。型26 到 0.55 就停 —— 外观由外层决定，
+                   内核在屏幕上本来就是看不见的。 */
+                if (acc > ((variant == 25) ? 0.975 : ((variant == 26) ? 0.55 : 0.88))) break;
             }
             if (acc < 0.004) continue;
             int o = (py * w + px) * 3;
@@ -29074,9 +29898,18 @@ if (variant == 25) {
             if (rr2 < 0.0) rr2 = 0.0; if (rr2 > 255.0) rr2 = 255.0;
             if (gg2 < 0.0) gg2 = 0.0; if (gg2 > 255.0) gg2 = 255.0;
             if (bb2 < 0.0) bb2 = 0.0; if (bb2 > 255.0) bb2 = 255.0;
-            sp[o]     = (unsigned char)rr2;
-            sp[o + 1] = (unsigned char)gg2;
-            sp[o + 2] = (unsigned char)bb2;
+            unsigned char R8 = (unsigned char)rr2, G8 = (unsigned char)gg2, B8 = (unsigned char)bb2;
+            int xe = px + stepPix; if (xe > w) xe = w;
+            int ye = py + stepPix; if (ye > h) ye = h;
+            for (int yy = py; yy < ye; ++yy) {
+                int ob = (yy * w + px) * 3;
+                for (int xx = px; xx < xe; ++xx) {
+                    sp[ob]     = R8;
+                    sp[ob + 1] = G8;
+                    sp[ob + 2] = B8;
+                    ob += 3;
+                }
+            }
         }
     }
     return vNone();
