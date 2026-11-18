@@ -10509,6 +10509,7 @@ struct RubyEmitter {
                 if (op == "!=") return "(not _等(" + a + ", " + b + "))";
                 if (op == "//") return "((" + a + ").div(" + b + "))";
                 if (op == "**") return "((" + a + ") ** (" + b + "))";
+                if (op == "/") return "((" + a + ").to_f / (" + b + ").to_f)";
                 return "((" + a + ") " + op + " (" + b + "))";
             }
             case Expr::K::Call: {
@@ -10720,6 +10721,352 @@ struct RubyEmitter {
         head << "end\n";
         head << "def _最大(a, b)\n  a > b ? a : b\nend\n";
         head << "def _最小(a, b)\n  a < b ? a : b\nend\n";
+        return head.str() + out.str();
+    }
+};
+
+struct LuaEmitter {
+    const vector<StmtPtr>& program;
+    vector<string> diags;
+    vector<string> warns;
+    std::ostringstream out;
+    int indent = 0;
+    std::set<string> userFuncs;
+
+    explicit LuaEmitter(const vector<StmtPtr>& p) : program(p) { collectFuncs(p); }
+    void collectFuncs(const vector<StmtPtr>& ps) {
+        for (const auto& s : ps) {
+            if (!s) continue;
+            if (s->k == Stmt::K::Func) userFuncs.insert(s->name);
+            collectFuncs(s->body);
+            collectFuncs(s->elseBody);
+            collectFuncs(s->finallyBody);
+            for (const auto& br : s->branches) collectFuncs(br.second);
+        }
+    }
+    void diag(int line, const string& msg) {
+        diags.push_back("第 " + std::to_string(line) + " 行：" + msg);
+    }
+    void line(const string& x) { out << string(indent * 4, ' ') << x << "\n"; }
+    // Lua 只认 ASCII 标识符，中文名按 UTF-8 字节转写成 ASCII
+    static string nm(const string& v) {
+        string o;
+        for (size_t i = 0; i < v.size(); ++i) {
+            unsigned char c = (unsigned char)v[i];
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_') {
+                o += (char)c;
+            } else if (c >= '0' && c <= '9' && !o.empty()) {
+                o += (char)c;
+            } else {
+                char buf[8];
+                snprintf(buf, sizeof(buf), "_%02x", (unsigned)c);
+                o += buf;
+            }
+        }
+        return o.empty() ? "_" : o;
+    }
+    static string q(const string& v) {
+        string o = "\"";
+        for (char c : v) {
+            if (c == '\\') o += "\\\\";
+            else if (c == '"') o += "\\\"";
+            else if (c == '\n') o += "\\n";
+            else o += c;
+        }
+        return o + "\"";
+    }
+    static string num(double d) {
+        std::ostringstream x;
+        x << std::setprecision(17) << d;
+        return x.str();
+    }
+    string expr(const ExprPtr& e) {
+        if (!e) return "nil";
+        switch (e->k) {
+            case Expr::K::Num: return num(e->num);
+            case Expr::K::Str: return q(e->text);
+            case Expr::K::Bool: return e->b ? "true" : "false";
+            case Expr::K::None: return "nil";
+            case Expr::K::Var:
+                if (e->text == "圆周率" || e->text == "π") return "math.pi";
+                if (e->text == "自然常数") return "math.exp(1)";
+                return nm(e->text);
+            case Expr::K::Unary: {
+                string a = expr(e->args[0]);
+                if (e->op == "非") return "(not (" + a + "))";
+                if (e->op == "插值") return "t_txt(" + a + ")";
+                if (e->op == "√") return "math.sqrt(" + a + ")";
+                return "(-(" + a + "))";
+            }
+            case Expr::K::Binary: {
+                string a = expr(e->args[0]), b = expr(e->args[1]);
+                string op = e->op;
+                if (op == "且") return "((" + a + ") and (" + b + "))";
+                if (op == "或") return "((" + a + ") or (" + b + "))";
+                if (op == "包含") return "t_has(" + a + ", " + b + ")";
+                if (op == "不包含") return "(not t_has(" + a + ", " + b + "))";
+                if (op == "==") return "t_eq(" + a + ", " + b + ")";
+                if (op == "!=") return "(not t_eq(" + a + ", " + b + "))";
+                if (op == "//") return "math.floor((" + a + ") / (" + b + "))";
+                if (op == "**") return "((" + a + ") ^ (" + b + "))";
+                return "((" + a + ") " + op + " (" + b + "))";
+            }
+            case Expr::K::Call: {
+                string name = e->args[0]->k == Expr::K::Var ? e->args[0]->text : "";
+                if (name == "长度" && e->args.size() == 2) return "t_len(" + expr(e->args[1]) + ")";
+                if (name == "范围" && e->args.size() == 2) return "t_range(" + expr(e->args[1]) + ")";
+                if (name == "绝对值" && e->args.size() == 2) return "math.abs(" + expr(e->args[1]) + ")";
+                if (name == "取整" && e->args.size() == 2) return "math.floor(" + expr(e->args[1]) + ")";
+                if (name == "最大" && e->args.size() >= 3) return "math.max(" + expr(e->args[1]) + ", " + expr(e->args[2]) + ")";
+                if (name == "最小" && e->args.size() >= 3) return "math.min(" + expr(e->args[1]) + ", " + expr(e->args[2]) + ")";
+                if (name == "求和" && e->args.size() == 2) return "t_sum(" + expr(e->args[1]) + ")";
+                if (name == "键" && e->args.size() == 2) return "t_keys(" + expr(e->args[1]) + ")";
+                if (name == "值" && e->args.size() == 2) return "t_vals(" + expr(e->args[1]) + ")";
+                if (name == "有键" && e->args.size() == 3) return "(" + expr(e->args[1]) + ")[" + expr(e->args[2]) + "] ~= nil";
+                if (name == "随机" && e->args.size() == 1) return "math.random()";
+                if (name == "随机整数" && e->args.size() >= 3) return "math.random(" + expr(e->args[1]) + ", " + expr(e->args[2]) + ")";
+                static const std::map<string, string> mathNames = {
+                    {"平方根", "math.sqrt"}, {"正弦", "math.sin"}, {"余弦", "math.cos"}, {"正切", "math.tan"},
+                    {"反余弦", "math.acos"}, {"反正弦", "math.asin"}, {"反正切", "math.atan"},
+                    {"指数", "math.exp"}, {"对数", "math.log"}, {"对数10", "math.log10"},
+                    {"向上取整", "math.ceil"}, {"向下取整", "math.floor"}};
+                auto mit = userFuncs.count(name) ? mathNames.end() : mathNames.find(name);
+                if (mit != mathNames.end()) {
+                    string r = mit->second + "(";
+                    for (size_t i = 1; i < e->args.size(); ++i) {
+                        if (i > 1) r += ", ";
+                        r += expr(e->args[i]);
+                    }
+                    return r + ")";
+                }
+                string callee = userFuncs.count(name) ? nm(name) : expr(e->args[0]);
+                string r = callee + "(";
+                for (size_t i = 1; i < e->args.size(); ++i) {
+                    if (i > 1) r += ", ";
+                    r += expr(e->args[i]);
+                }
+                return r + ")";
+            }
+            case Expr::K::Index: {
+                string o = expr(e->args[0]);
+                if (e->args[1]->k == Expr::K::Str) return "(" + o + ")[" + expr(e->args[1]) + "]";
+                return "(" + o + ")[(" + expr(e->args[1]) + ") + 1]";
+            }
+            case Expr::K::Slice: {
+                string o = expr(e->args[0]);
+                string a = e->args.size() > 1 && e->args[1] ? expr(e->args[1]) : "0";
+                string b = e->args.size() > 2 && e->args[2] ? expr(e->args[2]) : "t_len(" + o + ")";
+                return "t_slice(" + o + ", " + a + ", " + b + ")";
+            }
+            case Expr::K::List: {
+                string r = "{";
+                for (size_t i = 0; i < e->args.size(); ++i) {
+                    if (i) r += ", ";
+                    r += e->args[i] && e->args[i]->k == Expr::K::None ? "t_nil" : expr(e->args[i]);
+                }
+                return r + "}";
+            }
+            case Expr::K::Dict: {
+                string r = "{";
+                for (size_t i = 0; i < e->pairs.size(); ++i) {
+                    if (i) r += ", ";
+                    r += "[" + expr(e->pairs[i].first) + "] = " + expr(e->pairs[i].second);
+                }
+                return r + "}";
+            }
+        }
+        return "nil";
+    }
+    void block(const vector<StmtPtr>& body) {
+        ++indent;
+        for (const auto& s : body) stmt(s);
+        --indent;
+    }
+    void stmt(const StmtPtr& s) {
+        if (!s) return;
+        switch (s->k) {
+            case Stmt::K::Assign:
+                if (s->target->k == Expr::K::Var)
+                    line(nm(s->target->text) + " = " + expr(s->expr));
+                else if (s->target->k == Expr::K::Index)
+                    line(expr(s->target) + " = " + expr(s->expr));
+                else
+                    diag(s->line, "外派只支持变量/下标赋值");
+                break;
+            case Stmt::K::Print: {
+                string r = "print(table.concat({";
+                for (size_t i = 0; i < s->args.size(); ++i) {
+                    if (i) r += ", ";
+                    r += "t_txt(" + expr(s->args[i]) + ")";
+                }
+                line(r + "}, ' '))");
+                break;
+            }
+            case Stmt::K::If:
+                for (size_t i = 0; i < s->branches.size(); ++i) {
+                    line(string(i == 0 ? "if " : "elseif ") + expr(s->branches[i].first) + " then");
+                    block(s->branches[i].second);
+                }
+                if (!s->elseBody.empty()) {
+                    line("else");
+                    block(s->elseBody);
+                }
+                line("end");
+                break;
+            case Stmt::K::While:
+                line("while " + expr(s->expr) + " do");
+                block(s->body);
+                line("end");
+                break;
+            case Stmt::K::For:
+                line("for __i = 1, #" + expr(s->expr) + " do");
+                line("    " + nm(s->name) + " = (" + expr(s->expr) + ")[__i]");
+                block(s->body);
+                line("end");
+                break;
+            case Stmt::K::Func: {
+                string p;
+                for (size_t i = 0; i < s->params.size(); ++i) {
+                    if (i) p += ", ";
+                    p += nm(s->params[i]);
+                }
+                line("function " + nm(s->name) + "(" + p + ")");
+                block(s->body);
+                line("end");
+                break;
+            }
+            case Stmt::K::Return:
+                line("return " + (s->expr ? expr(s->expr) : "nil"));
+                break;
+            case Stmt::K::Break: line("break"); break;
+            case Stmt::K::Continue: diag(s->line, "Lua 没有 continue，改成条件包裹"); break;
+            case Stmt::K::ExprStmt: line(expr(s->expr)); break;
+            case Stmt::K::Import: {
+                string libs;
+                for (size_t k = 0; k < s->imports.size(); ++k) {
+                    if (k) libs += "、";
+                    libs += s->imports[k];
+                }
+                if (!libs.empty())
+                    warns.push_back("第 " + std::to_string(s->line) + " 行：依赖「" + libs +
+                                    "」没有自动补，目标工程里按需自备");
+                break;
+            }
+            case Stmt::K::Export: break;
+            case Stmt::K::Match: diag(s->line, "匹配暂不翻译"); break;
+            case Stmt::K::Try:
+                diag(s->line, "Lua 没有 try，暂不翻译");
+                break;
+        }
+    }
+    string generate() {
+        for (const auto& s : program) stmt(s);
+        vector<string> keep;
+        for (const auto& w : warns)
+            if (!(w.find("「数学库」") != string::npos || w.find("「随机库」") != string::npos)) keep.push_back(w);
+        warns = keep;
+        std::ostringstream head;
+        head << "-- 由「文」外派库生成 · WEN-LANG-0.3\n";
+        head << "local t_nil = {}\n";
+        head << "local function t_num(v)\n";
+        head << "    local d = tonumber(v)\n";
+        head << "    if d == nil then return tostring(v) end\n";
+        head << "    if d == 0 then return '0' end\n";
+        head << "    local a = math.abs(d)\n";
+        head << "    if a < 1e-9 or a >= 1e17 then return string.format('%.6e', d) end\n";
+        head << "    if d == math.floor(d) then return string.format('%.0f', d) end\n";
+        head << "    local x = string.format('%.16g', d)\n";
+        head << "    if string.find(x, 'e') or string.find(x, 'E') then\n";
+        head << "        x = string.format('%.16f', d)\n";
+        head << "        x = string.gsub(x, '0+$', '')\n";
+        head << "        x = string.gsub(x, '%.$', '')\n";
+        head << "    end\n";
+        head << "    return x\n";
+        head << "end\n";
+        head << "local function t_isarr(t)\n";
+        head << "    if type(t) ~= 'table' then return false end\n";
+        head << "    local n = #t\n";
+        head << "    if n == 0 then return next(t) == nil end\n";
+        head << "    for i = 1, n do if t[i] == nil then return false end end\n";
+        head << "    return true\n";
+        head << "end\n";
+        head << "local function t_val(v)\n";
+        head << "    if v == t_nil then return '空' end\n";
+        head << "    if v == nil then return '空' end\n";
+        head << "    if v == true then return '真' end\n";
+        head << "    if v == false then return '假' end\n";
+        head << "    if type(v) == 'string' then return '\"' .. v .. '\"' end\n";
+        head << "    if type(v) == 'table' then\n";
+        head << "        local p = {}\n";
+        head << "        if t_isarr(v) then\n";
+        head << "            for i = 1, #v do p[#p + 1] = t_val(v[i]) end\n";
+        head << "            return '[' .. table.concat(p, ', ') .. ']'\n";
+        head << "        end\n";
+        head << "        local ks = {}\n";
+        head << "        for k in pairs(v) do ks[#ks + 1] = k end\n";
+        head << "        table.sort(ks, function(x, y) return tostring(x) < tostring(y) end)\n";
+        head << "        for i = 1, #ks do p[#p + 1] = t_val(ks[i]) .. ': ' .. t_val(v[ks[i]]) end\n";
+        head << "        return '{' .. table.concat(p, ', ') .. '}'\n";
+        head << "    end\n";
+        head << "    return t_num(v)\n";
+        head << "end\n";
+        head << "function t_txt(v)\n";
+        head << "    if v == t_nil then return '空' end\n";
+        head << "    if v == nil then return '空' end\n";
+        head << "    if v == true then return '真' end\n";
+        head << "    if v == false then return '假' end\n";
+        head << "    if type(v) == 'string' then return v end\n";
+        head << "    if type(v) == 'table' then return t_val(v) end\n";
+        head << "    return t_num(v)\n";
+        head << "end\n";
+        head << "function t_len(v)\n";
+        head << "    if type(v) == 'string' then return #v end\n";
+        head << "    if type(v) == 'table' then\n";
+        head << "        if t_isarr(v) then return #v end\n";
+        head << "        local n = 0\n";
+        head << "        for _ in pairs(v) do n = n + 1 end\n";
+        head << "        return n\n";
+        head << "    end\n";
+        head << "    return 0\n";
+        head << "end\n";
+        head << "function t_range(n)\n";
+        head << "    local t = {}\n";
+        head << "    for i = 0, math.floor(n) - 1 do t[#t + 1] = i end\n";
+        head << "    return t\n";
+        head << "end\n";
+        head << "function t_sum(t)\n";
+        head << "    local s = 0\n";
+        head << "    for i = 1, #t do s = s + t[i] end\n";
+        head << "    return s\n";
+        head << "end\n";
+        head << "function t_keys(t)\n";
+        head << "    local ks = {}\n";
+        head << "    for k in pairs(t) do ks[#ks + 1] = k end\n";
+        head << "    table.sort(ks, function(x, y) return tostring(x) < tostring(y) end)\n";
+        head << "    return ks\n";
+        head << "end\n";
+        head << "function t_vals(t)\n";
+        head << "    local vs = {}\n";
+        head << "    for _, v in pairs(t) do vs[#vs + 1] = v end\n";
+        head << "    return vs\n";
+        head << "end\n";
+        head << "function t_slice(t, a, b)\n";
+        head << "    local r = {}\n";
+        head << "    for i = a + 1, math.min(b, #t) do r[#r + 1] = t[i] end\n";
+        head << "    return r\n";
+        head << "end\n";
+        head << "function t_eq(a, b)\n";
+        head << "    if type(a) == 'number' and type(b) == 'number' then return a == b end\n";
+        head << "    return tostring(a) == tostring(b)\n";
+        head << "end\n";
+        head << "function t_has(a, b)\n";
+        head << "    if type(b) == 'table' then\n";
+        head << "        for _, x in ipairs(b) do if t_eq(x, a) then return true end end\n";
+        head << "        return false\n";
+        head << "    end\n";
+        head << "    if type(b) == 'string' then return string.find(b, tostring(a), 1, true) ~= nil end\n";
+        head << "    return false\n";
+        head << "end\n";
         return head.str() + out.str();
     }
 };
@@ -13731,6 +14078,7 @@ Interpreter::Interpreter() {
         l->items.push_back(vStr("perl"));
         l->items.push_back(vStr("php"));
         l->items.push_back(vStr("ruby"));
+        l->items.push_back(vStr("lua"));
         return vList(l);
     });
     registerBuiltin("外派目标", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
@@ -13757,12 +14105,12 @@ Interpreter::Interpreter() {
         bool ok = target == "python" || target == "javascript" || target == "js" ||
                   target == "json" || target == "gson" || target == "java" || target == "typescript" || target == "ts" ||
                   target == "powershell" || target == "ps1" || target == "ps" ||
-                  target == "perl" || target == "pl" || target == "php" || target == "ruby" || target == "rb";
+                  target == "perl" || target == "pl" || target == "php" || target == "ruby" || target == "rb" || target == "lua";
         if (target.empty())
             diags.push_back("第 1 行：缺少外派目标；第一行写「# 外派: python」");
         else if (!ok)
             diags.push_back("第 1 行：目标「" + target +
-                            "」的适配器未安装；当前支持 python / javascript / typescript / json / java / powershell / perl / php / ruby");
+                            "」的适配器未安装；当前支持 python / javascript / typescript / json / java / powershell / perl / php / ruby / lua");
         if (ok) {
             try {
                 Interpreter sub;
@@ -13794,6 +14142,10 @@ Interpreter::Interpreter() {
                     for (const auto& d : em.diags) diags.push_back(d);
                 } else if (target == "ruby" || target == "rb") {
                     RubyEmitter em(program);
+                    em.generate();
+                    for (const auto& d : em.diags) diags.push_back(d);
+                } else if (target == "lua") {
+                    LuaEmitter em(program);
                     em.generate();
                     for (const auto& d : em.diags) diags.push_back(d);
                 } else {
@@ -13829,12 +14181,12 @@ Interpreter::Interpreter() {
         bool ok = target == "python" || target == "javascript" || target == "js" ||
                   target == "json" || target == "gson" || target == "java" || target == "typescript" || target == "ts" ||
                   target == "powershell" || target == "ps1" || target == "ps" ||
-                  target == "perl" || target == "pl" || target == "php" || target == "ruby" || target == "rb";
+                  target == "perl" || target == "pl" || target == "php" || target == "ruby" || target == "rb" || target == "lua";
         if (target.empty())
             diags.push_back("第 1 行：缺少外派目标；第一行写「# 外派: python」");
         else if (!ok)
             diags.push_back("第 1 行：目标「" + target +
-                            "」的适配器未安装；当前支持 python / javascript / typescript / json / java / powershell / perl / php / ruby");
+                            "」的适配器未安装；当前支持 python / javascript / typescript / json / java / powershell / perl / php / ruby / lua");
         string code;
         if (ok) {
             try {
@@ -13872,6 +14224,11 @@ Interpreter::Interpreter() {
                     for (const auto& d : em.warns) warns.push_back(d);
                 } else if (target == "ruby" || target == "rb") {
                     RubyEmitter em(program);
+                    code = em.generate();
+                    for (const auto& d : em.diags) diags.push_back(d);
+                    for (const auto& d : em.warns) warns.push_back(d);
+                } else if (target == "lua") {
+                    LuaEmitter em(program);
                     code = em.generate();
                     for (const auto& d : em.diags) diags.push_back(d);
                     for (const auto& d : em.warns) warns.push_back(d);
@@ -36419,6 +36776,7 @@ static string translateOutExt(const string& t) {
     if (t == "perl" || t == "pl") return ".pl";
     if (t == "php") return ".php";
     if (t == "ruby" || t == "rb") return ".rb";
+    if (t == "lua") return ".lua";
     if (t == "java") return ".java";
     if (t == "cpp" || t == "c++" || t == "c") return ".cpp";
     if (t == "字节码" || t == "bytecode") return ".json";
@@ -36431,7 +36789,7 @@ static bool translateTargetKnown(const string& t) {
            t == "typescript" || t == "ts" || t == "json" || t == "gson" ||
            t == "java" || t == "cpp" || t == "c++" || t == "c" ||
            t == "字节码" || t == "bytecode" || t == "汇编" || t == "asm" ||
-           t == "powershell" || t == "ps1" || t == "ps" || t == "perl" || t == "pl" || t == "php" || t == "ruby" || t == "rb";
+           t == "powershell" || t == "ps1" || t == "ps" || t == "perl" || t == "pl" || t == "php" || t == "ruby" || t == "rb" || t == "lua";
 }
 
 static int translateFileCli(const string& path, string target, string outPath) {
@@ -36446,12 +36804,12 @@ static int translateFileCli(const string& path, string target, string outPath) {
     if (lower.empty()) lower = lowerAscii(externalTarget(src));
     if (lower.empty()) {
         std::cerr << "缺少翻译目标：第一行写「# 外派: python」，或在命令里给目标\n";
-        std::cerr << "可用目标：python / javascript / typescript / json / java / powershell / perl / php / ruby / cpp / 字节码\n";
+        std::cerr << "可用目标：python / javascript / typescript / json / java / powershell / perl / php / ruby / lua / cpp / 字节码\n";
         return 1;
     }
     if (!translateTargetKnown(lower)) {
         std::cerr << "不支持的翻译目标：" << target << "\n";
-        std::cerr << "可用目标：python / javascript / typescript / json / java / powershell / perl / php / ruby / cpp / 字节码\n";
+        std::cerr << "可用目标：python / javascript / typescript / json / java / powershell / perl / php / ruby / lua / cpp / 字节码\n";
         return 1;
     }
     if (lower == "cpp" || lower == "c++" || lower == "c")
@@ -36509,6 +36867,11 @@ static int translateFileCli(const string& path, string target, string outPath) {
             code = em.generate();
         } else if (lower == "java") {
             JavaEmitter em(program);
+            code = em.generate();
+            diags = em.diags;
+            warns = em.warns;
+        } else if (lower == "lua") {
+            LuaEmitter em(program);
             code = em.generate();
             diags = em.diags;
             warns = em.warns;
@@ -36720,7 +37083,7 @@ static int runMain(vector<string> args) {
             "  wen.exe --编辑                     打开本地文语编辑器：原生窗口，不开端口、不走浏览器\n"
             "  wen.exe --库源                   打印当前库源地址\n"
             "  wen.exe --不联网                 关掉依赖自动下载（审计/离线发布用）\n"
-            "  wen.exe --翻译 文件.wen [目标] [输出]  翻译成别的语言：python/javascript/typescript/json/java/powershell/perl/php/ruby/cpp/字节码\n"
+            "  wen.exe --翻译 文件.wen [目标] [输出]  翻译成别的语言：python/javascript/typescript/json/java/powershell/perl/php/ruby/lua/cpp/字节码\n"
             "                                   省略目标时读首行「# 外派: python」\n"
             "  wen.exe --验证                   自检\n"
             "  wen.exe --帮助                   本页\n"
@@ -37100,7 +37463,7 @@ static int runMain(vector<string> args) {
     if (cmd == "--翻译") {
         if (args.size() < 3) {
             std::cerr << "用法：wen.exe --翻译 文件.wen [目标] [输出]\n";
-            std::cerr << "目标：python / javascript / typescript / json / java / cpp / 字节码\n";
+            std::cerr << "目标：python / javascript / typescript / json / java / powershell / perl / php / ruby / lua / cpp / 字节码\n";
             std::cerr << "省略目标时读首行「# 外派: 目标」\n";
             return 1;
         }

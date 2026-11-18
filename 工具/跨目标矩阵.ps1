@@ -80,9 +80,27 @@ Write-Utf8 $plRunner ("依赖 外派库`n外派翻译(`"$plSrc`", `"$plFile`")`n
 Run-Exe $plRunner | Out-Null
 $plOut = (((& 'C:\msys64\usr\bin\perl.exe' $plFile 2>&1) | Out-String).Trim()) -replace "`r`n", "`n"
 
+# Ruby
+$rbSrc = Join-Path $dir 'matrix_rb.wen'
+Write-Utf8 $rbSrc ("# 外派: ruby`n" + $core)
+$rbFile = Join-Path $dir 'matrix_rb.rb'
+$rbRunner = Join-Path $dir 'matrix_rb_runner.wen'
+Write-Utf8 $rbRunner ("依赖 外派库`n外派翻译(`"$rbSrc`", `"$rbFile`")`n")
+Run-Exe $rbRunner | Out-Null
+$rbOut = (((& 'C:\msys64\ucrt64\bin\ruby.exe' $rbFile 2>&1) | Out-String).Trim()) -replace "`r`n", "`n"
+
+# Lua
+$luaSrc = Join-Path $dir 'matrix_lua.wen'
+Write-Utf8 $luaSrc ("# 外派: lua`n" + $core)
+$luaFile = Join-Path $dir 'matrix_lua.lua'
+$luaRunner = Join-Path $dir 'matrix_lua_runner.wen'
+Write-Utf8 $luaRunner ("依赖 外派库`n外派翻译(`"$luaSrc`", `"$luaFile`")`n")
+Run-Exe $luaRunner | Out-Null
+$luaOut = (((& 'C:\msys64\ucrt64\bin\lua.exe' $luaFile 2>&1) | Out-String).Trim()) -replace "`r`n", "`n"
+
 $ok = $true
 foreach ($pair in @(@('解释器', $expected), @('字节码', $bc), @('Python', $py), @('C++', $cppOut),
-                    @('PowerShell', $psOut), @('Perl', $plOut))) {
+                    @('PowerShell', $psOut), @('Perl', $plOut), @('Ruby', $rbOut), @('Lua', $luaOut))) {
     if ($pair[1] -ne $expected) {
         $ok = $false
         Write-Host ("失败：{0} 输出不等价" -f $pair[0])
@@ -141,8 +159,26 @@ Write-Utf8 $vpsRunner ("依赖 外派库`n外派翻译(`"$vpsSrc`", `"$vpsFile`"
 Run-Exe $vpsRunner | Out-Null
 $vpsOut = (((& pwsh -NoProfile -File $vpsFile 2>&1) | Out-String).Trim()) -replace "`r`n", "`n"
 
+# Ruby 与 Lua 的值文本（布尔/空/列表/字典/大整数/小数）
+$vrbSrc = Join-Path $dir 'values_rb.wen'
+Write-Utf8 $vrbSrc ($vtext -replace '# 外派: python', '# 外派: ruby')
+$vrbFile = Join-Path $dir 'values_rb.rb'
+$vrbRunner = Join-Path $dir 'values_rb_runner.wen'
+Write-Utf8 $vrbRunner ("依赖 外派库`n外派翻译(`"$vrbSrc`", `"$vrbFile`")`n")
+Run-Exe $vrbRunner | Out-Null
+$vrbOut = (((& 'C:\msys64\ucrt64\bin\ruby.exe' $vrbFile 2>&1) | Out-String).Trim()) -replace "`r`n", "`n"
+
+$vluaSrc = Join-Path $dir 'values_lua.wen'
+Write-Utf8 $vluaSrc ($vtext -replace '# 外派: python', '# 外派: lua')
+$vluaFile = Join-Path $dir 'values_lua.lua'
+$vluaRunner = Join-Path $dir 'values_lua_runner.wen'
+Write-Utf8 $vluaRunner ("依赖 外派库`n外派翻译(`"$vluaSrc`", `"$vluaFile`")`n")
+Run-Exe $vluaRunner | Out-Null
+$vluaOut = (((& 'C:\msys64\ucrt64\bin\lua.exe' $vluaFile 2>&1) | Out-String).Trim()) -replace "`r`n", "`n"
+
 foreach ($pair in @(@('Python 值文本', $vp, $vi), @('C++ 数字文本', $nc, $ni),
-                    @('PowerShell 值文本', $vpsOut, $vi))) {
+                    @('PowerShell 值文本', $vpsOut, $vi), @('Ruby 值文本', $vrbOut, $vi),
+                    @('Lua 值文本', $vluaOut, $vi))) {
     if ($pair[1] -ne $pair[2]) {
         $ok = $false
         Write-Host ("失败：{0} 不等价" -f $pair[0])
@@ -152,4 +188,4 @@ foreach ($pair in @(@('Python 值文本', $vp, $vi), @('C++ 数字文本', $nc, 
 }
 
 if (-not $ok) { exit 1 }
-Write-Host ("跨目标矩阵：解释器 / 字节码 / Python / C++ / PowerShell / Perl 全部等价（函数+递归+√+值文本）")
+Write-Host ("跨目标矩阵：解释器 / 字节码 / Python / C++ / PowerShell / Perl / Ruby / Lua 全部等价（函数+递归+√+值文本）")
