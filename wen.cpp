@@ -8354,7 +8354,7 @@ static double wenCloudDens(const WenCloudOne& c, double x, double y, double z) {
     // 云底不是一张水平切面：铺在球面上的云，边缘会顺着曲率轻微下垂。
     double rn = std::sqrt(dx * dx + dz * dz) / std::max(c.rad, 1e-6);
     if (rn > 1.7) rn = 1.7;
-    double baseEff = c.base - c.rad * 0.085 * rn * rn;
+    double baseEff = c.base - c.rad * 0.018 * rn * rn;
     if (y < baseEff) return 0.0;
     double best = 0.0, t;
     // 每朵云的瓣朝向按自己的坐标转一个角度：不然所有云都长成同一个三瓣，
@@ -8377,7 +8377,7 @@ static double wenCloudDensN(const WenCloudOne& c, double x, double y, double z, 
     double dx = x - c.x, dz = z - c.z;
     double rn = std::sqrt(dx * dx + dz * dz) / std::max(c.rad, 1e-6);
     if (rn > 1.7) rn = 1.7;
-    double baseEff = c.base - c.rad * 0.085 * rn * rn;
+    double baseEff = c.base - c.rad * 0.018 * rn * rn;
     if (y < baseEff) return 0.0;
     double best = 0.0, t, n[3], bn[3] = { 0.0, 1.0, 0.0 }, bmax = 0.0;
     double a0 = c.x * 0.31 + c.z * 0.47;
@@ -9287,6 +9287,14 @@ struct PyEmitter {
         head += "    if isinstance(v, list): return '[' + ', '.join(_文值(x) for x in v) + ']'\n";
         head += "    if isinstance(v, dict): return '{' + ', '.join(_文值(k) + ': ' + _文值(x) for k, x in sorted(v.items(), key=lambda kv: str(kv[0]).encode('utf-8'))) + '}'\n";
         head += "    return str(v)\n";
+        if (usedMath || usedRandom) {
+            vector<string> keep;
+            for (const auto& w : warns)
+                if (!((usedMath && w.find("「数学库」") != string::npos) ||
+                      (usedRandom && w.find("「随机库」") != string::npos)))
+                    keep.push_back(w);
+            warns = keep;
+        }
         if (usedMath) head += "import math\n";
         if (usedRandom) head += "import random\n";
         return head + out.str();
@@ -9524,7 +9532,1195 @@ struct JsEmitter {
             "if(typeof v==='boolean')return '布尔';if(Array.isArray(v))return '列表';"
             "if(typeof v==='object')return '字典';return '未知';}\n"
             "function wenRandInt(a,b){return Math.floor(Math.random()*(b-a+1))+a;}\n";
+        {
+            vector<string> keep;
+            for (const auto& w : warns)
+                if (w.find("「数学库」") == string::npos && w.find("「随机库」") == string::npos)
+                    keep.push_back(w);
+            warns = keep;
+        }
         return "// 由「文」外派库生成 · WEN-LANG-0.3\n" + string(helpers) + "\n" + out.str();
+    }
+};
+
+struct PsEmitter {
+    const vector<StmtPtr>& program;
+    vector<string> diags;
+    vector<string> warns;
+    std::ostringstream out;
+    int indent = 0;
+    bool usedMath = false;
+    std::set<string> userFuncs;
+
+    explicit PsEmitter(const vector<StmtPtr>& p) : program(p) { collectFuncs(p); }
+
+    void collectFuncs(const vector<StmtPtr>& ps) {
+        for (const auto& s : ps) {
+            if (!s) continue;
+            if (s->k == Stmt::K::Func) userFuncs.insert(s->name);
+            collectFuncs(s->body);
+            collectFuncs(s->elseBody);
+            collectFuncs(s->finallyBody);
+            for (const auto& br : s->branches) collectFuncs(br.second);
+        }
+    }
+
+    void diag(int line, const string& msg) {
+        diags.push_back("第 " + std::to_string(line) + " 行：" + msg);
+    }
+    void line(const string& s) {
+        out << string(indent * 4, ' ') << s << "\n";
+    }
+    static string psQuote(const string& s) {
+        string out = "'";
+        for (char c : s) {
+            if (c == '\'') out += "''";
+            else out += c;
+        }
+        out += "'";
+        return out;
+    }
+    static string psNum(double d) {
+        std::ostringstream s;
+        s << std::setprecision(17) << d;
+        return s.str();
+    }
+    string expr(const ExprPtr& e) {
+        if (!e) return "$null";
+        switch (e->k) {
+            case Expr::K::Num: return psNum(e->num);
+            case Expr::K::Str: return psQuote(e->text);
+            case Expr::K::Bool: return e->b ? "$true" : "$false";
+            case Expr::K::None: return "$null";
+            case Expr::K::Var: {
+                if (e->text == "圆周率" || e->text == "π") { usedMath = true; return "[math]::PI"; }
+                if (e->text == "自然常数") { usedMath = true; return "[math]::E"; }
+                return "$" + e->text;
+            }
+            case Expr::K::Unary: {
+                string a = expr(e->args[0]);
+                if (e->op == "非") return "(-not " + a + ")";
+                if (e->op == "插值") return "([string]" + a + ")";
+                if (e->op == "√") { usedMath = true; return "[math]::Sqrt(" + a + ")"; }
+                return "(-" + a + ")";
+            }
+            case Expr::K::Binary: {
+                string a = expr(e->args[0]), b = expr(e->args[1]);
+                string op = e->op;
+                if (op == "且") return "(" + a + " -and " + b + ")";
+                if (op == "或") return "(" + a + " -or " + b + ")";
+                if (op == "包含") return "(" + b + " -contains " + a + ")";
+                if (op == "不包含") return "(-not (" + b + " -contains " + a + "))";
+                if (op == "==") return "(" + a + " -eq " + b + ")";
+                if (op == "!=") return "(" + a + " -ne " + b + ")";
+                if (op == ">") return "(" + a + " -gt " + b + ")";
+                if (op == "<") return "(" + a + " -lt " + b + ")";
+                if (op == ">=") return "(" + a + " -ge " + b + ")";
+                if (op == "<=") return "(" + a + " -le " + b + ")";
+                if (op == "**") { usedMath = true; return "[math]::Pow(" + a + ", " + b + ")"; }
+                if (op == "//") return "([math]::Floor(" + a + " / " + b + "))";
+                return "(" + a + " " + op + " " + b + ")";
+            }
+            case Expr::K::Call: {
+                string name = e->args[0]->k == Expr::K::Var ? e->args[0]->text : "";
+                string callee = userFuncs.count(name) ? name : expr(e->args[0]);
+                if (name == "长度" && e->args.size() == 2) return "(_长(" + expr(e->args[1]) + "))";
+                if (name == "范围" && e->args.size() == 2) return "(_范围(" + expr(e->args[1]) + "))";
+                if (name == "绝对值" && e->args.size() == 2) { usedMath = true; return "[math]::Abs(" + expr(e->args[1]) + ")"; }
+                if (name == "取整" && e->args.size() == 2) return "([int](" + expr(e->args[1]) + "))";
+                if (name == "最大" && e->args.size() >= 2) { usedMath = true; return "[math]::Max(" + expr(e->args[1]) + ", " + expr(e->args[2]) + ")"; }
+                if (name == "最小" && e->args.size() >= 2) { usedMath = true; return "[math]::Min(" + expr(e->args[1]) + ", " + expr(e->args[2]) + ")"; }
+                if (name == "求和" && e->args.size() == 2) return "(_求和(" + expr(e->args[1]) + "))";
+                if (name == "键" && e->args.size() == 2) return "(_键(" + expr(e->args[1]) + "))";
+                if (name == "值" && e->args.size() == 2) return "(_值(" + expr(e->args[1]) + "))";
+                if (name == "有键" && e->args.size() == 3) return "(_有键(" + expr(e->args[1]) + ", " + expr(e->args[2]) + "))";
+                if (name == "随机" && e->args.size() == 1) return "(Get-Random -Minimum 0 -Maximum 1 -AsDouble)";
+                if (name == "随机整数" && e->args.size() >= 2) return "(Get-Random -Minimum " + expr(e->args[1]) + " -Maximum (" + expr(e->args[2]) + " + 1))";
+                static const std::map<string, string> mathNames = {
+                    {"平方根", "Sqrt"}, {"正弦", "Sin"}, {"余弦", "Cos"},
+                    {"正切", "Tan"}, {"对数", "Log"}, {"对数10", "Log10"},
+                    {"指数", "Exp"}, {"反余弦", "Acos"}, {"反正弦", "Asin"},
+                    {"反正切", "Atan"}, {"向上取整", "Ceiling"}, {"向下取整", "Floor"}};
+                auto mit = userFuncs.count(name) ? mathNames.end() : mathNames.find(name);
+                if (mit != mathNames.end()) {
+                    usedMath = true;
+                    callee = "[math]::" + mit->second;
+                }
+                if (userFuncs.count(name) && !e->args.empty()) {
+                    string u = "(" + name;
+                    for (size_t i = 1; i < e->args.size(); ++i) u += " (" + expr(e->args[i]) + ")";
+                    return u + ")";
+                }
+                string s = callee + "(";
+                for (size_t i = 1; i < e->args.size(); ++i) {
+                    if (i > 1) s += ", ";
+                    s += expr(e->args[i]);
+                }
+                return s + ")";
+            }
+            case Expr::K::Index:
+                return "(" + expr(e->args[0]) + ")[" + expr(e->args[1]) + "]";
+            case Expr::K::Slice: {
+                string o = expr(e->args[0]);
+                string a = e->args.size() > 1 && e->args[1] ? expr(e->args[1]) : "0";
+                string b = e->args.size() > 2 && e->args[2] ? expr(e->args[2]) : "(_长(" + o + "))";
+                return "@(" + o + ")[" + a + "..((" + b + ") - 1)]";
+            }
+            case Expr::K::List: {
+                string s = "@(";
+                for (size_t i = 0; i < e->args.size(); ++i) {
+                    if (i) s += ", ";
+                    s += expr(e->args[i]);
+                }
+                return s + ")";
+            }
+            case Expr::K::Dict: {
+                string s = "@{";
+                for (size_t i = 0; i < e->pairs.size(); ++i) {
+                    if (i) s += "; ";
+                    s += expr(e->pairs[i].first) + " = " + expr(e->pairs[i].second);
+                }
+                return s + "}";
+            }
+        }
+        return "$null";
+    }
+    void block(const vector<StmtPtr>& body) {
+        ++indent;
+        if (body.empty()) line("pass");
+        for (const auto& s : body) stmt(s);
+        --indent;
+    }
+    void stmt(const StmtPtr& s) {
+        if (!s) return;
+        switch (s->k) {
+            case Stmt::K::Assign:
+                if (s->target->k == Expr::K::Var)
+                    line("$" + s->target->text + " = " + expr(s->expr));
+                else if (s->target->k == Expr::K::Index)
+                    line(expr(s->target) + " = " + expr(s->expr));
+                else
+                    diag(s->line, "外派只支持变量/下标赋值");
+                break;
+            case Stmt::K::Print: {
+                line("$__p = @()");
+                for (size_t i = 0; i < s->args.size(); ++i)
+                    line("$__p += _文(" + expr(s->args[i]) + ")");
+                line("Write-Host ($__p -join ' ')");
+                break;
+            }
+            case Stmt::K::If:
+                for (size_t i = 0; i < s->branches.size(); ++i) {
+                    line(string(i == 0 ? "if (" : "elseif (") + expr(s->branches[i].first) + ") {");
+                    block(s->branches[i].second);
+                    line("}");
+                }
+                if (!s->elseBody.empty()) {
+                    line("else {");
+                    block(s->elseBody);
+                    line("}");
+                }
+                break;
+            case Stmt::K::While:
+                line("while (" + expr(s->expr) + ") {");
+                block(s->body);
+                line("}");
+                break;
+            case Stmt::K::Func: {
+                string params;
+                for (size_t i = 0; i < s->params.size(); ++i) {
+                    if (i) params += ", ";
+                    params += "$" + s->params[i];
+                }
+                line("function " + s->name + "(" + params + ") {");
+                block(s->body);
+                line("}");
+                break;
+            }
+            case Stmt::K::Return:
+                line("return " + (s->expr ? expr(s->expr) : "$null"));
+                break;
+            case Stmt::K::Break: line("break"); break;
+            case Stmt::K::Continue: line("continue"); break;
+            case Stmt::K::ExprStmt: line(expr(s->expr) + " | Out-Null"); break;
+            case Stmt::K::Import: {
+                string libs;
+                for (size_t k = 0; k < s->imports.size(); ++k) {
+                    if (k) libs += "、";
+                    libs += s->imports[k];
+                }
+                if (!libs.empty())
+                    warns.push_back("第 " + std::to_string(s->line) + " 行：依赖「" + libs +
+                                    "」没有自动补，目标工程里按需自备");
+                break;
+            }
+            case Stmt::K::Export:
+                break;
+            case Stmt::K::Match:
+                diag(s->line, "匹配暂不翻译");
+                break;
+            case Stmt::K::Try:
+                line("try {");
+                block(s->body);
+                line("} catch {");
+                ++indent;
+                if (!s->name.empty()) line("$" + s->name + " = $_.Exception.Message");
+                for (const auto& st : s->elseBody) stmt(st);
+                --indent;
+                line("} finally {");
+                block(s->finallyBody);
+                line("}");
+                break;
+        }
+    }
+    string generate() {
+        for (const auto& s : program) stmt(s);
+        if (usedMath || true) {
+            vector<string> keep;
+            for (const auto& w : warns)
+                if (!(w.find("「数学库」") != string::npos || w.find("「随机库」") != string::npos))
+                    keep.push_back(w);
+            warns = keep;
+        }
+        std::ostringstream head;
+        head << "# 由「文」外派库生成 · WEN-LANG-0.3\n";
+        head << "$ErrorActionPreference = 'Stop'\n";
+        head << "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n";
+        head << "$OutputEncoding = [System.Text.Encoding]::UTF8\n";
+        head << "function _文数($v) {\n";
+        head << "    $d = [double]$v\n";
+        head << "    if ($d -eq 0) { return '0' }\n";
+        head << "    $a = [math]::Abs($d)\n";
+        head << "    if ($a -lt 1e-09 -or $a -ge 1e17) { return $d.ToString('0.000000e+00') }\n";
+        head << "    if ($d -eq [math]::Floor($d)) { return ([long]$d).ToString() }\n";
+        head << "    $x = $d.ToString('G16')\n";
+        head << "    if ($x -match '[eE]') { $x = $d.ToString('F16').TrimEnd('0').TrimEnd('.') }\n";
+        head << "    return $x\n";
+        head << "}\n";
+        head << "function _文值($v) {\n";
+        head << "    if ($null -eq $v) { return '空' }\n";
+        head << "    if ($v -is [bool]) { if ($v) { return '真' } else { return '假' } }\n";
+        head << "    if ($v -is [string]) { return '\"' + $v.Replace('\\', '\\\\').Replace('\"', '\\\"') + '\"' }\n";
+        head << "    if ($v -is [array]) { $p = @(); foreach ($x in $v) { $p += _文值($x) }; return '[' + ($p -join ', ') + ']' }\n";
+        head << "    if ($v -is [hashtable]) {\n";
+        head << "        $p = @()\n";
+        head << "        foreach ($__k in _键序($v)) {\n";
+        head << "            $__kv = _文值($__k)\n";
+        head << "            $__vv = _文值($v[$__k])\n";
+        head << "            $p += ($__kv + ': ' + $__vv)\n";
+        head << "        }\n";
+        head << "        return '{' + ($p -join ', ') + '}'\n";
+        head << "    }\n";
+        head << "    return _文($v)\n";
+        head << "}\n";
+        head << "function _文($v) {\n";
+        head << "    if ($null -eq $v) { return '空' }\n";
+        head << "    if ($v -is [bool]) { if ($v) { return '真' } else { return '假' } }\n";
+        head << "    if (($v -is [double]) -or ($v -is [int]) -or ($v -is [long]) -or ($v -is [decimal])) { return _文数($v) }\n";
+        head << "    if ($v -is [string]) { return $v }\n";
+        head << "    if ($v -is [array]) { $p = @(); foreach ($x in $v) { $p += _文值($x) }; return '[' + ($p -join ', ') + ']' }\n";
+        head << "    if ($v -is [hashtable]) {\n";
+        head << "        $p = @()\n";
+        head << "        foreach ($__k in _键序($v)) {\n";
+        head << "            $__kv = _文值($__k)\n";
+        head << "            $__vv = _文值($v[$__k])\n";
+        head << "            $p += ($__kv + ': ' + $__vv)\n";
+        head << "        }\n";
+        head << "        return '{' + ($p -join ', ') + '}'\n";
+        head << "    }\n";
+        head << "    return [string]$v\n";
+        head << "}\n";
+        head << "function _键序($h) {\n";
+        head << "    $keys = @($h.Keys)\n";
+        head << "    [Array]::Sort($keys, [System.StringComparer]::Ordinal)\n";
+        head << "    return $keys\n";
+        head << "}\n";
+        head << "function _长($v) {\n";
+        head << "    if ($v -is [string]) { return $v.Length }\n";
+        head << "    if ($v -is [hashtable]) { return $v.Count }\n";
+        head << "    if ($null -eq $v) { return 0 }\n";
+        head << "    return @($v).Count\n";
+        head << "}\n";
+        head << "function _范围($n) {\n";
+        head << "    $n = [int]$n\n";
+        head << "    if ($n -le 0) { return @() }\n";
+        head << "    return (0..($n - 1))\n";
+        head << "}\n";
+        head << "function _求和($a) { $s = 0; foreach ($x in $a) { $s = $s + $x }; return $s }\n";
+        head << "function _键($d) { return @($d.Keys) }\n";
+        head << "function _值($d) { return @($d.Values) }\n";
+        head << "function _有键($d, $k) { return $d.ContainsKey($k) }\n";
+        return head.str() + out.str();
+    }
+};
+
+struct PerlEmitter {
+    const vector<StmtPtr>& program;
+    vector<string> diags;
+    vector<string> warns;
+    std::ostringstream out;
+    int indent = 0;
+    bool usedMath = false;
+    std::set<string> userFuncs;
+
+    explicit PerlEmitter(const vector<StmtPtr>& p) : program(p) { collectFuncs(p); }
+
+    void collectFuncs(const vector<StmtPtr>& ps) {
+        for (const auto& s : ps) {
+            if (!s) continue;
+            if (s->k == Stmt::K::Func) userFuncs.insert(s->name);
+            collectFuncs(s->body);
+            collectFuncs(s->elseBody);
+            collectFuncs(s->finallyBody);
+            for (const auto& br : s->branches) collectFuncs(br.second);
+        }
+    }
+    void diag(int line, const string& msg) {
+        diags.push_back("第 " + std::to_string(line) + " 行：" + msg);
+    }
+    void line(const string& s) {
+        out << string(indent * 4, ' ') << s << "\n";
+    }
+    static string plQuote(const string& s) {
+        string out = "'";
+        for (char c : s) {
+            if (c == '\\') out += "\\\\";
+            else if (c == '\'') out += "\\'";
+            else out += c;
+        }
+        out += "'";
+        return out;
+    }
+    static string plNum(double d) {
+        std::ostringstream s;
+        s << std::setprecision(17) << d;
+        return s.str();
+    }
+    void collectVars(const vector<StmtPtr>& body, std::set<string>& vars) {
+        for (const auto& s : body) {
+            if (!s) continue;
+            if (s->k == Stmt::K::Assign && s->target && s->target->k == Expr::K::Var)
+                vars.insert(s->target->text);
+            if (s->k == Stmt::K::For && !s->name.empty()) vars.insert(s->name);
+            if (s->k == Stmt::K::For && !s->name2.empty()) vars.insert(s->name2);
+            if (s->k == Stmt::K::Try && !s->name.empty()) vars.insert(s->name);
+            if (s->k == Stmt::K::Func) continue;
+            collectVars(s->body, vars);
+            collectVars(s->elseBody, vars);
+            collectVars(s->finallyBody, vars);
+            for (const auto& br : s->branches) collectVars(br.second, vars);
+        }
+    }
+    string expr(const ExprPtr& e) {
+        if (!e) return "undef";
+        switch (e->k) {
+            case Expr::K::Num: return plNum(e->num);
+            case Expr::K::Str: return plQuote(e->text);
+            case Expr::K::Bool: return e->b ? "1" : "0";
+            case Expr::K::None: return "undef";
+            case Expr::K::Var: {
+                if (e->text == "圆周率" || e->text == "π") { usedMath = true; return "3.141592653589793"; }
+                if (e->text == "自然常数") { usedMath = true; return "2.718281828459045"; }
+                return "$" + e->text;
+            }
+            case Expr::K::Unary: {
+                string a = expr(e->args[0]);
+                if (e->op == "非") return "(!(" + a + "))";
+                if (e->op == "插值") return "(" + a + ")";
+                if (e->op == "√") { usedMath = true; return "sqrt(" + a + ")"; }
+                return "(-(" + a + "))";
+            }
+            case Expr::K::Binary: {
+                string a = expr(e->args[0]), b = expr(e->args[1]);
+                string op = e->op;
+                if (op == "且") return "(" + a + " && " + b + ")";
+                if (op == "或") return "(" + a + " || " + b + ")";
+                if (op == "不包含") return "(!_包含(" + a + ", " + b + "))";
+                if (op == "包含") return "_包含(" + a + ", " + b + ")";
+                if (op == "==") return "_等(" + a + ", " + b + ")";
+                if (op == "!=") return "(!_等(" + a + ", " + b + "))";
+                if (op == "//") return "int(" + a + " / " + b + ")";
+                if (op == "+" ) return "(" + a + " + " + b + ")";
+                if (op == "*" ) return "(" + a + " * " + b + ")";
+                return "(" + a + " " + op + " " + b + ")";
+            }
+            case Expr::K::Call: {
+                string name = e->args[0]->k == Expr::K::Var ? e->args[0]->text : "";
+                if (name == "长度" && e->args.size() == 2) return "_长(" + expr(e->args[1]) + ")";
+                if (name == "范围" && e->args.size() == 2) return "[_范围(" + expr(e->args[1]) + ")]";
+                if (name == "绝对值" && e->args.size() == 2) { usedMath = true; return "abs(" + expr(e->args[1]) + ")"; }
+                if (name == "取整" && e->args.size() == 2) return "int(" + expr(e->args[1]) + ")";
+                if (name == "最大" && e->args.size() >= 3) return "_最大(" + expr(e->args[1]) + ", " + expr(e->args[2]) + ")";
+                if (name == "最小" && e->args.size() >= 3) return "_最小(" + expr(e->args[1]) + ", " + expr(e->args[2]) + ")";
+                if (name == "求和" && e->args.size() == 2) return "_求和(" + expr(e->args[1]) + ")";
+                if (name == "键" && e->args.size() == 2) return "[sort keys %{" + expr(e->args[1]) + "}]";
+                if (name == "值" && e->args.size() == 2) return "[map { (" + expr(e->args[1]) + ")->{$_} } sort keys %{" + expr(e->args[1]) + "}]";
+                if (name == "有键" && e->args.size() == 3) return "exists " + expr(e->args[1]) + "->{" + expr(e->args[2]) + "}";
+                if (name == "随机" && e->args.size() == 1) return "rand()";
+                if (name == "随机整数" && e->args.size() >= 3) return "_随机整数(" + expr(e->args[1]) + ", " + expr(e->args[2]) + ")";
+                static const std::map<string, string> mathNames = {
+                    {"平方根", "sqrt"}, {"正弦", "sin"}, {"余弦", "cos"}, {"正切", "tan"},
+                    {"反余弦", "acos"}, {"反正弦", "asin"}, {"反正切", "atan"},
+                    {"指数", "exp"}, {"向上取整", "ceil"}, {"向下取整", "floor"},
+                    {"对数", "log"}, {"对数10", "log10"}};
+                auto mit = userFuncs.count(name) ? mathNames.end() : mathNames.find(name);
+                if (mit != mathNames.end()) {
+                    usedMath = true;
+                    string s = mit->second + "(";
+                    for (size_t i = 1; i < e->args.size(); ++i) {
+                        if (i > 1) s += ", ";
+                        s += expr(e->args[i]);
+                    }
+                    return s + ")";
+                }
+                string callee = userFuncs.count(name) ? name : expr(e->args[0]);
+                string s = callee + "(";
+                for (size_t i = 1; i < e->args.size(); ++i) {
+                    if (i > 1) s += ", ";
+                    s += expr(e->args[i]);
+                }
+                return s + ")";
+            }
+            case Expr::K::Index: {
+                string o = expr(e->args[0]);
+                if (e->args[1]->k == Expr::K::Str) return "(" + o + ")->{" + expr(e->args[1]) + "}";
+                return "(" + o + ")->[" + expr(e->args[1]) + "]";
+            }
+            case Expr::K::Slice: {
+                string o = expr(e->args[0]);
+                string a = e->args.size() > 1 && e->args[1] ? expr(e->args[1]) : "0";
+                string b = e->args.size() > 2 && e->args[2] ? expr(e->args[2]) : "scalar(@{" + o + "})";
+                return "[@{" + o + "}[" + a + "..((" + b + ") - 1)]]";
+            }
+            case Expr::K::List: {
+                string s = "[";
+                for (size_t i = 0; i < e->args.size(); ++i) {
+                    if (i) s += ", ";
+                    s += expr(e->args[i]);
+                }
+                return s + "]";
+            }
+            case Expr::K::Dict: {
+                string s = "{";
+                for (size_t i = 0; i < e->pairs.size(); ++i) {
+                    if (i) s += ", ";
+                    s += expr(e->pairs[i].first) + " => " + expr(e->pairs[i].second);
+                }
+                return s + "}";
+            }
+        }
+        return "undef";
+    }
+    void declare(const vector<StmtPtr>& body, int pad) {
+        std::set<string> vars;
+        collectVars(body, vars);
+        if (vars.empty()) return;
+        string names;
+        for (const auto& v : vars) {
+            if (!names.empty()) names += ", ";
+            names += "$" + v;
+        }
+        out << string(pad, ' ') << "my (" << names << ");\n";
+    }
+    void block(const vector<StmtPtr>& body) {
+        ++indent;
+        if (body.empty()) line(";");
+        for (const auto& s : body) stmt(s);
+        --indent;
+    }
+    void stmt(const StmtPtr& s) {
+        if (!s) return;
+        switch (s->k) {
+            case Stmt::K::Assign:
+                if (s->target->k == Expr::K::Var)
+                    line("$" + s->target->text + " = " + expr(s->expr) + ";");
+                else if (s->target->k == Expr::K::Index)
+                    line(expr(s->target) + " = " + expr(s->expr) + ";");
+                else
+                    diag(s->line, "外派只支持变量/下标赋值");
+                break;
+            case Stmt::K::Print: {
+                string a;
+                for (size_t i = 0; i < s->args.size(); ++i) {
+                    if (i) a += ", ";
+                    a += "_文(" + expr(s->args[i]) + ")";
+                }
+                line("print join(' ', (" + a + ")), \"\\n\";");
+                break;
+            }
+            case Stmt::K::If:
+                for (size_t i = 0; i < s->branches.size(); ++i) {
+                    line(string(i == 0 ? "if (" : "elsif (") + expr(s->branches[i].first) + ") {");
+                    block(s->branches[i].second);
+                    line("}");
+                }
+                if (!s->elseBody.empty()) {
+                    line("else {");
+                    block(s->elseBody);
+                    line("}");
+                }
+                break;
+            case Stmt::K::While:
+                line("while (" + expr(s->expr) + ") {");
+                block(s->body);
+                line("}");
+                break;
+            case Stmt::K::For: {
+                if (!s->name2.empty())
+                    line("for my $" + s->name + " (sort keys %{" + expr(s->expr) + "}) {");
+                else
+                    line("for my $" + s->name + " (@{" + expr(s->expr) + "}) {");
+                block(s->body);
+                line("}");
+                break;
+            }
+            case Stmt::K::Func: {
+                string params;
+                for (size_t i = 0; i < s->params.size(); ++i) {
+                    if (i) params += ", ";
+                    params += "$" + s->params[i];
+                }
+                string decl = params.empty() ? "" : "my (" + params + ") = @_; ";
+                line("sub " + s->name + " {");
+                ++indent;
+                line(decl + "# 参数");
+                declare(s->body, indent * 4);
+                for (const auto& st : s->body) stmt(st);
+                line("return undef;");
+                --indent;
+                line("}");
+                break;
+            }
+            case Stmt::K::Return:
+                line("return " + (s->expr ? expr(s->expr) : "undef") + ";");
+                break;
+            case Stmt::K::Break: line("last;"); break;
+            case Stmt::K::Continue: line("next;"); break;
+            case Stmt::K::ExprStmt: line(expr(s->expr) + ";"); break;
+            case Stmt::K::Import: {
+                string libs;
+                for (size_t k = 0; k < s->imports.size(); ++k) {
+                    if (k) libs += "、";
+                    libs += s->imports[k];
+                }
+                if (!libs.empty())
+                    warns.push_back("第 " + std::to_string(s->line) + " 行：依赖「" + libs +
+                                    "」没有自动补，目标工程里按需自备");
+                break;
+            }
+            case Stmt::K::Export:
+                break;
+            case Stmt::K::Match:
+                diag(s->line, "匹配暂不翻译");
+                break;
+            case Stmt::K::Try:
+                line("eval {");
+                block(s->body);
+                line("};");
+                line("if ($@) {");
+                ++indent;
+                if (!s->name.empty()) line("my $" + s->name + " = $@;");
+                for (const auto& st : s->elseBody) stmt(st);
+                --indent;
+                line("}");
+                break;
+        }
+    }
+    string generate() {
+        declare(program, 0);
+        for (const auto& s : program) stmt(s);
+        vector<string> keep;
+        for (const auto& w : warns)
+            if (!(w.find("「数学库」") != string::npos || w.find("「随机库」") != string::npos)) keep.push_back(w);
+        warns = keep;
+        std::ostringstream head;
+        head << "#!/usr/bin/env perl\n";
+        head << "# 由「文」外派库生成 · WEN-LANG-0.3\n";
+        head << "use strict;\n";
+        head << "use utf8;\n";
+        head << "no warnings 'uninitialized';\n";
+        head << "binmode(STDOUT, ':utf8');\n";
+        head << "sub _文数 {\n";
+        head << "    my $d = shift;\n";
+        head << "    return '0' if $d == 0;\n";
+        head << "    my $a = abs($d);\n";
+        head << "    if ($a < 1e-9 || $a >= 1e17) { return sprintf('%.6e', $d); }\n";
+        head << "    if ($d == int($d)) { return sprintf('%.0f', $d); }\n";
+        head << "    my $s = sprintf('%.16g', $d);\n";
+        head << "    if ($s =~ /[eE]/) { $s = sprintf('%.16f', $d); $s =~ s/0+$//; $s =~ s/\\.$//; }\n";
+        head << "    return $s;\n";
+        head << "}\n";
+        head << "sub _文值 {\n";
+        head << "    my $v = shift;\n";
+        head << "    return '空' unless defined $v;\n";
+        head << "    if (ref $v eq 'ARRAY') { return '[' . join(', ', map { _文值($_) } @$v) . ']'; }\n";
+        head << "    if (ref $v eq 'HASH') { my @p; for my $k (sort keys %$v) { push @p, _文值($k) . ': ' . _文值($v->{$k}); } return '{' . join(', ', @p) . '}'; }\n";
+        head << "    return '\"' . $v . '\"';\n";
+        head << "}\n";
+        head << "sub _文 {\n";
+        head << "    my $v = shift;\n";
+        head << "    return '空' unless defined $v;\n";
+        head << "    if (ref $v eq 'ARRAY') { return '[' . join(', ', map { _文值($_) } @$v) . ']'; }\n";
+        head << "    if (ref $v eq 'HASH') { my @p; for my $k (sort keys %$v) { push @p, _文值($k) . ': ' . _文值($v->{$k}); } return '{' . join(', ', @p) . '}'; }\n";
+        head << "    return _文数($v) if ($v =~ /^-?(\\d+\\.?\\d*|\\.\\d+)([eE][-+]?\\d+)?$/);\n";
+        head << "    return \"$v\";\n";
+        head << "}\n";
+        head << "sub _长 { my $v = shift; return 0 unless defined $v; if (ref $v eq 'ARRAY') { return scalar(@$v); } if (ref $v eq 'HASH') { return scalar(keys %$v); } return length($v); }\n";
+        head << "sub _范围 { my $n = shift; my $n2 = int($n); return () if ($n2 <= 0); return (0 .. ($n2 - 1)); }\n";
+        head << "sub _求和 { my $a = shift; my $s = 0; $s += $_ for @$a; return $s; }\n";
+        head << "sub _最大 { return $_[0] > $_[1] ? $_[0] : $_[1]; }\n";
+        head << "sub _最小 { return $_[0] < $_[1] ? $_[0] : $_[1]; }\n";
+        head << "sub _随机整数 { my ($a, $b) = @_; return $a + int(rand($b - $a + 1)); }\n";
+        head << "sub _等 { my ($a, $b) = @_; return ($a eq $b) ? 1 : 0; }\n";
+        head << "sub _包含 { my ($a, $b) = @_; return 0 unless defined $b; if (ref $b eq 'ARRAY') { for my $x (@$b) { return 1 if $x eq $a; } return 0; } return index($b, $a) >= 0 ? 1 : 0; }\n";
+        return head.str() + out.str();
+    }
+};
+
+struct PhpEmitter {
+    const vector<StmtPtr>& program;
+    vector<string> diags;
+    vector<string> warns;
+    std::ostringstream out;
+    int indent = 0;
+    std::set<string> userFuncs;
+
+    explicit PhpEmitter(const vector<StmtPtr>& p) : program(p) { collectFuncs(p); }
+    void collectFuncs(const vector<StmtPtr>& ps) {
+        for (const auto& s : ps) {
+            if (!s) continue;
+            if (s->k == Stmt::K::Func) userFuncs.insert(s->name);
+            collectFuncs(s->body);
+            collectFuncs(s->elseBody);
+            collectFuncs(s->finallyBody);
+            for (const auto& br : s->branches) collectFuncs(br.second);
+        }
+    }
+    void diag(int line, const string& msg) {
+        diags.push_back("第 " + std::to_string(line) + " 行：" + msg);
+    }
+    void line(const string& x) { out << string(indent * 4, ' ') << x << "\n"; }
+    static string q(const string& v) {
+        string o = "'";
+        for (char c : v) {
+            if (c == '\\') o += "\\\\";
+            else if (c == '\'') o += "\\'";
+            else o += c;
+        }
+        return o + "'";
+    }
+    static string num(double d) {
+        std::ostringstream x;
+        x << std::setprecision(17) << d;
+        return x.str();
+    }
+    string expr(const ExprPtr& e) {
+        if (!e) return "null";
+        switch (e->k) {
+            case Expr::K::Num: return num(e->num);
+            case Expr::K::Str: return q(e->text);
+            case Expr::K::Bool: return e->b ? "true" : "false";
+            case Expr::K::None: return "null";
+            case Expr::K::Var:
+                if (e->text == "圆周率" || e->text == "π") return "M_PI";
+                if (e->text == "自然常数") return "M_E";
+                return "$" + e->text;
+            case Expr::K::Unary: {
+                string a = expr(e->args[0]);
+                if (e->op == "非") return "(!" + a + ")";
+                if (e->op == "插值") return "(strval(" + a + "))";
+                if (e->op == "√") return "sqrt(" + a + ")";
+                return "(-" + a + ")";
+            }
+            case Expr::K::Binary: {
+                string a = expr(e->args[0]), b = expr(e->args[1]);
+                string op = e->op;
+                if (op == "且") return "(" + a + " && " + b + ")";
+                if (op == "或") return "(" + a + " || " + b + ")";
+                if (op == "包含") return "_包含(" + a + ", " + b + ")";
+                if (op == "不包含") return "(!_包含(" + a + ", " + b + "))";
+                if (op == "==") return "_等(" + a + ", " + b + ")";
+                if (op == "!=") return "(!_等(" + a + ", " + b + "))";
+                if (op == "**") return "pow(" + a + ", " + b + ")";
+                if (op == "//") return "intval(floor((" + a + ") / (" + b + ")))";
+                return "(" + a + " " + op + " " + b + ")";
+            }
+            case Expr::K::Call: {
+                string name = e->args[0]->k == Expr::K::Var ? e->args[0]->text : "";
+                if (name == "长度" && e->args.size() == 2) return "_长(" + expr(e->args[1]) + ")";
+                if (name == "范围" && e->args.size() == 2) return "_范围(" + expr(e->args[1]) + ")";
+                if (name == "绝对值" && e->args.size() == 2) return "abs(" + expr(e->args[1]) + ")";
+                if (name == "取整" && e->args.size() == 2) return "intval(" + expr(e->args[1]) + ")";
+                if (name == "最大" && e->args.size() >= 3) return "max(" + expr(e->args[1]) + ", " + expr(e->args[2]) + ")";
+                if (name == "最小" && e->args.size() >= 3) return "min(" + expr(e->args[1]) + ", " + expr(e->args[2]) + ")";
+                if (name == "求和" && e->args.size() == 2) return "array_sum(" + expr(e->args[1]) + ")";
+                if (name == "键" && e->args.size() == 2) return "array_keys(" + expr(e->args[1]) + ")";
+                if (name == "值" && e->args.size() == 2) return "array_values(" + expr(e->args[1]) + ")";
+                if (name == "有键" && e->args.size() == 3) return "array_key_exists(" + expr(e->args[2]) + ", " + expr(e->args[1]) + ")";
+                if (name == "随机" && e->args.size() == 1) return "(mt_rand() / mt_getrandmax())";
+                if (name == "随机整数" && e->args.size() >= 3) return "mt_rand(" + expr(e->args[1]) + ", " + expr(e->args[2]) + ")";
+                static const std::map<string, string> mathNames = {
+                    {"平方根", "sqrt"}, {"正弦", "sin"}, {"余弦", "cos"}, {"正切", "tan"},
+                    {"反余弦", "acos"}, {"反正弦", "asin"}, {"反正切", "atan"},
+                    {"指数", "exp"}, {"对数", "log"}, {"对数10", "log10"},
+                    {"向上取整", "ceil"}, {"向下取整", "floor"}};
+                auto mit = userFuncs.count(name) ? mathNames.end() : mathNames.find(name);
+                if (mit != mathNames.end()) {
+                    string r = mit->second + "(";
+                    for (size_t i = 1; i < e->args.size(); ++i) {
+                        if (i > 1) r += ", ";
+                        r += expr(e->args[i]);
+                    }
+                    return r + ")";
+                }
+                string callee = userFuncs.count(name) ? name : expr(e->args[0]);
+                string r = callee + "(";
+                for (size_t i = 1; i < e->args.size(); ++i) {
+                    if (i > 1) r += ", ";
+                    r += expr(e->args[i]);
+                }
+                return r + ")";
+            }
+            case Expr::K::Index: return "(" + expr(e->args[0]) + ")[" + expr(e->args[1]) + "]";
+            case Expr::K::Slice: {
+                string o = expr(e->args[0]);
+                string a = e->args.size() > 1 && e->args[1] ? expr(e->args[1]) : "0";
+                string b = e->args.size() > 2 && e->args[2] ? expr(e->args[2]) : "_长(" + o + ")";
+                return "array_slice(" + o + ", " + a + ", (" + b + ") - (" + a + "))";
+            }
+            case Expr::K::List: {
+                string r = "array(";
+                for (size_t i = 0; i < e->args.size(); ++i) {
+                    if (i) r += ", ";
+                    r += expr(e->args[i]);
+                }
+                return r + ")";
+            }
+            case Expr::K::Dict: {
+                string r = "array(";
+                for (size_t i = 0; i < e->pairs.size(); ++i) {
+                    if (i) r += ", ";
+                    r += expr(e->pairs[i].first) + " => " + expr(e->pairs[i].second);
+                }
+                return r + ")";
+            }
+        }
+        return "null";
+    }
+    void block(const vector<StmtPtr>& body) {
+        ++indent;
+        for (const auto& s : body) stmt(s);
+        --indent;
+    }
+    void stmt(const StmtPtr& s) {
+        if (!s) return;
+        switch (s->k) {
+            case Stmt::K::Assign:
+                if (s->target->k == Expr::K::Var)
+                    line("$" + s->target->text + " = " + expr(s->expr) + ";");
+                else if (s->target->k == Expr::K::Index)
+                    line(expr(s->target) + " = " + expr(s->expr) + ";");
+                else
+                    diag(s->line, "外派只支持变量/下标赋值");
+                break;
+            case Stmt::K::Print: {
+                string r = "echo ";
+                for (size_t i = 0; i < s->args.size(); ++i) {
+                    if (i) r += ", ' ', ";
+                    r += "_文(" + expr(s->args[i]) + ")";
+                }
+                line(r + ", \"\\n\";");
+                break;
+            }
+            case Stmt::K::If:
+                for (size_t i = 0; i < s->branches.size(); ++i) {
+                    line(string(i == 0 ? "if (" : "elseif (") + expr(s->branches[i].first) + ") {");
+                    block(s->branches[i].second);
+                    line("}");
+                }
+                if (!s->elseBody.empty()) {
+                    line("else {");
+                    block(s->elseBody);
+                    line("}");
+                }
+                break;
+            case Stmt::K::While:
+                line("while (" + expr(s->expr) + ") {");
+                block(s->body);
+                line("}");
+                break;
+            case Stmt::K::For:
+                if (!s->name2.empty())
+                    line("foreach (" + expr(s->expr) + " as $" + s->name + " => $" + s->name2 + ") {");
+                else
+                    line("foreach (" + expr(s->expr) + " as $" + s->name + ") {");
+                block(s->body);
+                line("}");
+                break;
+            case Stmt::K::Func: {
+                string p;
+                for (size_t i = 0; i < s->params.size(); ++i) {
+                    if (i) p += ", ";
+                    p += "$" + s->params[i];
+                }
+                line("function " + s->name + "(" + p + ") {");
+                block(s->body);
+                line("}");
+                break;
+            }
+            case Stmt::K::Return:
+                line("return " + (s->expr ? expr(s->expr) : "null") + ";");
+                break;
+            case Stmt::K::Break: line("break;"); break;
+            case Stmt::K::Continue: line("continue;"); break;
+            case Stmt::K::ExprStmt: line(expr(s->expr) + ";"); break;
+            case Stmt::K::Import: {
+                string libs;
+                for (size_t k = 0; k < s->imports.size(); ++k) {
+                    if (k) libs += "、";
+                    libs += s->imports[k];
+                }
+                if (!libs.empty())
+                    warns.push_back("第 " + std::to_string(s->line) + " 行：依赖「" + libs +
+                                    "」没有自动补，目标工程里按需自备");
+                break;
+            }
+            case Stmt::K::Export: break;
+            case Stmt::K::Match: diag(s->line, "匹配暂不翻译"); break;
+            case Stmt::K::Try:
+                line("try {");
+                block(s->body);
+                line("} catch (Exception $__e) {");
+                ++indent;
+                if (!s->name.empty()) line("$" + s->name + " = $__e->getMessage();");
+                for (const auto& st : s->elseBody) stmt(st);
+                --indent;
+                line("}");
+                break;
+        }
+    }
+    string generate() {
+        for (const auto& s : program) stmt(s);
+        vector<string> keep;
+        for (const auto& w : warns)
+            if (!(w.find("「数学库」") != string::npos || w.find("「随机库」") != string::npos)) keep.push_back(w);
+        warns = keep;
+        std::ostringstream head;
+        head << "<?php\n";
+        head << "// 由「文」外派库生成 · WEN-LANG-0.3\n";
+        head << "function _文数($v) {\n";
+        head << "    $d = (float)$v;\n";
+        head << "    if ($d == 0.0) { return '0'; }\n";
+        head << "    $a = abs($d);\n";
+        head << "    if ($a < 1e-9 || $a >= 1e17) { return sprintf('%.6e', $d); }\n";
+        head << "    if ($d == floor($d)) { return sprintf('%.0f', $d); }\n";
+        head << "    $x = sprintf('%.16G', $d);\n";
+        head << "    if (stripos($x, 'E') !== false) {\n";
+        head << "        $x = rtrim(sprintf('%.16F', $d), '0');\n";
+        head << "        $x = rtrim($x, '.');\n";
+        head << "    }\n";
+        head << "    return $x;\n";
+        head << "}\n";
+        head << "function _文值($v) {\n";
+        head << "    if ($v === null) { return '空'; }\n";
+        head << "    if (is_bool($v)) { return $v ? '真' : '假'; }\n";
+        head << "    if (is_array($v)) { return '[' . implode(', ', array_map('_文值', $v)) . ']'; }\n";
+        head << "    if (is_string($v)) { return '\"' . $v . '\"'; }\n";
+        head << "    return _文($v);\n";
+        head << "}\n";
+        head << "function _文($v) {\n";
+        head << "    if ($v === null) { return '空'; }\n";
+        head << "    if (is_bool($v)) { return $v ? '真' : '假'; }\n";
+        head << "    if (is_array($v)) { return '[' . implode(', ', array_map('_文值', $v)) . ']'; }\n";
+        head << "    if (is_int($v) || is_float($v)) { return _文数($v); }\n";
+        head << "    return (string)$v;\n";
+        head << "}\n";
+        head << "function _长($v) { if (is_array($v)) { return count($v); } if (is_string($v)) { return strlen($v); } return 0; }\n";
+        head << "function _范围($n) { $r = array(); for ($i = 0; $i < $n; $i++) { $r[] = $i; } return $r; }\n";
+        head << "function _等($a, $b) { if (is_numeric($a) && is_numeric($b)) { return ($a + 0) == ($b + 0); } return $a === $b; }\n";
+        head << "function _包含($a, $b) { if (is_array($b)) { return in_array($a, $b); } if (is_string($b)) { return strpos($b, (string)$a) !== false; } return false; }\n";
+        return head.str() + out.str();
+    }
+};
+
+struct RubyEmitter {
+    const vector<StmtPtr>& program;
+    vector<string> diags;
+    vector<string> warns;
+    std::ostringstream out;
+    int indent = 0;
+    std::set<string> userFuncs;
+
+    explicit RubyEmitter(const vector<StmtPtr>& p) : program(p) { collectFuncs(p); }
+    void collectFuncs(const vector<StmtPtr>& ps) {
+        for (const auto& s : ps) {
+            if (!s) continue;
+            if (s->k == Stmt::K::Func) userFuncs.insert(s->name);
+            collectFuncs(s->body);
+            collectFuncs(s->elseBody);
+            collectFuncs(s->finallyBody);
+            for (const auto& br : s->branches) collectFuncs(br.second);
+        }
+    }
+    void diag(int line, const string& msg) {
+        diags.push_back("第 " + std::to_string(line) + " 行：" + msg);
+    }
+    void line(const string& x) { out << string(indent * 4, ' ') << x << "\n"; }
+    static string q(const string& v) {
+        string o = "'";
+        for (char c : v) {
+            if (c == '\\') o += "\\\\";
+            else if (c == '\'') o += "\\'";
+            else o += c;
+        }
+        return o + "'";
+    }
+    static string num(double d) {
+        std::ostringstream x;
+        x << std::setprecision(17) << d;
+        return x.str();
+    }
+    string expr(const ExprPtr& e) {
+        if (!e) return "nil";
+        switch (e->k) {
+            case Expr::K::Num: return num(e->num);
+            case Expr::K::Str: return q(e->text);
+            case Expr::K::Bool: return e->b ? "true" : "false";
+            case Expr::K::None: return "nil";
+            case Expr::K::Var:
+                if (e->text == "圆周率" || e->text == "π") return "Math::PI";
+                if (e->text == "自然常数") return "Math::E";
+                return e->text;
+            case Expr::K::Unary: {
+                string a = expr(e->args[0]);
+                if (e->op == "非") return "(not (" + a + "))";
+                if (e->op == "插值") return "(" + a + ").to_s";
+                if (e->op == "√") return "Math.sqrt(" + a + ")";
+                return "(-(" + a + "))";
+            }
+            case Expr::K::Binary: {
+                string a = expr(e->args[0]), b = expr(e->args[1]);
+                string op = e->op;
+                if (op == "且") return "((" + a + ") && (" + b + "))";
+                if (op == "或") return "((" + a + ") || (" + b + "))";
+                if (op == "包含") return "_包含(" + a + ", " + b + ")";
+                if (op == "不包含") return "(not _包含(" + a + ", " + b + "))";
+                if (op == "==") return "_等(" + a + ", " + b + ")";
+                if (op == "!=") return "(not _等(" + a + ", " + b + "))";
+                if (op == "//") return "((" + a + ").div(" + b + "))";
+                if (op == "**") return "((" + a + ") ** (" + b + "))";
+                return "((" + a + ") " + op + " (" + b + "))";
+            }
+            case Expr::K::Call: {
+                string name = e->args[0]->k == Expr::K::Var ? e->args[0]->text : "";
+                if (name == "长度" && e->args.size() == 2) return "_长(" + expr(e->args[1]) + ")";
+                if (name == "范围" && e->args.size() == 2) return "_范围(" + expr(e->args[1]) + ")";
+                if (name == "绝对值" && e->args.size() == 2) return "(" + expr(e->args[1]) + ").abs";
+                if (name == "取整" && e->args.size() == 2) return "(" + expr(e->args[1]) + ").truncate";
+                if (name == "最大" && e->args.size() >= 3) return "[" + expr(e->args[1]) + ", " + expr(e->args[2]) + "].max";
+                if (name == "最小" && e->args.size() >= 3) return "[" + expr(e->args[1]) + ", " + expr(e->args[2]) + "].min";
+                if (name == "求和" && e->args.size() == 2) return "(" + expr(e->args[1]) + ").sum";
+                if (name == "键" && e->args.size() == 2) return "(" + expr(e->args[1]) + ").keys.sort";
+                if (name == "值" && e->args.size() == 2) return "(" + expr(e->args[1]) + ").values";
+                if (name == "有键" && e->args.size() == 3) return "(" + expr(e->args[1]) + ").key?(" + expr(e->args[2]) + ")";
+                if (name == "随机" && e->args.size() == 1) return "rand()";
+                if (name == "随机整数" && e->args.size() >= 3) return "rand(" + expr(e->args[1]) + ".." + expr(e->args[2]) + ")";
+                static const std::map<string, string> mathNames = {
+                    {"平方根", "Math.sqrt"}, {"正弦", "Math.sin"}, {"余弦", "Math.cos"}, {"正切", "Math.tan"},
+                    {"反余弦", "Math.acos"}, {"反正弦", "Math.asin"}, {"反正切", "Math.atan"},
+                    {"指数", "Math.exp"}, {"对数", "Math.log"}, {"对数10", "Math.log10"},
+                    {"向上取整", "CEIL"}, {"向下取整", "FLOOR"}};
+                auto mit = userFuncs.count(name) ? mathNames.end() : mathNames.find(name);
+                if (mit != mathNames.end()) {
+                    string a1 = e->args.size() > 1 ? expr(e->args[1]) : "0";
+                    if (mit->second == "CEIL") return "(" + a1 + ").ceil";
+                    if (mit->second == "FLOOR") return "(" + a1 + ").floor";
+                    return mit->second + "(" + a1 + ")";
+                }
+                string callee = userFuncs.count(name) ? name : expr(e->args[0]);
+                string r = callee + "(";
+                for (size_t i = 1; i < e->args.size(); ++i) {
+                    if (i > 1) r += ", ";
+                    r += expr(e->args[i]);
+                }
+                return r + ")";
+            }
+            case Expr::K::Index: return "(" + expr(e->args[0]) + ")[" + expr(e->args[1]) + "]";
+            case Expr::K::Slice: {
+                string o = expr(e->args[0]);
+                string a = e->args.size() > 1 && e->args[1] ? expr(e->args[1]) : "0";
+                string b = e->args.size() > 2 && e->args[2] ? expr(e->args[2]) : "_长(" + o + ")";
+                return "(" + o + ")[" + a + "...(" + b + ")]";
+            }
+            case Expr::K::List: {
+                string r = "[";
+                for (size_t i = 0; i < e->args.size(); ++i) {
+                    if (i) r += ", ";
+                    r += expr(e->args[i]);
+                }
+                return r + "]";
+            }
+            case Expr::K::Dict: {
+                string r = "{";
+                for (size_t i = 0; i < e->pairs.size(); ++i) {
+                    if (i) r += ", ";
+                    r += expr(e->pairs[i].first) + " => " + expr(e->pairs[i].second);
+                }
+                return r + "}";
+            }
+        }
+        return "nil";
+    }
+    void block(const vector<StmtPtr>& body) {
+        ++indent;
+        for (const auto& s : body) stmt(s);
+        --indent;
+    }
+    void stmt(const StmtPtr& s) {
+        if (!s) return;
+        switch (s->k) {
+            case Stmt::K::Assign:
+                if (s->target->k == Expr::K::Var)
+                    line(s->target->text + " = " + expr(s->expr));
+                else if (s->target->k == Expr::K::Index)
+                    line(expr(s->target) + " = " + expr(s->expr));
+                else
+                    diag(s->line, "外派只支持变量/下标赋值");
+                break;
+            case Stmt::K::Print: {
+                string r = "puts [";
+                for (size_t i = 0; i < s->args.size(); ++i) {
+                    if (i) r += ", ";
+                    r += "_文(" + expr(s->args[i]) + ")";
+                }
+                line(r + "].join(' ')");
+                break;
+            }
+            case Stmt::K::If:
+                for (size_t i = 0; i < s->branches.size(); ++i) {
+                    line(string(i == 0 ? "if " : "elsif ") + expr(s->branches[i].first));
+                    block(s->branches[i].second);
+                }
+                if (!s->elseBody.empty()) {
+                    line("else");
+                    block(s->elseBody);
+                }
+                line("end");
+                break;
+            case Stmt::K::While:
+                line("while " + expr(s->expr));
+                block(s->body);
+                line("end");
+                break;
+            case Stmt::K::For:
+                if (!s->name2.empty())
+                    line("(" + expr(s->expr) + ").each do |" + s->name + ", " + s->name2 + "|");
+                else
+                    line("(" + expr(s->expr) + ").each do |" + s->name + "|");
+                block(s->body);
+                line("end");
+                break;
+            case Stmt::K::Func: {
+                string p;
+                for (size_t i = 0; i < s->params.size(); ++i) {
+                    if (i) p += ", ";
+                    p += s->params[i];
+                }
+                line("def " + s->name + "(" + p + ")");
+                block(s->body);
+                line("end");
+                break;
+            }
+            case Stmt::K::Return:
+                line("return " + (s->expr ? expr(s->expr) : "nil"));
+                break;
+            case Stmt::K::Break: line("break"); break;
+            case Stmt::K::Continue: line("next"); break;
+            case Stmt::K::ExprStmt: line(expr(s->expr)); break;
+            case Stmt::K::Import: {
+                string libs;
+                for (size_t k = 0; k < s->imports.size(); ++k) {
+                    if (k) libs += "、";
+                    libs += s->imports[k];
+                }
+                if (!libs.empty())
+                    warns.push_back("第 " + std::to_string(s->line) + " 行：依赖「" + libs +
+                                    "」没有自动补，目标工程里按需自备");
+                break;
+            }
+            case Stmt::K::Export: break;
+            case Stmt::K::Match: diag(s->line, "匹配暂不翻译"); break;
+            case Stmt::K::Try:
+                line("begin");
+                block(s->body);
+                line("rescue StandardError => __e");
+                ++indent;
+                if (!s->name.empty()) line(s->name + " = __e.message");
+                for (const auto& st : s->elseBody) stmt(st);
+                --indent;
+                line("end");
+                break;
+        }
+    }
+    string generate() {
+        for (const auto& s : program) stmt(s);
+        vector<string> keep;
+        for (const auto& w : warns)
+            if (!(w.find("「数学库」") != string::npos || w.find("「随机库」") != string::npos)) keep.push_back(w);
+        warns = keep;
+        std::ostringstream head;
+        head << "# 由「文」外派库生成 · WEN-LANG-0.3\n";
+        head << "# frozen_string_literal: false\n";
+        head << "def _文数(v)\n";
+        head << "  d = v.to_f\n";
+        head << "  return '0' if d == 0\n";
+        head << "  a = d.abs\n";
+        head << "  return format('%.6e', d) if (a < 1e-9 || a >= 1e17)\n";
+        head << "  return format('%.0f', d) if d == d.floor\n";
+        head << "  x = format('%.16g', d)\n";
+        head << "  if x.include?('e') || x.include?('E')\n";
+        head << "    x = format('%.16f', d).sub(/0+\\z/, '').sub(/\\.\\z/, '')\n";
+        head << "  end\n";
+        head << "  x\n";
+        head << "end\n";
+        head << "def _文值(v)\n";
+        head << "  return '空' if v.nil?\n";
+        head << "  return (v ? '真' : '假') if v == true || v == false\n";
+        head << "  return '\"' + v.to_s + '\"' if v.is_a?(String)\n";
+        head << "  return '[' + v.map { |x| _文值(x) }.join(', ') + ']' if v.is_a?(Array)\n";
+        head << "  return '{' + v.keys.sort.map { |k| _文值(k) + ': ' + _文值(v[k]) }.join(', ') + '}' if v.is_a?(Hash)\n";
+        head << "  _文(v)\n";
+        head << "end\n";
+        head << "def _文(v)\n";
+        head << "  return '空' if v.nil?\n";
+        head << "  return (v ? '真' : '假') if v == true || v == false\n";
+        head << "  return '[' + v.map { |x| _文值(x) }.join(', ') + ']' if v.is_a?(Array)\n";
+        head << "  return '{' + v.keys.sort.map { |k| _文值(k) + ': ' + _文值(v[k]) }.join(', ') + '}' if v.is_a?(Hash)\n";
+        head << "  return _文数(v) if v.is_a?(Numeric)\n";
+        head << "  v.to_s\n";
+        head << "end\n";
+        head << "def _长(v)\n";
+        head << "  return 0 if v.nil?\n";
+        head << "  return v.length if v.is_a?(String) || v.is_a?(Array) || v.is_a?(Hash)\n";
+        head << "  0\n";
+        head << "end\n";
+        head << "def _范围(n)\n";
+        head << "  m = n.to_i\n";
+        head << "  return [] if m <= 0\n";
+        head << "  (0...m).to_a\n";
+        head << "end\n";
+        head << "def _等(a, b)\n";
+        head << "  return a == b if (a.is_a?(Numeric) && b.is_a?(Numeric))\n";
+        head << "  a.to_s == b.to_s\n";
+        head << "end\n";
+        head << "def _包含(a, b)\n";
+        head << "  return b.include?(a) if b.is_a?(Array)\n";
+        head << "  return b.include?(a.to_s) if b.is_a?(String)\n";
+        head << "  false\n";
+        head << "end\n";
+        head << "def _最大(a, b)\n  a > b ? a : b\nend\n";
+        head << "def _最小(a, b)\n  a < b ? a : b\nend\n";
+        return head.str() + out.str();
     }
 };
 
@@ -9930,6 +11126,13 @@ struct JavaEmitter {
     }
     string generate() {
         std::ostringstream head;
+        {
+            vector<string> keep;
+            for (const auto& w : warns)
+                if (w.find("「数学库」") == string::npos && w.find("「随机库」") == string::npos)
+                    keep.push_back(w);
+            warns = keep;
+        }
         head << "// 由「文」外派库生成 · WEN-LANG-0.3\nimport java.util.*;\n\npublic class Main {\n";
         head << R"JAVA(static class W {
     static void print(Object... a) {
@@ -12524,6 +13727,10 @@ Interpreter::Interpreter() {
         l->items.push_back(vStr("json"));
         l->items.push_back(vStr("java"));
         l->items.push_back(vStr("typescript"));
+        l->items.push_back(vStr("powershell"));
+        l->items.push_back(vStr("perl"));
+        l->items.push_back(vStr("php"));
+        l->items.push_back(vStr("ruby"));
         return vList(l);
     });
     registerBuiltin("外派目标", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
@@ -12548,12 +13755,14 @@ Interpreter::Interpreter() {
         vector<string> diags;
         string target = externalTarget(src);
         bool ok = target == "python" || target == "javascript" || target == "js" ||
-                  target == "json" || target == "gson" || target == "java" || target == "typescript" || target == "ts";
+                  target == "json" || target == "gson" || target == "java" || target == "typescript" || target == "ts" ||
+                  target == "powershell" || target == "ps1" || target == "ps" ||
+                  target == "perl" || target == "pl" || target == "php" || target == "ruby" || target == "rb";
         if (target.empty())
             diags.push_back("第 1 行：缺少外派目标；第一行写「# 外派: python」");
         else if (!ok)
             diags.push_back("第 1 行：目标「" + target +
-                            "」的适配器未安装；当前支持 python / javascript / typescript / json / java");
+                            "」的适配器未安装；当前支持 python / javascript / typescript / json / java / powershell / perl / php / ruby");
         if (ok) {
             try {
                 Interpreter sub;
@@ -12569,6 +13778,22 @@ Interpreter::Interpreter() {
                     em.generate();
                 } else if (target == "java") {
                     JavaEmitter em(program);
+                    em.generate();
+                    for (const auto& d : em.diags) diags.push_back(d);
+                } else if (target == "powershell" || target == "ps1" || target == "ps") {
+                    PsEmitter em(program);
+                    em.generate();
+                    for (const auto& d : em.diags) diags.push_back(d);
+                } else if (target == "perl" || target == "pl") {
+                    PerlEmitter em(program);
+                    em.generate();
+                    for (const auto& d : em.diags) diags.push_back(d);
+                } else if (target == "php") {
+                    PhpEmitter em(program);
+                    em.generate();
+                    for (const auto& d : em.diags) diags.push_back(d);
+                } else if (target == "ruby" || target == "rb") {
+                    RubyEmitter em(program);
                     em.generate();
                     for (const auto& d : em.diags) diags.push_back(d);
                 } else {
@@ -12602,12 +13827,14 @@ Interpreter::Interpreter() {
         vector<string> warns;
         string target = externalTarget(src);
         bool ok = target == "python" || target == "javascript" || target == "js" ||
-                  target == "json" || target == "gson" || target == "java" || target == "typescript" || target == "ts";
+                  target == "json" || target == "gson" || target == "java" || target == "typescript" || target == "ts" ||
+                  target == "powershell" || target == "ps1" || target == "ps" ||
+                  target == "perl" || target == "pl" || target == "php" || target == "ruby" || target == "rb";
         if (target.empty())
             diags.push_back("第 1 行：缺少外派目标；第一行写「# 外派: python」");
         else if (!ok)
             diags.push_back("第 1 行：目标「" + target +
-                            "」的适配器未安装；当前支持 python / javascript / typescript / json / java");
+                            "」的适配器未安装；当前支持 python / javascript / typescript / json / java / powershell / perl / php / ruby");
         string code;
         if (ok) {
             try {
@@ -12625,6 +13852,26 @@ Interpreter::Interpreter() {
                     code = em.generate();
                 } else if (target == "java") {
                     JavaEmitter em(program);
+                    code = em.generate();
+                    for (const auto& d : em.diags) diags.push_back(d);
+                    for (const auto& d : em.warns) warns.push_back(d);
+                } else if (target == "powershell" || target == "ps1" || target == "ps") {
+                    PsEmitter em(program);
+                    code = em.generate();
+                    for (const auto& d : em.diags) diags.push_back(d);
+                    for (const auto& d : em.warns) warns.push_back(d);
+                } else if (target == "perl" || target == "pl") {
+                    PerlEmitter em(program);
+                    code = em.generate();
+                    for (const auto& d : em.diags) diags.push_back(d);
+                    for (const auto& d : em.warns) warns.push_back(d);
+                } else if (target == "php") {
+                    PhpEmitter em(program);
+                    code = em.generate();
+                    for (const auto& d : em.diags) diags.push_back(d);
+                    for (const auto& d : em.warns) warns.push_back(d);
+                } else if (target == "ruby" || target == "rb") {
+                    RubyEmitter em(program);
                     code = em.generate();
                     for (const auto& d : em.diags) diags.push_back(d);
                     for (const auto& d : em.warns) warns.push_back(d);
@@ -35168,6 +36415,10 @@ static string translateOutExt(const string& t) {
     if (t == "javascript" || t == "js") return ".js";
     if (t == "typescript" || t == "ts") return ".ts";
     if (t == "json" || t == "gson") return ".json";
+    if (t == "powershell" || t == "ps1" || t == "ps") return ".ps1";
+    if (t == "perl" || t == "pl") return ".pl";
+    if (t == "php") return ".php";
+    if (t == "ruby" || t == "rb") return ".rb";
     if (t == "java") return ".java";
     if (t == "cpp" || t == "c++" || t == "c") return ".cpp";
     if (t == "字节码" || t == "bytecode") return ".json";
@@ -35179,7 +36430,8 @@ static bool translateTargetKnown(const string& t) {
     return t == "python" || t == "py" || t == "javascript" || t == "js" ||
            t == "typescript" || t == "ts" || t == "json" || t == "gson" ||
            t == "java" || t == "cpp" || t == "c++" || t == "c" ||
-           t == "字节码" || t == "bytecode" || t == "汇编" || t == "asm";
+           t == "字节码" || t == "bytecode" || t == "汇编" || t == "asm" ||
+           t == "powershell" || t == "ps1" || t == "ps" || t == "perl" || t == "pl" || t == "php" || t == "ruby" || t == "rb";
 }
 
 static int translateFileCli(const string& path, string target, string outPath) {
@@ -35257,6 +36509,26 @@ static int translateFileCli(const string& path, string target, string outPath) {
             code = em.generate();
         } else if (lower == "java") {
             JavaEmitter em(program);
+            code = em.generate();
+            diags = em.diags;
+            warns = em.warns;
+        } else if (lower == "ruby" || lower == "rb") {
+            RubyEmitter em(program);
+            code = em.generate();
+            diags = em.diags;
+            warns = em.warns;
+        } else if (lower == "php") {
+            PhpEmitter em(program);
+            code = em.generate();
+            diags = em.diags;
+            warns = em.warns;
+        } else if (lower == "perl" || lower == "pl") {
+            PerlEmitter em(program);
+            code = em.generate();
+            diags = em.diags;
+            warns = em.warns;
+        } else if (lower == "powershell" || lower == "ps1" || lower == "ps") {
+            PsEmitter em(program);
             code = em.generate();
             diags = em.diags;
             warns = em.warns;
@@ -35448,7 +36720,7 @@ static int runMain(vector<string> args) {
             "  wen.exe --编辑                     打开本地文语编辑器：原生窗口，不开端口、不走浏览器\n"
             "  wen.exe --库源                   打印当前库源地址\n"
             "  wen.exe --不联网                 关掉依赖自动下载（审计/离线发布用）\n"
-            "  wen.exe --翻译 文件.wen [目标] [输出]  翻译成别的语言：python/javascript/typescript/json/java/cpp/字节码\n"
+            "  wen.exe --翻译 文件.wen [目标] [输出]  翻译成别的语言：python/javascript/typescript/json/java/powershell/perl/php/ruby/cpp/字节码\n"
             "                                   省略目标时读首行「# 外派: python」\n"
             "  wen.exe --验证                   自检\n"
             "  wen.exe --帮助                   本页\n"

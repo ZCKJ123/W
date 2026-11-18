@@ -62,8 +62,27 @@ $p = Start-Process -FilePath 'C:\msys64\ucrt64\bin\g++.exe' `
 if ($p.ExitCode -ne 0) { throw 'C++ 编译失败' }
 $cppOut = (((& $cppExe 2>&1) | Out-String).Trim()) -replace "`r`n", "`n"
 
+# PowerShell
+$psSrc = Join-Path $dir 'matrix_ps.wen'
+Write-Utf8 $psSrc ("# 外派: powershell`n" + $core)
+$psFile = Join-Path $dir 'matrix_ps.ps1'
+$psRunner = Join-Path $dir 'matrix_ps_runner.wen'
+Write-Utf8 $psRunner ("依赖 外派库`n外派翻译(`"$psSrc`", `"$psFile`")`n")
+Run-Exe $psRunner | Out-Null
+$psOut = (((& pwsh -NoProfile -File $psFile 2>&1) | Out-String).Trim()) -replace "`r`n", "`n"
+
+# Perl
+$plSrc = Join-Path $dir 'matrix_pl.wen'
+Write-Utf8 $plSrc ("# 外派: perl`n" + $core)
+$plFile = Join-Path $dir 'matrix_pl.pl'
+$plRunner = Join-Path $dir 'matrix_pl_runner.wen'
+Write-Utf8 $plRunner ("依赖 外派库`n外派翻译(`"$plSrc`", `"$plFile`")`n")
+Run-Exe $plRunner | Out-Null
+$plOut = (((& 'C:\msys64\usr\bin\perl.exe' $plFile 2>&1) | Out-String).Trim()) -replace "`r`n", "`n"
+
 $ok = $true
-foreach ($pair in @(@('解释器', $expected), @('字节码', $bc), @('Python', $py), @('C++', $cppOut))) {
+foreach ($pair in @(@('解释器', $expected), @('字节码', $bc), @('Python', $py), @('C++', $cppOut),
+                    @('PowerShell', $psOut), @('Perl', $plOut))) {
     if ($pair[1] -ne $expected) {
         $ok = $false
         Write-Host ("失败：{0} 输出不等价" -f $pair[0])
@@ -114,7 +133,16 @@ $cp = Start-Process -FilePath 'C:\msys64\ucrt64\bin\g++.exe' `
 if ($cp.ExitCode -ne 0) { throw 'C++ 数字文本编译失败' }
 $nc = (((& $nex 2>&1) | Out-String).Trim()) -replace "`r`n", "`n"
 
-foreach ($pair in @(@('Python 值文本', $vp, $vi), @('C++ 数字文本', $nc, $ni))) {
+$vpsSrc = Join-Path $dir 'values_ps.wen'
+Write-Utf8 $vpsSrc ($vtext -replace '# 外派: python', '# 外派: powershell')
+$vpsFile = Join-Path $dir 'values_ps.ps1'
+$vpsRunner = Join-Path $dir 'values_ps_runner.wen'
+Write-Utf8 $vpsRunner ("依赖 外派库`n外派翻译(`"$vpsSrc`", `"$vpsFile`")`n")
+Run-Exe $vpsRunner | Out-Null
+$vpsOut = (((& pwsh -NoProfile -File $vpsFile 2>&1) | Out-String).Trim()) -replace "`r`n", "`n"
+
+foreach ($pair in @(@('Python 值文本', $vp, $vi), @('C++ 数字文本', $nc, $ni),
+                    @('PowerShell 值文本', $vpsOut, $vi))) {
     if ($pair[1] -ne $pair[2]) {
         $ok = $false
         Write-Host ("失败：{0} 不等价" -f $pair[0])
@@ -124,4 +152,4 @@ foreach ($pair in @(@('Python 值文本', $vp, $vi), @('C++ 数字文本', $nc, 
 }
 
 if (-not $ok) { exit 1 }
-Write-Host ("跨目标矩阵：解释器 / 字节码 / Python / C++ 全部等价（函数+递归+√+值文本）")
+Write-Host ("跨目标矩阵：解释器 / 字节码 / Python / C++ / PowerShell / Perl 全部等价（函数+递归+√+值文本）")
