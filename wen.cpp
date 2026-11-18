@@ -34039,6 +34039,66 @@ static bool padIsKeyword(const std::wstring& w) {
     return false;
 }
 
+static int padLangOf(const std::wstring& p) {
+    std::wstring low = p;
+    for (auto& c : low) c = (wchar_t)towlower(c);
+    auto ends = [&](const wchar_t* e) {
+        size_t n = wcslen(e);
+        return low.size() >= n && low.compare(low.size() - n, n, e) == 0;
+    };
+    if (ends(L".wen")) return 0;
+    if (ends(L".json") || ends(L".jsonc")) return 2;
+    if (ends(L".html") || ends(L".htm") || ends(L".xml") || ends(L".svg") || ends(L".xaml")) return 3;
+    if (ends(L".md") || ends(L".markdown")) return 4;
+    if (ends(L".c") || ends(L".h") || ends(L".cpp") || ends(L".hpp") || ends(L".cc") ||
+        ends(L".cs") || ends(L".java") || ends(L".js") || ends(L".ts") || ends(L".jsx") ||
+        ends(L".tsx") || ends(L".go") || ends(L".rs") || ends(L".py") || ends(L".ps1") ||
+        ends(L".bat") || ends(L".cmd") || ends(L".sh") || ends(L".lua") || ends(L".sql") ||
+        ends(L".yml") || ends(L".yaml") || ends(L".toml") || ends(L".ini") || ends(L".css")) return 1;
+    return 5;
+}
+
+static std::wstring padLangName(const std::wstring& p) {
+    switch (padLangOf(p)) {
+        case 0: return L"文语";
+        case 1: return L"源码";
+        case 2: return L"JSON";
+        case 3: return L"标记";
+        case 4: return L"Markdown";
+        default: return L"文本";
+    }
+}
+
+static bool padHashLang(const std::wstring& p) {
+    std::wstring low = p;
+    for (auto& c : low) c = (wchar_t)towlower(c);
+    const wchar_t* ex[] = { L".py", L".ps1", L".sh", L".yml", L".yaml", L".toml", L".ini", L".mk" };
+    for (auto e : ex) {
+        size_t n = wcslen(e);
+        if (low.size() >= n && low.compare(low.size() - n, n, e) == 0) return true;
+    }
+    return false;
+}
+
+static bool padIsKeywordCode(const std::wstring& w) {
+    static const wchar_t* kw[] = {
+        L"if", L"else", L"for", L"while", L"do", L"return", L"break", L"continue",
+        L"function", L"fn", L"def", L"class", L"struct", L"enum", L"union", L"namespace",
+        L"using", L"typedef", L"const", L"static", L"extern", L"inline", L"volatile",
+        L"let", L"var", L"new", L"delete", L"try", L"catch", L"finally", L"throw",
+        L"switch", L"case", L"default", L"public", L"private", L"protected", L"virtual",
+        L"async", L"await", L"import", L"export", L"from", L"package", L"interface",
+        L"implements", L"extends", L"instanceof", L"module", L"require",
+        L"int", L"long", L"short", L"char", L"float", L"double", L"bool", L"void", L"auto",
+        L"unsigned", L"signed", L"true", L"false", L"null", L"nullptr", L"None", L"True",
+        L"False", L"nil", L"lambda", L"yield", L"with", L"as", L"in", L"is", L"not",
+        L"and", L"or", L"print", L"sizeof", L"this", L"self", L"super",
+        L"end", L"then", L"elif", L"pass", L"raise", L"except", L"assert", L"echo", L"set"
+    };
+    for (auto k : kw) if (w == k) return true;
+    return false;
+}
+
 static void padColor(HWND re, long s, long e, COLORREF fg, bool bold) {
     if (!re || s >= e) return;
     CHARRANGE cr{ s, e };
@@ -34051,13 +34111,25 @@ static void padColor(HWND re, long s, long e, COLORREF fg, bool bold) {
     SendMessageW(re, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
 }
 
-// 整篇重着色：关键字 / 文本 / 注释 / 数字
+// 整篇重着色：按文件类型分别处理注释 / 文本 / 关键字
 static void padPaint() {
     if (!gPad || !gPad->edit) return;
     std::wstring s = padRaw(gPad->edit);
     long n = (long)s.size();
     if (n <= 0) return;
     if (n > 400000) return;   // 超大文件不着色，免得卡住
+
+    int lang = padLangOf(gPad->path);
+    bool hashCom = (lang == 0) || (lang == 4) || (lang == 1 && padHashLang(gPad->path));
+    bool slashCom = (lang == 1 && !padHashLang(gPad->path));
+    bool xmlCom = (lang == 3);
+    COLORREF comColor = (lang == 4) ? RGB(0xE8, 0xAE, 0x66) : RGB(0x5F, 0x6E, 0x70);
+    COLORREF kwColor = (lang == 0) ? RGB(0xE8, 0xAE, 0x66) : RGB(0x86, 0xA9, 0xE8);
+    auto atLineStart = [&](long p) {
+        long k = p - 1;
+        while (k >= 0 && (s[(size_t)k] == L' ' || s[(size_t)k] == L'\t')) --k;
+        return k < 0 || s[(size_t)k] == L'\n' || s[(size_t)k] == L'\r';
+    };
 
     CHARRANGE sel{};
     SendMessageW(gPad->edit, EM_EXGETSEL, 0, (LPARAM)&sel);
@@ -34076,10 +34148,41 @@ static void padPaint() {
     long i = 0;
     while (i < n) {
         wchar_t c = s[(size_t)i];
-        if (c == L'#') {
+        if (hashCom && c == L'#') {
             long j = i;
             while (j < n && s[(size_t)j] != L'\n') ++j;
-            padColor(gPad->edit, i, j, RGB(0x5F, 0x6E, 0x70), false);
+            padColor(gPad->edit, i, j, comColor, false);
+            i = j;
+            continue;
+        }
+        if (lang == 1 && !hashCom && c == L'#' && atLineStart(i)) {
+            // C/C++ 的 #include / #define：整行单独上色
+            long j = i;
+            while (j < n && s[(size_t)j] != L'\n') ++j;
+            padColor(gPad->edit, i, j, RGB(0xB2, 0x8F, 0xC6), false);
+            i = j;
+            continue;
+        }
+        if (slashCom && c == L'/' && i + 1 < n && s[(size_t)(i + 1)] == L'/') {
+            long j = i;
+            while (j < n && s[(size_t)j] != L'\n') ++j;
+            padColor(gPad->edit, i, j, comColor, false);
+            i = j;
+            continue;
+        }
+        if (slashCom && c == L'/' && i + 1 < n && s[(size_t)(i + 1)] == L'*') {
+            long j = i + 2;
+            while (j + 1 < n && !(s[(size_t)j] == L'*' && s[(size_t)(j + 1)] == L'/')) ++j;
+            j = (j + 1 < n) ? j + 2 : n;
+            padColor(gPad->edit, i, j, comColor, false);
+            i = j;
+            continue;
+        }
+        if (xmlCom && c == L'<' && i + 3 < n && s.compare((size_t)i, 4, L"<!--") == 0) {
+            long j = i + 4;
+            while (j + 2 < n && s.compare((size_t)j, 3, L"-->") != 0) ++j;
+            j = (j + 2 < n) ? j + 3 : n;
+            padColor(gPad->edit, i, j, comColor, false);
             i = j;
             continue;
         }
@@ -34105,8 +34208,12 @@ static void padPaint() {
             long j = i;
             while (j < n && padIsWordChar(s[(size_t)j])) ++j;
             std::wstring w = s.substr((size_t)i, (size_t)(j - i));
-            if (padIsKeyword(w)) padColor(gPad->edit, i, j, RGB(0xE8, 0xAE, 0x66), true);
-            else if (w[0] >= L'0' && w[0] <= L'9') padColor(gPad->edit, i, j, RGB(0xC9, 0xB2, 0x7A), false);
+            if (lang == 0) {
+                if (padIsKeyword(w)) padColor(gPad->edit, i, j, kwColor, true);
+            } else if (padIsKeywordCode(w)) {
+                padColor(gPad->edit, i, j, kwColor, true);
+            }
+            if (w[0] >= L'0' && w[0] <= L'9') padColor(gPad->edit, i, j, RGB(0xC9, 0xB2, 0x7A), false);
             i = j;
             continue;
         }
@@ -34135,7 +34242,7 @@ static void padStatusRefresh() {
     }
     std::wstring s = name + (gPad->dirty ? L" *" : L"") + L"    |    第 " +
                      std::to_wstring(line + 1) + L" 行 第 " + std::to_wstring(col + 1) +
-                     L" 列    |    UTF-8    |    文语 " + utf8ToWide(WEN_VERSION);
+                     L" 列    |    UTF-8    |    " + padLangName(gPad->path) + L" " + utf8ToWide(WEN_VERSION);
     if (!gPad->lastRun.empty()) s += L"    |    " + gPad->lastRun;
     SetWindowTextW(gPad->status, s.c_str());
 }
@@ -34344,6 +34451,21 @@ static void padTreeClear() {
     gTreePaths.clear();
 }
 
+static bool padTreeAccept(const std::wstring& low) {
+    static const wchar_t* ex[] = {
+        L".wen", L".txt", L".md", L".markdown", L".json", L".jsonc", L".csv", L".log",
+        L".c", L".h", L".cpp", L".hpp", L".cc", L".cs", L".java", L".js", L".ts", L".jsx",
+        L".tsx", L".go", L".rs", L".py", L".ps1", L".bat", L".cmd", L".sh", L".lua", L".sql",
+        L".html", L".htm", L".xml", L".svg", L".css", L".yml", L".yaml", L".toml", L".ini",
+        L".conf", L".cfg", L".props", L".vcxproj", L".sln", L".mk", L".gradle"
+    };
+    size_t dot = low.find_last_of(L'.');
+    if (dot == std::wstring::npos) return false;
+    std::wstring e = low.substr(dot);
+    for (auto x : ex) if (e == x) return true;
+    return false;
+}
+
 static void padFillTreeDir(HTREEITEM parent, const std::wstring& dir, int depth, int& budget) {
     if (budget <= 0 || depth > 6) return;
     std::vector<std::wstring> dirs, files;
@@ -34361,7 +34483,8 @@ static void padFillTreeDir(HTREEITEM parent, const std::wstring& dir, int depth,
         } else {
             std::wstring low = name;
             for (auto& c : low) c = (wchar_t)towlower(c);
-            if (low.size() > 4 && low.substr(low.size() - 4) == L".wen") files.push_back(name);
+            if (low.rfind(L"\u4e34\u65f6", 0) == 0) continue;   // 测试临时产物，不铺进树
+            if (padTreeAccept(low)) files.push_back(name);
         }
     }
     std::sort(dirs.begin(), dirs.end());
@@ -34398,6 +34521,14 @@ static void padLoadFile(const std::wstring& file) {
         return;
     }
     string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (body.size() > 8u * 1024u * 1024u) {
+        MessageBoxW(gPad->frame, L"这个文件超过 8 MB，编辑器不打开。", L"打开", MB_ICONINFORMATION);
+        return;
+    }
+    if (body.find('\0') != string::npos) {
+        MessageBoxW(gPad->frame, L"这是二进制文件，编辑器只开文本。", L"打开", MB_ICONINFORMATION);
+        return;
+    }
     padSetText(utf8ToWide(body));
     gPad->path = file;
     padSetDirty(false);
@@ -34472,6 +34603,14 @@ static void padPanelShow(bool issues) {
 
 static void padExec(bool check) {
     if (!gPad || gPad->busy) return;
+    if (!gPad->path.empty() && padLangOf(gPad->path) != 0) {
+        // 打开的是一般文件：只当文本看，别硬塞给文语编译器
+        padPanelShow(false);
+        SetWindowTextW(gPad->out, L"这个文件不是文语脚本（.wen），只用于查看和编辑，不参与运行/检查。");
+        gPad->lastRun = L"非文语脚本，已跳过";
+        padStatusRefresh();
+        return;
+    }
     std::wstring src = padText(gPad->edit);
     std::wstring tf = padTempFile();
     {
@@ -34572,14 +34711,29 @@ static bool padSaveAs() {
     OPENFILENAMEW o{};
     o.lStructSize = sizeof(o);
     o.hwndOwner = gPad->frame;
-    o.lpstrFilter = L"文语脚本 (*.wen)\0*.wen\0所有文件 (*.*)\0*.*\0";
+    o.lpstrFilter =
+        L"文语脚本 (*.wen)\0*.wen\0"
+        L"文本 (*.txt)\0*.txt\0"
+        L"Markdown (*.md)\0*.md\0"
+        L"JSON (*.json)\0*.json\0"
+        L"C/C++ (*.c;*.h;*.cpp;*.hpp)\0*.c;*.h;*.cpp;*.hpp\0"
+        L"Python (*.py)\0*.py\0"
+        L"JavaScript/TypeScript (*.js;*.ts)\0*.js;*.ts\0"
+        L"HTML/CSS (*.html;*.css)\0*.html;*.css\0"
+        L"PowerShell/批处理 (*.ps1;*.bat)\0*.ps1;*.bat\0"
+        L"所有文件 (*.*)\0*.*\0";
     o.lpstrFile = file;
     o.nMaxFile = MAX_PATH;
-    o.lpstrDefExt = L"wen";
+    o.lpstrDefExt = nullptr;
     o.Flags = OFN_OVERWRITEPROMPT | OFN_EXPLORER;
     if (!GetSaveFileNameW(&o)) return false;
     std::wstring p = file;
-    if (p.find(L'.') == std::wstring::npos) p += L".wen";
+    if (p.find(L'.') == std::wstring::npos) {
+        std::wstring src = gPad->path;
+        size_t dot = src.find_last_of(L'.');
+        if (dot != std::wstring::npos) p += src.substr(dot);
+        else p += L".wen";
+    }
     if (!padWriteTo(p)) {
         MessageBoxW(gPad->frame, L"写不进去，权限或路径有问题。", L"另存", MB_ICONWARNING);
         return false;
