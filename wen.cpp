@@ -8379,7 +8379,7 @@ static double wenCloudDensN(const WenCloudOne& c, double x, double y, double z, 
     if (rn > 1.7) rn = 1.7;
     double baseEff = c.base - c.rad * 0.018 * rn * rn;
     if (y < baseEff) return 0.0;
-    double best = 0.0, t, n[3], bn[3] = { 0.0, 1.0, 0.0 }, bmax = 0.0;
+    double best = 0.0, t, n[3], bn[3] = { 0.0, -1.0, 0.0 }, bmax = 0.0;
     double a0 = c.x * 0.31 + c.z * 0.47;
     double ca = std::cos(a0), sa = std::sin(a0);
     for (int L = 0; L < 1; ++L) {
@@ -8572,7 +8572,7 @@ static long long wenCloudRender(const shared_ptr<Dict>& vp, const shared_ptr<Lis
                     // sunDot 几乎一样，天顶就成了一块均匀的死灰，看不出起伏。
                     // 把表面法线的 y 分量接进来：鼓包朝上处亮，凹陷处暗，
                     // 阴天整片云的凹凸这才读得出来。
-                    double form = 0.62 + 0.34 * nrm[1] + 0.18 * sunDot;
+                    double form = 0.92 - 0.14 * nrm[1] + 0.10 * sunDot;
                     double lit = litH * form;
                     // 跨朵椭球遮挡已关闭：椭球是用 (底+顶)/2 那一颗做的，跟云的真实
                     // 形状对不上，重叠区会整片判定"被挡住 ×0.62"，在云中间打出一块
@@ -36446,12 +36446,12 @@ static int translateFileCli(const string& path, string target, string outPath) {
     if (lower.empty()) lower = lowerAscii(externalTarget(src));
     if (lower.empty()) {
         std::cerr << "缺少翻译目标：第一行写「# 外派: python」，或在命令里给目标\n";
-        std::cerr << "可用目标：python / javascript / typescript / json / java / cpp / 字节码\n";
+        std::cerr << "可用目标：python / javascript / typescript / json / java / powershell / perl / php / ruby / cpp / 字节码\n";
         return 1;
     }
     if (!translateTargetKnown(lower)) {
         std::cerr << "不支持的翻译目标：" << target << "\n";
-        std::cerr << "可用目标：python / javascript / typescript / json / java / cpp / 字节码\n";
+        std::cerr << "可用目标：python / javascript / typescript / json / java / powershell / perl / php / ruby / cpp / 字节码\n";
         return 1;
     }
     if (lower == "cpp" || lower == "c++" || lower == "c")
