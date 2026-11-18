@@ -5,7 +5,7 @@ set "PATH=C:\msys64\ucrt64\bin;%PATH%"
 set "GXX=C:\msys64\ucrt64\bin\g++.exe"
 if not exist "%GXX%" set "GXX=g++"
 rem 先编到 wen.exe.new：编失败时不会把现有的 wen.exe 弄没（g++ 链接失败会删除 -o 目标）
-"%GXX%" -std=c++17 -O3 -mavx2 -mfma -fno-math-errno -fno-trapping-math -fopenmp -static -municode -Wl,--stack,16777216 -o wen.exe.new wen.cpp -lwinhttp -lwinmm -lmfplat -lmfreadwrite -lmfuuid -lole32 -lgdi32 -lpsapi -limm32 -lws2_32
+"%GXX%" -std=c++17 -O3 -mavx2 -mfma -fno-math-errno -fno-trapping-math -fopenmp -static -municode -Wl,--stack,16777216 -o wen.exe.new wen.cpp -lwinhttp -lwinmm -lmfplat -lmfreadwrite -lmfuuid -lole32 -lgdi32 -lpsapi -limm32 -lws2_32 -lcomdlg32
 if errorlevel 1 (
     echo 构建失败，保留原来的 wen.exe。
     del /q wen.exe.new 2>nul
