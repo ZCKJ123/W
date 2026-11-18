@@ -280,17 +280,19 @@
     try {
       const r = await fetch(base + '/健康', { cache: 'no-store' });
       const j = await r.json();
+      const wasOffline = !online;
       online = true;
       $('#dot').className = 'dot ok';
       $('#conn').textContent = '已连接 ' + (j.版本 || '');
       $('#ver').textContent = '文语言 ' + (j.版本 || '');
       $('#offHint').style.display = 'none';
-      loadLists();
+      if (wasOffline) loadLists();
     } catch (_) {
       online = false;
       $('#dot').className = 'dot';
-      $('#conn').textContent = '未连接';
+      $('#conn').textContent = '未连接（等 wen.exe --编辑器）';
       $('#offHint').style.display = 'block';
+      setTimeout(ping, 3000);
     }
   }
   async function loadLists() {
@@ -410,7 +412,8 @@
     setTimeout(() => URL.revokeObjectURL(a.href), 3000);
   }
   function fresh() {
-    code.value = '# 新文件\n将 甲 变成 42\n打印 甲\n';    fname.value = '未命名';
+    code.value = '# 新文件\n将 甲 变成 42\n打印 甲\n';
+    fname.value = '未命名';
     paint(); syncSize(); updatePos(); saveDraft();
     code.focus();
   }
@@ -421,12 +424,16 @@
     panelDiag.style.display = k === 'diag' ? 'block' : 'none';
   }
 
-  $('#btnRun').onclick = run;
-  $('#btnCheck').onclick = check;
-  $('#btnSave').onclick = save;
-  $('#btnNew').onclick = fresh;
+  document.addEventListener('click', e => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    if (b.id === 'btnRun') run();
+    else if (b.id === 'btnCheck') check();
+    else if (b.id === 'btnSave') save();
+    else if (b.id === 'btnNew') fresh();
+    else if (b.id === 'sideToggle') $('#side').classList.toggle('open');
+  });
   document.querySelectorAll('.tab').forEach(t => t.onclick = () => switchTab(t.dataset.tab));
-  $('#sideToggle').onclick = () => $('#side').classList.toggle('open');
   fname.addEventListener('change', () => { const d = loadDraft(); if (d) { code.value = d; paint(); syncSize(); } });
   window.addEventListener('resize', syncSize);
 
