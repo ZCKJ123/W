@@ -9034,6 +9034,7 @@ static string pyQuote(const string& s) {
 struct PyEmitter {
     const vector<StmtPtr>& program;
     vector<string> diags;
+    vector<string> warns;
     std::ostringstream out;
     int indent = 0;
     bool usedMath = false;
@@ -9224,9 +9225,17 @@ struct PyEmitter {
             case Stmt::K::Break: line("break"); break;
             case Stmt::K::Continue: line("continue"); break;
             case Stmt::K::ExprStmt: line(expr(s->expr)); break;
-            case Stmt::K::Import:
-                diag(s->line, "「依赖」不翻译；请在外派目标里手动补库");
+            case Stmt::K::Import: {
+                string libs;
+                for (size_t k = 0; k < s->imports.size(); ++k) {
+                    if (k) libs += "、";
+                    libs += s->imports[k];
+                }
+                if (!libs.empty())
+                    warns.push_back("第 " + std::to_string(s->line) + " 行：依赖「" + libs +
+                                    "」没有自动补，目标工程里按需自备");
                 break;
+            }
             case Stmt::K::Export:
                 break;
             case Stmt::K::Match:
@@ -9287,6 +9296,7 @@ struct PyEmitter {
 struct JsEmitter {
     const vector<StmtPtr>& program;
     vector<string> diags;
+    vector<string> warns;
     std::ostringstream out;
     int indent = 0;
 
@@ -9457,9 +9467,17 @@ struct JsEmitter {
             case Stmt::K::Break: line("break;"); break;
             case Stmt::K::Continue: line("continue;"); break;
             case Stmt::K::ExprStmt: line(expr(s->expr) + ";"); break;
-            case Stmt::K::Import:
-                diag(s->line, "「依赖」不翻译；请在外派目标里手动补库");
+            case Stmt::K::Import: {
+                string libs;
+                for (size_t k = 0; k < s->imports.size(); ++k) {
+                    if (k) libs += "、";
+                    libs += s->imports[k];
+                }
+                if (!libs.empty())
+                    warns.push_back("第 " + std::to_string(s->line) + " 行：依赖「" + libs +
+                                    "」没有自动补，目标工程里按需自备");
                 break;
+            }
             case Stmt::K::Export: break;
             case Stmt::K::Match:
                 diag(s->line, "匹配暂不翻译");
@@ -9649,6 +9667,7 @@ struct JsonEmitter {
 struct JavaEmitter {
     const vector<StmtPtr>& program;
     vector<string> diags;
+    vector<string> warns;
     std::ostringstream out;
     int indent = 1;
     set<string> locals;
@@ -9880,9 +9899,17 @@ struct JavaEmitter {
             case Stmt::K::Break: line("break;"); break;
             case Stmt::K::Continue: line("continue;"); break;
             case Stmt::K::ExprStmt: line(expr(s->expr) + ";"); break;
-            case Stmt::K::Import:
-                diag(s->line, "「依赖」不翻译；请在外派目标里手动补库");
+            case Stmt::K::Import: {
+                string libs;
+                for (size_t k = 0; k < s->imports.size(); ++k) {
+                    if (k) libs += "、";
+                    libs += s->imports[k];
+                }
+                if (!libs.empty())
+                    warns.push_back("第 " + std::to_string(s->line) + " 行：依赖「" + libs +
+                                    "」没有自动补，目标工程里按需自备");
                 break;
+            }
             case Stmt::K::Export: break;
             case Stmt::K::Match:
                 diag(s->line, "匹配暂不翻译");
@@ -10398,7 +10425,6 @@ struct StackEmitter {
                 diag(s->line, "字节码/汇编暂不支持匹配");
                 break;
             case Stmt::K::Import:
-                diag(s->line, "「依赖」不翻译");
                 break;
             case Stmt::K::Export:
                 break;
@@ -12384,8 +12410,25 @@ Interpreter::Interpreter() {
                     continue;
                 }
                 Value fn;
-                if (!globals->lookup(fname, fn))
-                    throw WenError("运行时错误", line, 0, "字节码调用不存在的名字：" + fname);
+                if (!globals->lookup(fname, fn)) {
+                    auto mit = functionModules().find(fname);
+                    if (mit == functionModules().end())
+                        throw WenError("运行时错误", line, 0, "字节码调用不存在的名字：" + fname);
+                    string lib = mit->second;
+                    if (!loadedModules.count(lib)) {
+                        try {
+                            加载模块(lib, line);
+                        } catch (WenError& e) {
+                            throw WenError("运行时错误", line, 0,
+                                           "字节码调用「" + fname + "」，但库「" + lib +
+                                               "」加载失败：" + e.what());
+                        }
+                    }
+                    if (!globals->lookup(fname, fn))
+                        throw WenError("运行时错误", line, 0,
+                                       "字节码调用「" + fname + "」失败：库「" + lib +
+                                           "」已加载但找不到该函数");
+                }
                 stack.push_back(callValue(fn, args, line));
             } else if (op == "ret") {
                 Value r = stack.empty() ? vNone() : pop();
@@ -12556,6 +12599,7 @@ Interpreter::Interpreter() {
             throw WenError("文件错误", line, 0, e.what());
         }
         vector<string> diags;
+        vector<string> warns;
         string target = externalTarget(src);
         bool ok = target == "python" || target == "javascript" || target == "js" ||
                   target == "json" || target == "gson" || target == "java" || target == "typescript" || target == "ts";
@@ -12575,6 +12619,7 @@ Interpreter::Interpreter() {
                     PyEmitter em(program);
                     code = em.generate();
                     for (const auto& d : em.diags) diags.push_back(d);
+                    for (const auto& d : em.warns) warns.push_back(d);
                 } else if (target == "json" || target == "gson") {
                     JsonEmitter em(program);
                     code = em.generate();
@@ -12582,10 +12627,12 @@ Interpreter::Interpreter() {
                     JavaEmitter em(program);
                     code = em.generate();
                     for (const auto& d : em.diags) diags.push_back(d);
+                    for (const auto& d : em.warns) warns.push_back(d);
                 } else {
                     JsEmitter em(program);
                     code = em.generate();
                     for (const auto& d : em.diags) diags.push_back(d);
+                    for (const auto& d : em.warns) warns.push_back(d);
                 }
             } catch (WenError& e) {
                 diags.push_back("第 " + std::to_string(e.line) + " 行：语法错误：" + e.what());
@@ -12617,6 +12664,18 @@ Interpreter::Interpreter() {
             writeWholeFile(outPath, code, false);
         } catch (IoError& e) {
             throw WenError("文件错误", line, 0, e.what());
+        }
+        if (!warns.empty()) {
+            std::ostringstream rep;
+            rep << "外派目标：" << target << "\n文件：" << path << "\n";
+            rep << "提示（不阻断，共 " << warns.size() << " 条）\n\n";
+            for (const auto& d : warns) rep << "- " << d << "\n";
+            string report2 = outPath + ".外派报告.txt";
+            try {
+                ensureParentDirectory(report2);
+                writeWholeFile(report2, rep.str(), false);
+            } catch (IoError&) {
+            }
         }
         return vStr(outPath);
     });
@@ -35104,6 +35163,128 @@ static int padMain() {
 }
 #endif
 
+static string translateOutExt(const string& t) {
+    if (t == "python" || t == "py") return ".py";
+    if (t == "javascript" || t == "js") return ".js";
+    if (t == "typescript" || t == "ts") return ".ts";
+    if (t == "json" || t == "gson") return ".json";
+    if (t == "java") return ".java";
+    if (t == "cpp" || t == "c++" || t == "c") return ".cpp";
+    if (t == "字节码" || t == "bytecode") return ".json";
+    if (t == "汇编" || t == "asm") return ".asm";
+    return ".txt";
+}
+
+static bool translateTargetKnown(const string& t) {
+    return t == "python" || t == "py" || t == "javascript" || t == "js" ||
+           t == "typescript" || t == "ts" || t == "json" || t == "gson" ||
+           t == "java" || t == "cpp" || t == "c++" || t == "c" ||
+           t == "字节码" || t == "bytecode" || t == "汇编" || t == "asm";
+}
+
+static int translateFileCli(const string& path, string target, string outPath) {
+    string src;
+    try {
+        src = readWholeFile(resolveWenPath(path));
+    } catch (IoError& e) {
+        std::cerr << "读不了文件：" << e.what() << "\n";
+        return 1;
+    }
+    string lower = lowerAscii(target);
+    if (lower.empty()) lower = lowerAscii(externalTarget(src));
+    if (lower.empty()) {
+        std::cerr << "缺少翻译目标：第一行写「# 外派: python」，或在命令里给目标\n";
+        std::cerr << "可用目标：python / javascript / typescript / json / java / cpp / 字节码\n";
+        return 1;
+    }
+    if (!translateTargetKnown(lower)) {
+        std::cerr << "不支持的翻译目标：" << target << "\n";
+        std::cerr << "可用目标：python / javascript / typescript / json / java / cpp / 字节码\n";
+        return 1;
+    }
+    if (lower == "cpp" || lower == "c++" || lower == "c")
+        return compileFile(path, outPath, false);
+    if (lower == "汇编" || lower == "asm") {
+        std::cerr << "汇编出口还没接：可移植出口当前用 --翻译 文件.wen 字节码\n";
+        return 1;
+    }
+    if (lower == "字节码" || lower == "bytecode") {
+        Interpreter sub;
+        sub.filename = path;
+        sub.sourceLines = splitLines(src);
+        try {
+            auto program = sub.parseSource(src);
+            StackEmitter em(program);
+            string bc = em.bytecode();
+            if (!em.diags.empty()) {
+                for (const auto& d : em.diags) std::cerr << d << "\n";
+                return 1;
+            }
+            if (outPath.empty()) std::cout << bc << "\n";
+            else {
+                ensureParentDirectory(outPath);
+                writeWholeFile(outPath, bc, false);
+                std::cout << "已生成 " << outPath << "（目标：字节码）\n";
+            }
+            return 0;
+        } catch (WenError& e) {
+            std::cerr << e.what() << "\n";
+            return 1;
+        } catch (IncompleteError& e) {
+            std::cerr << e.what() << "\n";
+            return 1;
+        }
+    }
+    if (outPath.empty()) {
+        fs::path p = fs::u8path(resolveWenPath(path));
+        outPath = (p.parent_path() / fs::u8path(p.stem().u8string() + translateOutExt(lower))).u8string();
+    }
+    vector<string> diags;
+    vector<string> warns;
+    string code;
+    try {
+        Interpreter sub;
+        sub.filename = path;
+        sub.sourceLines = splitLines(src);
+        auto program = sub.parseSource(src);
+        if (lower == "python" || lower == "py") {
+            PyEmitter em(program);
+            code = em.generate();
+            diags = em.diags;
+            warns = em.warns;
+        } else if (lower == "json" || lower == "gson") {
+            JsonEmitter em(program);
+            code = em.generate();
+        } else if (lower == "java") {
+            JavaEmitter em(program);
+            code = em.generate();
+            diags = em.diags;
+            warns = em.warns;
+        } else {
+            JsEmitter em(program);
+            code = em.generate();
+            diags = em.diags;
+            warns = em.warns;
+        }
+    } catch (WenError& e) {
+        std::cerr << "第 " << e.line << " 行：语法错误：" << e.what() << "\n";
+        return 1;
+    } catch (IncompleteError& e) {
+        std::cerr << "第 " << e.line << " 行：代码不完整：" << e.what() << "\n";
+        return 1;
+    }
+    if (!diags.empty()) {
+        std::cerr << "翻译未完成：" << diags.size() << " 个问题\n";
+        for (const auto& d : diags) std::cerr << "- " << d << "\n";
+        return 1;
+    }
+    ensureParentDirectory(outPath);
+    writeWholeFile(outPath, code, false);
+    std::cout << "已生成 " << outPath << "（目标：" << lower << "）\n";
+    for (const auto& d : warns) std::cout << "提示：" << d << "\n";
+    return 0;
+}
+
 static int runMain(vector<string> args) {
     if (args.size() >= 2 && (args[1] == "--编辑" || args[1] == "--编辑器")) {
         if (args.size() >= 3 && !args[2].empty()) gPadInitFile = utf8ToWide(args[2]);
@@ -35258,6 +35439,7 @@ static int runMain(vector<string> args) {
             "  wen.exe --检查 文件.wen         只做词法/语法/静态检查\n"
             "  wen.exe --查 关键词             在教程/规范/错误说明里找答案\n"
             "  wen.exe --编译 文件.wen         编译成原生 exe\n"
+            "  wen.exe --进程编译 文件.wen 产物.exe 一条命令出独立进程（C++ 静态，不依赖 wen.exe）\n"
             "  wen.exe --打包 文件.wen 产物.exe 打包成单文件 exe（不需要安装 wen.exe）\n"
             "  wen.exe --取库 库名|网址          按名字取库，或直接给一条网址/本地文件\n"
             "  wen.exe --安装                   装一次运行时：关联 .wen/.wzp，双击就能跑，也不用带 exe\n"
@@ -35266,7 +35448,8 @@ static int runMain(vector<string> args) {
             "  wen.exe --编辑                     打开本地文语编辑器：原生窗口，不开端口、不走浏览器\n"
             "  wen.exe --库源                   打印当前库源地址\n"
             "  wen.exe --不联网                 关掉依赖自动下载（审计/离线发布用）\n"
-            "  wen.exe --翻译 文件.wen 目标    翻译（python/javascript/json/java/字节码/C++/汇编）\n"
+            "  wen.exe --翻译 文件.wen [目标] [输出]  翻译成别的语言：python/javascript/typescript/json/java/cpp/字节码\n"
+            "                                   省略目标时读首行「# 外派: python」\n"
             "  wen.exe --验证                   自检\n"
             "  wen.exe --帮助                   本页\n"
             "  wen.exe --自述                   只列本语言自己的规范/协议\n\n"
@@ -35641,6 +35824,30 @@ static int runMain(vector<string> args) {
             return 1;
         }
         return dumpTokens(args[2]);
+    }
+    if (cmd == "--翻译") {
+        if (args.size() < 3) {
+            std::cerr << "用法：wen.exe --翻译 文件.wen [目标] [输出]\n";
+            std::cerr << "目标：python / javascript / typescript / json / java / cpp / 字节码\n";
+            std::cerr << "省略目标时读首行「# 外派: 目标」\n";
+            return 1;
+        }
+        string target, outPath;
+        for (size_t i = 3; i < args.size(); ++i) {
+            if (args[i].rfind("--", 0) != 0) {
+                if (target.empty()) target = args[i];
+                else outPath = args[i];
+            }
+        }
+        return translateFileCli(args[2], target, outPath);
+    }
+    if (cmd == "--进程编译") {
+        if (args.size() < 3) {
+            std::cerr << "用法：wen.exe --进程编译 文件.wen [输出.exe]\n";
+            return 1;
+        }
+        std::cout << "进程编译：脚本 -> C++ -> 静态 exe（产物不依赖 wen.exe）\n";
+        return compileFile(args[2], args.size() >= 4 ? args[3] : "", true);
     }
     if (cmd == "--编译" || cmd == "-c") {
         if (args.size() < 3) {
