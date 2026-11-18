@@ -33930,16 +33930,24 @@ static int srvServe(int port, bool openBrowser) {
 #ifdef _WIN32
 #include <richedit.h>
 #include <commdlg.h>
+#include <commctrl.h>
+#include <shlobj.h>
 
 // ===================== 本地编辑器：--编辑 =====================
 // 原生 Win32 窗口：不开端口、不启浏览器、不需要服务。
 // 运行 / 检查都调用同目录的 wen.exe 子进程（临时文件 + 管道 + 8 秒超时）。
 struct WenPad {
     HWND frame = nullptr, edit = nullptr, out = nullptr, status = nullptr;
+    HWND gutter = nullptr;      // 行号栏
+    HWND tree = nullptr;        // 左侧文件树
+    HWND issues = nullptr;      // 问题列表
+    HWND tabOut = nullptr, tabIss = nullptr;   // 面板页签
     std::wstring path;          // 当前文件全路径，空表示未命名
+    std::wstring root;          // 侧栏当前根目录
     bool dirty = false;
     bool quiet = false;         // 内部改文本时抑制 EN_CHANGE 的连锁反应
     bool busy = false;
+    bool showIssues = false;    // 面板当前页：false=输出，true=问题
     std::wstring lastRun;       // 上次检查/运行的摘要，常驻状态栏
 };
 static WenPad* gPad = nullptr;
@@ -33950,8 +33958,12 @@ static HBRUSH gPadOutBrush = nullptr;
 static HBRUSH gPadStatusBrush = nullptr;
 
 static const int PAD_EDIT = 2001, PAD_OUT = 2002, PAD_STATUS = 2003;
+static const int PAD_GUTTER = 2004, PAD_TREE = 2005, PAD_ISSUES = 2006;
 static const int PAD_NEW = 2101, PAD_OPEN = 2102, PAD_SAVE = 2103, PAD_CHECK = 2104, PAD_RUN = 2105;
+static const int PAD_FOLDER = 2106, PAD_SAVEAS = 2110;
+static const int PAD_TAB_OUT = 2120, PAD_TAB_ISS = 2121;
 static const int PAD_T_PAINT = 1, PAD_T_POS = 2;
+static HFONT gPadSmall = nullptr;
 
 static const wchar_t* kPadBoot =
     L"# 文语 · 本地编辑器\n"
@@ -34004,9 +34016,10 @@ static void padSetText(const std::wstring& s) {
     if (!gPad || !gPad->edit) return;
     std::wstring cr = s;
     for (auto& c : cr) if (c == L'\n') c = L'\r';
+    bool q0 = gPad->quiet;
     gPad->quiet = true;
     SendMessageW(gPad->edit, WM_SETTEXT, 0, (LPARAM)cr.c_str());
-    gPad->quiet = false;
+    gPad->quiet = q0;
 }
 
 static bool padIsWordChar(wchar_t c) {
@@ -34044,10 +34057,12 @@ static void padPaint() {
     std::wstring s = padRaw(gPad->edit);
     long n = (long)s.size();
     if (n <= 0) return;
-    if (n > 120000) return;   // 太大就不着色，免得卡住
+    if (n > 400000) return;   // 超大文件不着色，免得卡住
 
     CHARRANGE sel{};
     SendMessageW(gPad->edit, EM_EXGETSEL, 0, (LPARAM)&sel);
+    bool q0 = gPad->quiet;
+    gPad->quiet = true;                 // 着色会触发 EN_CHANGE，别把它当成用户改稿
     SendMessageW(gPad->edit, WM_SETREDRAW, FALSE, 0);
 
     SendMessageW(gPad->edit, EM_SETSEL, 0, -1);
@@ -34101,6 +34116,8 @@ static void padPaint() {
     SendMessageW(gPad->edit, EM_EXSETSEL, 0, (LPARAM)&sel);
     SendMessageW(gPad->edit, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(gPad->edit, nullptr, FALSE);
+    if (gPad->gutter) InvalidateRect(gPad->gutter, nullptr, FALSE);
+    gPad->quiet = q0;
 }
 
 static void padStatusRefresh() {
@@ -34118,7 +34135,7 @@ static void padStatusRefresh() {
     }
     std::wstring s = name + (gPad->dirty ? L" *" : L"") + L"    |    第 " +
                      std::to_wstring(line + 1) + L" 行 第 " + std::to_wstring(col + 1) +
-                     L" 列    |    文语 " + utf8ToWide(WEN_VERSION);
+                     L" 列    |    UTF-8    |    文语 " + utf8ToWide(WEN_VERSION);
     if (!gPad->lastRun.empty()) s += L"    |    " + gPad->lastRun;
     SetWindowTextW(gPad->status, s.c_str());
 }
@@ -34132,6 +34149,7 @@ static void padSetDirty(bool d) {
 static void padGotoLine(int line1) {
     if (!gPad || !gPad->edit || line1 <= 0) return;
     long li = (long)SendMessageW(gPad->edit, EM_LINEINDEX, line1 - 1, 0);
+    if (li < 0) li = (long)SendMessageW(gPad->edit, WM_GETTEXTLENGTH, 0, 0);
     if (li < 0) return;
     SendMessageW(gPad->edit, EM_SETSEL, li, li);
     SendMessageW(gPad->edit, EM_SCROLLCARET, 0, 0);
@@ -34206,17 +34224,13 @@ static std::wstring padDiagText(const string& js) {
     }
     size_t p = js.find("\"diagnostics\":[");
     if (p == string::npos) return L"";
-    p = js.find('{', p);
     std::vector<string> objs;
-    while (p != string::npos && p < js.size()) {
-        size_t e = padScanObj(js, p);
+    size_t q = js.find("{\"kind\":", p);
+    while (q != string::npos && q < js.size()) {
+        size_t e = padScanObj(js, q);
         if (e == string::npos) break;
-        objs.push_back(js.substr(p, e - p + 1));
-        p = js.find('{', e);
-        if (p != string::npos && js.compare(p, 9, "{\"kind\":\"") != 0) {
-            // 不是下一条诊断的开头，继续往后找
-            continue;
-        }
+        objs.push_back(js.substr(q, e - q + 1));
+        q = js.find("{\"kind\":", e);
     }
     if (objs.empty()) return L"";
     std::wstring w = L"发现 " + std::to_wstring(objs.size()) + L" 个问题\r\n";
@@ -34255,6 +34269,207 @@ static int padFirstErrorLine(const string& js) {
 }
 
 // 检查 / 运行：写临时文件，起子进程，收回输出
+// ---------- 行号栏：跟着编辑区的首行和行高走 ----------
+static LRESULT CALLBACK padGutterProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_PAINT: {
+            PAINTSTRUCT ps{};
+            HDC dc = BeginPaint(h, &ps);
+            RECT rc;
+            GetClientRect(h, &rc);
+            HBRUSH bg = CreateSolidBrush(RGB(0x14, 0x17, 0x19));
+            FillRect(dc, &rc, bg);
+            DeleteObject(bg);
+            if (gPad && gPad->edit) {
+                HFONT old = (HFONT)SelectObject(dc, gPadSmall ? gPadSmall : gPadUi);
+                SetBkMode(dc, TRANSPARENT);
+                int total = (int)SendMessageW(gPad->edit, EM_GETLINECOUNT, 0, 0);
+                int cur = (int)SendMessageW(gPad->edit, EM_LINEFROMCHAR, (WPARAM)-1, 0);
+                int first = (int)SendMessageW(gPad->edit, EM_GETFIRSTVISIBLELINE, 0, 0);
+                int lineH = 18;
+                if (total > 1) {
+                    POINTL pa{}, pb{};
+                    SendMessageW(gPad->edit, EM_POSFROMCHAR, (WPARAM)&pa,
+                                 (LPARAM)SendMessageW(gPad->edit, EM_LINEINDEX, 0, 0));
+                    SendMessageW(gPad->edit, EM_POSFROMCHAR, (WPARAM)&pb,
+                                 (LPARAM)SendMessageW(gPad->edit, EM_LINEINDEX, 1, 0));
+                    if (pb.y > pa.y) lineH = pb.y - pa.y;
+                }
+                for (int ln = first; ln < total; ++ln) {
+                    long idx = (long)SendMessageW(gPad->edit, EM_LINEINDEX, ln, 0);
+                    if (idx < 0) break;
+                    POINTL p{};
+                    SendMessageW(gPad->edit, EM_POSFROMCHAR, (WPARAM)&p, idx);
+                    if (p.y > rc.bottom) break;
+                    if (p.y + lineH < 0) continue;
+                    if (ln == cur) {
+                        RECT hl{ 0, p.y, rc.right - 1, p.y + lineH };
+                        HBRUSH hb = CreateSolidBrush(RGB(0x2A, 0x24, 0x1E));
+                        FillRect(dc, &hl, hb);
+                        DeleteObject(hb);
+                        SetTextColor(dc, RGB(0xE8, 0xAE, 0x66));
+                    } else {
+                        SetTextColor(dc, RGB(0x6A, 0x74, 0x73));
+                    }
+                    wchar_t buf[16];
+                    swprintf(buf, 16, L"%d", ln + 1);
+                    RECT tr{ 2, p.y, rc.right - 8, p.y + lineH };
+                    DrawTextW(dc, buf, -1, &tr, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+                }
+                SelectObject(dc, old);
+            }
+            {
+                HPEN pen = CreatePen(PS_SOLID, 1, RGB(0x27, 0x2C, 0x2E));
+                HGDIOBJ op = SelectObject(dc, pen);
+                MoveToEx(dc, rc.right - 1, 0, nullptr);
+                LineTo(dc, rc.right - 1, rc.bottom);
+                SelectObject(dc, op);
+                DeleteObject(pen);
+            }
+            EndPaint(h, &ps);
+            return 0;
+        }
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+// ---------- 左侧文件树 ----------
+static std::map<HTREEITEM, std::wstring> gTreePaths;
+
+static void padTreeClear() {
+    if (!gPad || !gPad->tree) return;
+    SendMessageW(gPad->tree, TVM_DELETEITEM, 0, (LPARAM)TVI_ROOT);
+    gTreePaths.clear();
+}
+
+static void padFillTreeDir(HTREEITEM parent, const std::wstring& dir, int depth, int& budget) {
+    if (budget <= 0 || depth > 6) return;
+    std::vector<std::wstring> dirs, files;
+    std::error_code ec;
+    fs::directory_iterator it(fs::u8path(wideToUtf8(dir)),
+                             fs::directory_options::skip_permission_denied, ec);
+    if (ec) return;
+    for (auto& e : it) {
+        std::error_code ec2;
+        std::wstring name = utf8ToWide(e.path().filename().u8string());
+        if (e.is_directory(ec2)) {
+            if (name == L".git" || name == L".vs" || name == L"备份" || name == L"输出" ||
+                name == L"node_modules" || name == L"build") continue;
+            dirs.push_back(name);
+        } else {
+            std::wstring low = name;
+            for (auto& c : low) c = (wchar_t)towlower(c);
+            if (low.size() > 4 && low.substr(low.size() - 4) == L".wen") files.push_back(name);
+        }
+    }
+    std::sort(dirs.begin(), dirs.end());
+    std::sort(files.begin(), files.end());
+    for (auto& d : dirs) {
+        if (budget <= 0) return;
+        TVINSERTSTRUCTW is{};
+        is.hParent = parent;
+        is.hInsertAfter = TVI_LAST;
+        is.item.mask = TVIF_TEXT;
+        is.item.pszText = (LPWSTR)d.c_str();
+        HTREEITEM node = (HTREEITEM)SendMessageW(gPad->tree, TVM_INSERTITEMW, 0, (LPARAM)&is);
+        --budget;
+        if (node) padFillTreeDir(node, dir + L"\\" + d, depth + 1, budget);
+    }
+    for (auto& f : files) {
+        if (budget <= 0) return;
+        TVINSERTSTRUCTW is{};
+        is.hParent = parent;
+        is.hInsertAfter = TVI_LAST;
+        is.item.mask = TVIF_TEXT;
+        is.item.pszText = (LPWSTR)f.c_str();
+        HTREEITEM node = (HTREEITEM)SendMessageW(gPad->tree, TVM_INSERTITEMW, 0, (LPARAM)&is);
+        --budget;
+        if (node) gTreePaths[node] = dir + L"\\" + f;
+    }
+}
+
+static void padLoadFile(const std::wstring& file) {
+    if (!gPad) return;
+    std::ifstream in(fs::path(file), std::ios::binary);
+    if (!in) {
+        MessageBoxW(gPad->frame, L"读不到这个文件。", L"打开", MB_ICONWARNING);
+        return;
+    }
+    string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    padSetText(utf8ToWide(body));
+    gPad->path = file;
+    padSetDirty(false);
+    padPaint();
+    padStatusRefresh();
+    InvalidateRect(gPad->gutter, nullptr, FALSE);
+    SetWindowTextW(gPad->frame, (L"文语编辑器 — " + file).c_str());
+
+    // 文件不在当前树根里，就把它所在的目录当树根，省得用户再点一次"打开文件夹"
+    if (gPad->root.empty() || file.compare(0, gPad->root.size(), gPad->root) != 0) {
+        size_t q = file.find_last_of(L"\\");
+        if (q != std::wstring::npos) {
+            gPad->root = file.substr(0, q);
+            padTreeClear();
+            int budget = 900;
+            padFillTreeDir(TVI_ROOT, gPad->root, 0, budget);
+        }
+    }
+    padSetDirty(false);
+}
+
+static bool padAskSave();
+
+static void padTreeActivate() {
+    if (!gPad || !gPad->tree) return;
+    HTREEITEM sel = (HTREEITEM)SendMessageW(gPad->tree, TVM_GETNEXTITEM, TVGN_CARET, 0);
+    auto it = gTreePaths.find(sel);
+    if (it == gTreePaths.end() || it->second.empty()) return;
+    if (gPad->path == it->second) return;
+    if (!padAskSave()) { SetFocus(gPad->edit); return; }
+    padLoadFile(it->second);
+}
+
+static void padOpenFolder() {
+    if (!gPad) return;
+    BROWSEINFOW bi{};
+    bi.hwndOwner = gPad->frame;
+    bi.lpszTitle = L"选择要浏览的文件夹";
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    PIDLIST_ABSOLUTE pid = SHBrowseForFolderW(&bi);
+    if (!pid) return;
+    wchar_t buf[MAX_PATH]{};
+    bool ok = SHGetPathFromIDListW(pid, buf) != FALSE;
+    CoTaskMemFree(pid);
+    if (!ok) return;
+    gPad->root = buf;
+    padTreeClear();
+    int budget = 900;
+    padFillTreeDir(TVI_ROOT, gPad->root, 0, budget);
+    SetWindowTextW(gPad->tree, gPad->root.c_str());
+}
+
+// ---------- 底部面板：输出 / 问题 ----------
+static void padIssuesClear() {
+    if (gPad && gPad->issues) SendMessageW(gPad->issues, LB_RESETCONTENT, 0, 0);
+}
+
+static void padIssueAdd(const std::wstring& text, int line) {
+    if (!gPad || !gPad->issues) return;
+    int i = (int)SendMessageW(gPad->issues, LB_ADDSTRING, 0, (LPARAM)text.c_str());
+    if (i >= 0) SendMessageW(gPad->issues, LB_SETITEMDATA, i, (LPARAM)line);
+}
+
+static void padPanelShow(bool issues) {
+    if (!gPad) return;
+    gPad->showIssues = issues;
+    if (gPad->out) ShowWindow(gPad->out, issues ? SW_HIDE : SW_SHOW);
+    if (gPad->issues) ShowWindow(gPad->issues, issues ? SW_SHOW : SW_HIDE);
+    if (gPad->tabOut) InvalidateRect(gPad->tabOut, nullptr, TRUE);
+    if (gPad->tabIss) InvalidateRect(gPad->tabIss, nullptr, TRUE);
+}
+
 static void padExec(bool check) {
     if (!gPad || gPad->busy) return;
     std::wstring src = padText(gPad->edit);
@@ -34270,6 +34485,7 @@ static void padExec(bool check) {
     argv.push_back(wideToUtf8(tf));
 
     gPad->busy = true;
+    padIssuesClear();
     SetWindowTextW(gPad->out, check ? L"检查中…" : L"运行中…");
     UpdateWindow(gPad->out);
     SetWindowTextW(gPad->status, L"正在执行…");
@@ -34299,6 +34515,28 @@ static void padExec(bool check) {
     if (check && !to) {
         std::wstring fmt = padDiagText(o);
         if (!fmt.empty()) w = fmt;
+        if (o.find("\"ok\":true") != string::npos)
+            padIssueAdd(L"没有发现问题", 0);
+        // 同一批诊断再进问题面板（双击条目跳行）
+        size_t p0 = o.find("\"diagnostics\":[");
+        if (p0 != string::npos) {
+            size_t q = o.find("{\"kind\":", p0);
+            int n = 0;
+            while (q != string::npos && q < o.size() && n < 200) {
+                size_t e = padScanObj(o, q);
+                if (e == string::npos) break;
+                string obj = o.substr(q, e - q + 1);
+                int line = atoi(padField(obj, "line").c_str());
+                string reason = padField(obj, "reason");
+                string code = padField(obj, "code");
+                std::wstring probe = utf8ToWide(reason.empty() ? code : reason);
+                if (probe.empty()) probe = L"语法错误";
+                padIssueAdd(L"第 " + std::to_wstring(line) + L" 行  " + probe, line);
+                q = o.find("{\"kind\":", e);
+                ++n;
+            }
+            if (gPad->issues) InvalidateRect(gPad->issues, nullptr, TRUE);
+        }
     }
     SetWindowTextW(gPad->out, w.c_str());
 
@@ -34368,18 +34606,7 @@ static void padOpen() {
     o.nMaxFile = MAX_PATH;
     o.Flags = OFN_FILEMUSTEXIST | OFN_EXPLORER;
     if (!GetOpenFileNameW(&o)) return;
-    std::ifstream in(fs::path(std::wstring(file)), std::ios::binary);
-    if (!in) {
-        MessageBoxW(gPad->frame, L"读不到这个文件。", L"打开", MB_ICONWARNING);
-        return;
-    }
-    string s((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    padSetText(utf8ToWide(s));
-    gPad->path = file;
-    padSetDirty(false);
-    padPaint();
-    padStatusRefresh();
-    SetWindowTextW(gPad->frame, (L"文语编辑器 — " + std::wstring(file)).c_str());
+    padLoadFile(file);
 }
 
 static void padNew() {
@@ -34410,21 +34637,30 @@ static LRESULT CALLBACK padProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE |
                 ES_NOHIDESEL | ES_WANTRETURN,
                 0, 0, 100, 100, h, (HMENU)PAD_EDIT, nullptr, nullptr);
+            gPad->tree = CreateWindowExW(0, WC_TREEVIEWW, L"",
+                WS_CHILD | WS_VISIBLE | TVS_HASBUTTONS | TVS_HASLINES | TVS_LINESATROOT |
+                TVS_SHOWSELALWAYS,
+                0, 0, 100, 100, h, (HMENU)PAD_TREE, nullptr, nullptr);
+            gPad->gutter = CreateWindowExW(0, L"WenPadGutter", L"",
+                WS_CHILD | WS_VISIBLE, 0, 0, 100, 100, h, (HMENU)PAD_GUTTER, nullptr, nullptr);
             gPad->out = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                 WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY,
                 0, 0, 100, 100, h, (HMENU)PAD_OUT, nullptr, nullptr);
-            CreateWindowExW(0, L"BUTTON", L"新建", WS_CHILD | WS_VISIBLE,
-                0, 0, 0, 0, h, (HMENU)PAD_NEW, nullptr, nullptr);
-            CreateWindowExW(0, L"BUTTON", L"打开", WS_CHILD | WS_VISIBLE,
-                0, 0, 0, 0, h, (HMENU)PAD_OPEN, nullptr, nullptr);
-            CreateWindowExW(0, L"BUTTON", L"保存", WS_CHILD | WS_VISIBLE,
-                0, 0, 0, 0, h, (HMENU)PAD_SAVE, nullptr, nullptr);
-            CreateWindowExW(0, L"BUTTON", L"另存", WS_CHILD | WS_VISIBLE,
-                0, 0, 0, 0, h, (HMENU)2110, nullptr, nullptr);
-            CreateWindowExW(0, L"BUTTON", L"检查", WS_CHILD | WS_VISIBLE,
-                0, 0, 0, 0, h, (HMENU)PAD_CHECK, nullptr, nullptr);
-            CreateWindowExW(0, L"BUTTON", L"运行  Ctrl+Enter", WS_CHILD | WS_VISIBLE,
-                0, 0, 0, 0, h, (HMENU)PAD_RUN, nullptr, nullptr);
+            gPad->issues = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
+                WS_CHILD | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+                0, 0, 100, 100, h, (HMENU)PAD_ISSUES, nullptr, nullptr);
+            struct { int id; const wchar_t* text; } btns[] = {
+                { PAD_NEW, L"新建" }, { PAD_OPEN, L"打开文件" }, { PAD_SAVE, L"保存" },
+                { PAD_SAVEAS, L"另存" }, { PAD_FOLDER, L"打开文件夹" },
+                { PAD_CHECK, L"检查  Ctrl+B" }, { PAD_RUN, L"运行  F5" }
+            };
+            for (auto& b : btns)
+                CreateWindowExW(0, L"BUTTON", b.text, WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                    0, 0, 0, 0, h, (HMENU)b.id, nullptr, nullptr);
+            gPad->tabOut = CreateWindowExW(0, L"BUTTON", L"输出",
+                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 0, 0, h, (HMENU)PAD_TAB_OUT, nullptr, nullptr);
+            gPad->tabIss = CreateWindowExW(0, L"BUTTON", L"问题",
+                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 0, 0, h, (HMENU)PAD_TAB_ISS, nullptr, nullptr);
             gPad->status = CreateWindowExW(0, L"STATIC", L"",
                 WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP,
                 0, 0, 0, 0, h, (HMENU)PAD_STATUS, nullptr, nullptr);
@@ -34435,40 +34671,139 @@ static LRESULT CALLBACK padProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 SendMessageW(gPad->edit, EM_SETLIMITTEXT, 0x7FFFFFF0, 0);
                 SendMessageW(gPad->edit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
                              MAKELPARAM(10, 10));
+                SendMessageW(gPad->edit, EM_SETEVENTMASK, 0, ENM_CHANGE | ENM_SELCHANGE | ENM_SCROLL);
             }
-            if (!gPadOutBrush) gPadOutBrush = CreateSolidBrush(RGB(0x1E, 0x23, 0x26));
-            if (!gPadStatusBrush) gPadStatusBrush = CreateSolidBrush(RGB(0x20, 0x24, 0x27));
+            if (gPad->tree) {
+                SendMessageW(gPad->tree, WM_SETFONT, (WPARAM)gPadUi, TRUE);
+                SendMessageW(gPad->tree, TVM_SETBKCOLOR, 0, (LPARAM)RGB(0x1B, 0x1E, 0x20));
+                SendMessageW(gPad->tree, TVM_SETTEXTCOLOR, 0, (LPARAM)RGB(0xC3, 0xC9, 0xC8));
+                SendMessageW(gPad->tree, TVM_SETLINECOLOR, 0, (LPARAM)RGB(0x33, 0x38, 0x3A));
+                SendMessageW(gPad->tree, TVM_SETITEMHEIGHT, 20, 0);
+            }
+            if (!gPadOutBrush) gPadOutBrush = CreateSolidBrush(RGB(0x1B, 0x1E, 0x20));
+            if (!gPadStatusBrush) gPadStatusBrush = CreateSolidBrush(RGB(0x23, 0x27, 0x2A));
             if (gPad->out) SendMessageW(gPad->out, WM_SETFONT, (WPARAM)gPadUi, TRUE);
+            if (gPad->issues) SendMessageW(gPad->issues, WM_SETFONT, (WPARAM)gPadUi, TRUE);
             if (gPad->status) SendMessageW(gPad->status, WM_SETFONT, (WPARAM)gPadUi, TRUE);
-            for (int id : {PAD_NEW, PAD_OPEN, PAD_SAVE, PAD_CHECK, PAD_RUN, 2110}) {
-                HWND b = GetDlgItem(h, id);
-                if (b) SendMessageW(b, WM_SETFONT, (WPARAM)gPadUi, TRUE);
-            }
             padSetText(kPadBoot);
+            padSetDirty(false);
             padPaint();
             padStatusRefresh();
+            padPanelShow(false);
+            // 树里先放一条提示，免得左侧空得像坏了
+            {
+                TVINSERTSTRUCTW is{};
+                is.hParent = TVI_ROOT;
+                is.hInsertAfter = TVI_LAST;
+                is.item.mask = TVIF_TEXT;
+                is.item.pszText = (LPWSTR)L"（还没有打开文件夹）";
+                SendMessageW(gPad->tree, TVM_INSERTITEMW, 0, (LPARAM)&is);
+            }
             SetTimer(h, PAD_T_POS, 400, nullptr);
             return 0;
         }
         case WM_SIZE: {
             int W = LOWORD(lp), H = HIWORD(lp);
             if (W <= 0 || H <= 0) return 0;
-            int bar = 40, bottom = 170, stat = 24;
+            const int bar = 40, stat = 24, sidebar = 216, panelH = 176, gut = 54, tabs = 26;
             int x = 8;
             struct { int id, w; } btns[] = {
-                {PAD_NEW, 64}, {PAD_OPEN, 64}, {PAD_SAVE, 64}, {2110, 64}, {PAD_CHECK, 64}, {PAD_RUN, 150}
+                {PAD_NEW, 56}, {PAD_OPEN, 84}, {PAD_SAVE, 56}, {PAD_SAVEAS, 56},
+                {PAD_FOLDER, 96}, {PAD_CHECK, 98}, {PAD_RUN, 92}
             };
             for (auto& b : btns) {
                 HWND c = GetDlgItem(h, b.id);
-                if (c) MoveWindow(c, x, 7, b.w, 26, TRUE);
+                if (c) MoveWindow(c, x, 6, b.w, 28, TRUE);
                 x += b.w + 6;
             }
-            int eh = H - bar - bottom - stat;
-            if (eh < 60) eh = 60;
-            if (gPad->edit) MoveWindow(gPad->edit, 0, bar, W, eh, TRUE);
-            if (gPad->out) MoveWindow(gPad->out, 0, bar + eh, W, bottom - 6, TRUE);
-            if (gPad->status) MoveWindow(gPad->status, 6, H - stat + 3, W - 12, 20, TRUE);
+            int bodyH = H - bar - stat;
+            int editH = bodyH - panelH;
+            if (editH < 80) editH = 80;
+            if (gPad->tree) MoveWindow(gPad->tree, 0, bar, sidebar, bodyH, TRUE);
+            if (gPad->gutter) MoveWindow(gPad->gutter, sidebar, bar, gut, editH, TRUE);
+            if (gPad->edit) MoveWindow(gPad->edit, sidebar + gut, bar, W - sidebar - gut, editH, TRUE);
+            if (gPad->tabOut) MoveWindow(gPad->tabOut, sidebar + gut, bar + editH, 60, tabs, TRUE);
+            if (gPad->tabIss) MoveWindow(gPad->tabIss, sidebar + gut + 62, bar + editH, 60, tabs, TRUE);
+            if (gPad->out) MoveWindow(gPad->out, sidebar, bar + editH + tabs, W - sidebar, panelH - tabs, TRUE);
+            if (gPad->issues) MoveWindow(gPad->issues, sidebar, bar + editH + tabs, W - sidebar, panelH - tabs, TRUE);
+            if (gPad->status) MoveWindow(gPad->status, 8, H - stat + 3, W - 16, 20, TRUE);
+            InvalidateRect(gPad->gutter, nullptr, TRUE);
             return 0;
+        }
+        case WM_ERASEBKGND: {
+            RECT rc;
+            GetClientRect(h, &rc);
+            HBRUSH b = CreateSolidBrush(RGB(0x16, 0x18, 0x1A));
+            FillRect((HDC)wp, &rc, b);
+            DeleteObject(b);
+            return 1;
+        }
+        case WM_DRAWITEM: {
+            DRAWITEMSTRUCT* di = (DRAWITEMSTRUCT*)lp;
+            if (!di) break;
+            int id = (int)di->CtlID;
+            bool down = (di->itemState & ODS_SELECTED) != 0;
+            bool active = (id == PAD_TAB_OUT && !gPad->showIssues) ||
+                          (id == PAD_TAB_ISS && gPad->showIssues);
+            COLORREF bg = RGB(0x23, 0x27, 0x2A), fg = RGB(0xC3, 0xC9, 0xC8);
+            if (id == PAD_RUN) {
+                bg = down ? RGB(0x82, 0x5B, 0x28) : RGB(0x6E, 0x4B, 0x20);
+                fg = RGB(0xF2, 0xE3, 0xC8);
+            } else if (active) {
+                bg = RGB(0x33, 0x2A, 0x20);
+                fg = RGB(0xE8, 0xAE, 0x66);
+            } else if (down) {
+                bg = RGB(0x2E, 0x33, 0x36);
+            }
+            HBRUSH b2 = CreateSolidBrush(bg);
+            FillRect(di->hDC, &di->rcItem, b2);
+            DeleteObject(b2);
+            HPEN pen = CreatePen(PS_SOLID, 1, RGB(0x2E, 0x33, 0x36));
+            HGDIOBJ op = SelectObject(di->hDC, pen);
+            HGDIOBJ ob = SelectObject(di->hDC, GetStockObject(NULL_BRUSH));
+            Rectangle(di->hDC, di->rcItem.left, di->rcItem.top, di->rcItem.right, di->rcItem.bottom);
+            SelectObject(di->hDC, ob);
+            SelectObject(di->hDC, op);
+            DeleteObject(pen);
+            SetBkMode(di->hDC, TRANSPARENT);
+            SetTextColor(di->hDC, fg);
+            HFONT of = (HFONT)SelectObject(di->hDC, gPadUi);
+            wchar_t txt[64]{};
+            GetWindowTextW(di->hwndItem, txt, 63);
+            RECT tr = di->rcItem;
+            DrawTextW(di->hDC, txt, -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            SelectObject(di->hDC, of);
+            return TRUE;
+        }
+        case WM_NOTIFY: {
+            NMHDR* nh = (NMHDR*)lp;
+            if (!nh) break;
+            if (nh->hwndFrom == gPad->edit) {
+                InvalidateRect(gPad->gutter, nullptr, FALSE);
+                break;
+            }
+            if (nh->hwndFrom == gPad->tree) {
+                if (nh->code == TVN_SELCHANGEDW || nh->code == TVN_SELCHANGEDA ||
+                    nh->code == NM_CLICK || nh->code == NM_DBLCLK)
+                    padTreeActivate();
+                break;
+            }
+            if (nh->hwndFrom == gPad->issues && nh->code == LBN_DBLCLK) {
+                int i = (int)SendMessageW(gPad->issues, LB_GETCURSEL, 0, 0);
+                if (i >= 0) {
+                    int ln = (int)SendMessageW(gPad->issues, LB_GETITEMDATA, i, 0);
+                    if (ln > 0) padGotoLine(ln);
+                }
+                break;
+            }
+            break;
+        }
+        case WM_CTLCOLORLISTBOX: {
+            HDC dc = (HDC)wp;
+            SetTextColor(dc, RGB(0xC3, 0xC9, 0xC8));
+            SetBkColor(dc, RGB(0x1B, 0x1E, 0x20));
+            if (!gPadOutBrush) gPadOutBrush = CreateSolidBrush(RGB(0x1B, 0x1E, 0x20));
+            return (LRESULT)gPadOutBrush;
         }
         case WM_CTLCOLORSTATIC: {
             HDC dc = (HDC)wp;
@@ -34500,14 +34835,18 @@ static LRESULT CALLBACK padProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     padSetDirty(true);
                     SetTimer(h, PAD_T_PAINT, 350, nullptr);
                 }
+                InvalidateRect(gPad->gutter, nullptr, FALSE);
                 return 0;
             }
             if (id == PAD_NEW) { if (padAskSave()) padNew(); return 0; }
             if (id == PAD_OPEN) { if (padAskSave()) padOpen(); return 0; }
+            if (id == PAD_FOLDER) { padOpenFolder(); return 0; }
             if (id == PAD_SAVE) { padSave(); return 0; }
-            if (id == 2110) { padSaveAs(); return 0; }
-            if (id == PAD_CHECK) { padExec(true); return 0; }
-            if (id == PAD_RUN) { padExec(false); return 0; }
+            if (id == PAD_SAVEAS) { padSaveAs(); return 0; }
+            if (id == PAD_CHECK) { padPanelShow(true); padExec(true); return 0; }
+            if (id == PAD_RUN) { padPanelShow(false); padExec(false); return 0; }
+            if (id == PAD_TAB_OUT) { padPanelShow(false); return 0; }
+            if (id == PAD_TAB_ISS) { padPanelShow(true); return 0; }
             return 0;
         }
         case WM_CLOSE:
@@ -34537,6 +34876,8 @@ static bool padHasFont(const wchar_t* name, int size) {
     return _wcsicmp(got, name) == 0;
 }
 
+static std::wstring gPadInitFile;
+
 static int padMain() {
     FreeConsole();   // 桌面版不留黑窗
     LoadLibraryW(L"msftedit.dll");
@@ -34550,6 +34891,14 @@ static int padMain() {
     gPadUi = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                          DEFAULT_PITCH | FF_SWISS, L"Microsoft YaHei UI");
+    gPadSmall = CreateFontW(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                            FIXED_PITCH | FF_MODERN, mono);
+
+    INITCOMMONCONTROLSEX icc{};
+    icc.dwSize = sizeof(icc);
+    icc.dwICC = ICC_TREEVIEW_CLASSES | ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES;
+    InitCommonControlsEx(&icc);
 
     static WenPad st;
     gPad = &st;
@@ -34564,20 +34913,31 @@ static int padMain() {
     wc.lpszClassName = L"WenPadWindow";
     if (!RegisterClassExW(&wc)) return 1;
 
+    WNDCLASSEXW wg{};
+    wg.cbSize = sizeof(wg);
+    wg.lpfnWndProc = padGutterProc;
+    wg.hInstance = inst;
+    wg.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wg.lpszClassName = L"WenPadGutter";
+    RegisterClassExW(&wg);
+
     HWND h = CreateWindowExW(0, L"WenPadWindow",
                              (L"文语编辑器 — 未命名 " + utf8ToWide(WEN_VERSION)).c_str(),
                              WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                             80, 50, 1120, 780,
+                             70, 40, 1280, 840,
                              nullptr, nullptr, inst, nullptr);
     if (!h) return 1;
+    if (!gPadInitFile.empty()) padLoadFile(gPadInitFile);
 
-    ACCEL acc[5]{};
+    ACCEL acc[7]{};
     acc[0] = { FVIRTKEY | FCONTROL, (WORD)'N', PAD_NEW };
     acc[1] = { FVIRTKEY | FCONTROL, (WORD)'O', PAD_OPEN };
     acc[2] = { FVIRTKEY | FCONTROL, (WORD)'S', PAD_SAVE };
-    acc[3] = { FVIRTKEY | FCONTROL, (WORD)'B', 2110 };
+    acc[3] = { FVIRTKEY | FCONTROL | FSHIFT, (WORD)'S', PAD_SAVEAS };
     acc[4] = { FVIRTKEY | FCONTROL, (WORD)VK_RETURN, PAD_RUN };
-    gPadAcc = CreateAcceleratorTableW(acc, 5);
+    acc[5] = { FVIRTKEY, (WORD)VK_F5, PAD_RUN };
+    acc[6] = { FVIRTKEY | FCONTROL, (WORD)'B', PAD_CHECK };
+    gPadAcc = CreateAcceleratorTableW(acc, 7);
 
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -34591,7 +34951,10 @@ static int padMain() {
 #endif
 
 static int runMain(vector<string> args) {
-    if (args.size() >= 2 && (args[1] == "--编辑" || args[1] == "--编辑器")) return padMain();
+    if (args.size() >= 2 && (args[1] == "--编辑" || args[1] == "--编辑器")) {
+        if (args.size() >= 3 && !args[2].empty()) gPadInitFile = utf8ToWide(args[2]);
+        return padMain();
+    }
     if (args.size() > 1 && args[1] == "--不快") { gNoFast = true; args.erase(args.begin() + 1); }
     if (args.size() > 1 && (args[1] == "--不联网" || args[1] == "--offline")) {
         gNoNetLib = true; args.erase(args.begin() + 1);
