@@ -43,6 +43,8 @@
 #include <vector>
 
 #ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <mmsystem.h>
 #include <mfapi.h>
@@ -33550,7 +33552,389 @@ static void waitEnterAtExit() {
     std::getline(std::cin, line);
 }
 
+
+// ===================== 本地编辑服务：--编辑器 / --服务 =====================
+// 只监听 127.0.0.1，把网页编辑器的请求转成 wen.exe 子进程去跑，网页端不碰解释器，出事也伤不到服务。
+static bool srvReadAll(const string& path, string& out) {
+    HANDLE h = CreateFileW(utf8ToWide(path).c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz{};
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 0 || sz.QuadPart > 8 * 1024 * 1024) {
+        CloseHandle(h);
+        return false;
+    }
+    out.assign((size_t)sz.QuadPart, '\0');
+    size_t got = 0;
+    while (got < out.size()) {
+        DWORD n = 0;
+        if (!ReadFile(h, out.data() + got, (DWORD)(out.size() - got), &n, nullptr) || n == 0) break;
+        got += n;
+    }
+    out.resize(got);
+    CloseHandle(h);
+    return got > 0;
+}
+
+static bool srvWriteAll(const string& path, const string& data) {
+    HANDLE h = CreateFileW(utf8ToWide(path).c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    size_t off = 0;
+    while (off < data.size()) {
+        DWORD n = 0;
+        if (!WriteFile(h, data.data() + off, (DWORD)(data.size() - off), &n, nullptr) || n == 0) {
+            CloseHandle(h);
+            return false;
+        }
+        off += n;
+    }
+    CloseHandle(h);
+    return true;
+}
+
+static string srvRoot() {
+    fs::path p = fs::u8path(selfExePath());
+    string dir = p.parent_path().u8string();
+    return dir.empty() ? string(".") : dir;
+}
+
+static string srvUrlDecode(const string& s) {
+    string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '%' && i + 2 < s.size()) {
+            auto hex = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                return -1;
+            };
+            int hi = hex(s[i + 1]), lo = hex(s[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out.push_back((char)((hi << 4) | lo));
+                i += 2;
+                continue;
+            }
+        }
+        if (s[i] == '+') out.push_back(' ');
+        else out.push_back(s[i]);
+    }
+    return out;
+}
+
+static bool srvSendAll(SOCKET s, const string& data) {
+    size_t off = 0;
+    while (off < data.size()) {
+        int n = send(s, data.data() + off, (int)(data.size() - off), 0);
+        if (n <= 0) return false;
+        off += (size_t)n;
+    }
+    return true;
+}
+
+static string srvHttp(const string& status, const string& type, const string& body) {
+    std::ostringstream o;
+    o << "HTTP/1.1 " << status << "\r\n";
+    o << "Content-Type: " << type << "; charset=utf-8\r\n";
+    o << "Content-Length: " << body.size() << "\r\n";
+    o << "Access-Control-Allow-Origin: *\r\n";
+    o << "Access-Control-Allow-Headers: *\r\n";
+    o << "Cache-Control: no-store\r\n";
+    o << "Connection: close\r\n\r\n";
+    o << body;
+    return o.str();
+}
+
+// 起一个子进程，把 stdout/stderr 一起收回来；超时就杀，绝不让网页卡死在解释器里。
+static int srvChild(const string& exe, const vector<string>& argv, string& out, DWORD timeoutMs, bool& timedOut) {
+    timedOut = false;
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    HANDLE rd = nullptr, wr = nullptr;
+    if (!CreatePipe(&rd, &wr, &sa, 0)) return -1;
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+
+    std::wstring cmd = L"\"" + utf8ToWide(exe) + L"\"";
+    for (size_t i = 0; i < argv.size(); ++i) cmd += L" \"" + utf8ToWide(argv[i]) + L"\"";
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput = wr;
+    si.hStdError = wr;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+
+    PROCESS_INFORMATION pi{};
+    BOOL ok = CreateProcessW(nullptr, (LPWSTR)cmd.c_str(), nullptr, nullptr, TRUE,
+                             CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    CloseHandle(wr);
+    if (!ok) {
+        CloseHandle(rd);
+        return -1;
+    }
+
+    string buf;
+    char tmp[8192];
+    DWORD waited = 0;
+    while (true) {
+        DWORD avail = 0;
+        while (PeekNamedPipe(rd, nullptr, 0, nullptr, &avail, nullptr) && avail > 0) {
+            DWORD want = avail > (DWORD)sizeof(tmp) ? (DWORD)sizeof(tmp) : avail;
+            DWORD got = 0;
+            if (!ReadFile(rd, tmp, want, &got, nullptr) || got == 0) break;
+            buf.append(tmp, (size_t)got);
+        }
+        DWORD w = WaitForSingleObject(pi.hProcess, 15);
+        if (w == WAIT_OBJECT_0) {
+            while (PeekNamedPipe(rd, nullptr, 0, nullptr, &avail, nullptr) && avail > 0) {
+                DWORD want = avail > (DWORD)sizeof(tmp) ? (DWORD)sizeof(tmp) : avail;
+                DWORD got = 0;
+                if (!ReadFile(rd, tmp, want, &got, nullptr) || got == 0) break;
+                buf.append(tmp, (size_t)got);
+            }
+            break;
+        }
+        waited += 15;
+        if (timeoutMs && waited >= timeoutMs) {
+            TerminateProcess(pi.hProcess, 2);
+            timedOut = true;
+            break;
+        }
+        if (buf.size() > 2 * 1024 * 1024) break;   // 输出失控就别收了
+    }
+    DWORD code = 0;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    CloseHandle(rd);
+    out = buf;
+    return (int)code;
+}
+
+static bool srvSafeRel(const string& rel) {
+    if (rel.empty() || rel.find("..") != string::npos) return false;
+    string p = rel;
+    for (auto& ch : p) if (ch == '\\') ch = '/';
+    if (p[0] == '/') return false;
+    static const char* allow[] = {"库/", "例子/", "新手示例/", "示例/", "模板/", "测试/用例/"};
+    for (auto a : allow) if (p.rfind(a, 0) == 0) return true;
+    return false;
+}
+
+static void srvAppendList(string& out, const string& dir) {
+    std::error_code ec;
+    fs::path d = fs::u8path(dir);
+    if (!fs::exists(d, ec) || !fs::is_directory(d, ec)) return;
+    int n = 0;
+    for (auto it = fs::directory_iterator(d, ec); !ec && it != fs::directory_iterator(); it.increment(ec)) {
+        if (!it->is_regular_file()) continue;
+        string ext = it->path().extension().u8string();
+        if (ext != ".wen" && ext != ".脚本" && ext != ".程序" && ext != ".库") continue;
+        string name = it->path().stem().u8string();
+        string rel = fs::relative(it->path(), fs::u8path(srvRoot()), ec).u8string();
+        for (auto& ch : rel) if (ch == '\\') ch = '/';
+        if (!out.empty()) out += ",";
+        out += "{\"路径\":" + jsonQuote(rel) + ",\"名字\":" + jsonQuote(name) + "}";
+        if (++n >= 60) break;
+    }
+}
+
+static string srvRoute(const string& method, const string& target, const string& body, int& status) {
+    string path = target, query;
+    size_t qp = target.find('?');
+    if (qp != string::npos) {
+        path = target.substr(0, qp);
+        query = target.substr(qp + 1);
+    }
+    path = srvUrlDecode(path);   // 浏览器会把中文路径发成百分号编码
+    status = 200;
+    if (method == "OPTIONS") return srvHttp("204 No Content", "text/plain", "");
+
+    if (path == "/健康") {
+        return srvHttp("200 OK", "application/json",
+                       "{\"ok\":true,\"版本\":" + jsonQuote(WEN_VERSION) + "}");
+    }
+
+    if (path == "/" || path == "/编辑器") {
+        string html;
+        string root = srvRoot();
+        if (!srvReadAll(root + "/编辑器/文语编辑器.html", html)) srvReadAll("编辑器/文语编辑器.html", html);
+        if (!html.empty()) return srvHttp("200 OK", "text/html", html);
+        return srvHttp("200 OK", "text/html",
+                       "<meta charset=\"utf-8\"><p>没找到 编辑器/文语编辑器.html，它应该和 wen.exe 放在同一层。</p>");
+    }
+
+    if (path == "/列表") {
+        string root = srvRoot();
+        string lib, demo;
+        srvAppendList(lib, root + "/库");
+        srvAppendList(demo, root + "/新手示例");
+        srvAppendList(demo, root + "/例子");
+        srvAppendList(demo, root + "/示例");
+        srvAppendList(demo, root + "/模板");
+        return srvHttp("200 OK", "application/json",
+                       "{\"库\":[" + lib + "],\"示例\":[" + demo + "]}");
+    }
+
+    if (path == "/文件") {
+        string rel;
+        std::istringstream qs(query);
+        string kv;
+        while (std::getline(qs, kv, '&')) {
+            if (kv.rfind("p=", 0) == 0) rel = srvUrlDecode(kv.substr(2));
+        }
+        if (!srvSafeRel(rel)) {
+            status = 403;
+            return srvHttp("403 Forbidden", "text/plain", "只能读项目里的 库/、例子/、新手示例/、示例/、模板/");
+        }
+        string txt;
+        if (!srvReadAll(srvRoot() + "/" + rel, txt)) {
+            status = 404;
+            return srvHttp("404 Not Found", "text/plain", "读不到：" + rel);
+        }
+        return srvHttp("200 OK", "text/plain", txt);
+    }
+
+    if (path == "/运行" || path == "/检查") {
+        if (method != "POST") {
+            status = 405;
+            return srvHttp("405 Method Not Allowed", "text/plain", "这个接口只收 POST");
+        }
+        string dir = (fs::temp_directory_path() / fs::u8path("wen_编辑器")).u8string();
+        std::error_code ec;
+        fs::create_directories(fs::u8path(dir), ec);
+        string tag = (path == "/检查" ? "检查_" : "运行_") + std::to_string((unsigned long long)GetTickCount64());
+        string file = dir + "/" + tag + ".wen";
+        if (!srvWriteAll(file, body)) {
+            status = 500;
+            return srvHttp("500 Internal Server Error", "text/plain", "写不了临时文件");
+        }
+        vector<string> argv;
+        if (path == "/检查") {
+            argv.push_back("--检查");
+            argv.push_back("--json");
+        }
+        argv.push_back(file);
+        string out;
+        bool to = false;
+        int code = srvChild(selfExePath(), argv, out, 8000, to);
+        std::ostringstream j;
+        j << "{\"ok\":" << (!to && code == 0 ? "true" : "false")
+          << ",\"退出码\":" << code
+          << ",\"超时\":" << (to ? "true" : "false")
+          << ",\"输出\":" << jsonQuote(out) << "}";
+        return srvHttp("200 OK", "application/json", j.str());
+    }
+
+    status = 404;
+    return srvHttp("404 Not Found", "text/plain", "没有这个接口：" + path);
+}
+
+static void srvHandleConn(SOCKET c) {
+    string req;
+    char buf[8192];
+    while (req.find("\r\n\r\n") == string::npos) {
+        int n = recv(c, buf, sizeof(buf), 0);
+        if (n <= 0) return;
+        req.append(buf, (size_t)n);
+        if (req.size() > 128 * 1024) break;
+    }
+    size_t headEnd = req.find("\r\n\r\n");
+    if (headEnd == string::npos) {
+        srvSendAll(c, srvHttp("400 Bad Request", "text/plain", "请求头不完整"));
+        return;
+    }
+    string head = req.substr(0, headEnd);
+    string body = req.substr(headEnd + 4);
+    size_t sp1 = head.find(' ');
+    size_t sp2 = sp1 == string::npos ? string::npos : head.find(' ', sp1 + 1);
+    if (sp1 == string::npos || sp2 == string::npos) {
+        srvSendAll(c, srvHttp("400 Bad Request", "text/plain", "请求行不完整"));
+        return;
+    }
+    string method = head.substr(0, sp1);
+    string target = head.substr(sp1 + 1, sp2 - sp1 - 1);
+
+    size_t clen = 0;
+    string lower = head;
+    for (auto& ch : lower) ch = (char)std::tolower((unsigned char)ch);
+    size_t cp = lower.find("\r\ncontent-length:");
+    if (cp != string::npos) {
+        cp += 17;
+        size_t endp = lower.find("\r\n", cp);
+        string num = head.substr(cp, endp == string::npos ? string::npos : endp - cp);
+        try { clen = (size_t)std::stoull(num); } catch (...) { clen = 0; }
+    }
+    if (clen > 4 * 1024 * 1024) clen = 4 * 1024 * 1024;
+    while (body.size() < clen) {
+        int n = recv(c, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        body.append(buf, (size_t)n);
+    }
+    if (body.size() > clen && clen > 0) body.resize(clen);
+
+    int status = 200;
+    string resp = srvRoute(method, target, body, status);
+    srvSendAll(c, resp);
+}
+
+static int srvServe(int port, bool openBrowser) {
+    WSADATA wsa{};
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        std::cerr << "网络初始化失败\n";
+        return 1;
+    }
+    SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (ls == INVALID_SOCKET) {
+        std::cerr << "建不了监听套接字\n";
+        WSACleanup();
+        return 1;
+    }
+    BOOL yes = TRUE;
+    setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
+    int bound = -1;
+    int usePort = port;
+    for (int i = 0; i < 10; ++i) {
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons((u_short)(port + i));
+        if (bind(ls, (sockaddr*)&addr, sizeof(addr)) == 0) { bound = 0; usePort = port + i; break; }
+    }
+    if (bound != 0 || listen(ls, 16) != 0) {
+        std::cerr << "端口 " << port << " 起不来（可能被占用）\n";
+        closesocket(ls);
+        WSACleanup();
+        return 1;
+    }
+    string url = "http://127.0.0.1:" + std::to_string(usePort) + "/";
+    std::cout << "文语编辑器：" << url << "\n";
+    std::cout << "这个窗口别关；Ctrl+C 结束。\n";
+    std::cout.flush();
+    if (openBrowser) ShellExecuteW(nullptr, L"open", utf8ToWide(url).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    while (true) {
+        SOCKET c = accept(ls, nullptr, nullptr);
+        if (c == INVALID_SOCKET) break;
+        srvHandleConn(c);
+        closesocket(c);
+    }
+    closesocket(ls);
+    WSACleanup();
+    return 0;
+}
+
 static int runMain(vector<string> args) {
+    if (args.size() >= 2 && (args[1] == "--服务" || args[1] == "--编辑器")) {
+        int port = 4731;
+        if (args.size() >= 3) {
+            try { port = std::stoi(args[2]); } catch (...) { port = 4731; }
+        }
+        return srvServe(port, args[1] == "--编辑器");
+    }
     if (args.size() > 1 && args[1] == "--不快") { gNoFast = true; args.erase(args.begin() + 1); }
     if (args.size() > 1 && (args[1] == "--不联网" || args[1] == "--offline")) {
         gNoNetLib = true; args.erase(args.begin() + 1);
@@ -33705,6 +34089,8 @@ static int runMain(vector<string> args) {
             "  wen.exe --安装                   装一次运行时：关联 .wen/.wzp，双击就能跑，也不用带 exe\n"
             "  wen.exe --卸载                   撤掉关联和 PATH，删掉装的运行时\n"
             "  wen.exe --打包 文件.wen 产物.wzp 轻量包（只放脚本，KB 级，装过运行时就能跑）\n"
+            "  wen.exe --编辑器                   打开文语编辑器：本地起服务，浏览器里写代码点运行就跑\n"
+            "  wen.exe --服务 [端口]              同上但不自动开浏览器（默认 4731）\n"
             "  wen.exe --库源                   打印当前库源地址\n"
             "  wen.exe --不联网                 关掉依赖自动下载（审计/离线发布用）\n"
             "  wen.exe --翻译 文件.wen 目标    翻译（python/javascript/json/java/字节码/C++/汇编）\n"

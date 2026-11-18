@@ -41,19 +41,22 @@ powershell -NoProfile -ExecutionPolicy Bypass -File 工具\文档覆盖.ps1 | Ou
 if ($LASTEXITCODE -ne 0) { 失败 "文档覆盖检查不通过" }
 
 Write-Host "9/11 版本 / 签名"
-$version = (.\wen_full.exe --版本) -join "`n"
-if ($version -notmatch '文语言 v0\.2 · 作者 Akm / 筑宸科技 · 2026-10-25 首次发布') { 失败 "版本签名不对：$version" }
-$sign = .\wen_full.exe --签名
-if ($sign -notmatch 'WEN-LANG-0\.2') { 失败 "内置签名不对" }
+$expect = (Get-Content VERSION -Raw).Trim()
+$major = ($expect -split '\.')[0..1] -join '.'
+$version = (.\wen.exe --版本) -join "`n"
+if ($version -notmatch ("版本: " + [regex]::Escape($expect))) { 失败 "版本号与 VERSION 不一致（应为 $expect）：$version" }
+if ($version -notmatch ("文语言 v" + [regex]::Escape($major))) { 失败 "版本横幅主版本不对（应为 v$major）：$version" }
+$sign = .\wen.exe --签名
+if ($sign -notmatch ("WEN-LANG-" + [regex]::Escape($major))) { 失败 "内置签名不对（应为 WEN-LANG-$major）：$sign" }
 
 Write-Host "10/11 二进制标记"
-foreach ($exe in @('wen_full.exe', 'wen32.exe')) {
+foreach ($exe in @('wen.exe')) {
     $a = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes((Resolve-Path $exe)))
     if (-not $a.Contains('WEN-EMBEDDED-MARK')) { 失败 "$exe 缺少内嵌标记" }
 }
 
 Write-Host "11/11 库检查"
-$libs = (.\wen_full.exe --库) -join "`n"
+$libs = (.\wen.exe --库) -join "`n"
 foreach ($name in @('时间库', '编码库', '正则库', 'CPU库', '路径库', '日志库', '哈希库', '硬件库', '视口库')) {
     if ($libs -notmatch $name) { 失败 "缺少 $name" }
 }
