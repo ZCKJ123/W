@@ -169,7 +169,29 @@ elseif ($LASTEXITCODE -ne 0) { exit 1 }
 $native = '✓'; & (Join-Path $PSScriptRoot '..\工具\原生EXE检查.ps1'); if ($LASTEXITCODE -ne 0) { exit 1 }
 $selfhost = '✓'; & (Join-Path $PSScriptRoot '..\工具\自举PE检查.ps1'); if ($LASTEXITCODE -ne 0) { exit 1 }
 $selfdisplay = '✓'; & (Join-Path $PSScriptRoot '..\工具\自举显示检查.ps1'); if ($LASTEXITCODE -ne 0) { exit 1 }
+$evalcheck = '✓'; & (Join-Path $PSScriptRoot '..\工具\自举求值检查.ps1'); if ($LASTEXITCODE -ne 0) { exit 1 }
+# 报错归因对拍：宿主报的原因，自举求值 必须报同一句（静默通过也算失败）。
+$errpair = '✓'; & (Join-Path $PSScriptRoot '..\工具\自举报错对拍.ps1'); if ($LASTEXITCODE -ne 0) { exit 1 }
 
-Write-Host ("总账：主用例 {0}/{1}、错误 {2}/{3}、协议 {4}、防崩溃 {5}、索引 {6}、体算子 {7}、体误用 {8}、体尺寸 {9}、自述 {10}、TS {11}、音频 {12}、原生 {13}、自举 {14}、自举显示 {15}" -f `
-    $casePass, $caseTotal, $errorPass, $errorTotal, $protocol, $crash, $index, $volop, $volmis, $voldim, $self, $ts, $audio, $native, $selfhost, $selfdisplay)
+# 自举运行时这一族原先只有 PE / 显示 / 求值三项进总账，其余 15 个绿着的巡检一直没人守，
+# 于是它们红了也没人知道（编译产物缺 类型/迭代 那 8 个就是这么攒下来的）。
+# 这里把当前实跑为绿的 15 项挂进来：以后谁把它们弄红，总账当场掉。
+$selfruntime = 0
+$selfruntimeTotal = 0
+foreach ($name in @('自举窗口检查','自举堆检查','自举分支检查','自举函数检查','自举函数用例检查',
+                    '自举基本用例检查','自举列表检查','自举列表用例检查','自举列表原语检查','自举内置检查',
+                    '自举数学用例检查','自举文本用例检查','自举异常用例检查','自举字典用例检查',
+                    '自举字符串运行时检查')) {
+    $selfruntimeTotal++
+    & (Join-Path $PSScriptRoot "..\工具\$name.ps1") | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "自举巡检未通过：$name"
+        exit 1
+    }
+    $selfruntime++
+}
+$selfruntimeText = "$selfruntime/$selfruntimeTotal"
+
+Write-Host ("总账：主用例 {0}/{1}、错误 {2}/{3}、协议 {4}、防崩溃 {5}、索引 {6}、体算子 {7}、体误用 {8}、体尺寸 {9}、自述 {10}、TS {11}、音频 {12}、原生 {13}、自举 {14}、自举显示 {15}、求值 {16}、报错对拍 {17}、自举巡检 {18}" -f `
+    $casePass, $caseTotal, $errorPass, $errorTotal, $protocol, $crash, $index, $volop, $volmis, $voldim, $self, $ts, $audio, $native, $selfhost, $selfdisplay, $evalcheck, $errpair, $selfruntimeText)
 exit 0

@@ -21,8 +21,8 @@
   ],
   "wen": {
     "official": true,
-    "signature": "WEN-LANG-0.2",
-    "version": "0.2.0-snapshot"
+    "signature": "WEN-LANG-0.3",
+    "version": "0.3.0-snapshot"
   },
   "dsh": {
     "bundle": {

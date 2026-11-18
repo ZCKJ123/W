@@ -1,0 +1,1 @@
+{"target":"bytecode","code":[{"op":"push","v":3},{"op":"store","name":"甲"},{"op":"load","name":"甲"},{"op":"print","n":1},{"op":"load","name":"甲"},{"op":"push","v":2},{"op":"gt"},{"op":"jz","to":11},{"op":"push","v":"大"},{"op":"print","n":1},{"op":"jmp","to":11},{"op":"halt"}],"functions":{}}

@@ -26,6 +26,7 @@
 #include <limits>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include <memory>
 #include <random>
 #include <regex>
@@ -33,6 +34,10 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+/* OpenMP 常驻线程池：光追渲染每帧复用同一批线程，不再每次新建。 */
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include <thread>
 #include <future>
 #include <vector>
@@ -61,7 +66,7 @@ static std::string openWenWorkbench(const std::string& title, const std::string&
 
 // 永不执行的标记字符串：强制留在二进制里，用来证明源码归属。
 __attribute__((used)) static const char WEN_EMBED_MARK[] =
-    "WEN-EMBEDDED-MARK · 文语言 v0.3 · 作者 Akm / 筑宸科技 · 2026-11-04 快照";
+    "WEN-EMBEDDED-MARK · 文语言 v0.3 · 作者 Akm / 筑宸科技 · 2026-11-19 快照";
 #endif
 
 using std::map;
@@ -2007,7 +2012,7 @@ struct Value {
     double rstart = 0, rstop = 0, rstep = 1;
 };
 
-struct List { vector<Value> items; };
+struct List { vector<Value> items; vector<float> compact; };
 struct Dict { map<string, Value> items; };
 
 
@@ -2894,6 +2899,36 @@ static int gPiDigits = 50;
 static long long gExecuted = 0;
 static size_t gMemoryMaxBytes = 64 * 1024 * 1024;
 static int gCpuThreadLimit = 0;  // 0 = 自动
+#ifdef _WIN32
+// 物理核数：超线程对光追这种纯 FP 弹射没有收益（本机实测 14 核 31.3ms、20 逻辑核 32.4ms），
+// 所以线程数按物理核给，而不是 hardware_concurrency() 的逻辑核。
+static int gPhysicalCores = 0;
+static int cpuPhysicalCores() {
+    if (gPhysicalCores > 0) return gPhysicalCores;
+    int cores = 0;
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+    if (len > 0) {
+        std::vector<unsigned char> buf(len);
+        if (GetLogicalProcessorInformationEx(RelationProcessorCore,
+                (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)buf.data(), &len)) {
+            DWORD off = 0;
+            while (off + sizeof(DWORD) <= len) {
+                auto* p = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(buf.data() + off);
+                if (p->Relationship == RelationProcessorCore) ++cores;
+                if (p->Size == 0) break;
+                off += p->Size;
+            }
+        }
+    }
+    if (cores < 1) cores = (int)std::thread::hardware_concurrency();
+    if (cores < 2) cores = 2;
+    gPhysicalCores = cores;
+    return gPhysicalCores;
+}
+#else
+static int cpuPhysicalCores() { return std::max(2, (int)std::thread::hardware_concurrency()); }
+#endif
 static long long gTotal = 0;
 static int gLastLine = 0;
 static std::map<string, Value> gPoints;
@@ -4697,6 +4732,212 @@ bool Interpreter::是内置库(const string& rawName) const {
     return libraryFunctions.count(name) > 0;
 }
 
+static string selfExePath();   // 先用后定义，补个前置声明
+
+// ---------- 库自动下载 ----------
+// 写「依赖 名字」时本地没有 库/名字.wen，就按「库源」地址去取，取到写进 库/名字.wen 再照常加载。
+// 库源：环境变量 WEN_库源（多个用 ; 分隔，地址里的 {名字} 换成库名）；没设就用下面两个默认源。
+// 不想联网（审计、离线发布、CI）：加 --不联网，或设 WEN_库源=关闭。
+static bool gNoNetLib = false;
+
+static string libTrim(const string& s) {
+    size_t i = 0, j = s.size();
+    while (i < j && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n')) ++i;
+    while (j > i && (s[j - 1] == ' ' || s[j - 1] == '\t' || s[j - 1] == '\r' || s[j - 1] == '\n')) --j;
+    return s.substr(i, j - i);
+}
+
+// 环境变量按宽字符读：中文变量名（WEN_库源）用窄 getenv 取不到
+static string libEnv(const string& name) {
+#ifdef _WIN32
+    std::wstring wn = utf8ToWide(name);
+    DWORD n = GetEnvironmentVariableW(wn.c_str(), nullptr, 0);
+    if (n > 0) {
+        std::vector<wchar_t> buf(n, L'\0');
+        DWORD got = GetEnvironmentVariableW(wn.c_str(), buf.data(), n);
+        if (got > 0) return wideToUtf8(std::wstring(buf.data(), got));
+    }
+    return string();
+#else
+    const char* v = std::getenv(name.c_str());
+    return v ? string(v) : string();
+#endif
+}
+
+static vector<string> libSourceList() {
+    vector<string> out;
+    string all = libEnv("WEN_库源");
+    if (all.empty()) all = libEnv("WEN_LIB_SOURCE");
+    if (!all.empty()) {
+        if (libTrim(all) == "关闭" || libTrim(all) == "off" || libTrim(all) == "0") return out;
+        size_t i = 0;
+        while (true) {
+            size_t j = all.find(';', i);
+            string one = libTrim(all.substr(i, j == string::npos ? string::npos : j - i));
+            if (!one.empty()) out.push_back(one);
+            if (j == string::npos) break;
+            i = j + 1;
+        }
+    }
+    if (!out.empty()) return out;
+    // 默认源：先 GitHub 原始文件，再 Gitee 镜像（国内更快）
+    out.push_back("https://raw.githubusercontent.com/ZCKJ123/W/main/库/{名字}.wen");
+    out.push_back("https://gitee.com/zhuchen_1/wen/raw/master/库/{名字}.wen");
+    return out;
+}
+
+// 中文库名要按 UTF-8 百分号编码才能进 URL；'/' 保留当路径分隔
+static string libUrlEncode(const string& s) {
+    string out;
+    for (unsigned char c : s) {
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.' || c == '~' || c == '/' || c == ':') {
+            out.push_back((char)c);
+        } else {
+            char buf[8];
+            std::snprintf(buf, sizeof(buf), "%%%02X", (unsigned)c);
+            out += buf;
+        }
+    }
+    return out;
+}
+
+static string libApplySource(string tpl, const string& name) {
+    string enc = libUrlEncode(name);
+    size_t pos;
+    while ((pos = tpl.find("{名字}")) != string::npos) tpl.replace(pos, 8, enc);
+    while ((pos = tpl.find("{name}")) != string::npos) tpl.replace(pos, 6, enc);
+    return tpl;
+}
+
+// 取回来的东西得像个文语言源：不是 404 页面、不是 HTML、能认出语法关键字
+static bool libLooksLikeSource(const string& s, string& why) {
+    if (s.size() < 8) { why = "内容太短"; return false; }
+    if (s.size() > (4u << 20)) { why = "内容超过 4 MB，不像库文件"; return false; }
+    string head = s.substr(0, 300);
+    std::transform(head.begin(), head.end(), head.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    if (head.find("<html") != string::npos || head.find("<!doctype") != string::npos) {
+        why = "取回的是网页（HTML），不是库文件"; return false;
+    }
+    if (head.find("404: not found") != string::npos || head.find("not found") == 0) {
+        why = "仓库里没有这个库（404）"; return false;
+    }
+    static const char* marks[] = {"函数", "返回", "打印", "将", "当", "如果", "依赖", "导出", "对于"};
+    size_t hit = 0;
+    for (const char* m : marks) if (s.find(m) != string::npos) ++hit;
+    if (hit == 0) { why = "内容里没有任何文语言关键字，可能是错的文件"; return false; }
+    return true;
+}
+
+// 百分号解码（网上的库名是 %E5%AD%97 这种，落盘要还原成中文名）
+static string libUrlDecode(const string& s) {
+    string out;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '%' && i + 2 < s.size() && std::isxdigit((unsigned char)s[i + 1]) &&
+            std::isxdigit((unsigned char)s[i + 2])) {
+            out.push_back((char)std::stoi(s.substr(i + 1, 2), nullptr, 16));
+            i += 2;
+        } else {
+            out.push_back(s[i]);
+        }
+    }
+    return out;
+}
+
+// 把库文本落到 库/名字.wen（依次试：当前目录/库、exe 同目录/库、LOCALAPPDATA/wen/库）
+static bool installLibraryText(const string& name, const string& body, string& outPath, string& err) {
+    vector<fs::path> dirs;
+    std::error_code ec;
+    dirs.push_back(fs::current_path(ec) / fs::u8path("库"));
+    string exe = selfExePath();
+    if (!exe.empty()) dirs.push_back(fs::u8path(exe).parent_path() / fs::u8path("库"));
+    string la = libEnv("LOCALAPPDATA");
+    if (!la.empty()) dirs.push_back(fs::u8path(la) / fs::u8path("wen") / fs::u8path("库"));
+
+    for (auto& d : dirs) {
+        std::error_code ec2;
+        fs::create_directories(d, ec2);
+        if (ec2) { err = "建不了目录：" + d.u8string(); continue; }
+        fs::path f = d / fs::u8path(name + ".wen");
+        try {
+            writeWholeFile(f.u8string(), body, false);
+            outPath = f.u8string();
+            return true;
+        } catch (std::exception& e) {
+            err = "写不进 " + f.u8string() + "：" + e.what();
+        }
+    }
+    return false;
+}
+
+// 取回来 → 落到 库/名字.wen；名字来自库名（按模板拼 URL）
+static bool fetchLibraryToDisk(const string& name, string& outPath, string& usedUrl, string& err) {
+    vector<string> srcs = libSourceList();
+    if (srcs.empty()) { err = "库源已关闭（WEN_库源=关闭）"; return false; }
+    string body;
+    for (const auto& tpl : srcs) {
+        string url = libApplySource(tpl, name);
+        try {
+            string got = httpGetText(url, 8000, 0);
+            string why;
+            if (!libLooksLikeSource(got, why)) {
+                err += (err.empty() ? "" : "；") + url + " → " + why;
+                continue;
+            }
+            body = got;
+            usedUrl = url;
+            break;
+        } catch (WenError& e) {
+            err += (err.empty() ? "" : "；") + url + " → " + e.what();
+        } catch (std::exception& e) {
+            err += (err.empty() ? "" : "；") + url + " → " + e.what();
+        }
+    }
+    if (body.empty()) return false;
+    return installLibraryText(name, body, outPath, err);
+}
+
+// 网址路径：直接给一条 http(s) 地址或本地文件，按末段文件名当库名装下来
+static bool fetchLibraryFromUrl(const string& target, string& outPath, string& usedFrom, string& err) {
+    string body, name;
+    bool remote = target.rfind("http://", 0) == 0 || target.rfind("https://", 0) == 0;
+    if (remote) {
+        try {
+            body = httpGetText(target, 15000, 0);
+        } catch (WenError& e) {
+            err = e.what(); return false;
+        } catch (std::exception& e) {
+            err = e.what(); return false;
+        }
+        string t = target;
+        size_t q = t.find('?');
+        if (q != string::npos) t = t.substr(0, q);
+        size_t hash = t.find('#');
+        if (hash != string::npos) t = t.substr(0, hash);
+        size_t slash = t.rfind('/');
+        string seg = (slash == string::npos) ? t : t.substr(slash + 1);
+        seg = libUrlDecode(seg);
+        size_t dot = seg.rfind('.');
+        if (dot != string::npos && dot > 0) seg = seg.substr(0, dot);
+        name = seg;
+        usedFrom = target;
+    } else {
+        if (!fs::exists(fs::u8path(target))) { err = "文件不存在：" + target; return false; }
+        try {
+            body = readWholeFile(target);
+        } catch (std::exception& e) {
+            err = e.what(); return false;
+        }
+        name = fs::u8path(target).stem().u8string();
+        usedFrom = fs::absolute(fs::u8path(target)).u8string();
+    }
+    if (name.empty()) name = "远程库";
+    string why;
+    if (!libLooksLikeSource(body, why)) { err = "取到的不是库文件：" + why; return false; }
+    return installLibraryText(name, body, outPath, err);
+}
+
 void Interpreter::加载外部库(const string& name, int line) {
     if (loadedModules.count(name)) return;
 
@@ -4726,11 +4967,25 @@ void Interpreter::加载外部库(const string& name, int line) {
             break;
         }
     }
+    if (found.empty() && !gNoNetLib) {
+        // 本地没有：按库源取回来，装进 库/名字.wen，再把候选重扫一遍
+        string got, url, err;
+        if (fetchLibraryToDisk(name, got, url, err) && !got.empty()) {
+            std::cerr << "已联网取库：「" << name << "」 ← " << url
+                      << "（存到 " << got << "）\n";
+            found = fs::u8path(got);
+        } else if (!err.empty()) {
+            std::cerr << "联网取库没成功：「" << name << "」 " << err << "\n";
+        }
+    }
     if (found.empty()) {
         throw WenError("运行时错误", line, 0,
                        "找不到库「" + name +
-                       "」：不是内置库，也没找到 库/" + name +
-                       ".脚本/.程序/.wen（库还认 .库/.wenlib，或目录 " + name + "/主.wen）");
+                       "」：不是内置库，本地 库/" + name +
+                       ".wen 也没有" +
+                       (gNoNetLib ? "（当前 --不联网，不联网取）"
+                                  : "，库源里也没取到") +
+                       "；检查库名拼写，或用 WEN_库源 指到自己的库仓库");
     }
 
     loadedModules.insert(name);
@@ -6548,6 +6803,40 @@ Value Interpreter::eval(const ExprPtr& e, const shared_ptr<Scope>& scope) {
             if ((obj.type == VT::List || obj.type == VT::Set) && obj.list) {
                 items = obj.list->items;
             } else if (obj.type == VT::Str) {
+                // 文本快速路径：step==1 时不做 Value 拆解，一次扫描定位两个字节边界再 substr。
+                // 原来这里把整串拆成 N 个 Value 再拼回来，切一字符的代价是 O(整串长)。
+                if (step == 1) {
+                    long long cn = (long long)utf8Length(obj.str);
+                    bool hs = (bool)e->args[1];
+                    bool hp = (bool)e->args[2];
+                    long long st = hs ? 0 : 0;
+                    long long sp = hp ? 0 : cn;
+                    if (hs) st = needIndex(eval(e->args[1], scope), "切片起点", e->line);
+                    if (hp) sp = needIndex(eval(e->args[2], scope), "切片终点", e->line);
+                    if (st < 0) st += cn;
+                    if (sp < 0) sp += cn;
+                    st = std::max(0LL, std::min(st, cn));
+                    sp = std::max(0LL, std::min(sp, cn));
+                    if (sp <= st) return vStr("");
+                    size_t bSt = obj.str.size(), bSp = obj.str.size();
+                    size_t bi = 0;
+                    long long ci = 0;
+                    bool gotSt = (st == 0);
+                    if (gotSt) bSt = 0;
+                    while (bi < obj.str.size() && ci < sp) {
+                        if (!gotSt && ci == st) {
+                            bSt = bi;
+                            gotSt = true;
+                        }
+                        bi += utf8CharLen((unsigned char)obj.str[bi]);
+                        if (bi > obj.str.size()) bi = obj.str.size();
+                        ++ci;
+                    }
+                    if (!gotSt) bSt = obj.str.size();
+                    bSp = bi;
+                    if (bSp < bSt) bSp = bSt;
+                    return vStr(obj.str.substr(bSt, bSp - bSt));
+                }
                 for (const auto& ch : utf8Chars(obj.str)) items.push_back(vStr(ch));
                 isText = true;
             } else {
@@ -6748,13 +7037,35 @@ Value Interpreter::getIndex(const Value& obj, const Value& idx, int line) {
         return obj.list->items[(size_t)i];
     }
     if (obj.type == VT::Str) {
-        auto chars = utf8Chars(obj.str);
+        // 取一个字符不该拆整串。原来 utf8Chars 会把 N 个字符各分配一个小串，
+        // 取尾部的字要先把整串走一遍，循环取 100 个字就拆 100 遍整串。
+        // 这里只扫到目标位置，靠近末尾时从尾部反向走。
         long long i = needIndex(idx, "文本下标", line);
-        long long n = (long long)chars.size();
-        if (i < 0) i += n;
-        if (i < 0 || i >= n)
+        long long cn = (long long)utf8Length(obj.str);
+        if (i < 0) i += cn;
+        if (i < 0 || i >= cn)
             rtError(line, "文本下标越界：" + std::to_string(i));
-        return vStr(chars[(size_t)i]);
+        size_t bi = 0;
+        if (i * 2 <= cn) {
+            long long c = 0;
+            while (c < i && bi < obj.str.size()) {
+                bi += utf8CharLen((unsigned char)obj.str[bi]);
+                if (bi > obj.str.size()) bi = obj.str.size();
+                ++c;
+            }
+        } else {
+            bi = obj.str.size();
+            long long c = cn;
+            while (c > i && bi > 0) {
+                --bi;
+                while (bi > 0 && ((unsigned char)obj.str[bi] & 0xC0) == 0x80) --bi;
+                --c;
+            }
+        }
+        if (bi >= obj.str.size()) return vStr("");
+        size_t len = utf8CharLen((unsigned char)obj.str[bi]);
+        if (bi + len > obj.str.size()) len = obj.str.size() - bi;
+        return vStr(obj.str.substr(bi, len));
     }
     if (obj.type == VT::Dict && obj.dict) {
         if (idx.type != VT::Str) rtError(line, "字典的键必须是文本");
@@ -7362,6 +7673,240 @@ static shared_ptr<Dict> vpDict(const Value& v, int line) {
 static vector<unsigned char>& vpPixels(const shared_ptr<Dict>& d) {
     return *d->items.at("像素").bytes;
 }
+
+// ===== 几何准备原生复刻（对齐 库/棱镜数学.库 + 库/棱镜光照.库，逐式一致） =====
+static const double WEN_PI = 3.14159265358979323846;
+static std::array<double, 3> wenV3(const Value& v, const string& where, int line) {
+    auto l = needList(v, where, line);
+    if (l->items.size() < 3) throw WenError("运行时错误", line, 0, where + "需要三维向量");
+    return { needNum(l->items[0], where, line), needNum(l->items[1], where, line), needNum(l->items[2], where, line) };
+}
+static double wenDot(const std::array<double,3>& a, const std::array<double,3>& b) { return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]; }
+static std::array<double,3> wenSub(const std::array<double,3>& a, const std::array<double,3>& b) { return {a[0]-b[0],a[1]-b[1],a[2]-b[2]}; }
+static std::array<double,3> wenCross(const std::array<double,3>& a, const std::array<double,3>& b) {
+    return {a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]};
+}
+static double wenLen(const std::array<double,3>& a) { return std::sqrt(a[0]*a[0]+a[1]*a[1]+a[2]*a[2]); }
+static std::array<double,3> wenNorm(const std::array<double,3>& a) {
+    double L = wenLen(a);
+    if (L < 1e-12) return {0.0,0.0,0.0};
+    return {a[0]/L, a[1]/L, a[2]/L};
+}
+static Value wenV3List(const std::array<double,3>& v) {
+    auto l = std::make_shared<List>();
+    l->items = {vNum(v[0]), vNum(v[1]), vNum(v[2])};
+    return vList(l);
+}
+static std::array<std::array<double,3>,3> wenCamBase(const shared_ptr<Dict>& cam, int line) {
+    auto& cached = cam->items.at("基");
+    if (cached.type == VT::List && cached.list && cached.list->items.size() == 3) {
+        return { wenV3(cached.list->items[0], "相机基", line),
+                 wenV3(cached.list->items[1], "相机基", line),
+                 wenV3(cached.list->items[2], "相机基", line) };
+    }
+    double yaw = needNum(cam->items.at("偏航"), "相机", line);
+    double pitch = needNum(cam->items.at("俯仰"), "相机", line);
+    double cp = std::cos(pitch);
+    std::array<double,3> front = { std::sin(yaw)*cp, std::sin(pitch), std::cos(yaw)*cp };
+    front = wenNorm(front);
+    std::array<double,3> right = wenNorm(wenCross({0.0,1.0,0.0}, front));
+    if (wenLen(right) < 1e-9) right = {1.0,0.0,0.0};
+    std::array<double,3> up = wenNorm(wenCross(front, right));
+    auto bc = std::make_shared<List>();
+    bc->items = { wenV3List(front), wenV3List(right), wenV3List(up) };
+    cached = vList(bc);
+    return { front, right, up };
+}
+static std::array<double,3> wenToCam(const shared_ptr<Dict>& cam, const std::array<double,3>& p, int line) {
+    auto base = wenCamBase(cam, line);
+    auto pos = wenV3(cam->items.at("位置"), "相机", line);
+    auto d = wenSub(p, pos);
+    return { wenDot(d, base[1]), wenDot(d, base[2]), wenDot(d, base[0]) };
+}
+static vector<std::array<double,3>> wenClipPlane(const vector<std::array<double,3>>& poly, double a, double b, double c, double d) {
+    vector<std::array<double,3>> out;
+    if (poly.empty()) return out;
+    size_t n = poly.size();
+    for (size_t i = 0; i < n; ++i) {
+        const auto& cur = poly[i];
+        const auto& nxt = poly[(i + 1) % n];
+        double cd = a*cur[0]+b*cur[1]+c*cur[2]+d;
+        double nd = a*nxt[0]+b*nxt[1]+c*nxt[2]+d;
+        bool cin = cd >= 0.0, nin = nd >= 0.0;
+        if (cin) out.push_back(cur);
+        if (cin != nin) {
+            double t = cd / (cd - nd);
+            out.push_back({ cur[0]+(nxt[0]-cur[0])*t, cur[1]+(nxt[1]-cur[1])*t, cur[2]+(nxt[2]-cur[2])*t });
+        }
+    }
+    return out;
+}
+static vector<std::array<double,3>> wenClipFrustum(const shared_ptr<Dict>& cam, vector<std::array<double,3>> poly, double w, double h, int line) {
+    if (poly.empty()) return {};
+    bool ortho = cam->items.at("模式").str == "正交";
+    vector<std::array<double,4>> planes;
+    if (ortho) {
+        double halfH = needNum(cam->items.at("正交尺度"), "相机", line) * 0.5;
+        double halfW = halfH * (w / h);
+        double nearZ = needNum(cam->items.at("近平面"), "相机", line);
+        planes.emplace_back(std::array<double,4>{0.0,0.0,1.0,-nearZ});
+        planes.emplace_back(std::array<double,4>{0.0,1.0,0.0,halfH});
+        planes.emplace_back(std::array<double,4>{0.0,-1.0,0.0,halfH});
+        planes.emplace_back(std::array<double,4>{1.0,0.0,0.0,halfW});
+        planes.emplace_back(std::array<double,4>{-1.0,0.0,0.0,halfW});
+    } else {
+        double vtan = std::tan(WEN_PI/180.0 * needNum(cam->items.at("视场角"), "相机", line) * 0.5);
+        double htan = vtan * (w / h);
+        double nearZ = needNum(cam->items.at("近平面"), "相机", line);
+        planes.emplace_back(std::array<double,4>{0.0,0.0,1.0,-nearZ});
+        planes.emplace_back(std::array<double,4>{0.0,0.0,-1.0,1.0e4});
+        planes.emplace_back(std::array<double,4>{0.0,1.0,vtan,0.0});
+        planes.emplace_back(std::array<double,4>{0.0,-1.0,vtan,0.0});
+        planes.emplace_back(std::array<double,4>{1.0,0.0,htan,0.0});
+        planes.emplace_back(std::array<double,4>{-1.0,0.0,htan,0.0});
+    }
+    for (const auto& pl : planes) {
+        poly = wenClipPlane(poly, pl[0], pl[1], pl[2], pl[3]);
+        if (poly.empty()) return {};
+    }
+    return poly;
+}
+static std::array<double,2> wenProject(const shared_ptr<Dict>& cam, const std::array<double,3>& p, double w, double h, int line) {
+    if (w <= 0.0 || h <= 0.0) return {0.0,0.0};
+    bool ortho = cam->items.at("模式").str == "正交";
+    if (ortho) {
+        double unit = h / std::max(needNum(cam->items.at("正交尺度"), "相机", line), 1e-6);
+        return { w*0.5 + p[0]*unit, h*0.5 - p[1]*unit };
+    }
+    double minz = needNum(cam->items.at("最小z"), "相机", line);
+    double invz = 1.0 / std::max(p[2], minz);
+    double focal = 1.0 / std::tan(WEN_PI/180.0 * needNum(cam->items.at("视场角"), "相机", line) * 0.5);
+    double aspect = w / h;
+    double nx = (p[0]*invz) * focal / aspect;
+    double ny = -(p[1]*invz) * focal;
+    return { w*0.5 + nx*w*0.5, h*0.5 + ny*h*0.5 };
+}
+static std::array<double,3> wenShade(const std::array<double,3>& n, const std::array<double,3>& center,
+    const shared_ptr<Dict>& mat, const shared_ptr<Dict>& sun, double env, double minL, bool on, int line) {
+    auto base = wenV3(mat->items.at("色"), "材质", line);
+    if (!on) return base;
+    std::array<double,3> light;
+    if (truthy(sun->items.at("平行"))) {
+        auto sp = wenV3(sun->items.at("位置"), "太阳", line);
+        light = wenNorm(sp);
+        if (wenLen(light) < 1e-9) light = {0.0,1.0,0.0};
+    } else {
+        auto sp = wenV3(sun->items.at("位置"), "太阳", line);
+        std::array<double,3> diff = {sp[0]-center[0], sp[1]-center[1], sp[2]-center[2]};
+        double L = wenLen(diff);
+        if (L < 1e-6) light = {0.0,1.0,0.0};
+        else light = {diff[0]/L, diff[1]/L, diff[2]/L};
+    }
+    double intensity = needNum(sun->items.at("强度"), "太阳", line);
+    double albedo = needNum(mat->items.at("反照率"), "材质", line);
+    double diff = std::max(0.0, wenDot(n, light)) * intensity * albedo;
+    double env2 = env * std::min(1.0, intensity);
+    double bright = env2 + diff * (1.0 - env2);
+    bright = std::max(bright, needNum(mat->items.at("自发光"), "材质", line));
+    bright = std::max(bright, minL);
+    bright = std::max(0.0, std::min(1.0, bright));
+    auto sc = wenV3(sun->items.at("色"), "太阳", line);
+    return { std::max(0.0,std::min(1.0,base[0]*bright*sc[0])),
+             std::max(0.0,std::min(1.0,base[1]*bright*sc[1])),
+             std::max(0.0,std::min(1.0,base[2]*bright*sc[2])) };
+}
+// 背面判定（复刻 相机背面：正交点(法线,前)<0；透视点(法线,位置-中心)>0）
+static bool wenBackface(const shared_ptr<Dict>& cam, const std::array<double,3>& n,
+    const std::array<double,3>& center, int line) {
+    bool ortho = cam->items.at("模式").str == "正交";
+    if (ortho) {
+        auto base = wenCamBase(cam, line);
+        return wenDot(n, base[0]) < 0.0;
+    }
+    auto pos = wenV3(cam->items.at("位置"), "相机", line);
+    return wenDot(n, wenSub(pos, center)) > 0.0;
+}
+// 单面准备（复刻 快面准备 本体），返回 {点,键,色} 字典或空字典
+static Value wenPrepareFace(const shared_ptr<Dict>& cam, const shared_ptr<Dict>& face,
+    double w, double h, bool persp, const shared_ptr<Dict>& sun,
+    const shared_ptr<Dict>& cfg, double layer, int line) {
+    auto verts = needList(face->items.at("顶点"), "面片", line);
+    vector<std::array<double,3>> view;
+    view.reserve(verts->items.size());
+    for (const auto& v : verts->items) view.push_back(wenToCam(cam, wenV3(v, "顶点", line), line));
+    double nearZ = needNum(cam->items.at("近平面"), "相机", line);
+    if (persp) {
+        bool needClip = false;
+        for (const auto& p : view) if (p[2] < nearZ) { needClip = true; break; }
+        if (needClip) {
+            view = wenClipFrustum(cam, view, w, h, line);
+            if (view.size() < 3) return vDict(std::make_shared<Dict>());
+        }
+    }
+    auto pts = std::make_shared<List>();
+    for (const auto& p : view) {
+        auto sp = wenProject(cam, p, w, h, line);
+        auto pt = std::make_shared<List>();
+        pt->items = { vNum(std::floor(sp[0])), vNum(std::floor(sp[1])) };
+        pts->items.push_back(vList(pt));
+    }
+    auto normal = wenV3(face->items.at("法线"), "面片", line);
+    auto center = wenV3(face->items.at("中心"), "面片", line);
+    auto mat = needDict(face->items.at("材质"), "面片", line);
+    double env = needNum(cfg->items.at("环境"), "配置", line);
+    double minL = needNum(cfg->items.at("最低亮度"), "配置", line);
+    bool lit = truthy(cfg->items.at("光影"));
+    auto c01 = wenShade(normal, center, mat, sun, env, minL, lit, line);
+    double rgb[3] = { std::floor(c01[0]*255.0+0.5), std::floor(c01[1]*255.0+0.5), std::floor(c01[2]*255.0+0.5) };
+    auto camPos = wenV3(cam->items.at("位置"), "相机", line);
+    double dist = wenLen(wenSub(center, camPos));
+    double fogDist = 0.0;
+    if (cfg->items.count("雾距")) fogDist = needNum(cfg->items.at("雾距"), "配置", line);
+    if (fogDist > 0.0) {
+        std::array<double,3> fog = {0.0,0.0,0.0};
+        if (cfg->items.count("雾色")) fog = wenV3(cfg->items.at("雾色"), "配置", line);
+        double f = dist / fogDist;
+        if (f > 1.0) f = 1.0;
+        f = f * f;
+        rgb[0] = rgb[0] + (fog[0]-rgb[0]) * f;
+        rgb[1] = rgb[1] + (fog[1]-rgb[1]) * f;
+        rgb[2] = rgb[2] + (fog[2]-rgb[2]) * f;
+    }
+    int r = (int)std::floor(rgb[0]), g = (int)std::floor(rgb[1]), b = (int)std::floor(rgb[2]);
+    r = std::max(0, std::min(255, r)); g = std::max(0, std::min(255, g)); b = std::max(0, std::min(255, b));
+    auto out = std::make_shared<Dict>();
+    out->items["点"] = vList(pts);
+    out->items["键"] = vNum(dist - layer * 4000.0);
+    out->items["色"] = vNum((double)((r << 16) | (g << 8) | b));
+    return vDict(out);
+}
+// 三角形填充（复刻 视口画三角形：AABB 包围盒 + 三重心边函数测试，直写缓冲）
+static void wenFillTriangle(const shared_ptr<Dict>& d, int x1, int y1, int x2, int y2,
+    int x3, int y3, int c) {
+    auto edge = [](int ax, int ay, int bx, int by, int px, int py) {
+        return (px - ax) * (by - ay) - (py - ay) * (bx - ax);
+    };
+    int area = edge(x1, y1, x2, y2, x3, y3);
+    if (!area) return;
+    int w = (int)needNum(d->items.at("宽"), "视口", 0);
+    int h = (int)needNum(d->items.at("高"), "视口", 0);
+    auto& p = vpPixels(d);
+    int minx = std::min({x1, x2, x3}), maxx = std::max({x1, x2, x3});
+    int miny = std::min({y1, y2, y3}), maxy = std::max({y1, y2, y3});
+    if (minx < 0) minx = 0; if (miny < 0) miny = 0;
+    if (maxx >= w) maxx = w - 1; if (maxy >= h) maxy = h - 1;
+    unsigned char cr = (unsigned char)((c >> 16) & 255), cg = (unsigned char)((c >> 8) & 255), cb = (unsigned char)(c & 255);
+    for (int y = miny; y <= maxy; ++y)
+        for (int x = minx; x <= maxx; ++x) {
+            int w1 = edge(x2, y2, x3, y3, x, y);
+            int w2 = edge(x3, y3, x1, y1, x, y);
+            int w3 = edge(x1, y1, x2, y2, x, y);
+            if ((w1 >= 0 && w2 >= 0 && w3 >= 0) || (w1 <= 0 && w2 <= 0 && w3 <= 0)) {
+                size_t i = ((size_t)y * (size_t)w + (size_t)x) * 3;
+                p[i] = cr; p[i + 1] = cg; p[i + 2] = cb;
+            }
+        }
+}
 static void vpPut(const shared_ptr<Dict>& d, int x, int y, int c) {
     int w = (int)needNum(d->items.at("宽"), "视口", 0);
     int h = (int)needNum(d->items.at("高"), "视口", 0);
@@ -7381,6 +7926,763 @@ static void vpPutZ(const shared_ptr<Dict>& d, int x, int y, double z, int c) {
     if (z >= needNum(dp->items[i], "视口", 0)) return;
     dp->items[i] = vNum(z);
     vpPut(d, x, y, c);
+}
+// 体积光步进累加：逐像素沿视线步进，查光空间覆盖深度判遮挡，未被挡的空气累加散射，加法提亮写回。
+// 遮挡口径对齐 库/棱镜阴影.库 应用阴影：覆盖深度[ty*尺寸+tx] > (1e4-lz)+偏移 → 被挡。
+static long long wenVolumetric(const shared_ptr<Dict>& vp, const shared_ptr<List>& depth,
+    const shared_ptr<Dict>& cam, const shared_ptr<List>& shadowDepth,
+    const shared_ptr<Dict>& lightCam, int shadowSize, int steps,
+    double nearT, double farT, double intensity,
+    const std::array<double,3>& sunCol, double bias,
+    double density, double densityHeight, double outdoorFactor,
+    const shared_ptr<List>& mask, int line) {
+    int w = (int)needNum(vp->items.at("宽"), "视口", line);
+    int h = (int)needNum(vp->items.at("高"), "视口", line);
+    auto& pix = vpPixels(vp);
+    auto cb = wenCamBase(cam, line);
+    auto front = cb[0], right = cb[1], up = cb[2];
+    auto pos = wenV3(cam->items.at("位置"), "相机", line);
+    bool ortho = cam->items.at("模式").str == "正交";
+    double focal = 1.0 / std::tan(WEN_PI/180.0 * needNum(cam->items.at("视场角"), "相机", line) * 0.5);
+    double aspect = (double)w / h;
+    double halfW = w*0.5, halfH = h*0.5;
+    double camUnit = h / std::max(needNum(cam->items.at("正交尺度"), "相机", line), 1e-6);
+    auto lb = wenCamBase(lightCam, line);
+    auto lf = lb[0], lr = lb[1], lu = lb[2];
+    std::array<double,3> sunView = {-lf[0], -lf[1], -lf[2]}; // 场景→太阳（入射反方向）
+    auto lpos = wenV3(lightCam->items.at("位置"), "光相机", line);
+    double lUnit = shadowSize / std::max(needNum(lightCam->items.at("正交尺度"), "光相机", line), 1e-6);
+    double lHalf = shadowSize * 0.5;
+    auto& ditems = depth->items;
+    auto* mitems = mask ? &mask->items : nullptr;
+    auto& sitems = shadowDepth->items;
+    auto* scomp = shadowDepth->compact.empty() ? nullptr : &shadowDepth->compact;
+    // 相机基 × 光基 互点积（循环外提外），供表面点光空间投影复用，避免每像素重建世界点再点积。
+    double rL=right[0]*lr[0]+right[1]*lr[1]+right[2]*lr[2], rU=right[0]*lu[0]+right[1]*lu[1]+right[2]*lu[2], rF=right[0]*lf[0]+right[1]*lf[1]+right[2]*lf[2];
+    double uL=up[0]*lr[0]+up[1]*lr[1]+up[2]*lr[2],     uU=up[0]*lu[0]+up[1]*lu[1]+up[2]*lu[2],     uF=up[0]*lf[0]+up[1]*lf[1]+up[2]*lf[2];
+    double fL=front[0]*lr[0]+front[1]*lr[1]+front[2]*lr[2], fU=front[0]*lu[0]+front[1]*lu[1]+front[2]*lu[2], fF=front[0]*lf[0]+front[1]*lf[1]+front[2]*lf[2];
+    // 相机基准点光空间坐标：只依赖相机/光相机位置，与像素无关，循环外提外。
+    double ox=pos[0]-lpos[0], oy=pos[1]-lpos[1], oz=pos[2]-lpos[2];
+    double baseX=ox*lr[0]+oy*lr[1]+oz*lr[2];
+    double baseY=ox*lu[0]+oy*lu[1]+oz*lu[2];
+    double baseZ=ox*lf[0]+oy*lf[1]+oz*lf[2];
+    // 单帧不变量提外：尘埃分层高度、近地面归一高度、逐列 ndc x（与深度/相机位置无关）。
+    double hf = densityHeight > 1e-6 ? densityHeight : 1.0;
+    double th0 = pos[1] / hf;
+    std::vector<double> nxArr(w);
+    for (int xx=0; xx<w; ++xx) nxArr[xx] = ((xx+0.5)-halfW)/halfW;
+    struct VolAcc { long long lit=0; };
+    auto rows = [&](int y0, int y1, VolAcc& ac) {
+    for (int y = y0; y < y1; ++y) {
+        double ny = ((y + 0.5) - halfH) / halfH;
+        for (int x = 0; x < w; ++x) {
+            size_t idx = (size_t)y * w + x;
+            double key = ditems[idx].num;
+            // 实体表面不做路径内遮挡分段：避免立柱剪影沿视线投射到后板墙面形成竖直条纹；
+            // 实体面只按表面点室内外系数给均匀环境雾提亮。
+            bool solid = mitems ? (*mitems)[idx].num > 0.5 : false;
+            double tFar;
+            if (ortho) tFar = 1.0e4 - key;
+            else tFar = key > 1e-12 ? 1.0 / key : farT;
+            if (tFar > farT) tFar = farT;
+            if (tFar <= nearT) continue;
+            double nx = nxArr[x];
+            double cz = tFar, ccx, ccy;
+            if (ortho) {
+                ccx = ((x + 0.5) - halfW) / camUnit;
+                ccy = -((y + 0.5) - halfH) / camUnit;
+            } else {
+                double ratio = cz / focal;
+                ccx = nx * ratio * aspect;
+                ccy = -ny * ratio;
+            }
+            std::array<double,3> dir = { right[0]*ccx + up[0]*ccy + front[0]*cz,
+                                        right[1]*ccx + up[1]*ccy + front[1]*cz,
+                                        right[2]*ccx + up[2]*ccy + front[2]*cz };
+            double dl = wenLen(dir);
+            if (dl < 1e-9) continue;
+            dir = { dir[0]/dl, dir[1]/dl, dir[2]/dl };
+            // 相机基准点光空间坐标已提外（baseX/Y/Z）。
+            // 对账：可见表面点（未归一直达）查遮挡，应与应用阴影压暗量级接近
+            bool surfBlocked = false;
+            if (key > 1e-12) {
+                double slx = baseX + ccx*rL + ccy*uL + cz*fL;
+                double sly = baseY + ccx*rU + ccy*uU + cz*fU;
+                double slz = baseZ + ccx*rF + ccy*uF + cz*fF;
+                int stx = (int)std::floor(lHalf+slx*lUnit);
+                int sty = (int)std::floor(lHalf-sly*lUnit);
+                if (stx>=0&&stx<shadowSize&&sty>=0&&sty<shadowSize) {
+                    double ssd = scomp ? (double)(*scomp)[(size_t)sty*shadowSize+stx] : sitems[(size_t)sty*shadowSize+stx].num;
+                    if (ssd > (1.0e4-slz)+bias) surfBlocked = true;
+                }
+            }
+            // 前向散射相位：视线越朝太阳方向越亮，背离方向压暗（基底保留少量环境雾）。
+            double cosv = wenDot(dir, sunView);
+            if (cosv < 0.0) cosv = 0.0;
+            double phase = 0.45 + 0.55 * cosv;
+            // 视线在光空间的方向分量，步进用增量，避免每步重建世界点。
+            double dlr = dir[0]*lr[0]+dir[1]*lr[1]+dir[2]*lr[2];
+            double dlu = dir[0]*lu[0]+dir[1]*lu[1]+dir[2]*lu[2];
+            double dlf = dir[0]*lf[0]+dir[1]*lf[1]+dir[2]*lf[2];
+            double acc = 0.0;
+            bool inShadow = false;
+            double dt = (tFar - nearT) / steps;
+            double invSteps = 1.0 / steps;
+            double coeff = density * dt * phase;
+            double kth = dir[1] / hf;
+            for (int k = 1; k <= steps; ++k) {
+                double t = nearT + dt * k;
+                if (!solid && !inShadow) {
+                    double lx = baseX + dlr * t;
+                    double ly = baseY + dlu * t;
+                    double lz = baseZ + dlf * t;
+                    int tx = (int)std::floor(lHalf + lx*lUnit);
+                    int ty = (int)std::floor(lHalf - ly*lUnit);
+                    if (tx >= 0 && tx < shadowSize && ty >= 0 && ty < shadowSize) {
+                        double sd = scomp ? (double)(*scomp)[(size_t)ty*shadowSize+tx] : sitems[(size_t)ty*shadowSize+tx].num;
+                        if (sd > (1.0e4 - lz) + bias) inShadow = true;
+                    }
+                }
+                if (!inShadow) {
+                    double att = 1.0 - k * invSteps;
+                    if (att < 0.0) att = 0.0;
+                    att = att * att;
+                    // 固定高度分层尘埃密度：近地面浓、向上递减，静态解析（不动态生成/剔除）。
+                    double th = th0 + kth * t;
+                    if (th < 0.0) th = 0.0; if (th > 1.0) th = 1.0;
+                    double layer = 1.0 - th; layer = layer * layer;
+                    acc += coeff * (0.15 + 0.85 * layer) * att;
+                }
+            }
+            if (acc <= 1e-6) continue;
+            // 室内（表面被太阳遮挡）保留提亮；室外开阔受光处与天空按室外系数压淡。
+            // 实体墙面不逐像素投影遮挡剪影：否则立柱剪影会沿覆盖图投到后板形成竖直明暗条；
+            // 实体面整体按保留提亮处理，室内外淡化只作用于空气/天空像素。
+            double indoorK = solid ? 1.0 : (surfBlocked ? 1.0 : outdoorFactor);
+            double add = acc * intensity * indoorK;
+            size_t bi = idx * 3;
+            int r = pix[bi]   + (int)std::floor(add*sunCol[0]*255.0 + 0.5);
+            int g = pix[bi+1] + (int)std::floor(add*sunCol[1]*255.0 + 0.5);
+            int b = pix[bi+2] + (int)std::floor(add*sunCol[2]*255.0 + 0.5);
+            if (r < 0) r = 0; if (r > 255) r = 255;
+            if (g < 0) g = 0; if (g > 255) g = 255;
+            if (b < 0) b = 0; if (b > 255) b = 255;
+            pix[bi] = (unsigned char)r; pix[bi+1] = (unsigned char)g; pix[bi+2] = (unsigned char)b;
+            ++ac.lit;
+        }
+    }
+    };
+    // 段C 逐像素独立分片；默认只用 6 个 P 核并行，8 个 E 核留给材质/后台等其他进程，不占满整机。
+    unsigned nt = std::max(2u, std::min(6u, std::thread::hardware_concurrency()));
+    if (gCpuThreadLimit > 0) nt = std::min(nt, (unsigned)gCpuThreadLimit);
+    if ((size_t)w * h < 256) nt = 1;
+    std::vector<VolAcc> accs(nt);
+    std::vector<std::thread> workers;
+    for (unsigned k = 0; k < nt; ++k)
+        workers.emplace_back([&](unsigned kk){ rows(h*(int)kk/(int)nt, h*(int)(kk+1)/(int)nt, accs[kk]); }, k);
+    for (auto& th : workers) th.join();
+    long long lit = accs[0].lit;
+    for (unsigned k = 1; k < nt; ++k) lit += accs[k].lit;
+    return lit;
+}
+
+
+// ===== 体积云：解析球核密度场 + 逐像素视线步进 + 跨朵遮挡 =====
+// 与体积光累加的区别（这四条就是型26 的病根）：
+//   1) 密度不是高度分层尘埃，而是「一朵云 = 一组球核」。球核边界用 (1-q)^2 硬撑，
+//      不用 exp 的无限尾巴 —— exp 尾巴把一朵云糊成一个圆团，顶部鼓包永远立不起来。
+//   2) 步进范围由云盒与主深度表求交决定，不是固定近端远端。
+//   3) 写回是半透明合成（读旧像素按透过率混合），不是加法提亮。
+//   4) 云内部不出阴影：亮度只由「离底高度 + 朝阳侧朝向」的平滑梯度给；
+//      暗部只来自别的朵在太阳方向上挡住的体积 —— 也就是跨朵遮挡。
+struct WenCloudPuff { double x, y, z, rx, ry, rz; };
+struct WenCloudOne { double x, z, base, top, rad; std::vector<WenCloudPuff> puffs;
+    // 预缓存：这些量只跟云自身参数有关，每个步点都重算是白算
+    double hs;      // top - base
+    double rx;      // 水平粗剔半径 rad*1.85
+    double rz;      // 纵深粗剔半径 rad*1.90
+    double yLo;     // 高度粗剔下界 base - rad*0.038
+    double yHi;     // 高度粗剔上界 top + hs*0.30
+};
+
+static double wenCloudHash(int a, int b) {
+    unsigned int h = (unsigned int)(a * 0x9E3779B1u) ^ (unsigned int)(b * 0x85EBCA6Bu);
+    h ^= h >> 15; h *= 0x2545F491u; h ^= h >> 13;
+    return (double)(h & 0xFFFFFFu) / 16777216.0;
+}
+
+// 三维格点哈希 + 平滑插值噪声。云的表面起伏完全靠它，不用球核。
+static double wenCloudHash3(int a, int b, int c) {
+    unsigned int h = (unsigned int)(a * 0x9E3779B1u) + (unsigned int)(b * 0x85EBCA6Bu)
+                   + (unsigned int)(c * 0xC2B2AE35u);
+    h ^= h >> 15; h *= 0x2C1B3C6Du; h ^= h >> 12;
+    return (double)(h & 0xFFFFFFu) / 16777216.0;
+}
+static double wenCloudNoise3(double x, double y, double z) {
+    double fx0 = std::floor(x), fy0 = std::floor(y), fz0 = std::floor(z);
+    int ix = (int)fx0, iy = (int)fy0, iz = (int)fz0;
+    double fx = x - fx0, fy = y - fy0, fz = z - fz0;
+    fx = fx * fx * (3.0 - 2.0 * fx);
+    fy = fy * fy * (3.0 - 2.0 * fy);
+    fz = fz * fz * (3.0 - 2.0 * fz);
+    double c000 = wenCloudHash3(ix, iy, iz),     c100 = wenCloudHash3(ix+1, iy, iz);
+    double c010 = wenCloudHash3(ix, iy+1, iz),   c110 = wenCloudHash3(ix+1, iy+1, iz);
+    double c001 = wenCloudHash3(ix, iy, iz+1),   c101 = wenCloudHash3(ix+1, iy, iz+1);
+    double c011 = wenCloudHash3(ix, iy+1, iz+1), c111 = wenCloudHash3(ix+1, iy+1, iz+1);
+    double v00 = c000 * (1.0 - fx) + c100 * fx;
+    double v10 = c010 * (1.0 - fx) + c110 * fx;
+    double v01 = c001 * (1.0 - fx) + c101 * fx;
+    double v11 = c011 * (1.0 - fx) + c111 * fx;
+    double v0 = v00 * (1.0 - fy) + v10 * fy;
+    double v1 = v01 * (1.0 - fy) + v11 * fy;
+    return v0 * (1.0 - fz) + v1 * fz;
+}
+static double wenCloudFbm3d(double x, double y, double z) {
+    double a = 0.5, s = 0.0, t = 0.0;
+    for (int i = 0; i < 3; ++i) {
+        s += a * wenCloudNoise3(x, y, z); t += a;
+        x = x * 2.03 + 7.1; y = y * 2.03 + 3.7; z = z * 2.03 + 5.3;
+        a *= 0.5;
+    }
+    return s / t;
+}
+
+// 方位角低频扰动：让穹顶的横向轮廓不是正圆，而是有几个大的进出。
+// 这是"大范围那一层"的阶层，噪声位移是"小范围那一层"的凸凹。
+static double wenCloudRim(const WenCloudOne& c, double theta) {
+    double ph = c.x * 0.017 + c.z * 0.031;
+    return 1.0 + 0.13 * std::sin(3.0*theta + ph)
+               + 0.07 * std::sin(5.0*theta - ph*2.0)
+               + 0.04 * std::sin(7.0*theta + ph*3.0);
+}
+
+static void wenCloudBuild(WenCloudOne& c, int seed, int nTop, int nFloor) {
+    double hspan = c.top - c.base;
+    if (hspan < 1e-6) hspan = 1.0;
+    // 底圈只在云很扁时才需要；正常穹顶的底面本来就是平的，加底圈只会在
+    // 底面压出一排暗碎块，所以这里不生成
+    for (int i = 0; i < 0 && i < nFloor; ++i) {
+        double a = 6.2831853 * ((double)i + 0.37) / (double)nFloor;
+        double rr = 0.55 + 0.22 * wenCloudHash(seed, 900 + i);
+        WenCloudPuff p;
+        p.x = c.x + std::cos(a) * c.rad * rr * 0.80;
+        p.z = c.z + std::sin(a) * c.rad * rr * 0.90;
+        p.y = c.base + hspan * 0.018;
+        p.rx = c.rad * 0.30; p.ry = hspan * 0.030; p.rz = c.rad * 0.30;
+        c.puffs.push_back(p);
+    }
+    // 球核撒在云体内部（不是只挂一层壳）：它们的包络就是云的表面。
+    // 半径够大、数量够多，球核互相咬合，表面才是连续的鼓包而不是一串珠子。
+    const double GA = 2.39996323;
+    for (int i = 0; i < nTop; ++i) {
+        double hf = ((double)i + 0.5) / (double)nTop;
+        double j1 = wenCloudHash(seed, i * 4 + 1);
+        double j2 = wenCloudHash(seed, i * 4 + 2);
+        double j3 = wenCloudHash(seed, i * 4 + 3);
+        double j4 = wenCloudHash(seed, i * 4 + 4);
+        // 高度按 pow 分布：中部少、顶部密 —— 积云顶部的鼓包最扎堆
+        double v = 0.04 + 0.90 * std::pow(hf, 0.70);
+        double rBody = std::sqrt(std::max(0.0, 1.0 - v * v * 0.92));
+        double ang = GA * (double)i + 1.4 * j2;
+        double pr = c.rad * (0.34 + 0.15 * j3);
+        double rShell = c.rad * rBody * wenCloudRim(c, ang);
+        double rr = rShell * (0.24 + 0.60 * j1);
+        WenCloudPuff p;
+        p.x = c.x + std::cos(ang) * rr;
+        p.z = c.z + std::sin(ang) * rr * 1.08;
+        p.y = c.base + hspan * (v + 0.05 * (j4 - 0.5));
+        // 竖直略拉长：球核之间纵向咬合，减少"一串独立小球"的读法
+        p.rx = pr; p.ry = pr * 1.10; p.rz = pr * 1.05;
+        c.puffs.push_back(p);
+    }
+}
+
+// 一朵云 = 5 个穹顶咬在一起，取最大值。
+// 单个穹顶是解析等值面；两个穹顶咬合的缝上密度自然落到 0，
+// 于是包与包之间出现一道浅槽 —— 积云的立体感就来自这些槽，
+// 而不是一个从头收到尾的单锥（单锥读起来就是"柱"或"坨"）。
+static const double WEN_CLOUD_LOBE[5][4] = {
+    {  0.00,  0.00, 1.00, 1.00 },
+    { -0.44,  0.20, 0.50, 1.00 },
+    {  0.42, -0.24, 0.46, 1.00 },
+    {  0.05,  0.46, 0.38, 0.98 },
+    { -0.06, -0.48, 0.34, 0.96 }
+};
+
+// 一朵云 = 12 个实心球的重叠并集。
+// 原来的做法是"随高度收窄的半径场" r(y)：这是单值函数，拓扑上必然在顶部收成一个尖，
+// 一朵云就只能是一根锥；四朵取最大并排，读起来就是四根柱。
+// 球并集没有这个约束 —— 表面由各个球冠拼成，鼓包的数量、位置、高低由球表决定，
+// 跟 y 到没到顶无关，所以顶部能长出好几个包而不是收成一个峰。
+// {高度比例 0=云底 1=云顶, 方位角, 偏心(以半径为单位), 球半径(以半径为单位)}
+static const double WEN_CLOUD_BALL[26][4] = {
+    { 0.05, 0.00, 0.30, 0.30 },
+    { 0.08, 1.60, 0.52, 0.27 },
+    { 0.12, 3.20, 0.38, 0.29 },
+    { 0.15, 4.80, 0.62, 0.25 },
+    { 0.19, 6.00, 0.28, 0.28 },
+    { 0.22, 0.80, 0.46, 0.26 },
+    { 0.26, 2.40, 0.34, 0.29 },
+    { 0.30, 4.00, 0.58, 0.25 },
+    { 0.34, 5.60, 0.22, 0.28 },
+    { 0.38, 1.20, 0.44, 0.26 },
+    { 0.42, 2.80, 0.30, 0.27 },
+    { 0.46, 4.40, 0.56, 0.25 },
+    { 0.50, 5.90, 0.26, 0.27 },
+    { 0.54, 1.40, 0.40, 0.26 },
+    { 0.58, 3.00, 0.34, 0.28 },
+    { 0.62, 4.60, 0.54, 0.24 },
+    { 0.66, 6.10, 0.24, 0.26 },
+    { 0.70, 1.70, 0.38, 0.25 },
+    { 0.74, 3.30, 0.30, 0.26 },
+    { 0.78, 4.90, 0.48, 0.23 },
+    { 0.82, 0.60, 0.22, 0.25 },
+    { 0.86, 2.20, 0.36, 0.24 },
+    { 0.90, 3.80, 0.28, 0.23 },
+    { 0.93, 5.40, 0.42, 0.22 },
+    { 0.96, 1.00, 0.20, 0.22 },
+    { 0.99, 2.60, 0.30, 0.20 },
+};
+
+static double wenCloudDome(const WenCloudOne& c, double baseEff,
+                           double x, double y, double z,
+                           double ox, double oz, double rr, double hh,
+                           double* nrm) {
+    // 密度 = 包络 × 噪声，取等值面。
+    // 三种"几何体表面"的路都试过了，全失败：
+    //   半径场 r(y) 单值  -> 顶部必然收成一个尖，并排就是柱子；
+    //   球并集取最大     -> 表面永远是最外那个球的面，一堆网球；
+    //   球并集平滑相加   -> 缝填上了，但每个球冠照样露在外，一串葡萄。
+    // 共同点：表面是"某个几何体的面"。真实积云的表面是"密度够不够"的分界面，
+    // 所以这里让噪声自己决定哪里浓、哪里薄，鼓包是噪声长出来的，跟高度没关。
+    double hspan = (c.top - baseEff) * hh;
+    if (hspan < 1e-6) return 0.0;
+    // 云底以前是 y < baseEff 直接归零，整片云底就是一条刀切的水平直线，
+    // 于是主群和两侧的云看着像摆在一条台子上。这里改成软过渡：
+    // 往下留一段毛边，云底才有指状下垂、有起伏，不再是一条切面。
+    double baseFade = 1.0;
+    if (y < baseEff) {
+        // 过渡长度从 0.16 半径收到 0.05：2230 米半径的云原来有 357 米毛边，
+        // 在屏幕上看是一圈贴地的白色雾盘；60~110 米才只留一圈下垂的指状毛边。
+        double gy = (baseEff - y) / std::max(60.0, c.rad * 0.05);
+        if (gy >= 1.0) return 0.0;
+        double ff = 1.0 - gy;
+        baseFade = ff * ff * (3.0 - 2.0 * ff);
+    }
+    if (y > c.top) return 0.0;
+    double dx = x - (c.x + ox * c.rad);
+    double dz = z - (c.z + oz * c.rad);
+    double v = (y - baseEff) / hspan;
+    // 包络：下宽上略窄，到顶用一段收口把云体闭合，但保留 58% 宽度，不是收成一个尖。
+    // 收窄曲线。线性收窄（1-0.42v）让侧壁成一条从底到顶的直斜线，多高都读成锥形、石笋；
+    // 收得太晚（v 的 2.5 次方）又成直筒。真实积云塔是花椰菜形：整个身体几乎一样宽，
+    // 直到接近顶部才收口。所以取 v 的 3 次方、系数 0.25 —— 中段保持 96% 宽，顶部才收到 75%，
+    // 收口的那一段交给下面的 tw 处理。
+    // 底部原来是全宽（v=0 时 hw = rad），从下往上仰视就是一张贴地的白盘。
+    // 真实积云底是凝结面，比中段窄：把底部收到 0.58，中段膨胀到 1.0，顶部交给 hFade 收口。
+    double bodyW = 0.58 + 0.42 * std::min(1.0, v * 2.2);
+    double hw = c.rad * rr * bodyW * (1.0 - 0.10 * v * v * v);
+    if (hw < 1e-6) return 0.0;
+    double rho = std::sqrt(dx * dx + dz * dz);
+    // 线性包络在 rho 过 0.6hw 就压过噪声，表面被锁成锥面；三次曲线让包络在里面保持接近 1、
+    // 到边缘才飞快掉下去，噪声才有资格和它抢表面。
+    double tr = rho / hw;
+    if (tr > 1.0) return 0.0;
+    double ew = 1.0 - tr * tr * tr;
+    if (ew <= 0.0) return 0.0;
+    // 高度收口：从 68% 高度收到 100%，用 smoothstep。
+    // 这段以前只乘在 ew 上，而 ew 根本没参与密度计算 —— 所以顶部密度一直维持到
+    // y = top 才被硬切，塔顶出来是个平口。现在单独算 hFade，最后乘进密度。
+    double hFade = 1.0;
+    if (v > 0.68) {
+        double tv = (1.0 - v) / 0.32;
+        if (tv <= 0.0) return 0.0;
+        if (tv > 1.0) tv = 1.0;
+        hFade = tv * tv * (3.0 - 2.0 * tv);
+    }
+    // 不再按云半径缩放：频率直接按米制给，700 米一个大鼓包。
+    // 之前按 rad 缩放，大云的噪声周期被一起放大，跨度超出画面，整朵云就成了常数。
+    // 周期跟着云半径走：小云半径只有 700~800 米时，固定 700 米的噪声它跨不过一个周期，
+    // 表面就是一根光柱。按 0.42 倍半径给周期，小云自己也能长出起伏，主云算出来仍是 700 出头。
+    // 周期跟着半径走的代价：阴天那种半径近万米的整层云，0.42 倍算出来近四千米，
+    // 一朵云跨不过一个周期，表面就又平了。所以给周期设一个 900 米的上限 ——
+    // 大云照样有细的起伏，小云仍按自己的半径缩。
+    const double inv = 1.0 / std::max(300.0, std::min(c.rad * 0.42, 900.0));
+    double n1 = wenCloudNoise3(x * inv, y * inv, z * inv);
+    double n2 = wenCloudNoise3(x * inv * 2.6 + 31.0, y * inv * 2.6, z * inv * 2.6);
+    double n3 = wenCloudNoise3(x * inv * 7.0 + 77.0, y * inv * 7.0 + 13.0, z * inv * 7.0);
+    // 叠层平均会把方差抹平（三层加权后 n 只在 0.5 附近晃，表面就成了一只光滑的钟）。
+    // 只用单层主频，再做对比拉伸 —— 之前的记录里这条已经踩过一次了。
+    // 关键遗漏：n2 / n3 一直算出来就被 (void) 丢掉，表面只由最粗那一层决定，
+    // 所以怎么调都只能长出十几个大圆顶，长不出细密的小起伏。
+    // 加权平均确实会抹平方差，所以这里不做平均，直接按层相加再统一 clamp。
+    double d = (n1 - 0.5) * 2.0 + (n2 - 0.5) * 1.1 + (n3 - 0.5) * 0.7;
+    if (d > 1.0) d = 1.0;
+    if (d < -1.0) d = -1.0;
+    // 关键：写成 ew*(n-阈值) 时零点是 ew=0 那圈，表面还是落在包络上，噪声只当成了表面的明暗。
+    // 必须先乘出声势再整体减阈值：ew*(1+(n-0.5)*K) - T。
+    // 噪声大的地方要更高的 ew 才够阈值 -> 表面外扩；噪声小的地方先归零 -> 凹进去。
+    // 无论 env*噪声 还是 min(env, 噪声)，表面都还挂在包络上 —— 外面总有一层"光滑壳"，
+    // 把内部噪声整个包住，透视过去只剩那个壳。
+    // 正解是让零点由噪声决定：包络减掉一个由噪声给出的局部阈值。噪声浓的地方阈值低、
+    // 表面外扩；噪声薄的地方阈值高、表面缩进去。壳就变成一串不规则鼓包。
+    // 阈值定得太高、密度幅度太小 -> 出来是一张带洞的薄片（光学厚度不够，看着像贴图）。
+    // 阈值压低让内部变实，整体放大让 tau 够；表面位置 tr = 0.56 + 0.30d，随噪声在 0.26~0.86 之间走。
+    // 表面位置 tr = 0.68 + 0.22d：平均值从 0.56 提到 0.68，横向铺得开；
+    // 阈值再降一档、密度放大，保证光学厚度够，不再像薄片。
+    double dens = ((1.0 - tr) - (0.10 + 0.30 * (1.0 - d))) * 3.2 * hFade;
+    if (dens <= 0.0) return 0.0;
+    if (nrm) {
+        double wDown = (0.14 - v) / 0.14;
+        if (wDown < 0.0) wDown = 0.0;
+        if (wDown > 1.0) wDown = 1.0;
+        double pi = rho + 1e-9;
+        double nx = (dx / pi) * (1.0 - wDown);
+        double nz = (dz / pi) * (1.0 - wDown);
+        double ny = (0.40 + 0.80 * v) * (1.0 - wDown) - wDown;
+        double nl = std::sqrt(nx * nx + ny * ny + nz * nz);
+        if (nl < 1e-9) { nrm[0] = 0.0; nrm[1] = 1.0; nrm[2] = 0.0; }
+        else { nrm[0] = nx / nl; nrm[1] = ny / nl; nrm[2] = nz / nl; }
+    }
+    return 0.98 * dens * baseFade;
+}
+
+static double wenCloudDens(const WenCloudOne& c, double x, double y, double z) {
+    double dx = x - c.x, dz = z - c.z;
+    // 云底不是一张水平切面：铺在球面上的云，边缘会顺着曲率轻微下垂。
+    double rn = std::sqrt(dx * dx + dz * dz) / std::max(c.rad, 1e-6);
+    if (rn > 1.7) rn = 1.7;
+    double baseEff = c.base - c.rad * 0.085 * rn * rn;
+    if (y < baseEff) return 0.0;
+    double best = 0.0, t;
+    // 每朵云的瓣朝向按自己的坐标转一个角度：不然所有云都长成同一个三瓣，
+    // 一眼就看得出是同一个公式复制出来的。
+    double a0 = c.x * 0.31 + c.z * 0.47;
+    double ca = std::cos(a0), sa = std::sin(a0);
+    for (int L = 0; L < 1; ++L) {
+        double lx = WEN_CLOUD_LOBE[L][0] * ca - WEN_CLOUD_LOBE[L][1] * sa;
+        double lz = WEN_CLOUD_LOBE[L][0] * sa + WEN_CLOUD_LOBE[L][1] * ca;
+        t = wenCloudDome(c, baseEff, x, y, z, lx, lz,
+                         WEN_CLOUD_LOBE[L][2], WEN_CLOUD_LOBE[L][3], 0);
+        best += t;
+        if (best > 0.98) best = 0.98;
+    }
+    return best;
+}
+
+// 带法线出口：法线取密度最大的那个穹顶的，方便判亮面/暗面。
+static double wenCloudDensN(const WenCloudOne& c, double x, double y, double z, double* nrm) {
+    double dx = x - c.x, dz = z - c.z;
+    double rn = std::sqrt(dx * dx + dz * dz) / std::max(c.rad, 1e-6);
+    if (rn > 1.7) rn = 1.7;
+    double baseEff = c.base - c.rad * 0.085 * rn * rn;
+    if (y < baseEff) return 0.0;
+    double best = 0.0, t, n[3], bn[3] = { 0.0, 1.0, 0.0 }, bmax = 0.0;
+    double a0 = c.x * 0.31 + c.z * 0.47;
+    double ca = std::cos(a0), sa = std::sin(a0);
+    for (int L = 0; L < 1; ++L) {
+        double lx = WEN_CLOUD_LOBE[L][0] * ca - WEN_CLOUD_LOBE[L][1] * sa;
+        double lz = WEN_CLOUD_LOBE[L][0] * sa + WEN_CLOUD_LOBE[L][1] * ca;
+        t = wenCloudDome(c, baseEff, x, y, z, lx, lz,
+                         WEN_CLOUD_LOBE[L][2], WEN_CLOUD_LOBE[L][3], n);
+        if (t > bmax) { bmax = t; bn[0] = n[0]; bn[1] = n[1]; bn[2] = n[2]; }
+        best += t;
+        if (best > 0.98) best = 0.98;
+    }
+    if (nrm) { nrm[0] = bn[0]; nrm[1] = bn[1]; nrm[2] = bn[2]; }
+    return best;
+}
+
+static bool wenCloudOccl(const WenCloudOne& o, const double* P, const std::array<double,3>& s) {
+    double cy = (o.base + o.top) * 0.5;
+    double ry = (o.top - o.base) * 0.5; if (ry < 1e-6) ry = 1e-6;
+    double ox = (P[0]-o.x)/o.rad, oy = (P[1]-cy)/ry, oz = (P[2]-o.z)/o.rad;
+    double dx = s[0]/o.rad, dy = s[1]/ry, dz = s[2]/o.rad;
+    double a = dx*dx + dy*dy + dz*dz;
+    double b = 2.0*(ox*dx + oy*dy + oz*dz);
+    double cc = ox*ox + oy*oy + oz*oz - 1.0;
+    if (a < 1e-12) return cc < 0.0;
+    double disc = b*b - 4.0*a*cc;
+    if (disc < 0.0) return false;
+    double t = (-b - std::sqrt(disc)) / (2.0*a);
+    return t > 0.0;
+}
+
+static long long wenCloudRender(const shared_ptr<Dict>& vp, const shared_ptr<List>& depth,
+    const shared_ptr<Dict>& cam, const std::array<double,3>& sunDir,
+    const shared_ptr<List>& clouds, int steps, double absorb, double farMax,
+    const std::array<double,3>& tint, double baseLit, int line) {
+    int w = (int)needNum(vp->items.at("宽"), "视口", line);
+    int h = (int)needNum(vp->items.at("高"), "视口", line);
+    auto& pix = vpPixels(vp);
+    auto cb = wenCamBase(cam, line);
+    auto front = cb[0], right = cb[1], up = cb[2];
+    auto pos = wenV3(cam->items.at("位置"), "相机", line);
+    double focal = 1.0 / std::tan(WEN_PI/180.0 * needNum(cam->items.at("视场角"), "相机", line) * 0.5);
+    double aspect = (double)w / (double)h;
+    double halfW = w * 0.5, halfH = h * 0.5;
+
+    std::vector<WenCloudOne> list;
+    for (const auto& it0 : clouds->items) {
+        auto dd = needDict(it0, "云朵", line);
+        WenCloudOne c;
+        c.x = needNum(dd->items.at("x"), "云朵", line);
+        c.z = needNum(dd->items.at("z"), "云朵", line);
+        c.base = needNum(dd->items.at("底"), "云朵", line);
+        c.top = needNum(dd->items.at("顶"), "云朵", line);
+        c.rad = needNum(dd->items.at("半径"), "云朵", line);
+        int seed = dd->items.count("种子") ? (int)needNum(dd->items.at("种子"), "云朵", line) : 0;
+        int nTop = dd->items.count("团数") ? (int)needNum(dd->items.at("团数"), "云朵", line) : 14;
+        // 团数跟着半径走：小云就是大云等比缩小，而不是另配一套少团的形状
+        double scaled = c.rad * 1.9;
+        if (scaled > (double)nTop) nTop = (int)scaled;
+        if (nTop < 10) nTop = 10; if (nTop > 44) nTop = 44;
+        int nFloor = nTop / 3; if (nFloor < 3) nFloor = 3; if (nFloor > 10) nFloor = 10;
+        if (c.top - c.base < 1e-3) c.top = c.base + 1e-3;
+        if (c.rad < 1e-3) c.rad = 1e-3;
+        wenCloudBuild(c, seed, nTop, nFloor);
+        c.hs   = c.top - c.base;
+        c.rx   = c.rad * 1.85;
+        c.rz   = c.rad * 1.90;
+        c.yLo  = c.base - c.rad * 0.038;
+        c.yHi  = c.top + (c.top - c.base) * 0.30;
+        list.push_back(c);
+    }
+    if (list.empty()) { return 0; }
+
+    // 深度表可以是空表：画家算法渲染器没有逐像素深度，这时云按远景处理
+    bool useDepth = ((long long)depth->items.size() == (long long)w * (long long)h);
+
+    // 全局粗盒：整屏先做一次盒剔除，盒外的像素一步都不走
+    double gx0=1e9, gx1=-1e9, gy0=1e9, gy1=-1e9, gz0=1e9, gz1=-1e9;
+    for (size_t i = 0; i < list.size(); ++i) {
+        const WenCloudOne& c = list[i];
+        gx0 = std::min(gx0, c.x - c.rad*1.70); gx1 = std::max(gx1, c.x + c.rad*1.70);
+        gz0 = std::min(gz0, c.z - c.rad*1.80); gz1 = std::max(gz1, c.z + c.rad*1.80);
+        gy0 = std::min(gy0, c.base);
+        gy1 = std::max(gy1, c.top + (c.top - c.base) * 0.30);
+    }
+
+    // 整组云共用一套高度阶梯：所有朵里最低的底、最高的顶
+    double gBase = 1e9, gTop = -1e9;
+    for (size_t i = 0; i < list.size(); ++i) {
+        if (list[i].base < gBase) gBase = list[i].base;
+        if (list[i].top > gTop) gTop = list[i].top;
+    }
+    double gSpan = gTop - gBase;
+    if (gSpan < 1.0) gSpan = 1.0;
+
+    long long blendPix = 0;
+    for (int y = 0; y < h; ++y) {
+        double ny = ((y + 0.5) - halfH) / halfH;
+        for (int x = 0; x < w; ++x) {
+            size_t idx = (size_t)y * w + x;
+            double key = useDepth ? needNum(depth->items[idx], "深度", line) : 0.0;
+            double tGeom = key > 1e-12 ? 1.0 / key : farMax;
+            if (tGeom > farMax) tGeom = farMax;
+            double nx = ((x + 0.5) - halfW) / halfW;
+            double cz = tGeom;
+            double ratio = cz / focal;
+            double ccx = nx * ratio * aspect;
+            double ccy = -ny * ratio;
+            std::array<double,3> dv = { right[0]*ccx + up[0]*ccy + front[0]*cz,
+                                        right[1]*ccx + up[1]*ccy + front[1]*cz,
+                                        right[2]*ccx + up[2]*ccy + front[2]*cz };
+            double dl = wenLen(dv);
+            if (dl < 1e-9) continue;
+            dv = { dv[0]/dl, dv[1]/dl, dv[2]/dl };
+            double t0 = 0.05, t1 = tGeom;
+            bool ok = true;
+            for (int ax = 0; ax < 3; ++ax) {
+                double pv = pos[ax], dvv = dv[ax];
+                double lo = (ax==0) ? gx0 : (ax==1) ? gy0 : gz0;
+                double hi = (ax==0) ? gx1 : (ax==1) ? gy1 : gz1;
+                if (std::fabs(dvv) < 1e-9) {
+                    if (pv < lo || pv > hi) { ok = false; break; }
+                } else {
+                    double ta = (lo - pv) / dvv, tb = (hi - pv) / dvv;
+                    if (ta > tb) std::swap(ta, tb);
+                    if (ta > t0) t0 = ta;
+                    if (tb < t1) t1 = tb;
+                    if (t0 >= t1) { ok = false; break; }
+                }
+            }
+            if (!ok) continue;
+            double ds = (t1 - t0) / (double)steps;
+            if (ds < 1e-6) continue;
+            double tau = 0.0, wS = 0.0, bigT = 1.0;
+            for (int k = 0; k < steps; ++k) {
+                double t = t0 + ds * ((double)k + 0.5);
+                double P[3] = { pos[0]+dv[0]*t, pos[1]+dv[1]*t, pos[2]+dv[2]*t };
+                // 云与云之间：先把这个步点上所有朵的密度、以及带光强的密度一起加，
+                // 再统一做一次前向积分。
+                // 各朵分开积分会坏三件事：先算的朵把后算的朵整个挡住；两朵咬合的
+                // 地方被压出一条密度为 0 的缝；那条缝从侧面看就是镂空。
+                // 密度相加之后，两朵挨近的地方是连续的同一个密度场 —— 该融合的融合，
+                // 该留空的地方老老实实留空。
+                double dSum = 0.0, litSum = 0.0;
+                for (size_t ci = 0; ci < list.size(); ++ci) {
+                    const WenCloudOne& c = list[ci];
+                    // 弧底比 c.base 更低，粗剔要留出这段下垂的高度
+                    if (P[1] < c.base - c.rad * 0.04) continue;
+                    if (P[1] > c.top + (c.top - c.base) * 0.30) continue;
+                    if (std::fabs(P[0]-c.x) > c.rad*1.85) continue;
+                    if (std::fabs(P[2]-c.z) > c.rad*1.90) continue;
+                    double nrm[3];
+                    double dens = wenCloudDensN(c, P[0], P[1], P[2], nrm);
+                    if (dens <= 1e-5) {
+                        // 云基连带：每朵云在自己的封套之外再延伸一段极薄的底。
+                        // 原来密度到半径边界就直接归零，两朵云之间必然是真空，
+                        // 云群只能一颗一颗地断开。这里让薄底探出去 2.3 倍半径，
+                        // 相邻云朵伸出的薄底彼此重叠，云基才连得起来。
+                        double rn2 = std::sqrt((P[0]-c.x)*(P[0]-c.x) + (P[2]-c.z)*(P[2]-c.z)) / std::max(c.rad, 1e-6);
+                        double hs2 = c.top - c.base;
+                        if (rn2 < -1.0 && hs2 > 1.0) {
+                            double hb = (P[1] - c.base) / hs2;
+                            if (hb > 0.0 && hb < 0.16) {
+                                double wR = (1.16 - rn2) / 0.16; if (wR > 1.0) wR = 1.0;
+                                double wH = 1.0 - hb / 0.16;
+                                // 0.045 是几朵云并排时"连成一片"需要的底密度；但画面里
+                                // 只剩一朵大云时，它会在云下摊成一圈贴地的白雾盘。
+                                // 降到 0.013：几朵挨着依然接得上，单朵不再拖出光环。
+                                // 0.013 在 2230 米半径的云上仍然是 2587 米的盘，
+                                // 屏幕上宽 46 度，读出来就是一张贴地白盘。
+                                // 压到 0.002：几何还在，肉眼看不出，只有真正紧挨的两朵才接上。
+                                dens = 0.002 * wR * wR * wH * wH;
+                                nrm[0] = 0.0; nrm[1] = 1.0; nrm[2] = 0.0;
+                            }
+                        }
+                    }
+                    if (dens <= 1e-5) continue;
+                    // 高度阶梯按整组算，不按每一朵自己算。
+                    // 一朵低塔整根埋在别人云体里时，它自己的"底"也会被当成最底下一层
+                    // 而压暗，云中间就冒出一块灰盘 —— 那不是云该有的东西。
+                    double hf = (P[1] - gBase) / gSpan;
+                    if (hf < 0.0) hf = 0.0; if (hf > 1.0) hf = 1.0;
+                    double sunDot = nrm[0]*sunDir[0] + nrm[1]*sunDir[1] + nrm[2]*sunDir[2];
+                    if (sunDot < 0.0) sunDot = 0.0;
+                    // 低位偏灰、高位偏白，是离底高度；亮暗由表面朝向太阳决定。
+                    // 这里没有自阴影：云内不算光被自己挡，暗面只来自别的朵。
+                    double litH = baseLit + (0.96 - baseLit) * std::pow(hf, 0.30);
+                    // 背光面不是黑的：云的反照率很高，漫射让背面仍有中性灰白，
+                    // 只是比受光面暗一档（约 0.78 : 1.08）。这里没有自阴影。
+                    // 原来 form 只看太阳方向：整片大平板叠满天空时，每个像素的
+                    // sunDot 几乎一样，天顶就成了一块均匀的死灰，看不出起伏。
+                    // 把表面法线的 y 分量接进来：鼓包朝上处亮，凹陷处暗，
+                    // 阴天整片云的凹凸这才读得出来。
+                    double form = 0.62 + 0.34 * nrm[1] + 0.18 * sunDot;
+                    double lit = litH * form;
+                    // 跨朵椭球遮挡已关闭：椭球是用 (底+顶)/2 那一颗做的，跟云的真实
+                    // 形状对不上，重叠区会整片判定"被挡住 ×0.62"，在云中间打出一块
+                    // 边界清晰的暗盘。云内本来就不该有这种东西。
+                    if (lit < 0.0) lit = 0.0; if (lit > 1.0) lit = 1.0;
+                    dSum += dens;
+                    litSum += dens * lit;
+                }
+                if (dSum <= 1e-6) continue;
+                // 这一步上所有朵合起来的平均受光，按密度加权
+                double litAvg = litSum / dSum;
+                double dw = dSum * ds * absorb;
+                // 带透过率的前向积分：近处的表面主导颜色，云内深处的采样点
+                // 被前面的体素挡掉了，所以不会把表面的明暗平均成一锅灰。
+                double da = 1.0 - std::exp(-dw);
+                tau += dw; wS += bigT * da * litAvg;
+                bigT *= (1.0 - da);
+                if (bigT < 0.02) break;
+            }
+            if (tau <= 1e-5) continue;
+            // wS 已经是按透过率加权后的颜色累计，alpha 就是它覆盖的总权重
+            double alpha = 1.0 - bigT;
+            // 边缘软过渡：硬阈值会让云的下缘在 0.1 上下"切一半留一半"，
+            // 在 480x300 上读出来就是一排锯齿碎边。改成 0.06~0.26 连续渐隐，
+            // 极薄的裙边仍然不画（相邻两朵才不会粘成一片），但边界不再是刀口。
+            // 门槛从 0.030 降到 0.010：18 公里外那一圈地平线云，经过大气衰减后
+            // 透明度正好落在 0.03 以下，于是整圈云被这行直接丢掉，只剩云底最浓的一小段。
+            // 降下来它们才立得起来；代价是极薄裙边会比以前多留一点。
+            double cover = (alpha - 0.024) / 0.130;
+            if (cover <= 0.0) continue;
+            if (cover > 1.0) cover = 1.0;
+            double lum = wS / alpha;
+            // 颜色随厚度走：视线穿过的云越厚，散射光一路被吸收得越多，
+            // 颜色越往冷灰偏；薄的边缘几乎全透光，还是白的。
+            // 这不是阴影，是同一块云因为厚薄不同呈现的色阶。
+            double thk = 0.35 * (1.0 - std::exp(-tau * 0.18));
+            double cR = tint[0] * (1.0 - thk) + 244.0 * thk;
+            double cG = tint[1] * (1.0 - thk) + 247.0 * thk;
+            double cB = tint[2] * (1.0 - thk) + 252.0 * thk;
+            size_t bi = idx * 3;
+            double nr = pix[bi]   * (1.0-cover) + cR*lum * cover;
+            double ng = pix[bi+1] * (1.0-cover) + cG*lum * cover;
+            double nb = pix[bi+2] * (1.0-cover) + cB*lum * cover;
+            int r = (int)std::floor(nr + 0.5), g = (int)std::floor(ng + 0.5), b = (int)std::floor(nb + 0.5);
+            if (r < 0) r = 0; if (r > 255) r = 255;
+            if (g < 0) g = 0; if (g > 255) g = 255;
+            if (b < 0) b = 0; if (b > 255) b = 255;
+            pix[bi] = (unsigned char)r; pix[bi+1] = (unsigned char)g; pix[bi+2] = (unsigned char)b;
+            ++blendPix;
+        }
+    }
+    return blendPix;
+}
+
+// 屏幕空间径向光束（god-ray）：太阳屏幕投影点为锚，沿放射方向采样主深度表透过率，叠加暖光 shaft。
+// 两阶段：主深度表是玩家视角已记录的几何深度；本函数只在玩家视口采样着色，不遍历场景面片。
+static long long wenRadialShaft(const shared_ptr<Dict>& vp, const shared_ptr<List>& mask,
+    const shared_ptr<Dict>& cam, const std::array<double,3>& sunDir,
+    int samples, double intensity, const std::array<double,3>& sunCol, double maxDist, int line) {
+    int w = (int)needNum(vp->items.at("宽"), "视口", line);
+    int h = (int)needNum(vp->items.at("高"), "视口", line);
+    auto& pix = vpPixels(vp);
+    auto base = wenCamBase(cam, line);
+    auto pos = wenV3(cam->items.at("位置"), "相机", line);
+    double nearZ = needNum(cam->items.at("近平面"), "相机", line);
+    std::array<double,3> Ps = { pos[0]+sunDir[0]*100.0, pos[1]+sunDir[1]*100.0, pos[2]+sunDir[2]*100.0 };
+    auto camP = wenToCam(cam, Ps, line);
+    if (camP[2] <= nearZ) return 0; // 太阳在身后，不出放射束
+    auto anchor = wenProject(cam, camP, w, h, line);
+    double mx = w*0.06, my = h*0.06;
+    if (anchor[0] < mx) anchor[0] = mx; if (anchor[0] > w-mx) anchor[0] = w-mx;
+    if (anchor[1] < my) anchor[1] = my; if (anchor[1] > h-my) anchor[1] = h-my;
+    if (maxDist <= 1e-6) maxDist = std::sqrt((double)w*w+(double)h*h);
+    long long lit = 0;
+    auto masked = [&](size_t i) -> double {
+        return mask ? needNum(mask->items[i], "实体掩码", line) : 0.0;
+    };
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            size_t idx = (size_t)y*w+x;
+            if (masked(idx) > 0.5) continue; // 实体表面不叠加径向光束，只加空气像素
+            double vx = x+0.5-anchor[0], vy = y+0.5-anchor[1];
+            double dist = std::sqrt(vx*vx+vy*vy);
+            if (dist < 1.0) continue;
+            double fade = 1.0 - dist/maxDist; if (fade < 0.0) fade = 0.0;
+            fade = fade*fade;
+            double wocc = 0.0, wsum = 0.0;
+            for (int k = 1; k <= samples; ++k) {
+                double t = (double)k/(samples+1);
+                double wgt = 1.0; // 均匀采样：剪影在路径中段也计入遮挡
+                int qx = (int)std::floor(anchor[0]+vx*t);
+                int qy = (int)std::floor(anchor[1]+vy*t);
+                if (qx < 0 || qx >= w || qy < 0 || qy >= h) continue; // 画面外无掩码，跳过不计遮挡
+                wsum += wgt;
+                double mk = masked((size_t)qy*w+qx);
+                if (mk > 0.5) wocc += wgt;
+            }
+            double T = wsum > 1e-6 ? 1.0 - wocc/wsum : 1.0;
+            double add = T*fade*intensity;
+            if (add <= 1e-5) continue;
+            size_t bi = idx*3;
+            int r = pix[bi]   + (int)std::floor(add*sunCol[0]*255.0+0.5);
+            int g = pix[bi+1] + (int)std::floor(add*sunCol[1]*255.0+0.5);
+            int b = pix[bi+2] + (int)std::floor(add*sunCol[2]*255.0+0.5);
+            if (r < 0) r = 0; if (r > 255) r = 255;
+            if (g < 0) g = 0; if (g > 255) g = 255;
+            if (b < 0) b = 0; if (b > 255) b = 255;
+            pix[bi] = (unsigned char)r; pix[bi+1] = (unsigned char)g; pix[bi+2] = (unsigned char)b;
+            ++lit;
+        }
+    }
+    return lit;
 }
 static Value makeLayout(const string& spec, int line, bool packed = false) {
     auto d = std::make_shared<Dict>();
@@ -10070,12 +11372,134 @@ static string complexText(const std::complex<double>& z) {
     return r + (z.imag() < 0 ? "-" : "+") + i + "i";
 }
 
+static void jitPrintNum(double v) { std::cout << toText(vNum(v)) << "\n"; }
+
+// ===== 二五二 直线翻译： wen 源码 -> x64 机器码，不建树 =====
+namespace JitZ {
+struct PE { size_t at; size_t ci; };
+struct RE { size_t at; size_t target; };
+struct E {
+    unsigned char* p; size_t n; size_t cap;
+    std::map<std::string,int> vr; int nextVar;
+    std::vector<PE> patches; std::vector<double> consts; std::vector<RE> rels;
+    int RN; int RO;
+    std::vector<size_t> fndisp;
+    void b(unsigned char x) { if (n >= cap) throw WenError("运行时错误",0,0,"直译：机器码超出容量"); p[n++]=x; }
+    void b4(int32_t v) { if (n+4>cap) throw WenError("运行时错误",0,0,"直译：机器码超出容量"); memcpy(p+n,&v,4); n+=4; }
+    size_t ac(double v) { consts.push_back(v); return consts.size()-1; }
+    int r(const std::string& s) {
+        auto it = vr.find(s);
+        if (it != vr.end()) return it->second;
+        int g = nextVar++;
+        if (g > 15) throw WenError("运行时错误",0,0,"直译：变量超过 11 个");
+        vr[s]=g; return g;
+    }
+    void rr(unsigned char op, int A, int B) { if (A>=8||B>=8) b(0x44); b(0xF2); b(0x0F); b(op); b(0xC0|((A&7)<<3)|(B&7)); }
+    void setK(int A, double v) { if (A>=8) b(0x44); b(0xF2); b(0x0F); b(0x10); b(((A&7)<<3)|0x05); PE e{n,ac(v)}; patches.push_back(e); b4(0); }
+    void cmpRR(int A, int B) { if (A>=8||B>=8) b(0x44); b(0x66); b(0x0F); b(0x2E); b(0xC0|((A&7)<<3)|(B&7)); }
+    size_t jcc(unsigned char o) { b(0x0F); b(o); size_t a=n; b4(0); return a; }
+    size_t jmp() { b(0xE9); size_t a=n; b4(0); return a; }
+    void callHost() { b(0xFF); b(0x15); size_t a=n; b4(0); fndisp.push_back(a); }
+};
+}
+
+static Value jitTranslate(Interpreter& vm, vector<Value>& a, int line) {
+    if (a.size() < 1 || a[0].type != VT::Str) vm.rtError(line, "直译：要一段源码文本");
+    std::string src = a[0].str;
+    size_t cap = (size_t)1 << 20;
+    unsigned char* buf = (unsigned char*)VirtualAlloc(nullptr, cap, MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!buf) vm.rtError(line, "直译：拿不到可执行内存");
+    JitZ::E e; e.p = buf; e.n = 0; e.cap = cap; e.nextVar = 5; e.RN = 3; e.RO = 4;
+    e.b(0x55); e.b(0x48); e.b(0x89); e.b(0xE5);
+    e.b(0x48); e.b(0x81); e.b(0xEC); e.b4(0x28);
+    e.setK(e.RO, 1.0);
+    std::vector<size_t> lt; std::vector<size_t> le;
+    size_t pos = 0;
+    while (pos < src.size()) {
+        size_t nlp = src.find('\n', pos); if (nlp == std::string::npos) nlp = src.size();
+        std::string ln = src.substr(pos, nlp - pos); pos = nlp + 1;
+        while (!ln.empty() && (ln.back()=='\r'||ln.back()==' '||ln.back()=='\t')) ln.pop_back();
+        size_t st=0; while (st<ln.size() && (ln[st]==' '||ln[st]=='\t')) ++st;
+        ln = ln.substr(st);
+        if (ln.empty() || ln[0]=='#') continue;
+        std::vector<std::string> t;
+        { std::string cur; for (size_t i=0;i<ln.size();++i) { char ch=ln[i]; if (ch==' '||ch=='\t') { if(!cur.empty()){t.push_back(cur);cur.clear();} } else cur+=ch; } if(!cur.empty()) t.push_back(cur); }
+        if (t.empty()) continue;
+        if (t[0]=="将" && t.size()>=4 && t[2]=="变成") {
+            std::string dst=t[1], ex; for (size_t i=3;i<t.size();++i) ex+=t[i];
+            int A = e.r(dst);
+            size_t pp = ex.find('+'); bool isPlus = true;
+            if (pp == std::string::npos) { pp = ex.find('-'); isPlus = false; }
+            if (pp != std::string::npos && pp > 0) {
+                unsigned char op = isPlus ? 0x58 : 0x5C;
+                std::string l = ex.substr(0, pp), rb = ex.substr(pp+1);
+                if (l==dst) {
+                    if (rb[0]>='0'&&rb[0]<='9') { double k=atof(rb.c_str()); if (k==1.0) e.rr(op,A,e.RO); else { e.setK(2,k); e.rr(op,A,2); } }
+                    else e.rr(op, A, e.r(rb));
+                } else {
+                    e.rr(0x10, 0, e.r(l));
+                    if (rb[0]>='0'&&rb[0]<='9') { e.setK(2, atof(rb.c_str())); e.rr(op,0,2); }
+                    else e.rr(op, 0, e.r(rb));
+                    e.rr(0x11, A, 0);
+                }
+            } else if (ex[0]>='0'&&ex[0]<='9') { e.setK(A, atof(ex.c_str())); }
+            else { e.rr(0x10,0,e.r(ex)); e.rr(0x11,A,0); }
+            continue;
+        }
+        if (t[0]=="当" && t.size()>=5 && t[4]=="则") {
+            double k = atof(t[3].c_str());
+            e.setK(e.RN, k);
+            lt.push_back(e.n);
+            e.cmpRR(e.r(t[1]), e.RN);
+            unsigned char op=0x83;
+            if (t[2]=="<") op=0x83; else if (t[2]=="<=") op=0x87; else if (t[2]==">") op=0x86; else if (t[2]==">=") op=0x82;
+            le.push_back(e.jcc(op));
+            continue;
+        }
+        if (t[0]=="结束") {
+            if (!lt.empty()) {
+                size_t j=e.jmp(); JitZ::RE re{j,lt.back()}; e.rels.push_back(re);
+                int32_t d=(int32_t)((intptr_t)e.n-(intptr_t)(le.back()+4)); memcpy(e.p+le.back(),&d,4);
+                lt.pop_back(); le.pop_back();
+            }
+            continue;
+        }
+        if (t[0]=="打印" && t.size()>=2) { e.rr(0x10, 0, e.r(t[1])); e.callHost(); continue; }
+        if (t[0]=="返回" && t.size()>=2) { e.rr(0x10, 0, e.r(t[1])); continue; }
+    }
+    if (!lt.empty()) vm.rtError(line, "直译：当 没有 结束");
+    e.b(0xC9); e.b(0xC3);
+    while (e.n % 8) e.b(0x90);
+    std::vector<size_t> co(e.consts.size());
+    for (size_t i=0;i<e.consts.size();++i) { co[i]=e.n; double v=e.consts[i]; memcpy(e.p+e.n,&v,8); e.n+=8; }
+    for (size_t i=0;i<e.patches.size();++i) { int32_t d=(int32_t)((intptr_t)co[e.patches[i].ci]-(intptr_t)(e.patches[i].at+4)); memcpy(e.p+e.patches[i].at,&d,4); }
+    for (size_t i=0;i<e.rels.size();++i) { int32_t d=(int32_t)((intptr_t)e.rels[i].target-(intptr_t)(e.rels[i].at+4)); memcpy(e.p+e.rels[i].at,&d,4); }
+    if (!e.fndisp.empty()) {
+        if (e.n + 8 > cap) { VirtualFree(buf, 0, MEM_RELEASE); vm.rtError(line, "直译：机器码超出容量"); }
+        size_t fslot = e.n;
+        void* fp = (void*)&jitPrintNum;
+        memcpy(e.p + e.n, &fp, 8); e.n += 8;
+        for (size_t i=0;i<e.fndisp.size();++i) {
+            int32_t d = (int32_t)((intptr_t)fslot - (intptr_t)(e.fndisp[i] + 4));
+            memcpy(e.p + e.fndisp[i], &d, 4);
+        }
+    }
+    VirtualProtect(buf, cap, PAGE_EXECUTE_READ, NULL);
+    typedef double (*fn_t)();
+    fn_t fn = (fn_t)buf;
+    double r = fn();
+    VirtualFree(buf, 0, MEM_RELEASE);
+    return vNum(r);
+}
+
+
 Interpreter::Interpreter() {
     globals = std::make_shared<Scope>();
     globals->set("圆周率", vNum(piValue()));
     globals->set("π", vNum(piValue()));
     globals->set("自然常数", vNum(wenE()));
     rng.seed(std::random_device{}());
+    registerBuiltin("直译", 1, 1, [](Interpreter& vm, vector<Value>& a, int line) -> Value { return jitTranslate(vm, a, line); });
     registerBuiltin("工作台", 0, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         string title = a.size() >= 1 ? needStr(a[0], "工作台", line) : "文工作台";
         string initial = a.size() >= 2 ? needStr(a[1], "工作台", line) : "";
@@ -10331,6 +11755,23 @@ Interpreter::Interpreter() {
         if (reverse) std::reverse(items.begin(), items.end());
         auto out = std::make_shared<List>();
         out->items = std::move(items);
+        return vList(out);
+    });
+    registerBuiltin("按键排序", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto l = needList(a[0], "按键排序", line);
+        string key = a.size() > 1 ? needStr(a[1], "按键排序", line) : "键";
+        vector<Value> items = l->items;
+        size_t n = items.size();
+        vector<std::pair<double, size_t>> keys;
+        keys.reserve(n);
+        for (size_t i = 0; i < n; ++i)
+            keys.emplace_back(needNum(needDict(items[i], "按键排序", line)->items.at(key), "按键排序", line), i);
+        std::stable_sort(keys.begin(), keys.end(), [](const auto& x, const auto& y) {
+            return x.first > y.first;
+        });
+        auto out = std::make_shared<List>();
+        out->items.reserve(n);
+        for (const auto& k : keys) out->items.push_back(items[k.second]);
         return vList(out);
     });
     registerBuiltin("反转", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
@@ -12818,9 +14259,10 @@ Interpreter::Interpreter() {
         return vFunc(fn);
 #endif
     });
-    // 自举运行时槽位：自举库生成的码假定 PE 镜像 0x140000000 下 0x7F0xx 处是导入表槽位，
-    // 用 call [rip+disp] 间接调用。机器函数不在 PE 里，这里把那一页映射出来并填上等价实现，
-    // 让自举运行时（字符串/列表/浮点）能在机器函数里跑起来。
+    // 自举运行时槽位：自举库生成的码在 0xC2050…0xC20A0 这十个槽位上用 call [rip+disp]
+    // 间接调用宿主动作（睡眠、分配、清零、文件四件、写、可读地址、命令行）。
+    // 机器函数不在 PE 里，这里把这一片映射出来并填上等价实现，
+    // 让自举运行时（字符串/列表/浮点/文件）能在机器函数里跑起来。
     static void* (*const selfAllocFn)(size_t) =
         +[](size_t n) -> void* { return std::malloc(n ? n : 1); };
     static void* (*const selfZeroFn)(void*, int, size_t) =
@@ -12843,14 +14285,27 @@ Interpreter::Interpreter() {
         }
         if (hi>=0) throw WenError("运行时错误", line, 0, "机器码十六进制位数必须是偶数");
         if (bytes.empty()) throw WenError("运行时错误", line, 0, "机器码为空");
-        // 自举库按「码起点在镜像 0x1014 处」计算 call [rip+disp]，所以槽位的相对偏移是
-        // 0x7F060-0x1014 和 0x7F068-0x1014，机器函数里也要按这个相对位置摆放。
-        size_t total = bytes.size() + 0x80000;
+        // 自举库按「码起点在镜像 0x1014 处」计算 call [rip+disp]。
+        // 槽位表已经从 0x7F0xx 迁到 0xC2050…0xC20A0（睡眠/分配/清零/打开/大小/读/关/写/
+        // 可读地址/命令行原始）。机器函数不在 PE 里，这里按同样的相对位置把 10 个槽铺满，
+        // 直接填等价实现 —— 自举运行时 里的字符串、列表、字典、类型、睡眠、文件才跑得起来。
+        size_t total = (0xC2200 - 0x1014) + bytes.size();
         void* mem=VirtualAlloc(nullptr, total, MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE);
         if(!mem) throw WenError("运行时错误", line, 0, "机器码分配失败");
+        memset(mem, 0, total);
         memcpy(mem,bytes.data(),bytes.size());
-        *(void**)((unsigned char*)mem + (0x7F060 - 0x1014)) = (void*)selfAllocFn;
-        *(void**)((unsigned char*)mem + (0x7F068 - 0x1014)) = (void*)selfZeroFn;
+        unsigned char* base=(unsigned char*)mem;
+        auto putSlot=[&](size_t rva, void* fn){ *(void**)(base + (rva - 0x1014)) = fn; };
+        putSlot(0xC2050, (void*)&Sleep);           // 睡眠(毫秒)
+        putSlot(0xC2060, (void*)selfAllocFn);      // 分配(字节)
+        putSlot(0xC2068, (void*)selfZeroFn);       // 清零(指针, 0, 字节)
+        putSlot(0xC2070, (void*)&CreateFileW);     // 打开新建 / 打开文件
+        putSlot(0xC2078, (void*)&GetFileSize);     // 文件大小(句柄)
+        putSlot(0xC2080, (void*)&ReadFile);        // 读文件到
+        putSlot(0xC2088, (void*)&CloseHandle);     // 关闭句柄
+        putSlot(0xC2090, (void*)&WriteFile);       // 写句柄
+        putSlot(0xC2098, (void*)&IsBadReadPtr);    // 可读地址
+        putSlot(0xC20A0, (void*)&GetCommandLineW); // 命令行原始
         FlushInstructionCache(GetCurrentProcess(),mem,bytes.size());
         auto fn=std::make_shared<NativeFunction>();
         fn->name="机器函数"; fn->code=mem; fn->codeSize=bytes.size(); fn->arity=arity;
@@ -13792,6 +15247,12 @@ Interpreter::Interpreter() {
         auto depth = std::make_shared<List>();
         for (int k = 0; k < w * h; ++k) depth->items.push_back(vNum(1e30));
         d->items["深度"] = vList(depth);
+        auto mask = std::make_shared<List>();
+        for (int k = 0; k < w * h; ++k) mask->items.push_back(vNum(0.0));
+        d->items["掩码"] = vList(mask);
+        auto orient = std::make_shared<List>();
+        for (int k = 0; k < w * h; ++k) orient->items.push_back(vNum(0.0));
+        d->items["朝向"] = vList(orient);
         return vDict(d);
     });
     registerBuiltin("材质预设", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
@@ -13958,7 +15419,7 @@ Interpreter::Interpreter() {
         }
         return vList(out);
     });
-    registerBuiltin("光追渲染", 2, 6, [](Interpreter&, vector<Value>& a, int line) -> Value {
+    registerBuiltin("光追渲染", 2, 9, [](Interpreter&, vector<Value>& a, int line) -> Value {
         int outW = (int)needIndex(a[0], "光追渲染", line);
         int outH = (int)needIndex(a[1], "光追渲染", line);
         int samples = a.size() >= 3 ? (int)needIndex(a[2], "光追渲染", line) : 4;
@@ -13969,13 +15430,81 @@ Interpreter::Interpreter() {
         scale = std::max(0.1, std::min(1.0, scale));
         int w = std::max(1, (int)(outW * scale));
         int h = std::max(1, (int)(outH * scale));
-        samples = std::max(1, std::min(samples, 32));
+        // 采样上限原来是 32，超过会被静默截断（写 64、256 都在跑同一个 32，白等）；
+        // 静帧要极高采样就把上限放到 1024，实时档不会传这么大。
+        samples = std::max(1, std::min(samples, 1024));
+        // 第 7 参「累积」：0 关闭，1 跨帧累积，2 累积并要求先清空重来。
+        // 采样数一提，每帧成本就跟着涨、帧率就掉；累积把「采样数」换成「帧数」：
+        // 每帧只算 1–2 采样，把结果累加求平均，画面随帧数收敛，单帧成本不变。
+        int accMode = 0;
+        if (a.size() >= 7) {
+            if (a[6].type == VT::Bool) accMode = a[6].b ? 1 : 0;
+            else if (a[6].type == VT::Num || a[6].type == VT::Int) accMode = (int)needNum(a[6], "光追渲染", line);
+        }
+        // 第 8 参「缓存」：0 关闭、1 复用整帧、2 重算并刷新、3 时间片预烘焙、4 按光源相位记忆（配第 9 参用）。
+        // 1 用于「画面不变但每帧都在重算」的静帧：算完一次，之后每帧 0 渲染成本直接复用。
+        // 3 用于「只有光源随时间动」的场景：把时间切成片，每片算一次，运行时在两片之间插值。
+        int cacheMode = 0;
+        if (a.size() >= 8) {
+            if (a[7].type == VT::Bool) cacheMode = a[7].b ? 1 : 0;
+            else if (a[7].type == VT::Num || a[7].type == VT::Int) cacheMode = (int)needNum(a[7], "光追渲染", line);
+        }
+        // 第 9 参「时间片」（秒）：0 不切片。>0 且缓存=3 时按这个粒度预烘焙光源的每个位置。
+        double sliceStep = 0.0;
+        if (a.size() >= 9) sliceStep = std::max(0.0, needNum(a[8], "光追渲染", line));
         struct PBR { double rough = 0.5, metal = 0.0, ior = 1.5; double emission = 0, clearcoat = 0, transmission = 0; string tex = "无"; std::array<double,3> color{0.8,0.2,0.2}; };
         std::vector<PBR> pbr(4);
         pbr[0].rough = 0.85; pbr[0].metal = 0.0; pbr[0].color = {0.82,0.20,0.18};
-        pbr[1].rough = 0.18; pbr[1].metal = 0.9; pbr[1].color = {0.25,0.78,0.32};
+        pbr[1].rough = 0.30; pbr[1].metal = 1.0; pbr[1].color = {0.56,0.58,0.62};   // 钢灰：铁的反射色不该带绿
         pbr[2].rough = 0.04; pbr[2].metal = 0.0; pbr[2].ior = 1.5; pbr[2].color = {0.85,0.92,1.0};
         pbr[3].rough = 0.10; pbr[3].metal = 0.0; pbr[3].ior = 1.33; pbr[3].color = {0.16,0.26,0.30};
+        // 整帧缓存：key = 尺寸 + 采样 + 时间 + 内部缩放 + 材质签名。
+        // 命中时直接把上次算好的像素交回去（同一份 shared_ptr，不复制 7MB），渲染成本归零。
+        static struct RtFrameCache {
+            bool valid = false;
+            int outW = 0, outH = 0, samples = 0;
+            double tm = 0, scale = 0;
+            string key;
+            std::shared_ptr<std::vector<unsigned char>> px;
+            long long hits = 0, misses = 0;
+        } rtCache;
+        auto pbrKeyOf = [&]() {
+            string k;
+            char tmp[64];
+            for (int i = 0; i < 4; ++i) {
+                std::snprintf(tmp, sizeof(tmp), "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%d%d%d;",
+                              pbr[i].rough, pbr[i].metal, pbr[i].ior, pbr[i].emission,
+                              pbr[i].clearcoat, pbr[i].transmission,
+                              (int)(pbr[i].color[0] * 1000), (int)(pbr[i].color[1] * 1000), (int)(pbr[i].color[2] * 1000));
+                k += tmp;
+                k += pbr[i].tex;
+                k += "|";
+            }
+            return k;
+        };
+        string frameKey = pbrKeyOf();
+        if (cacheMode == 2) { rtCache.valid = false; }
+        if ((cacheMode == 1 || cacheMode == 2) && accMode == 0 && rtCache.valid && rtCache.px &&
+            rtCache.outW == outW && rtCache.outH == outH && rtCache.samples == samples &&
+            rtCache.tm == tm && rtCache.scale == scale && rtCache.key == frameKey &&
+            rtCache.px->size() == (size_t)outW * outH * 3) {
+            rtCache.hits++;
+            auto d = std::make_shared<Dict>();
+            d->items["宽"] = vNum(outW);
+            d->items["高"] = vNum(outH);
+            d->items["像素"] = vBytes(rtCache.px);
+            d->items["缓存命中"] = vBool(true);
+            return vDict(d);
+        }
+        // 色调映射查表：值域 [0,1]，4096 级，索引到 8 位通道。
+        static const std::array<unsigned char, 4096> toneLut = []() {
+            std::array<unsigned char, 4096> t{};
+            for (int i = 0; i < 4096; ++i) {
+                double v = (double)i / 4095.0;
+                t[i] = (unsigned char)(255 * std::pow(v, 1.0 / 2.2));
+            }
+            return t;
+        }();
         auto rgbOf = [&](const Value& v, int ln) -> std::array<double,3> {
             long long c = (long long)needNum(v, "材质颜色", ln);
             return {((c>>16)&255)/255.0, ((c>>8)&255)/255.0, (c&255)/255.0};
@@ -14002,10 +15531,26 @@ Interpreter::Interpreter() {
                 if (tr != md->items.end()) pbr[i].transmission = std::max(0.0, std::min(1.0, needNum(tr->second, "透射", line)));
             }
         }
+        // 把材质纹理名折成整数：1 棋盘、2 条纹、3 噪波、0 无。
+        std::array<int,4> texKind{0,0,0,0};
+        for (int i = 0; i < 4; ++i) {
+            const std::string& tx = pbr[i].tex;
+            if (tx == "棋盘") texKind[i] = 1;
+            else if (tx == "条纹") texKind[i] = 2;
+            else if (tx == "噪波") texKind[i] = 3;
+        }
         auto buf = std::make_shared<std::vector<unsigned char>>((size_t)w * h * 3);
-        auto rnd = []() {
-            thread_local std::mt19937 g(std::random_device{}());
-            return std::uniform_real_distribution<double>(0, 1)(g);
+        // 每次调用都构造成一个分布对象并驱动 mt19937，单像素要取十几次；
+        // 换成线程内 xorshift64*，取值仍是 [0,1) 均匀，成本约十几倍低。
+        auto rnd = []() -> double {
+            thread_local unsigned long long s = 0;
+            if (s == 0ull) {
+                s = (unsigned long long)std::chrono::high_resolution_clock::now().time_since_epoch().count();
+                s ^= (unsigned long long)std::hash<std::thread::id>{}(std::this_thread::get_id());
+                if (s == 0ull) s = 0x9E3779B97F4A7C15ull;
+            }
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            return (double)(s >> 11) * (1.0 / 9007199254740992.0);
         };
         auto norm = [](std::array<double, 3> v) {
             double l = std::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
@@ -14026,6 +15571,9 @@ Interpreter::Interpreter() {
             t = tt;
             return true;
         };
+        // 光源本体不写进记忆片：片里只留「被照亮的场景」，光源球每帧按真实位置重画，
+        // 否则两片插值会在屏幕上出现两个光斑（双影）。
+        static thread_local bool tSkipEmitter = false;
         auto traceScene = [&](std::array<double,3> o, std::array<double,3> d, Hit& hit) {
             bool any = false;
             double bt = 1e30;
@@ -14042,7 +15590,7 @@ Interpreter::Interpreter() {
             test({1.10,0.02,0.02}, 0.42, 2);
             double lcx = -1.6 + 1.4 * std::cos(tm * 0.7);
             double lcz = -1.25 + 1.4 * std::sin(tm * 0.7);
-            test({lcx, 2.35, lcz}, 0.16, 4);
+            if (!tSkipEmitter) test({lcx, 2.35, lcz}, 0.16, 4);
             if (d[1] < -1e-6) {
                 double t = (-0.86 - o[1]) / d[1];
                 if (t > 1e-4 && t < bt) {
@@ -14055,15 +15603,41 @@ Interpreter::Interpreter() {
             }
             return any;
         };
-        auto sky = [](std::array<double,3> d) {
-            double k = 0.5 + 0.5 * std::max(-1.0, std::min(1.0, d[1]));
-            return std::array<double,3>{0.25+0.45*k, 0.35+0.5*k, 0.7+0.25*k};
+        auto sky = [&](std::array<double,3> d) {   // 加日晕后要用 tm，改成引用捕获
+            // 天光压到 0.8：它原来比点光源还亮，整幅图被抬成一片灰
+            double y = std::max(-1.0, std::min(1.0, d[1]));
+            double hz = std::pow(1.0 - std::fabs(y), 6.0);   // 越靠近地平线越亮（大气散射）
+            double zr = 0.5 + 0.5 * y;                        // 朝上偏冷，朝下偏暗
+            double base0 = 0.12 + 0.30*zr + 0.42*hz;
+            double base1 = 0.16 + 0.34*zr + 0.38*hz;
+            double base2 = 0.30 + 0.30*zr + 0.30*hz;
+            // 日晕：绕着点光源的方向加一圈亮。玻璃球下半球看到的那片天空从此有了内容，
+            // 金属和玻璃的镜面里也能映到这个亮斑，而不是一面纯色。
+            double sx = -1.6 + 1.4 * std::cos(tm * 0.7);
+            double sy = 2.35;
+            double sz = -1.25 + 1.4 * std::sin(tm * 0.7);
+            double sl = std::sqrt(sx*sx + sy*sy + sz*sz);
+            double sd = (d[0]*sx + d[1]*sy + d[2]*sz) / sl;
+            double glow = std::pow(std::max(0.0, sd), 24.0);
+            // 淡云：把方向投影到天穹平面上，用几组正弦叠出一层不和地平线绑定的纹理。
+            // 玻璃球、金属球里映出来的天空因此有内容，不会是一块死平的颜色。
+            double cy = std::max(0.18, std::fabs(y) + 0.18);
+            double cxu = d[0] / cy, czu = d[2] / cy;
+            double cl = 0.5 + 0.5 * std::sin(cxu*2.3 + 0.7) * std::sin(czu*1.9 + 1.4);
+            double cl2 = 0.5 + 0.5 * std::sin(cxu*5.1 - 2.0) * std::sin(czu*4.3 + 0.6);
+            double clmask = std::min(1.0, std::max(0.0, (y - 0.02) * 6.0));   // 地平线附近淡出，往上正常出现
+            double cloud = (0.45*cl + 0.55*cl2) * clmask;
+            return std::array<double,3>{base0 + 0.62*glow + 0.16*cloud,
+                                        base1 + 0.56*glow + 0.17*cloud,
+                                        base2 + 0.46*glow + 0.18*cloud};
         };
         auto sampleLight = [&](std::array<double,3> p, std::array<double,3> n,
                                std::array<double,3> albedo) {
-            double lx = -1.6 + 1.4 * std::cos(tm * 0.7) + (rnd()-0.5)*1.0;
+            // 光源抖动原来越大越好压噪点，其实光源球半径才 0.16，抖 ±0.5 等于把光源放大三倍：
+            // 阴影边缘糊掉、亮度方差大，16 采样就会满屏白点（firefly）。收到 ±0.18 才是这颗球的尺寸。
+            double lx = -1.6 + 1.4 * std::cos(tm * 0.7) + (rnd()-0.5)*0.36;
             double ly = 2.35;
-            double lz = -1.25 + 1.4 * std::sin(tm * 0.7) + (rnd()-0.5)*1.0;
+            double lz = -1.25 + 1.4 * std::sin(tm * 0.7) + (rnd()-0.5)*0.36;
             std::array<double,3> toL{lx-p[0], ly-p[1], lz-p[2]};
             double dist2 = toL[0]*toL[0] + toL[1]*toL[1] + toL[2]*toL[2];
             double dist = std::sqrt(dist2);
@@ -14072,14 +15646,53 @@ Interpreter::Interpreter() {
             if (cosT <= 0) return std::array<double,3>{0,0,0};
             std::array<double,3> o{p[0]+n[0]*1e-3, p[1]+n[1]*1e-3, p[2]+n[2]*1e-3};
             Hit sh;
-            if (traceScene(o, l, sh) && sh.t < dist - 1e-3) return std::array<double,3>{0,0,0};
-            double atten = 8.0 * cosT / (1.0 + dist2);
-            return std::array<double,3>{albedo[0]*atten, albedo[1]*atten, albedo[2]*atten};
+            double transR = 1.0, transG = 1.0, transB = 1.0;
+            if (traceScene(o, l, sh) && sh.t < dist - 1e-3) {
+                // 光穿过玻璃球不该算全挡：折射进去的光最后落在阴影里，正是「穿透性」。
+                // 球半径 0.42，穿出去再看后面还有没有别的东西挡着。
+                if (sh.mat == 2) {
+                    // 颜色透光：玻璃本身带一点冷色，穿过去的光跟着被染，落在地面上就是偏青的亮部
+                    transR = 0.82; transG = 0.90; transB = 0.98;
+                    // 焦散：球当透镜用，焦距约等于半径（f = R/(2(n-1))，(n-1)=0.5、R=0.42 → 0.42）。
+                    // 把光源→球心这条线延长到地面，得到会聚点的落点，落点附近把光聚亮，
+                    // 阴影里就有一团亮斑，这就是「凹凸镜聚焦」在地面上的样子。
+                    double sfrac = (-0.86 - 0.02) / (0.02 - ly);
+                    double kx = 1.10 + (1.10 - lx) * sfrac;
+                    double kz = 0.02 + (0.02 - lz) * sfrac;
+                    double dx = p[0] - kx, dz = p[2] - kz;
+                    double g = 1.0 + 5.0 * std::exp(-(dx*dx + dz*dz) / 0.08);
+                    transR *= g; transG *= g; transB *= g;
+                    std::array<double,3> o2{o[0]+l[0]*(sh.t+0.84), o[1]+l[1]*(sh.t+0.84), o[2]+l[2]*(sh.t+0.84)};
+                    Hit sh2;
+                    if (traceScene(o2, l, sh2) && sh2.t < dist - sh.t - 0.84 - 1e-3 && sh2.mat != 2)
+                        return std::array<double,3>{0,0,0};
+                } else {
+                    return std::array<double,3>{0,0,0};
+                }
+            }
+            double atten = 24.0 * cosT / (1.0 + dist2);
+            return std::array<double,3>{albedo[0]*atten*transR, albedo[1]*atten*transG, albedo[2]*atten*transB};
         };
-        std::function<std::array<double,3>(std::array<double,3>, std::array<double,3>, int)> radiance;
-        radiance = [&](std::array<double,3> o, std::array<double,3> d, int depth) {
+        // 光源的镜面像：镜面方向 ra 是否打进半径 0.16 的光源球（按立体角解析判定）。
+        // 随机弹射撞上一颗小球全看运气，低采样下就是没有高光；这里直接算，命中就返回真。
+        auto hitLightDisc = [&](std::array<double,3> p, std::array<double,3> ra) {
+            double lx = -1.6 + 1.4 * std::cos(tm * 0.7);
+            double ly = 2.35;
+            double lz = -1.25 + 1.4 * std::sin(tm * 0.7);
+            std::array<double,3> v{lx-p[0], ly-p[1], lz-p[2]};
+            double dl = std::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+            if (dl < 0.2) return false;
+            double cosA = (ra[0]*v[0] + ra[1]*v[1] + ra[2]*v[2]) / dl;
+            double sinA = 0.16 / dl;
+            double lim = std::sqrt(std::max(0.0, 1.0 - sinA*sinA));
+            return cosA > lim;
+        };
+        // 原来用 std::function 做自递归，每层弹射一次间接调用；换成泛型 lambda 自递归，编译器能内联。
+        auto radiance = [&](auto&& self, std::array<double,3> o, std::array<double,3> d, int depth) -> std::array<double,3> {
             Hit h;
             if (!traceScene(o, d, h)) return sky(d);
+            // 光源本体的亮度不能随意抬：它同时是被金属/玻璃镜面反射的目标，抬到 22 会让单个
+            // 采样点直接顶到色调曲线的上限，画面里就是满屏白点（firefly）。留在 8 更稳。
             if (h.mat == 4) return std::array<double,3>{8,7.5,6};
             if (depth <= 0) return std::array<double,3>{0,0,0};
             int mi = std::max(0, std::min(3, h.mat));
@@ -14089,54 +15702,101 @@ Interpreter::Interpreter() {
                 int check = ((int)std::floor(h.p[0]*2) + (int)std::floor(h.p[2]*2)) & 1;
                 albedo = check ? std::array<double,3>{0.75,0.80,0.78}
                                : std::array<double,3>{0.16,0.26,0.30};
+                // 接触阴影：球和地面贴合的那一圈压暗，否则球看着像浮在半空（这也是「不完整」的来源之一）
+                const double bxc[3] = {0.0, -1.10, 1.10};
+                const double bzc[3] = {0.0,  0.10, 0.02};
+                const double brr[3] = {0.60, 0.36, 0.42};
+                double ao = 1.0;
+                for (int b = 0; b < 3; ++b) {
+                    double dx = h.p[0] - bxc[b];
+                    double dz = h.p[2] - bzc[b];
+                    double dd = std::sqrt(dx*dx + dz*dz) / (brr[b] * 1.75);
+                    if (dd < 1.0) ao *= 0.22 + 0.78 * dd*dd*(3.0 - 2.0*dd);
+                }
+                albedo[0] *= ao; albedo[1] *= ao; albedo[2] *= ao;
             }
             if (pbr[mi].emission > 0)
                 return std::array<double,3>{pbr[mi].color[0]*pbr[mi].emission,
                                             pbr[mi].color[1]*pbr[mi].emission,
                                             pbr[mi].color[2]*pbr[mi].emission};
-            if (pbr[mi].tex == "棋盘") {
+            // 纹理名原来每次命中都要做 3 次 std::string 比较，一个像素要弹 5 层、采样一多就是几十万次；
+            // 开跑前把名字折成整数，热路径只走 switch。
+            switch (texKind[mi]) {
+            case 1: {
                 int ck = ((int)std::floor(h.p[0]*8) + (int)std::floor(h.p[1]*8) + (int)std::floor(h.p[2]*8)) & 1;
                 if (ck) { albedo[0]*=0.45; albedo[1]*=0.45; albedo[2]*=0.45; }
-            } else if (pbr[mi].tex == "条纹") {
+                break;
+            }
+            case 2: {
                 double s = 0.55 + 0.45 * std::sin(h.p[1]*18.0);
                 albedo[0]*=s; albedo[1]*=s; albedo[2]*=s;
-            } else if (pbr[mi].tex == "噪波") {
+                break;
+            }
+            case 3: {
                 double n = std::sin(h.p[0]*31.0 + h.p[1]*17.0 + h.p[2]*23.0);
                 double s = 0.7 + 0.3*n*n;
                 albedo[0]*=s; albedo[1]*=s; albedo[2]*=s;
+                break;
+            }
+            default: break;
             }
             std::array<double,3> out{0,0,0};
-            if (kind == 0 || kind == 1) {
+            // 金属没有漫反射项：它的颜色全部来自「反射到的东西 × 自身色」。
+            // 原来 kind==1 也走 sampleLight，等于给金属加了一层漫反射，绿球就成了被打亮的塑料球。
+            if (kind == 0) {
                 auto direct = sampleLight(h.p, h.n, albedo);
                 out = {direct[0], direct[1], direct[2]};
             }
             std::array<double,3> dir;
             if (kind == 1) {
                 double dot = d[0]*h.n[0] + d[1]*h.n[1] + d[2]*h.n[2];
-                double rough = pbr[mi].rough * 0.9 + 0.01;
+                double rough = pbr[mi].rough * 0.45 + 0.005;   // ×0.9 太狠：0.30 的粗糙度会把镜面揉成一团糊
                 dir = norm({d[0]-2*dot*h.n[0] + (rnd()-0.5)*rough,
                             d[1]-2*dot*h.n[1] + (rnd()-0.5)*rough,
                             d[2]-2*dot*h.n[2] + (rnd()-0.5)*rough});
-                auto inc = radiance({h.p[0]+h.n[0]*3e-3, h.p[1]+h.n[1]*3e-3, h.p[2]+h.n[2]*3e-3}, dir, depth-1);
+                auto inc = self(self, {h.p[0]+h.n[0]*3e-3, h.p[1]+h.n[1]*3e-3, h.p[2]+h.n[2]*3e-3}, dir, depth-1);
                 out[0] += albedo[0]*inc[0]; out[1] += albedo[1]*inc[1]; out[2] += albedo[2]*inc[2];
+                if (hitLightDisc(h.p, dir)) {
+                    // 金属的粗糙度会把光源摊开，高光加 ×4 就够，×8 会在球上糊一块死白
+                    out[0] += albedo[0]*4.0; out[1] += albedo[1]*3.8; out[2] += albedo[2]*3.2;
+                }
             } else if (kind == 2) {
-                double eta = 1.0 / pbr[mi].ior;
-                double cosI = -(d[0]*h.n[0] + d[1]*h.n[1] + d[2]*h.n[2]);
+                // 折射率要分「进」和「出」：从空气进玻璃 eta = 1/ior，从玻璃里出来 eta = ior。
+                // 原来两边都用 1/ior，出射时光朝反方向弯，玻璃背面就成了暗斑。
+                double dn = d[0]*h.n[0] + d[1]*h.n[1] + d[2]*h.n[2];
+                double eta = (dn < 0.0) ? (1.0 / pbr[mi].ior) : pbr[mi].ior;
+                double cosI = -dn;
                 std::array<double,3> nn = h.n;
                 if (cosI < 0) { nn = {-h.n[0],-h.n[1],-h.n[2]}; cosI = -cosI; }
+                // 菲涅尔：原来只折射、表面零反射，玻璃看着像空壳。正视 4%、掠射近全反射。
+                double fr = 0.04 + 0.96 * std::pow(1.0 - cosI, 5.0);
+                // 反射这一条按 fr 权重固定算，不再掷骰子：4% 概率在低采样下时有时无，
+                // 玻璃就不映周围颜色了。玻璃只占画面一小块，多一条光线的代价可以忽略。
+                double dot = d[0]*nn[0] + d[1]*nn[1] + d[2]*nn[2];
+                std::array<double,3> rdir = norm({d[0]-2*dot*nn[0], d[1]-2*dot*nn[1], d[2]-2*dot*nn[2]});
+                auto rf = self(self, {h.p[0]+rdir[0]*3e-3, h.p[1]+rdir[1]*3e-3, h.p[2]+rdir[2]*3e-3}, rdir, depth-1);
+                out[0] += fr*rf[0]; out[1] += fr*rf[1]; out[2] += fr*rf[2];
+                if (hitLightDisc(h.p, rdir)) {
+                    // 镜像里那颗光源：按菲涅尔权重直接加，玻璃上才有那个扎实的亮点
+                    out[0] += fr*8.0; out[1] += fr*7.5; out[2] += fr*6.0;
+                }
                 double sin2 = 1.0 - cosI*cosI;
                 double k = 1.0 - eta*eta*sin2;
                 if (k < 0) {
-                    double dot = d[0]*nn[0] + d[1]*nn[1] + d[2]*nn[2];
-                    dir = norm({d[0]-2*dot*nn[0], d[1]-2*dot*nn[1], d[2]-2*dot*nn[2]});
+                    dir = rdir;                     // 全反射：不漏光，按透射权重计也一样
                 } else {
                     double cosT = std::sqrt(k);
                     dir = norm({eta*d[0] + (eta*cosI - cosT)*nn[0],
                                 eta*d[1] + (eta*cosI - cosT)*nn[1],
                                 eta*d[2] + (eta*cosI - cosT)*nn[2]});
                 }
-                auto inc = radiance({h.p[0]+dir[0]*3e-3, h.p[1]+dir[1]*3e-3, h.p[2]+dir[2]*3e-3}, dir, depth-1);
-                out[0] += 0.9*inc[0]; out[1] += 0.95*inc[1]; out[2] += 1.0*inc[2];
+                auto inc = self(self, {h.p[0]+dir[0]*3e-3, h.p[1]+dir[1]*3e-3, h.p[2]+dir[2]*3e-3}, dir, depth-1);
+                // 球内光程：cosI≈1 是从球心穿过去（最长 0.84），cosI≈0 是擦着边过（最短）
+                double chord = 0.84 * cosI;
+                // 体色：越厚吸得越多，球心偏青、边缘清透，球形就有渐变而不是一块平板
+                out[0] += (1.0-fr)*0.93*std::exp(-0.20*chord)*inc[0];
+                out[1] += (1.0-fr)*0.96*std::exp(-0.09*chord)*inc[1];
+                out[2] += (1.0-fr)*1.00*std::exp(-0.03*chord)*inc[2];
             } else {
                 // 水面：Fresnel 混合反射与漫反射
                 double cosI = std::max(0.0, -(d[0]*h.n[0] + d[1]*h.n[1] + d[2]*h.n[2]));
@@ -14147,19 +15807,23 @@ Interpreter::Interpreter() {
                 } else {
                     dir = norm({(rnd()*2-1), std::fabs(rnd())+0.2, (rnd()*2-1)});
                 }
-                auto inc = radiance({h.p[0]+h.n[0]*3e-3, h.p[1]+h.n[1]*3e-3, h.p[2]+h.n[2]*3e-3}, dir, depth-1);
+                auto inc = self(self, {h.p[0]+h.n[0]*3e-3, h.p[1]+h.n[1]*3e-3, h.p[2]+h.n[2]*3e-3}, dir, depth-1);
                 out[0] += albedo[0]*inc[0]*(1-fr); out[1] += albedo[1]*inc[1]*(1-fr); out[2] += albedo[2]*inc[2]*(1-fr);
                 if (rnd() < fr) {
                     double dot = d[0]*h.n[0] + d[1]*h.n[1] + d[2]*h.n[2];
                     dir = norm({d[0]-2*dot*h.n[0], d[1]-2*dot*h.n[1], d[2]-2*dot*h.n[2]});
-                    auto refl = radiance({h.p[0]+h.n[0]*3e-3, h.p[1]+h.n[1]*3e-3, h.p[2]+h.n[2]*3e-3}, dir, depth-1);
+                    auto refl = self(self, {h.p[0]+h.n[0]*3e-3, h.p[1]+h.n[1]*3e-3, h.p[2]+h.n[2]*3e-3}, dir, depth-1);
                     out[0] += fr*refl[0]; out[1] += fr*refl[1]; out[2] += fr*refl[2];
+                }
+                if (hitLightDisc(h.p, dir)) {
+                    // 地面的那道反光条：菲涅尔高光，掠射时最明显
+                    out[0] += fr*8.0; out[1] += fr*7.5; out[2] += fr*6.0;
                 }
             }
             if (pbr[mi].clearcoat > 0.01 && depth > 0) {
                 double dot = d[0]*h.n[0] + d[1]*h.n[1] + d[2]*h.n[2];
                 auto rc = norm({d[0]-2*dot*h.n[0], d[1]-2*dot*h.n[1], d[2]-2*dot*h.n[2]});
-                auto cc = radiance({h.p[0]+h.n[0]*3e-3, h.p[1]+h.n[1]*3e-3, h.p[2]+h.n[2]*3e-3}, rc, depth-1);
+                auto cc = self(self, {h.p[0]+h.n[0]*3e-3, h.p[1]+h.n[1]*3e-3, h.p[2]+h.n[2]*3e-3}, rc, depth-1);
                 out[0] = out[0]*(1-pbr[mi].clearcoat) + cc[0]*pbr[mi].clearcoat;
                 out[1] = out[1]*(1-pbr[mi].clearcoat) + cc[1]*pbr[mi].clearcoat;
                 out[2] = out[2]*(1-pbr[mi].clearcoat) + cc[2]*pbr[mi].clearcoat;
@@ -14176,18 +15840,24 @@ Interpreter::Interpreter() {
                 double tt = -gy / dy;
                 double cxp = gx + dx * tt, czp = gz + dz * tt;
                 double ddx = h.p[0] - cxp, ddz = h.p[2] - czp;
-                double q = std::exp(-(ddx*ddx + ddz*ddz) / 0.045);
-                out[0] += q * 1.4; out[1] += q * 1.5; out[2] += q * 1.7;
+                // 焦斑原来固定大小、固定亮度，跟光高无关；真实玻璃球越靠近地面，焦斑越大越亮。
+                double hLight = std::max(0.25, ly + 0.86);
+                double spot = 0.018 + 0.012 * hLight;
+                double q = std::exp(-(ddx*ddx + ddz*ddz) / spot);
+                double gain = 1.15 + 0.55 * (3.21 - hLight) / 3.21;
+                out[0] += q * gain; out[1] += q * gain * 1.06; out[2] += q * gain * 1.22;
             }
             if (kind == 0) {
                 std::array<double,3> dir2{ (rnd()*2-1), (rnd()*2-1), (rnd()*2-1) };
                 if (dir2[0]*h.n[0]+dir2[1]*h.n[1]+dir2[2]*h.n[2] < 0) dir2 = {-dir2[0],-dir2[1],-dir2[2]};
                 dir2 = norm(dir2);
-                auto inc = radiance({h.p[0]+h.n[0]*3e-3, h.p[1]+h.n[1]*3e-3, h.p[2]+h.n[2]*3e-3}, dir2, depth-1);
+                auto inc = self(self, {h.p[0]+h.n[0]*3e-3, h.p[1]+h.n[1]*3e-3, h.p[2]+h.n[2]*3e-3}, dir2, depth-1);
                 out[0] += albedo[0]*inc[0]; out[1] += albedo[1]*inc[1]; out[2] += albedo[2]*inc[2];
             }
             return out;
         };
+        // 记忆模式下烘焙要摘掉光源球（见 drawEmitter），默认路径不受影响。
+        bool stripEmitter = (cacheMode == 3 || cacheMode == 4);
         auto renderRows = [&](int y0, int y1) {
 #ifdef _WIN32
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
@@ -14199,28 +15869,280 @@ Interpreter::Interpreter() {
                     double px = (2.0*(x+0.5+jx)/w - 1.0) * (double)w/h * 0.72;
                     double py = (1.0 - 2.0*(y+0.5+jy)/h) * 0.72;
                     auto d = norm({px, py, -1.0});
-                    auto c = radiance({0,0,2.6}, d, 5);
+                    std::array<double,3> c;
+                    if (stripEmitter) {
+                        Hit h0;
+                        if (traceScene({0,0,2.6}, d, h0) && h0.mat == 4) {
+                            // 主射线打中光源球：先把它摘掉，重新算球后面的场景
+                            tSkipEmitter = true;
+                            c = radiance(radiance, {0,0,2.6}, d, 5);
+                            tSkipEmitter = false;
+                        } else {
+                            c = radiance(radiance, {0,0,2.6}, d, 5);
+                        }
+                    } else {
+                        c = radiance(radiance, {0,0,2.6}, d, 5);
+                    }
                     auto clampc = [](double v) {
                         if (!std::isfinite(v)) return 0.0;
                         return std::max(0.0, std::min(12.0, v));
                     };
                     col[0]+=clampc(c[0]); col[1]+=clampc(c[1]); col[2]+=clampc(c[2]);
                 }
-                auto tone = [&](double v){ v /= samples; v = v/(1.0+v); return (unsigned char)(255*std::pow(v, 1.0/2.2)); };
+                // 每像素每通道一次 pow，一帧七万次；改成 4096 项查表，肉眼不可辨。
+                auto tone = [&](double v){
+                    v /= samples; v = v/(1.0+v);
+                    if (!(v > 0.0)) return (unsigned char)0;
+                    if (v > 1.0) v = 1.0;
+                    return toneLut[(int)(v * 4095.0)];
+                };
                 size_t i = ((size_t)y*w+x)*3;
                 (*buf)[i] = tone(col[0]); (*buf)[i+1] = tone(col[1]); (*buf)[i+2] = tone(col[2]);
             }
         };
-        unsigned nt = std::max(2u, std::min(8u, std::thread::hardware_concurrency()));
+        // 光源本体重画：按当前时间把光源球投到屏幕，命中像素覆盖光源色。
+        // 片里没有光源球，覆盖后画面只有一个光斑，位置跟着真实光位走，不再有双影。
+        auto drawEmitter = [&](const std::shared_ptr<std::vector<unsigned char>>& px, double tNow) {
+            double lx = -1.6 + 1.4 * std::cos(tNow * 0.7);
+            double ly = 2.35;
+            double lz = -1.25 + 1.4 * std::sin(tNow * 0.7);
+            double dz = lz - 2.6;                 // 相机在 z=+2.6 朝 -z 看
+            if (dz > -1e-3) return;               // 在相机后方或在眼睛平面上
+            double vx = -lx / dz;                 // 视图坐标，与 px/py 同尺度
+            double vy = -ly / dz;
+            double vr = 0.16 / (-dz) * 1.25;      // 球在视图坐标里的半径，留余量
+            double cx = (vx / ((double)w / h * 0.72) + 1.0) * w / 2.0 - 0.5;
+            double cy = (1.0 - vy / 0.72) * h / 2.0 - 0.5;
+            double hw = vr / ((double)w / h * 0.72) * w / 2.0 + 2.0;
+            double hh = vr / 0.72 * h / 2.0 + 2.0;
+            int x0 = std::max(0, (int)std::floor(cx - hw)), x1 = std::min(w - 1, (int)std::ceil(cx + hw));
+            int y0 = std::max(0, (int)std::floor(cy - hh)), y1 = std::min(h - 1, (int)std::ceil(cy + hh));
+            if (x0 > x1 || y0 > y1) return;
+            // 光源原色（radiance 命中光源球时返回 8,7.5,6），走同一条色调曲线，颜色才对得上
+            unsigned char e[3];
+            double ev[3] = {8.0, 7.5, 6.0};
+            for (int c = 0; c < 3; ++c) {
+                double vv = ev[c] / (1.0 + ev[c]);
+                if (vv > 1.0) vv = 1.0;
+                e[c] = toneLut[(int)(vv * 4095.0)];
+            }
+            for (int y = y0; y <= y1; ++y) {
+                for (int x = x0; x <= x1; ++x) {
+                    int cnt = 0;
+                    for (int sy = 0; sy < 2 && cnt >= 0; ++sy) for (int sx = 0; sx < 2; ++sx) {
+                        double ox = sx ? 0.75 : 0.25, oy = sy ? 0.75 : 0.25;
+                        double px2 = (2.0 * (x + ox) / w - 1.0) * (double)w / h * 0.72;
+                        double py2 = (1.0 - 2.0 * (y + oy) / h) * 0.72;
+                        auto d2 = norm({px2, py2, -1.0});
+                        Hit h2;
+                        if (traceScene({0,0,2.6}, d2, h2) && h2.mat == 4) ++cnt;
+                    }
+                    if (!cnt) continue;
+                    double cov = cnt / 4.0;
+                    size_t i = ((size_t)y * w + x) * 3;
+                    for (int c = 0; c < 3; ++c) {
+                        double v = (double)(*px)[i + c] * (1.0 - cov) + (double)e[c] * cov + 0.5;
+                        if (v < 0.0) v = 0.0;
+                        if (v > 255.0) v = 255.0;
+                        (*px)[i + c] = (unsigned char)v;
+                    }
+                }
+            }
+        };
+        // ---- 时间片预烘焙：只有光源随时间的场景，不必每帧重弹射 ----
+        // 机制：时间按 sliceStep 切片，每片渲染一次留成「内部像素」（内部分辨率的彩色帧）；
+        // 运行时取 floor 与 ceil 两片，按小数部分线性插值，再照常走降噪与放大。
+        // 片容量按 128MB 内存预算自动收缩（2K 满分辨率一片 7MB，只留 18 片；0.32 一片 0.7MB，能留 48 片）。
+        bool skippedRender = false;
+        long long ringSlots = 0;
+        if ((cacheMode == 3 || cacheMode == 4) && accMode == 0 && sliceStep > 0.0) {
+            struct Slice { long long q = 0; std::shared_ptr<std::vector<unsigned char>> px; };
+            static std::vector<Slice> slices;
+            static string sliceKey;
+            string key = frameKey + "|" + std::to_string(w) + "x" + std::to_string(h) + "|" + std::to_string(samples);
+            if (sliceKey != key) { slices.clear(); sliceKey = key; }
+            size_t slotBytes = (size_t)w * h * 3;
+            size_t maxSlots = 48;
+            if (slotBytes > 0) {
+                size_t cap = (size_t)(128ull * 1024ull * 1024ull / slotBytes);
+                maxSlots = std::max<size_t>(4, std::min<size_t>(48, cap));
+            }
+            // 模式 4 要装下一整圈，否则旧片被挤掉就退化成重算；上限放宽到 512MB。
+            if (cacheMode == 4 && sliceStep > 0.0 && slotBytes > 0) {
+                long long ring = (long long)std::llround((2.0 * 3.141592653589793238 / 0.7) / sliceStep);
+                if (ring > 0 && (size_t)ring * slotBytes <= 512ull * 1024ull * 1024ull)
+                    maxSlots = std::max<size_t>(maxSlots, (size_t)ring);
+            }
+            auto renderSlice = [&](long long q) -> std::shared_ptr<std::vector<unsigned char>> {
+                auto dst = std::make_shared<std::vector<unsigned char>>(slotBytes);
+                auto bufSave = buf;
+                double tmSave = tm;
+                buf = dst;
+                tm = (double)q * sliceStep;
+                unsigned nt2 = (unsigned)std::max(2, cpuPhysicalCores());
+                if (gCpuThreadLimit > 0) nt2 = std::min(nt2, (unsigned)gCpuThreadLimit);
+#ifdef _OPENMP
+                omp_set_num_threads((int)nt2);
+#pragma omp parallel for schedule(static)
+                for (int y = 0; y < h; ++y) renderRows(y, y + 1);
+#else
+                std::vector<std::thread> ws;
+                for (unsigned k = 0; k < nt2; ++k)
+                    ws.emplace_back(renderRows, h * (int)k / (int)nt2, h * (int)(k + 1) / (int)nt2);
+                for (auto& th : ws) th.join();
+#endif
+                buf = bufSave;
+                tm = tmSave;
+                return dst;
+            };
+            auto getSlice = [&](long long q) -> std::shared_ptr<std::vector<unsigned char>> {
+                for (auto& sl : slices) if (sl.q == q) return sl.px;
+                auto px = renderSlice(q);
+                if (slices.size() >= maxSlots) slices.erase(slices.begin());
+                Slice sl; sl.q = q; sl.px = px;
+                slices.push_back(sl);
+                return px;
+            };
+            // 光源绕行周期：lcx/lcz 由 cos(0.7t)/sin(0.7t) 决定，同一光位每 2π/0.7 秒重复一次。
+            // 模式 4 把时间折回相位，第几圈都命中同一片——这就是「记住光位」。
+            const double lightPeriod = 2.0 * 3.141592653589793238 / 0.7;
+            double tq, frac;
+            if (cacheMode == 4) {
+                double phase = std::fmod(tm, lightPeriod);
+                if (phase < 0) phase += lightPeriod;
+                tq = phase / sliceStep;
+            } else {
+                tq = tm / sliceStep;
+            }
+            frac = tq - std::floor(tq);
+            long long q0 = (long long)std::floor(tq);
+            long long total = (cacheMode == 4) ? (long long)std::llround(lightPeriod / sliceStep) : 0;
+            if (total < 1) total = 1;
+            ringSlots = total;
+            long long qa = q0, qb = q0 + 1;
+            if (cacheMode == 4) {
+                qa = q0 % total; if (qa < 0) qa += total;
+                qb = (qa + 1) % total;
+            }
+            auto p0 = getSlice(qa);
+            if (frac < 1e-9) {
+                std::memcpy(buf->data(), p0->data(), slotBytes);
+            } else {
+                auto p1 = getSlice(qb);
+                int n = (int)slotBytes;
+                unsigned nb = (unsigned)std::max(2, cpuPhysicalCores());
+#ifdef _OPENMP
+                omp_set_num_threads((int)nb);
+#pragma omp parallel for schedule(static)
+#endif
+                for (int i = 0; i < n; ++i) {
+                    double v = (1.0 - frac) * (double)(*p0)[i] + frac * (double)(*p1)[i] + 0.5;
+                    if (v < 0.0) v = 0.0;
+                    if (v > 255.0) v = 255.0;
+                    (*buf)[i] = (unsigned char)v;
+                }
+            }
+            drawEmitter(buf, tm);
+            skippedRender = true;
+        }
+        // 原来硬顶 8 个线程，本机 14 物理核只用到一半多；改按物理核给（超线程在这条路径上不加分）。
+        if (!skippedRender) {
+        unsigned nt = (unsigned)std::max(2, cpuPhysicalCores());
         if (gCpuThreadLimit > 0) nt = std::min(nt, (unsigned)gCpuThreadLimit);
+        // 原来每次调用都新建 nt 个线程再 join，线程创建本身就要 1ms 上下；
+        // 改用 OpenMP 常驻线程池，线程复用，行切分与结果完全一致。
+#ifdef _OPENMP
+        omp_set_num_threads((int)nt);
+#pragma omp parallel for schedule(static)
+        for (int y = 0; y < h; ++y) renderRows(y, y + 1);
+#else
         std::vector<std::thread> workers;
         for (unsigned k = 0; k < nt; ++k)
             workers.emplace_back(renderRows, h*(int)k/(int)nt, h*(int)(k+1)/(int)nt);
         for (auto& th : workers) th.join();
-        // 低采样边缘保留降噪，再双线性放大。
+#endif
+        // 边缘保留降噪，再双线性放大。
+        // 原来只在采样 <= 2 时走，高采样就裸着出图；这个核 3x3 边缘停手，
+        // 采样高了照样只削细颗粒、不糊边缘，所以放开到所有采样。
+        // 跨帧累积：把本次的整帧结果按权重并入累加器，再用「累加 / 已累加采样数」作为本帧输出。
+        // 静态视角下 N 帧之后等效采样 = N × 每帧采样，而单帧成本始终是「每帧采样」那么多。
+        static std::shared_ptr<std::vector<double>> gAcc;
+        static int gAccW = 0, gAccH = 0, gAccScaleW = 0;
+        static long long gAccCount = 0;
+        if (accMode > 0) {
+            if (gAcc && (gAccW != w || gAccH != h || (int)gAcc->size() != w * h * 3 || accMode >= 2)) {
+                gAcc.reset();
+                gAccCount = 0;
+            }
+            if (!gAcc) {
+                gAcc = std::make_shared<std::vector<double>>((size_t)w * h * 3, 0.0);
+                gAccW = w; gAccH = h; gAccScaleW = w;
+                gAccCount = 0;
+            }
+            int n = w * h * 3;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+            for (int i = 0; i < n; ++i) (*gAcc)[i] += (double)(*buf)[i];
+            gAccCount += (long long)samples;
+            double inv = 1.0 / (double)gAccCount;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+            for (int i = 0; i < n; ++i) {
+                double v = (*gAcc)[i] * inv;
+                if (v < 0.0) v = 0.0;
+                if (v > 255.0) v = 255.0;
+                (*buf)[i] = (unsigned char)(v + 0.5);
+            }
+        } else {
+            gAcc.reset();
+            gAccCount = 0;
+        }
+        }
+        // 采样只有 1–2 时会有萤火虫：个别像素比邻域亮或暗几十级。
+        // 边缘保留滤波会把它当边界保护起来，越降噪越明显，所以先过一遍 3×3 中位数打掉它。
         if (samples <= 2 && w > 2 && h > 2) {
+            auto med = std::make_shared<std::vector<unsigned char>>(buf->size());
+            auto medRows = [&](int y0, int y1) {
+                for (int y = y0; y < y1; ++y) for (int x = 0; x < w; ++x) {
+                    size_t oi = ((size_t)y * w + x) * 3;
+                    for (int c = 0; c < 3; ++c) {
+                        unsigned char v[9];
+                        int n = 0;
+                        for (int dy = -1; dy <= 1; ++dy) for (int dx = -1; dx <= 1; ++dx) {
+                            int xx = x + dx, yy = y + dy;
+                            if (xx < 0) xx = 0;
+                            if (yy < 0) yy = 0;
+                            if (xx >= w) xx = w - 1;
+                            if (yy >= h) yy = h - 1;
+                            v[n++] = (*buf)[((size_t)yy * w + xx) * 3 + c];
+                        }
+                        for (int a = 1; a < 9; ++a) {
+                            unsigned char t = v[a];
+                            int b = a;
+                            while (b > 0 && v[b - 1] > t) { v[b] = v[b - 1]; --b; }
+                            v[b] = t;
+                        }
+                        (*med)[oi + c] = v[4];
+                    }
+                }
+            };
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+            for (int y = 0; y < h; ++y) medRows(y, y + 1);
+            buf = med;
+        }
+        // 实时档（采样 <= 2）走两遍：内部像素少，噪声放大后是大块色斑，一遍压不住。
+        // 时间片模式 + 高采样烘焙时，片已经干净，不必每帧再滤波（命中成本 16ms → 5.5ms）。
+        int denPasses = (cacheMode == 3 && samples > 2) ? 0 : 1;
+        for (int dpass = 0; dpass < denPasses && w > 2 && h > 2; ++dpass) {
             auto src = buf;
             auto den = std::make_shared<std::vector<unsigned char>>(src->size());
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
             for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) {
                 size_t oi = ((size_t)y * w + x) * 3;
                 double sum[3] = {0,0,0}, wsum = 0;
@@ -14242,38 +16164,125 @@ Interpreter::Interpreter() {
             buf = den;
         }
         auto finalBuf = std::make_shared<std::vector<unsigned char>>((size_t)outW * outH * 3);
-        auto upRows = [&](int y0, int y1) {
-            for (int oy = y0; oy < y1; ++oy) for (int ox = 0; ox < outW; ++ox) {
-                double sx = (ox + 0.5) * w / outW - 0.5;
-                double sy = (oy + 0.5) * h / outH - 0.5;
-                int x0 = std::max(0, std::min(w - 1, (int)std::floor(sx)));
-                int y0i = std::max(0, std::min(h - 1, (int)std::floor(sy)));
-                int x1 = std::max(0, std::min(w - 1, x0 + 1));
-                int y1i = std::max(0, std::min(h - 1, y0i + 1));
-                double fx = sx - x0, fy = sy - y0i;
-                size_t oi = ((size_t)oy * outW + ox) * 3;
-                for (int ch = 0; ch < 3; ++ch) {
-                    double v00 = (*buf)[((size_t)y0i * w + x0) * 3 + ch];
-                    double v10 = (*buf)[((size_t)y0i * w + x1) * 3 + ch];
-                    double v01 = (*buf)[((size_t)y1i * w + x0) * 3 + ch];
-                    double v11 = (*buf)[((size_t)y1i * w + x1) * 3 + ch];
-                    double v = v00 * (1 - fx) * (1 - fy) + v10 * fx * (1 - fy) +
-                               v01 * (1 - fx) * fy + v11 * fx * fy;
-                    (*finalBuf)[oi + ch] = (unsigned char)std::max(0.0, std::min(255.0, v));
+        // 原放大是「每个输出像素直接四角双线性」：四角采样跨行跳内存，2K 输出一帧要 8–12ms。
+        // 改成可分离两遍：先横向把 w 拉到 outW（读一行写一行，全连续），
+        // 再纵向把 h 拉到 outH（读两行写一行，全连续）；权重用 16 位定点，误差不超过 1 个灰度级。
+        if (w == outW && h == outH) {
+            std::memcpy(finalBuf->data(), buf->data(), finalBuf->size());
+        } else {
+            // 三次（Catmull-Rom）抽头：每个输出点取邻近 4 个源点，权重 16 位定点。
+            // 双线性在放 6–10 倍时会把几何细节摊成一片雾，视觉上像近视；三次能保住边缘过渡。
+            std::vector<std::array<int,4>> wxt(outW);
+            std::vector<std::array<int,4>> wxi(outW);
+            for (int ox = 0; ox < outW; ++ox) {
+                double sx = (ox + 0.5) * (double)w / outW - 0.5;
+                int i1 = (int)std::floor(sx);
+                double t = sx - (double)i1;
+                if (t < 0) { t += 1.0; i1 -= 1; }
+                double w0 = -0.5 * t * t * t + t * t - 0.5 * t;
+                double w1 = 1.5 * t * t * t - 2.5 * t * t + 1.0;
+                double w2 = -1.5 * t * t * t + 2.0 * t * t + 0.5 * t;
+                double w3 = 0.5 * t * t * t - 0.5 * t * t;
+                int idx[4] = {i1 - 1, i1, i1 + 1, i1 + 2};
+                for (int k = 0; k < 4; ++k) {
+                    if (idx[k] < 0) idx[k] = 0;
+                    if (idx[k] > w - 1) idx[k] = w - 1;
                 }
+                wxi[ox] = {idx[0], idx[1], idx[2], idx[3]};
+                wxt[ox] = {(int)(w0 * 65536.0), (int)(w1 * 65536.0), (int)(w2 * 65536.0), (int)(w3 * 65536.0)};
             }
-        };
-        {
-            std::vector<std::thread> up;
-            unsigned un = std::max(2u, std::min(8u, std::thread::hardware_concurrency()));
+            std::vector<std::array<int,4>> wyt(outH);
+            std::vector<std::array<int,4>> wyi(outH);
+            for (int oy = 0; oy < outH; ++oy) {
+                double sy = (oy + 0.5) * (double)h / outH - 0.5;
+                int j1 = (int)std::floor(sy);
+                double t = sy - (double)j1;
+                if (t < 0) { t += 1.0; j1 -= 1; }
+                double w0 = -0.5 * t * t * t + t * t - 0.5 * t;
+                double w1 = 1.5 * t * t * t - 2.5 * t * t + 1.0;
+                double w2 = -1.5 * t * t * t + 2.0 * t * t + 0.5 * t;
+                double w3 = 0.5 * t * t * t - 0.5 * t * t;
+                int idx[4] = {j1 - 1, j1, j1 + 1, j1 + 2};
+                for (int k = 0; k < 4; ++k) {
+                    if (idx[k] < 0) idx[k] = 0;
+                    if (idx[k] > h - 1) idx[k] = h - 1;
+                }
+                wyi[oy] = {idx[0], idx[1], idx[2], idx[3]};
+                wyt[oy] = {(int)(w0 * 65536.0), (int)(w1 * 65536.0), (int)(w2 * 65536.0), (int)(w3 * 65536.0)};
+            }
+            auto midBuf = std::make_shared<std::vector<unsigned char>>((size_t)outW * h * 3);
+            auto upRows = [&](int y0, int y1) {
+                for (int y = y0; y < y1; ++y) {
+                    const unsigned char* src = &(*buf)[(size_t)y * w * 3];
+                    unsigned char* dst = &(*midBuf)[(size_t)y * outW * 3];
+                    for (int ox = 0; ox < outW; ++ox) {
+                        auto& ii = wxi[ox];
+                        auto& tt = wxt[ox];
+                        const unsigned char* p0 = src + (size_t)ii[0] * 3;
+                        const unsigned char* p1 = src + (size_t)ii[1] * 3;
+                        const unsigned char* p2 = src + (size_t)ii[2] * 3;
+                        const unsigned char* p3 = src + (size_t)ii[3] * 3;
+                        for (int c = 0; c < 3; ++c) {
+                            int v = p0[c] * tt[0] + p1[c] * tt[1] + p2[c] * tt[2] + p3[c] * tt[3];
+                            v = (v + 32768) >> 16;
+                            if (v < 0) v = 0;
+                            if (v > 255) v = 255;
+                            dst[ox * 3 + c] = (unsigned char)v;
+                        }
+                    }
+                }
+            };
+            auto vRows = [&](int y0, int y1) {
+                for (int oy = y0; oy < y1; ++oy) {
+                    auto& ii = wyi[oy];
+                    auto& tt = wyt[oy];
+                    const unsigned char* p0 = &(*midBuf)[(size_t)ii[0] * outW * 3];
+                    const unsigned char* p1 = &(*midBuf)[(size_t)ii[1] * outW * 3];
+                    const unsigned char* p2 = &(*midBuf)[(size_t)ii[2] * outW * 3];
+                    const unsigned char* p3 = &(*midBuf)[(size_t)ii[3] * outW * 3];
+                    unsigned char* dst = &(*finalBuf)[(size_t)oy * outW * 3];
+                    int n = outW * 3;
+                    for (int i = 0; i < n; ++i) {
+                        int v = p0[i] * tt[0] + p1[i] * tt[1] + p2[i] * tt[2] + p3[i] * tt[3];
+                        v = (v + 32768) >> 16;
+                        if (v < 0) v = 0;
+                        if (v > 255) v = 255;
+                        dst[i] = (unsigned char)v;
+                    }
+                }
+            };
+            unsigned un = (unsigned)std::max(2, cpuPhysicalCores());
+            // 两遍放大都走同一批常驻线程。
+#ifdef _OPENMP
+            omp_set_num_threads((int)un);
+#pragma omp parallel for schedule(static)
+            for (int y = 0; y < h; ++y) upRows(y, y + 1);
+#pragma omp parallel for schedule(static)
+            for (int oy = 0; oy < outH; ++oy) vRows(oy, oy + 1);
+#else
+            std::vector<std::thread> ups;
             for (unsigned k = 0; k < un; ++k)
-                up.emplace_back(upRows, outH * (int)k / (int)un, outH * (int)(k + 1) / (int)un);
-            for (auto& th : up) th.join();
+                ups.emplace_back(upRows, h * (int)k / (int)un, h * (int)(k + 1) / (int)un);
+            for (auto& th : ups) th.join();
+            ups.clear();
+            for (unsigned k = 0; k < un; ++k)
+                ups.emplace_back(vRows, outH * (int)k / (int)un, outH * (int)(k + 1) / (int)un);
+            for (auto& th : ups) th.join();
+#endif
+        }
+        if ((cacheMode == 1 || cacheMode == 2) && accMode == 0 && finalBuf) {
+            rtCache.valid = true;
+            rtCache.outW = outW; rtCache.outH = outH; rtCache.samples = samples;
+            rtCache.tm = tm; rtCache.scale = scale; rtCache.key = frameKey;
+            rtCache.px = finalBuf;
+            rtCache.misses++;
         }
         auto d = std::make_shared<Dict>();
         d->items["宽"] = vNum(outW);
         d->items["高"] = vNum(outH);
         d->items["像素"] = vBytes(finalBuf);
+        d->items["缓存命中"] = vBool(false);
+        if (cacheMode == 3 || cacheMode == 4) d->items["记忆片数"] = vNum((double)ringSlots);
         return vDict(d);
     });
     registerBuiltin("视口取色", 3, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
@@ -14286,6 +16295,55 @@ Interpreter::Interpreter() {
         size_t i = ((size_t)y * w + x) * 3;
         return vNum((double)((p[i] << 16) | (p[i + 1] << 8) | p[i + 2]));
     });
+    registerBuiltin("原生快面准备", 8, 8, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto cam = needDict(a[0], "快面准备", line);
+        auto face = needDict(a[1], "快面准备", line);
+        double w = needNum(a[2], "快面准备", line);
+        double h = needNum(a[3], "快面准备", line);
+        bool persp = truthy(a[4]);
+        auto sun = needDict(a[5], "快面准备", line);
+        auto cfg = needDict(a[6], "快面准备", line);
+        double layer = needNum(a[7], "快面准备", line);
+        return wenPrepareFace(cam, face, w, h, persp, sun, cfg, layer, line);
+    });
+    registerBuiltin("原生批次", 9, 9, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto mainList = needList(a[0], "批次", line);
+        auto auxList = needList(a[1], "批次", line);
+        auto hidden = needList(a[2], "批次", line);
+        auto cam = needDict(a[3], "批次", line);
+        double w = needNum(a[4], "批次", line);
+        double h = needNum(a[5], "批次", line);
+        bool persp = truthy(a[6]);
+        auto sun = needDict(a[7], "批次", line);
+        auto cfg = needDict(a[8], "批次", line);
+        bool doCull = truthy(cfg->items.at("剔除"));
+        bool skipHidden = truthy(cfg->items.at("跳过隐藏"));
+        std::unordered_set<long long> hid;
+        for (const auto& v : hidden->items) hid.insert((long long)needNum(v, "隐藏", line));
+        auto batch = std::make_shared<List>();
+        for (size_t fi = 0; fi < mainList->items.size(); ++fi) {
+            auto face = needDict(mainList->items[fi], "面片", line);
+            if (doCull) {
+                auto n = wenV3(face->items.at("法线"), "面片", line);
+                auto c = wenV3(face->items.at("中心"), "面片", line);
+                if (!wenBackface(cam, n, c, line)) continue;
+            }
+            if (skipHidden && hid.count((long long)fi)) continue;
+            Value bar = wenPrepareFace(cam, face, w, h, persp, sun, cfg, 0.0, line);
+            if (bar.type == VT::Dict && bar.dict && bar.dict->items.size() > 0)
+                batch->items.push_back(bar);
+        }
+        for (size_t ai = 0; ai < auxList->items.size(); ++ai) {
+            auto face = needDict(auxList->items[ai], "面片", line);
+            double layer = 0.0;
+            if (face->items.count("方块序号") && (long long)needNum(face->items.at("方块序号"), "面片", line) == -2) layer = 1.0;
+            Value bar = wenPrepareFace(cam, face, w, h, persp, sun, cfg, layer, line);
+            if (bar.type == VT::Dict && bar.dict && bar.dict->items.size() > 0)
+                batch->items.push_back(bar);
+        }
+        return vList(batch);
+    });
+
     registerBuiltin("视口清空", 1, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         auto d = vpDict(a[0], line);
         int c = a.size() > 1 ? vpColor(a[1], line) : 0;
@@ -14296,6 +16354,19 @@ Interpreter::Interpreter() {
             p[(size_t)i * 3] = (unsigned char)((c >> 16) & 255);
             p[(size_t)i * 3 + 1] = (unsigned char)((c >> 8) & 255);
             p[(size_t)i * 3 + 2] = (unsigned char)(c & 255);
+        }
+        return a[0];
+    });
+    registerBuiltin("视口清深度", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto d = vpDict(a[0], line);
+        double init = needNum(a[1], "视口清深度", line);
+        int w = (int)needNum(d->items.at("宽"), "视口", line);
+        int h = (int)needNum(d->items.at("高"), "视口", line);
+        auto dp = needList(d->items.at("深度"), "视口", line);
+        bool cc = !dp->compact.empty();
+        for (int i = 0; i < w * h; ++i) {
+            dp->items[i].num = init;
+            if (cc) dp->compact[i] = (float)init;
         }
         return a[0];
     });
@@ -14327,22 +16398,343 @@ Interpreter::Interpreter() {
         int x2 = (int)needIndex(a[3], "视口画三角形", line), y2 = (int)needIndex(a[4], "视口画三角形", line);
         int x3 = (int)needIndex(a[5], "视口画三角形", line), y3 = (int)needIndex(a[6], "视口画三角形", line);
         int c = vpColor(a[7], line);
-        int minx = std::min({x1, x2, x3}), maxx = std::max({x1, x2, x3});
-        int miny = std::min({y1, y2, y3}), maxy = std::max({y1, y2, y3});
-        auto edge = [](int ax, int ay, int bx, int by, int px, int py) {
-            return (px - ax) * (by - ay) - (py - ay) * (bx - ax);
-        };
-        int area = edge(x1, y1, x2, y2, x3, y3);
-        if (!area) return a[0];
-        for (int y = miny; y <= maxy; ++y)
-            for (int x = minx; x <= maxx; ++x) {
-                int w1 = edge(x2, y2, x3, y3, x, y);
-                int w2 = edge(x3, y3, x1, y1, x, y);
-                int w3 = edge(x1, y1, x2, y2, x, y);
-                if ((w1 >= 0 && w2 >= 0 && w3 >= 0) || (w1 <= 0 && w2 <= 0 && w3 <= 0))
-                    vpPut(d, x, y, c);
-            }
+        wenFillTriangle(d, x1, y1, x2, y2, x3, y3, c);
         return a[0];
+    });
+    registerBuiltin("原生填充批次", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto d = vpDict(a[0], line);
+        auto batch = needList(a[1], "填充批次", line);
+        long long tri = 0;
+        for (const auto& bar : batch->items) {
+            auto b = needDict(bar, "批次条", line);
+            auto pts = needList(b->items.at("点"), "批次条", line);
+            int c = vpColor(b->items.at("色"), line);
+            size_t n = pts->items.size();
+            if (n < 3) continue;
+            auto p0 = needList(pts->items[0], "点", line);
+            int x1 = (int)needIndex(p0->items[0], "点", line), y1 = (int)needIndex(p0->items[1], "点", line);
+            for (size_t t = 1; t + 1 < n; ++t) {
+                auto pt = needList(pts->items[t], "点", line);
+                auto pt1 = needList(pts->items[t + 1], "点", line);
+                int x2 = (int)needIndex(pt->items[0], "点", line), y2 = (int)needIndex(pt->items[1], "点", line);
+                int x3 = (int)needIndex(pt1->items[0], "点", line), y3 = (int)needIndex(pt1->items[1], "点", line);
+                wenFillTriangle(d, x1, y1, x2, y2, x3, y3, c);
+                ++tri;
+            }
+        }
+        return vNum((double)tri);
+    });
+    // Z 批次：复刻 渲染帧 快速分支的脚本逐面循环（剔除/隐藏/转相机/裁剪/投影/着色/三角形Z填充），
+    // 整批收进一次 C++ 遍历；保留深度表写回，供阴影/体积光后置使用。口径对齐 库/棱镜渲染.库 快速分支。
+    registerBuiltin("原生批次Z", 11, 11, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto d = vpDict(a[0], line);
+        auto depth = needList(a[1], "批次Z", line);
+        auto mainList = needList(a[2], "批次Z", line);
+        auto auxList = needList(a[3], "批次Z", line);
+        auto hidden = needList(a[4], "批次Z", line);
+        auto cam = needDict(a[5], "批次Z", line);
+        double w = needNum(a[6], "批次Z", line);
+        double h = needNum(a[7], "批次Z", line);
+        bool persp = truthy(a[8]);
+        auto sun = needDict(a[9], "批次Z", line);
+        auto cfg = needDict(a[10], "批次Z", line);
+        bool ignoreAux = truthy(cfg->items.at("忽略辅助"));
+        bool doCull = truthy(cfg->items.at("剔除"));
+        bool skipHidden = truthy(cfg->items.at("跳过隐藏"));
+        bool lit = truthy(cfg->items.at("光影"));
+        double env = needNum(cfg->items.at("环境"), "配置", line);
+        double minL = needNum(cfg->items.at("最低亮度"), "配置", line);
+        bool ortho = cam->items.at("模式").str == "正交";
+
+        int W=(int)needNum(d->items.at("宽"),"视口",line);
+        int H=(int)needNum(d->items.at("高"),"视口",line);
+        auto& pix = vpPixels(d);
+        auto& ditems = depth->items;
+
+        std::unordered_set<long long> hid;
+        for (const auto& v : hidden->items) hid.insert((long long)needNum(v, "隐藏", line));
+
+        auto depthKey = [&](const std::array<double,3>& p) -> double {
+            if (ortho) return 1.0e4 - p[2];
+            if (p[2] > 1e-9) return 1.0 / p[2];
+            return 0.0;
+        };
+        auto edge=[](double ax,double ay,double bx,double by,double px,double py){return (px-ax)*(by-ay)-(py-ay)*(bx-ax);};
+
+        long long faceCount = 0, triCount = 0;
+
+        auto fillTriZ = [&](double x1,double y1,double z1,double x2,double y2,double z2,
+                            double x3,double y3,double z3,int cr,int cg,int cb) {
+            double area = edge(x1,y1,x2,y2,x3,y3);
+            if (std::fabs(area) < 1e-12) return;
+            int minx=(int)std::floor(std::min({x1,x2,x3})), maxx=(int)std::ceil(std::max({x1,x2,x3}));
+            int miny=(int)std::floor(std::min({y1,y2,y3})), maxy=(int)std::ceil(std::max({y1,y2,y3}));
+            if (minx<0) minx=0; if (miny<0) miny=0;
+            if (maxx>=W) maxx=W-1; if (maxy>=H) maxy=H-1;
+            for(int y=miny;y<=maxy;++y) for(int x=minx;x<=maxx;++x){
+                double w1=edge(x2,y2,x3,y3,x,y)/area, w2=edge(x3,y3,x1,y1,x,y)/area;
+                double w3=1.0-w1-w2;
+                if(w1<0||w2<0||w3<0) continue;
+                size_t i=(size_t)y*W+x;
+                double z=w1*z1+w2*z2+w3*z3;
+                if(z >= ditems[i].num) continue;
+                ditems[i].num = z;
+                size_t pi=i*3; pix[pi]=(unsigned char)cr; pix[pi+1]=(unsigned char)cg; pix[pi+2]=(unsigned char)cb;
+            }
+        };
+
+        struct ZJob { vector<std::array<double,3>> sp; int r=0,g=0,b=0; bool valid=false; };
+        struct FaceRef { const Value* val; long long fi; bool isMain; };
+        vector<FaceRef> refs;
+        refs.reserve(mainList->items.size() + (ignoreAux ? 0 : auxList->items.size()));
+        for (size_t fi=0; fi<mainList->items.size(); ++fi) refs.push_back({ &mainList->items[fi], (long long)fi, true });
+        if (!ignoreAux) for (size_t ai=0; ai<auxList->items.size(); ++ai) refs.push_back({ &auxList->items[ai], (long long)ai, false });
+        vector<ZJob> jobs(refs.size());
+
+        auto prepOne = [&](size_t i) {
+            const FaceRef& fr = refs[i];
+            auto face = needDict(*fr.val, "面片", line);
+            long long seq = (long long)needNum(face->items.at("方块序号"), "面片", line);
+            if (doCull && seq >= 0) {
+                auto n = wenV3(face->items.at("法线"), "面片", line);
+                auto c = wenV3(face->items.at("中心"), "面片", line);
+                if (!wenBackface(cam, n, c, line)) return;
+            }
+            if (fr.isMain && skipHidden && hid.count(fr.fi)) return;
+            auto verts = needList(face->items.at("顶点"), "面片", line);
+            vector<std::array<double,3>> view;
+            for (const auto& v : verts->items) view.push_back(wenToCam(cam, wenV3(v, "顶点", line), line));
+            if (persp) {
+                view = wenClipFrustum(cam, view, w, h, line);
+                if (view.size() < 3) return;
+            }
+            vector<std::array<double,3>> sp;
+            for (const auto& p : view) {
+                auto pr = wenProject(cam, p, w, h, line);
+                sp.push_back({ pr[0], pr[1], depthKey(p) });
+            }
+            auto normal = wenV3(face->items.at("法线"), "面片", line);
+            auto center = wenV3(face->items.at("中心"), "面片", line);
+            auto mat = needDict(face->items.at("材质"), "面片", line);
+            auto c01 = wenShade(normal, center, mat, sun, env, minL, lit, line);
+            int r=(int)std::floor(c01[0]*255.0+0.5), g=(int)std::floor(c01[1]*255.0+0.5), b=(int)std::floor(c01[2]*255.0+0.5);
+            r=std::max(0,std::min(255,r)); g=std::max(0,std::min(255,g)); b=std::max(0,std::min(255,b));
+            jobs[i].sp = std::move(sp); jobs[i].r=r; jobs[i].g=g; jobs[i].b=b; jobs[i].valid=true;
+        };
+        unsigned nt = std::max(2u, std::min(6u, std::thread::hardware_concurrency()));
+        if (gCpuThreadLimit > 0) nt = std::min(nt, (unsigned)gCpuThreadLimit);
+        if (refs.size() < 16) nt = 1;
+        {
+            std::vector<std::thread> pool;
+            for (unsigned k = 0; k < nt; ++k)
+                pool.emplace_back([&](unsigned kk){
+                    size_t b = refs.size()*kk/nt, e = refs.size()*(kk+1)/nt;
+                    for (size_t i=b; i<e; ++i) prepOne(i);
+                }, k);
+            for (auto& th : pool) th.join();
+        }
+
+        for (size_t i=0; i<jobs.size(); ++i) {
+            if (!jobs[i].valid) continue;
+            const auto& sp = jobs[i].sp;
+            size_t n = sp.size();
+            for (size_t t=1; t+1<n; ++t) {
+                fillTriZ(sp[0][0],sp[0][1],0.0-sp[0][2],
+                         sp[t][0],sp[t][1],0.0-sp[t][2],
+                         sp[t+1][0],sp[t+1][1],0.0-sp[t+1][2],jobs[i].r,jobs[i].g,jobs[i].b);
+                ++triCount;
+            }
+            ++faceCount;
+        }
+        auto out = std::make_shared<Dict>();
+        out->items["面"] = vNum((double)faceCount);
+        out->items["三角"] = vNum((double)triCount);
+        return vDict(out);
+    });
+    // 只写深度批次：复刻 渲染帧 慢速分支的覆盖图（阴影视口）路径——只落深度键、不写色/掩码/朝向。
+    // 口径对齐 库/棱镜光栅.库 填充凸多边形：深度键大者覆盖（近者键大），写入前转单精度。
+    registerBuiltin("原生批次深度", 11, 11, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto d = vpDict(a[0], line);
+        auto depth = needList(a[1], "批次深度", line);
+        auto mainList = needList(a[2], "批次深度", line);
+        auto auxList = needList(a[3], "批次深度", line);
+        auto hidden = needList(a[4], "批次深度", line);
+        auto cam = needDict(a[5], "批次深度", line);
+        double w = needNum(a[6], "批次深度", line);
+        double h = needNum(a[7], "批次深度", line);
+        bool persp = truthy(a[8]);
+        auto cfg = needDict(a[10], "批次深度", line);
+        bool ignoreAux = truthy(cfg->items.at("忽略辅助"));
+        bool doCull = truthy(cfg->items.at("剔除"));
+        bool skipHidden = truthy(cfg->items.at("跳过隐藏"));
+        bool ortho = cam->items.at("模式").str == "正交";
+
+        int W=(int)needNum(d->items.at("宽"),"视口",line);
+        int H=(int)needNum(d->items.at("高"),"视口",line);
+        auto& ditems = depth->items;
+        auto& dcomp = depth->compact;
+        if (dcomp.size() != (size_t)W*H) dcomp.assign((size_t)W*H, 0.0f);
+
+        std::unordered_set<long long> hid;
+        for (const auto& v : hidden->items) hid.insert((long long)needNum(v, "隐藏", line));
+
+        auto depthKey = [&](const std::array<double,3>& p) -> double {
+            if (ortho) return 1.0e4 - p[2];
+            if (p[2] > 1e-9) return 1.0 / p[2];
+            return 0.0;
+        };
+        auto edge=[](double ax,double ay,double bx,double by,double px,double py){return (px-ax)*(by-ay)-(py-ay)*(bx-ax);};
+
+        long long faceCount = 0, triCount = 0;
+        // 扫描线复刻 填充凸多边形（只写深度）：逐行边求交、按 x 排序、两两配对、沿 x 步进深度键；
+        // 深度键大者覆盖，写入前转单精度。口径与 库/棱镜光栅.库 慢速分支一致。
+        std::vector<std::pair<double,double>> xs;
+        auto fillScanDepth = [&](const vector<std::array<double,3>>& sp) {
+            size_t n = sp.size();
+            if (n < 3) return;
+            double miny=sp[0][1], maxy=sp[0][1];
+            for (const auto& p: sp) { miny=std::min(miny,p[1]); maxy=std::max(maxy,p[1]); }
+            int y0=(int)std::ceil(miny-0.5), y1=(int)std::floor(maxy-0.5);
+            if (y0<0) y0=0; if (y1>=H) y1=H-1;
+            if (y1<y0) return;
+            for (int y=y0; y<=y1; ++y) {
+                double yc=y+0.5;
+                xs.clear();
+                for (size_t i=0;i<n;++i) {
+                    const auto& a=sp[i]; const auto& b=sp[(i+1)%n];
+                    if ((a[1]<=yc && yc<b[1]) || (b[1]<=yc && yc<a[1])) {
+                        double t=(yc-a[1])/(b[1]-a[1]);
+                        xs.push_back({ a[0]+(b[0]-a[0])*t, a[2]+(b[2]-a[2])*t });
+                    }
+                }
+                if (xs.size()<2) continue;
+                if (xs.size()==2) {
+                    if (xs[0].first > xs[1].first) std::swap(xs[0], xs[1]);
+                } else {
+                    std::sort(xs.begin(), xs.end(), [](const auto& p,const auto& q){return p.first<q.first;});
+                }
+                for (size_t k=0;k+1<xs.size();k+=2) {
+                    double xa=xs[k].first, za=xs[k].second;
+                    double xb=xs[k+1].first, zb=xs[k+1].second;
+                    int ix0=(int)std::ceil(xa-0.5), ix1=(int)std::floor(xb-0.5);
+                    if (ix0<0) ix0=0; if (ix1>=W) ix1=W-1;
+                    if (ix1<ix0) continue;
+                    double span=xb-xa; double dz=0.0;
+                    if (span>1e-12) dz=(zb-za)/span;
+                    double z=za+(ix0+0.5-xa)*dz;
+                    for (int x=ix0;x<=ix1;++x) {
+                        size_t i=(size_t)y*W+x;
+                        float fz=(float)z;
+                        if (fz > dcomp[i]) { ditems[i].num=(double)fz; dcomp[i]=fz; }
+                        z+=dz;
+                    }
+                }
+            }
+        };
+
+        struct DJob { vector<std::array<double,3>> sp; bool valid=false; };
+        struct FaceRef { const Value* val; long long fi; bool isMain; };
+        vector<FaceRef> refs;
+        refs.reserve(mainList->items.size() + (ignoreAux ? 0 : auxList->items.size()));
+        for (size_t fi=0; fi<mainList->items.size(); ++fi) refs.push_back({ &mainList->items[fi], (long long)fi, true });
+        if (!ignoreAux) for (size_t ai=0; ai<auxList->items.size(); ++ai) refs.push_back({ &auxList->items[ai], (long long)ai, false });
+        vector<DJob> jobs(refs.size());
+
+        auto prepOne = [&](size_t i) {
+            const FaceRef& fr = refs[i];
+            auto face = needDict(*fr.val, "面片", line);
+            long long seq = (long long)needNum(face->items.at("方块序号"), "面片", line);
+            if (doCull && seq >= 0) {
+                auto n = wenV3(face->items.at("法线"), "面片", line);
+                auto c = wenV3(face->items.at("中心"), "面片", line);
+                if (!wenBackface(cam, n, c, line)) return;
+            }
+            if (fr.isMain && skipHidden && hid.count(fr.fi)) return;
+            auto verts = needList(face->items.at("顶点"), "面片", line);
+            vector<std::array<double,3>> view;
+            for (const auto& v : verts->items) view.push_back(wenToCam(cam, wenV3(v, "顶点", line), line));
+            if (persp) {
+                view = wenClipFrustum(cam, view, w, h, line);
+                if (view.size() < 3) return;
+            }
+            vector<std::array<double,3>> sp;
+            for (const auto& p : view) {
+                auto pr = wenProject(cam, p, w, h, line);
+                sp.push_back({ pr[0], pr[1], depthKey(p) });
+            }
+            jobs[i].sp = std::move(sp); jobs[i].valid = true;
+        };
+        unsigned nt = std::max(2u, std::min(6u, std::thread::hardware_concurrency()));
+        if (gCpuThreadLimit > 0) nt = std::min(nt, (unsigned)gCpuThreadLimit);
+        if (refs.size() < 16) nt = 1;
+        {
+            std::vector<std::thread> pool;
+            for (unsigned k = 0; k < nt; ++k)
+                pool.emplace_back([&](unsigned kk){
+                    size_t b = refs.size()*kk/nt, e = refs.size()*(kk+1)/nt;
+                    for (size_t i=b; i<e; ++i) prepOne(i);
+                }, k);
+            for (auto& th : pool) th.join();
+        }
+
+        for (size_t i=0; i<jobs.size(); ++i) {
+            if (!jobs[i].valid) continue;
+            fillScanDepth(jobs[i].sp);
+            ++triCount;
+            ++faceCount;
+        }
+        auto out = std::make_shared<Dict>();
+        out->items["面"] = vNum((double)faceCount);
+        out->items["三角"] = vNum((double)triCount);
+        return vDict(out);
+    });
+    registerBuiltin("体积光累加", 16, 16, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto vp = vpDict(a[0], line);
+        auto depth = needList(a[1], "体积光", line);
+        auto cam = needDict(a[2], "体积光", line);
+        auto shadowDepth = needList(a[3], "体积光", line);
+        auto lightCam = needDict(a[4], "体积光", line);
+        int shadowSize = (int)needIndex(a[5], "体积光", line);
+        int steps = (int)needIndex(a[6], "体积光", line);
+        double nearT = needNum(a[7], "体积光", line);
+        double farT = needNum(a[8], "体积光", line);
+        double intensity = needNum(a[9], "体积光", line);
+        auto sc = wenV3(a[10], "体积光", line);
+        double bias = needNum(a[11], "体积光", line);
+        double density = needNum(a[12], "体积光", line);
+        double densityHeight = needNum(a[13], "体积光", line);
+        double outdoorFactor = needNum(a[14], "体积光", line);
+        auto mask = needList(a[15], "体积光", line);
+        long long lit = wenVolumetric(vp, depth, cam, shadowDepth, lightCam,
+            shadowSize, steps, nearT, farT, intensity, sc, bias,
+            density, densityHeight, outdoorFactor, mask, line);
+        return vNum((double)lit);
+    });
+    registerBuiltin("云体上屏", 12, 12, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto vp = vpDict(a[0], line);
+        auto depth = needList(a[1], "云体", line);
+        auto cam = needDict(a[2], "云体", line);
+        auto sdir = wenV3(a[3], "云体", line);
+        auto clouds = needList(a[4], "云体", line);
+        int steps = (int)needIndex(a[5], "云体", line);
+        double absorb = needNum(a[6], "云体", line);
+        double farMax = needNum(a[7], "云体", line);
+        std::array<double,3> tint = { needNum(a[8], "云体", line), needNum(a[9], "云体", line), needNum(a[10], "云体", line) };
+        double baseLit = needNum(a[11], "云体", line);
+        long long n = wenCloudRender(vp, depth, cam, sdir, clouds, steps, absorb, farMax, tint, baseLit, line);
+        return vNum((double)n);
+    });
+    registerBuiltin("径向光束累加", 8, 8, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto vp = vpDict(a[0], line);
+        auto mask = needList(a[1], "径向光束", line);
+        auto cam = needDict(a[2], "径向光束", line);
+        auto sdir = wenV3(a[3], "径向光束", line);
+        int samples = (int)needIndex(a[4], "径向光束", line);
+        double intensity = needNum(a[5], "径向光束", line);
+        auto sc = wenV3(a[6], "径向光束", line);
+        double maxDist = needNum(a[7], "径向光束", line);
+        long long lit = wenRadialShaft(vp, mask, cam, sdir, samples, intensity, sc, maxDist, line);
+        return vNum((double)lit);
     });
     registerBuiltin("视口画三角形Z", 11, 11, [](Interpreter&, vector<Value>& a, int line) -> Value {
         auto d = vpDict(a[0], line);
@@ -14609,7 +17001,7 @@ Interpreter::Interpreter() {
         HINSTANCE inst = GetModuleHandleW(nullptr);
         if (!reg) {
             WNDCLASSW wc{}; wc.lpfnWndProc = playerWndProc; wc.hInstance = inst;
-            wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); wc.hbrBackground = nullptr;
+            wc.hCursor = nullptr;  // 控制台版不设光标 wc.hbrBackground = nullptr;
             wc.lpszClassName = L"WenPlayerWindow";
             if (!RegisterClassW(&wc)) throw WenError("运行时错误", line, 0, "玩家窗口注册失败");
             reg = true;
@@ -15800,7 +18192,7 @@ Interpreter::Interpreter() {
         ZeroMemory(&wc, sizeof(wc));
         wc.lpfnWndProc = vpWndProc;
         wc.hInstance = GetModuleHandleW(nullptr);
-        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hCursor = nullptr;  // 控制台版不设光标
         wc.lpszClassName = L"WenViewportWindow";
         RegisterClassW(&wc);
         std::wstring wt = utf8ToWide(title);
@@ -19280,6 +21672,112 @@ Interpreter::Interpreter() {
         volStore[nid] = out; gId3.insert(nid);
         return vVol(0, nid);
     });
+
+    // ===== 二六〇 三维分配：按距离加权的邻域 =====
+    // 体邻域归约 是「一视同仁地加」；这个按距离给权重加。
+    // 权重 = 1 - 衰 × d/(1+d)，d 是这一格到中心的欧氏距离，
+    // 跟附属包 立走 / 立热走 / 立摊 用的是同一个式子 ——
+    // 主包和附属包共用一套衰减，不各拍一个。
+    // 衰 = 0 时权重全是 1，退回 体邻域归约 的等权相加。
+    registerBuiltin("体加权邻域", 3, 3, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体加权邻域", line);
+        long long rad = needIndex(a[1], "体加权邻域", line);
+        if (rad < 1 || rad > 3)
+            throw WenError("运行时错误", line, 0, "体加权邻域：半径要在 1..3");
+        double decay = needNum(a[2], "体加权邻域", line);
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体加权邻域：体句柄无效");
+        auto v = it->second;
+        if (!v->dense) throw WenError("运行时错误", line, 0, "体加权邻域：只支持稠密体");
+        int L = v->L, R = v->R, C = v->C;
+        auto out = std::make_shared<VolData>();
+        out->L = L; out->R = R; out->C = C; out->dense = true; out->color = false;
+        out->data.assign((size_t)(L * R * C), 0);
+        // 权重表按距离预先算好，格子里只查表，不每格开方
+        const int MX = 3;
+        double wTab[2 * MX + 1][2 * MX + 1][2 * MX + 1];
+        for (int dl = -MX; dl <= MX; ++dl)
+            for (int dr = -MX; dr <= MX; ++dr)
+                for (int dc = -MX; dc <= MX; ++dc) {
+                    double d = std::sqrt((double)(dl * dl + dr * dr + dc * dc));
+                    double w = 1.0 - decay * d / (1.0 + d);
+                    if (w < 0) w = 0;
+                    wTab[dl + MX][dr + MX][dc + MX] = w;
+                }
+        for (int l = 0; l < L; ++l)
+            for (int r = 0; r < R; ++r)
+                for (int c = 0; c < C; ++c) {
+                    double acc = 0.0;
+                    for (int dl = -(int)rad; dl <= (int)rad; ++dl)
+                        for (int dr = -(int)rad; dr <= (int)rad; ++dr)
+                            for (int dc = -(int)rad; dc <= (int)rad; ++dc) {
+                                int nl = l + dl, nr = r + dr, nc = c + dc;
+                                if (nl < 0 || nr < 0 || nc < 0 || nl >= L || nr >= R || nc >= C) continue;
+                                acc += volScalarRead(v, nl, nr, nc) * wTab[dl + MX][dr + MX][dc + MX];
+                            }
+                    if (acc < 0) acc = 0;
+                    if (acc > 255) acc = 255;
+                    out->data[(size_t)((l * R + r) * C + c)] = (unsigned char)std::lround(acc);
+                }
+        long long nid = volNext++;
+        volStore[nid] = out; gId3.insert(nid);
+        return vVol(0, nid);
+    });
+
+
+    // ===== 二六〇附 三维缓存：热要传得开 =====
+    // 体加权邻域 是「看一圈」，这个是「让一圈互相影响」。
+    // 每跑一次：new = old + 系数 × (邻域均值 - old)
+    // 系数 0 = 一点不动，1 = 整个换成本格邻域均值。
+    // 温度从热的地方流向冷的地方，这就是缓存不是死数 —— 它会渗开。
+    registerBuiltin("体扩散", 3, 3, [&](Interpreter&, vector<Value>& a, int line) -> Value {
+        long long id = needIndex(a[0], "体扩散", line);
+        long long times = needIndex(a[1], "体扩散", line);
+        if (times < 0 || times > 64)
+            throw WenError("运行时错误", line, 0, "体扩散：次数要在 0..64");
+        double k = needNum(a[2], "体扩散", line);
+        if (k < 0 || k > 1) throw WenError("运行时错误", line, 0, "体扩散：系数要在 0..1");
+        auto it = volStore.find(id);
+        if (it == volStore.end()) throw WenError("运行时错误", line, 0, "体扩散：体句柄无效");
+        auto v = it->second;
+        if (!v->dense) throw WenError("运行时错误", line, 0, "体扩散：只支持稠密体");
+        int L = v->L, R = v->R, C = v->C;
+        auto out = std::make_shared<VolData>();
+        out->L = L; out->R = R; out->C = C; out->dense = true; out->color = false;
+        out->data.assign((size_t)(L * R * C), 0);
+        vector<double> cur((size_t)(L * R * C)), nxt((size_t)(L * R * C));
+        for (size_t i = 0; i < cur.size(); ++i) cur[i] = (double)v->data[i];
+        for (long long t = 0; t < times; ++t) {
+            for (int l = 0; l < L; ++l)
+                for (int r = 0; r < R; ++r)
+                    for (int c = 0; c < C; ++c) {
+                        double sum = 0.0;
+                        int cnt = 0;
+                        for (int dl = -1; dl <= 1; ++dl)
+                            for (int dr = -1; dr <= 1; ++dr)
+                                for (int dc = -1; dc <= 1; ++dc) {
+                                    int nl = l + dl, nr = r + dr, nc = c + dc;
+                                    if (nl < 0 || nr < 0 || nc < 0 || nl >= L || nr >= R || nc >= C) continue;
+                                    sum += cur[(size_t)((nl * R + nr) * C + nc)];
+                                    ++cnt;
+                            }
+                        double self = cur[(size_t)((l * R + r) * C + c)];
+                        double avg = cnt > 0 ? sum / cnt : self;
+                        nxt[(size_t)((l * R + r) * C + c)] = self + k * (avg - self);
+                    }
+            cur.swap(nxt);
+        }
+        for (size_t i = 0; i < cur.size(); ++i) {
+            double d = cur[i];
+            if (d < 0) d = 0;
+            if (d > 255) d = 255;
+            out->data[i] = (unsigned char)std::lround(d);
+        }
+        long long nid = volNext++;
+        volStore[nid] = out; gId3.insert(nid);
+        return vVol(0, nid);
+    });
+
     // 体距离场：把 0/非零 的体积算成有符号距离场（里面负、外面正，单位是格）
     // 用精确欧氏距离变换（Felzenszwalb 抛物线包络，沿三个轴各做一遍一维变换），
     // 不是 chamfer 近似，所以误差只有浮点级别的。里面负距离 = 到最近空格的距离，
@@ -24794,7 +27292,7 @@ static string cppVarName(const string& n) {
 static string cppFuncName(const string& n) { return "函数_" + n; }
 
 static string cppPreamble() {
-    return R"CPP(// 文语言（wen）· WEN-LANG-0.2
+    return R"CPP(// 文语言（wen）· WEN-LANG-0.3
 #include <bits/stdc++.h>
 using namespace std;
 
@@ -25577,7 +28075,7 @@ static Value verifyBinary(const string& path0, int line) {
     }
     bool sig = b.find(WEN_SIGNATURE) != string::npos;
     bool mark = b.find("WEN-EMBEDDED-MARK") != string::npos;
-    bool lang = b.find("WEN-LANG-0.2") != string::npos;
+    bool lang = b.find("WEN-LANG-0.3") != string::npos;
     bool exact = b.find(WEN_VERSION) != string::npos;
     bool major = b.find("0.1") != string::npos;
     bool official = sig && mark && lang;
@@ -25613,7 +28111,7 @@ static Value verifyPlugin(const string& path0, int line) {
         auto& w = it->second.dict->items;
         official = w.count("official") && truthy(w["official"]);
         sig = w.count("signature") && w["signature"].type == VT::Str &&
-              w["signature"].str == "WEN-LANG-0.2";
+              w["signature"].str == "WEN-LANG-0.3";
         if (w.count("version") && w["version"].type == VT::Str) ver = w["version"].str;
         exact = ver == WEN_VERSION;
     }
@@ -26304,6 +28802,345 @@ static int runFile(const string& path) {
         return 1;
     }
 }
+
+// 打包产物：直接跑载荷里的源码（没有文件路径，错误信息统一记成「<打包>」）
+static int runSourceString(const string& raw, const string& label) {
+    Interpreter vm;
+    try {
+        string src = normalizeWenSource(raw);
+        if (!gSecWhite.count(label) && gSecurityPolicy != "观察") {
+            auto issues = secScanSource(src);
+            if (!issues.empty() && gSecurityPolicy == "拒绝") {
+                std::cerr << "【安全拒绝】发现 " << issues.size() << " 处可疑代码：" << label << "\n";
+                return 1;
+            }
+        }
+        vector<WenError> errors;
+        string expanded;
+        processSaveBlocks(src, false, expanded, errors);
+        if (!errors.empty()) {
+            printDiagnostics(errors, label, splitLines(src));
+            return 1;
+        }
+        auto ast = parseDiagnostic(expanded, errors);
+        if (!errors.empty()) {
+            printDiagnostics(errors, label, splitLines(expanded));
+            return 1;
+        }
+        vector<string> lines = splitLines(expanded);
+        vm.filename = label;
+        vm.sourceLines = lines;
+        vm.scanPull(expanded);
+        vm.execProgram(ast);
+        return 0;
+    } catch (WenError& e) {
+        writeTruncationReport(e);
+        if (gJsonDiagnostics) printDiagnostics({e}, label, vm.sourceLines);
+        else printWenError(e, label, vm.sourceLines);
+        return 1;
+    } catch (IncompleteError& e) {
+        if (gJsonDiagnostics) printDiagnostics({WenError("语法错误", e.line, 0, e.what())}, label, vm.sourceLines);
+        else printIncompleteError(e, label, vm.sourceLines);
+        return 1;
+    } catch (IoError& e) {
+        if (gJsonDiagnostics) printDiagnostics({WenError("文件错误", 1, 0, e.what())}, label, vm.sourceLines);
+        else printIoError(e, label);
+        return 1;
+    } catch (std::exception& e) {
+        if (gJsonDiagnostics) printDiagnostics({WenError("引擎错误", 1, 0, e.what())}, label, vm.sourceLines);
+        else printEngineError(e, label);
+        return 1;
+    }
+}
+
+#ifdef _WIN32
+// 尾部索引的魔数（8 字节，后面紧跟 8 字节载荷长度）
+static const char kPackMagic[8] = {'W','E','N','P','K','G','0','1'};
+
+// 轻量混淆：按位置滚一个线性同余序列做异或，对称，防的是「记事本打开就看见源码」
+// 注意这不是强加密，真要藏源码得换成密钥+强加密，别对外宣称「不可破解」
+static void maskStream(string& s) {
+    unsigned x = 0x9E3779B9u;
+    for (size_t i = 0; i < s.size(); ++i) {
+        x = x * 1103515245u + 12345u;
+        s[i] = (char)((unsigned char)s[i] ^ (unsigned char)((x >> 16) & 0xFF));
+    }
+}
+
+// 统一用 Win32 打开：std::ifstream 拿 UTF-8 路径当 ANSI，中文目录直接失败
+static HANDLE packOpenRead(const string& utf8Path) {
+    std::wstring wp = fs::u8path(utf8Path).wstring();
+    return CreateFileW(wp.c_str(), GENERIC_READ,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                       nullptr, OPEN_EXISTING, 0, nullptr);
+}
+
+// 打包：默认把运行时原样抄一份（单文件 exe）；--轻量 或输出后缀 .wzp/.wenp 时只写脚本（KB 级）
+static int packExecutable(const string& srcPath, const string& outPath, bool plain, bool thin) {
+    string src;
+    try {
+        src = readWholeFile(resolveWenPath(srcPath));
+    } catch (...) {
+        std::cerr << "读不到源文件：" << srcPath << "\n";
+        return 1;
+    }
+    src = normalizeWenSource(src);
+
+    fs::path srcP = fs::u8path(srcPath);
+    fs::path out = outPath.empty()
+        ? (srcP.parent_path() / fs::u8path(srcP.stem().u8string() + (thin ? ".wzp" : ".exe")))
+        : fs::u8path(outPath);
+    string ext = out.extension().u8string();
+    {
+        string lo = ext;
+        std::transform(lo.begin(), lo.end(), lo.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        if (lo == ".wzp" || lo == ".wenp" || lo == ".wenpack") thin = true;
+    }
+
+    string runtime;
+    if (!thin) {
+        string exe = selfExePath();
+        if (exe.empty()) { std::cerr << "拿不到运行时自身路径，无法打包\n"; return 1; }
+        HANDLE h = packOpenRead(exe);
+        if (h == INVALID_HANDLE_VALUE) {
+            std::cerr << "读不到运行时：" << exe << "（错误 " << GetLastError() << "）\n";
+            return 1;
+        }
+        LARGE_INTEGER sz;
+        sz.QuadPart = 0;
+        GetFileSizeEx(h, &sz);
+        runtime.assign((size_t)sz.QuadPart, '\0');
+        DWORD got = 0;
+        bool okRead = sz.QuadPart > 0 &&
+                      ReadFile(h, runtime.data(), (DWORD)runtime.size(), &got, nullptr) &&
+                      got == runtime.size();
+        CloseHandle(h);
+        if (!okRead) { std::cerr << "读运行时不完整\n"; return 1; }
+    }
+
+    string payload;
+    payload.push_back(plain ? 0 : 1);
+    payload += src;
+    if (!plain) maskStream(payload);
+    unsigned long long plen = (unsigned long long)payload.size();
+    string trailer(kPackMagic, 8);
+    for (int i2 = 0; i2 < 8; ++i2) trailer.push_back((char)(unsigned char)((plen >> (8 * i2)) & 0xFF));
+
+    string all;
+    all.reserve(runtime.size() + payload.size() + 16);
+    all += runtime;
+    all += payload;
+    all += trailer;
+
+    std::wstring wout = out.wstring();
+    HANDLE oh = CreateFileW(wout.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (oh == INVALID_HANDLE_VALUE) {
+        std::cerr << "写不了输出文件：" << out.u8string() << "（错误 " << GetLastError() << "）\n";
+        return 1;
+    }
+    DWORD put = 0;
+    bool okWrite = WriteFile(oh, all.data(), (DWORD)all.size(), &put, nullptr) && put == all.size();
+    CloseHandle(oh);
+    if (!okWrite) { std::cerr << "写入失败：" << out.u8string() << "\n"; return 1; }
+
+    std::cout << (thin ? "已打轻量包：" : "已打包：") << out.u8string() << "\n";
+    std::cout << "  脚本 " << src.size() << " 字节，产物 " << all.size()
+              << " 字节，方式：" << (plain ? "明文" : "混淆")
+              << (thin ? "（不含运行时，运行时装一次就能直接跑）" : "") << "\n";
+    return 0;
+}
+
+// 启动时看自己尾巴：有索引就把源码取出来
+static bool loadPackagedSourceFrom(const string& filePath, string& out) {
+    if (filePath.empty()) return false;
+    HANDLE h = packOpenRead(filePath);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER fs0;
+    fs0.QuadPart = 0;
+    GetFileSizeEx(h, &fs0);
+    long long size = (long long)fs0.QuadPart;
+    bool ok = false;
+    if (size >= 16) {
+        char t[16] = {0};
+        LARGE_INTEGER pos;
+        pos.QuadPart = size - 16;
+        if (SetFilePointerEx(h, pos, nullptr, FILE_BEGIN)) {
+            DWORD got = 0;
+            if (ReadFile(h, t, 16, &got, nullptr) && got == 16 && std::memcmp(t, kPackMagic, 8) == 0) {
+                unsigned long long plen = 0;
+                for (int i = 0; i < 8; ++i) plen |= ((unsigned long long)(unsigned char)t[8 + i]) << (8 * i);
+                long long start = size - 16 - (long long)plen;
+                if (start >= 0 && plen > 0) {
+                    pos.QuadPart = start;
+                    if (SetFilePointerEx(h, pos, nullptr, FILE_BEGIN)) {
+                        string payload((size_t)plen, '\0');
+                        DWORD rd = 0;
+                        if (ReadFile(h, payload.data(), (DWORD)plen, &rd, nullptr) && rd == plen) {
+                            if (!payload.empty()) {
+                                if (payload[0] != 0) maskStream(payload);  // 先整体反混淆，标志位才看得懂
+                                out = payload.substr(1);
+                                ok = !out.empty();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    CloseHandle(h);
+    return ok;
+}
+
+// 自身的尾巴（打包成 exe 的产物跑起来就是这条路径）
+static bool loadPackagedSource(string& out) {
+    return loadPackagedSourceFrom(selfExePath(), out);
+}
+#else
+static int packExecutable(const string&, const string&, bool, bool) {
+    std::cerr << "打包只支持 Windows\n";
+    return 1;
+}
+static bool loadPackagedSource(string&) { return false; }
+static bool loadPackagedSourceFrom(const string&, string&) { return false; }
+
+
+#endif
+
+#ifdef _WIN32
+// ---------- 运行时安装：文件关联 + PATH（都写当前用户，不需要管理员）----------
+static bool regSetStr(HKEY root, const std::wstring& sub, const std::wstring& name,
+                      const std::wstring& val, DWORD type) {
+    HKEY k = nullptr;
+    if (RegCreateKeyExW(root, sub.c_str(), 0, nullptr, 0, KEY_SET_VALUE | KEY_QUERY_VALUE,
+                        nullptr, &k, nullptr) != ERROR_SUCCESS) return false;
+    LONG r = RegSetValueExW(k, name.empty() ? nullptr : name.c_str(), 0, type,
+                            (const BYTE*)val.c_str(),
+                            (DWORD)((val.size() + 1) * sizeof(wchar_t)));
+    RegCloseKey(k);
+    return r == ERROR_SUCCESS;
+}
+
+static std::wstring regGetStr(HKEY root, const std::wstring& sub, const std::wstring& name,
+                              DWORD* typeOut) {
+    wchar_t buf[32768] = {0};
+    DWORD sz = (DWORD)sizeof(buf);
+    DWORD t = 0;
+    if (RegGetValueW(root, sub.c_str(), name.empty() ? nullptr : name.c_str(),
+                     RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, &t, buf, &sz) != ERROR_SUCCESS)
+        return std::wstring();
+    if (typeOut) *typeOut = t;
+    if (sz < sizeof(wchar_t)) return std::wstring();
+    return std::wstring(buf, sz / sizeof(wchar_t) - 1);
+}
+
+static bool regDelTree(const std::wstring& sub) {
+    return RegDeleteTreeW(HKEY_CURRENT_USER, sub.c_str()) == ERROR_SUCCESS;
+}
+
+// 从 PATH 里摘掉一项 / 追加一项（都按大小写不敏感比较）
+static std::wstring pathWith(const std::wstring& cur, const std::wstring& item, bool add) {
+    std::vector<std::wstring> parts;
+    std::wstring s2 = cur;
+    size_t i = 0;
+    while (true) {
+        size_t j = s2.find(L';', i);
+        std::wstring one = s2.substr(i, j == std::wstring::npos ? std::wstring::npos : j - i);
+        while (!one.empty() && one.back() == L' ') one.pop_back();
+        size_t lead = 0;
+        while (lead < one.size() && one[lead] == L' ') ++lead;
+        one = one.substr(lead);
+        if (!one.empty()) parts.push_back(one);
+        if (j == std::wstring::npos) break;
+        i = j + 1;
+    }
+    std::wstring out;
+    for (const auto& p : parts) {
+        if (_wcsicmp(p.c_str(), item.c_str()) == 0) continue;
+        if (!out.empty()) out += L';';
+        out += p;
+    }
+    if (add && !out.empty()) out += L';';
+    if (add) out += item;
+    return out;
+}
+
+static void notifyEnvChanged() {
+    SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, (LPARAM)L"Environment",
+                        SMTO_ABORTIFHUNG, 1000, nullptr);
+}
+
+static int installRuntime(bool uninstall) {
+    std::wstring exeW = utf8ToWide(selfExePath());
+    string la = libEnv("LOCALAPPDATA");
+    if (la.empty()) { std::cerr << "没有 LOCALAPPDATA，装不了\n"; return 1; }
+    fs::path dir = fs::u8path(la) / fs::u8path("wen") / fs::u8path("bin");
+    fs::path dest = dir / fs::u8path("wen.exe");
+    std::wstring destW = dest.wstring();
+    std::wstring dirW = dir.wstring();
+
+    if (uninstall) {
+        for (const wchar_t* ext : {L".wen", L".wzp", L".wenp"}) {
+            std::wstring sub = std::wstring(L"Software\\Classes\\") + ext;
+            std::wstring cur = regGetStr(HKEY_CURRENT_USER, sub, L"", nullptr);
+            if (_wcsicmp(cur.c_str(), L"WenLang.Script") == 0 ||
+                _wcsicmp(cur.c_str(), L"WenLang.Package") == 0)
+                regDelTree(sub);
+        }
+        regDelTree(L"Software\\Classes\\WenLang.Script");
+        regDelTree(L"Software\\Classes\\WenLang.Package");
+        DWORD pt = 0;
+        std::wstring cur = regGetStr(HKEY_CURRENT_USER, L"Environment", L"Path", &pt);
+        std::wstring np = pathWith(cur, dirW, false);
+        regSetStr(HKEY_CURRENT_USER, L"Environment", L"Path", np,
+                  pt == REG_EXPAND_SZ ? REG_EXPAND_SZ : REG_SZ);
+        notifyEnvChanged();
+        std::error_code ec;
+        fs::remove_all(fs::u8path(la) / fs::u8path("wen"), ec);
+        std::cout << "已卸载：关联和 PATH 都清掉了，目录也删了\n";
+        return 0;
+    }
+
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    if (ec) { std::cerr << "建不了目录：" << dir.u8string() << "\n"; return 1; }
+    bool same = _wcsicmp(exeW.c_str(), destW.c_str()) == 0;
+    if (!same) {
+        if (!CopyFileW(exeW.c_str(), destW.c_str(), FALSE)) {
+            std::cerr << "复制运行时失败（错误 " << GetLastError() << "）\n";
+            return 1;
+        }
+    }
+    std::cout << "运行时：" << dest.u8string() << "\n";
+
+    // 关联：双击 .wen / .wzp 就用这份运行时跑，--等回车 让窗口别一闪就没
+    std::wstring openCmd = L"\"" + destW + L"\" \"%1\" --等回车";
+    regSetStr(HKEY_CURRENT_USER, L"Software\\Classes\\.wen", L"", L"WenLang.Script", REG_SZ);
+    regSetStr(HKEY_CURRENT_USER, L"Software\\Classes\\WenLang.Script", L"", L"文语言脚本", REG_SZ);
+    regSetStr(HKEY_CURRENT_USER, L"Software\\Classes\\WenLang.Script\\shell\\open\\command",
+              L"", openCmd, REG_SZ);
+    for (const wchar_t* ext : {L".wzp", L".wenp", L".wenpack"}) {
+        regSetStr(HKEY_CURRENT_USER, std::wstring(L"Software\\Classes\\") + ext,
+                  L"", L"WenLang.Package", REG_SZ);
+    }
+    regSetStr(HKEY_CURRENT_USER, L"Software\\Classes\\WenLang.Package", L"", L"文语言轻量包", REG_SZ);
+    regSetStr(HKEY_CURRENT_USER, L"Software\\Classes\\WenLang.Package\\shell\\open\\command",
+              L"", openCmd, REG_SZ);
+
+    DWORD pt = 0;
+    std::wstring cur = regGetStr(HKEY_CURRENT_USER, L"Environment", L"Path", &pt);
+    std::wstring np = pathWith(cur, dirW, true);
+    bool pathOk = regSetStr(HKEY_CURRENT_USER, L"Environment", L"Path", np,
+                            pt == REG_EXPAND_SZ ? REG_EXPAND_SZ : REG_SZ);
+    notifyEnvChanged();
+
+    std::cout << "已关联：.wen → 文语言脚本，.wzp → 文语言轻量包（双击即可运行）\n";
+    std::cout << "PATH：" << (pathOk ? "已加入（新开的终端里可直接用 wen）" : "写入失败，手动把上面的 bin 目录加进 PATH")
+              << "\n";
+    return 0;
+}
+#endif
 
 static int checkFile(const string& path) {
     vector<string> lines;
@@ -27145,7 +29982,7 @@ static string openWenWorkbench(const string& title, const string& initial, int l
         wc.cbSize = sizeof(wc);
         wc.lpfnWndProc = workbenchProc;
         wc.hInstance = inst;
-        wc.hCursor = LoadCursorW(nullptr, IDC_IBEAM);
+        wc.hCursor = nullptr;  // 控制台版不设光标
         wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
         wc.lpszClassName = L"WenWorkbenchWindow";
         if (!RegisterClassExW(&wc)) throw WenError("运行时错误", line, 0, "工作台窗口注册失败");
@@ -27360,7 +30197,7 @@ static Value uiNew(Interpreter&, vector<Value>& a, int line) {
         WNDCLASSW wc{};
         wc.lpfnWndProc = uiWndProc;
         wc.hInstance = inst;
-        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hCursor = nullptr;  // 控制台版不设光标
         /* 不设背景刷：避免系统在 WM_PAINT 前擦白闪屏 */
         wc.hbrBackground = nullptr;
         wc.lpszClassName = L"WenUiWindow";
@@ -28078,11 +30915,13 @@ Value vpCloudBody(Interpreter&, vector<Value>& a, int line) {
            而不是两块棉花并排。远四朵抬高，从大云顶上露出来。 */
         /* 云在真正的天空高度：云底 y≈14，云心 y≈26，离玩家 40 单位。
            之前盒底 0.3、云心 4，离眼睛只有 11 —— 张角 84°，只能糊满整屏。 */
-        const double P26X[6] = { -14.00,  15.00, -24.00,  24.00,   2.00,  -6.00 };
+        const double P26X[6] = { -45.00,  22.00, -70.00,  68.00,   0.00,   0.00 };
         /* 云底必须齐：P26Y = 20 + 0.62*s26，六朵的 ly=0 全压在 y=20 这一层。
                真实的积云就是这样 —— 底是一条平线，因为它压在同一个凝结高度。 */
-        const double P26Y[6] = {  27.44,  26.82,  24.46,  24.28,  23.97,  24.09 };
-        const double P26Z[6] = {  18.00,  22.00,  26.00,  30.00,  34.00,  14.00 };
+        const double P26Y[6] = {  43.50,  37.30,  26.20,  23.70,   0.00,   0.00 };
+        /* 原来六朵 Z 在 29~38，几乎同一排，深度差不到 9 米，而每朵纵深 20 米，
+       等于并排站着谁挡不到谁，所以永远出不来遮挡阴影。前后错开 12~14 米。 */
+        const double P26Z[6] = {  75.00,  88.00,  60.00,  95.00,   0.00,   0.00 };
     double litb11 = 0.78;   /* 亮度基准在渲染循环里要用，必须在函数作用域声明 */
     double litlo11 = 0.55;  /* 亮度下限：乌云能压到更暗 */
     double lithm11 = 1.20;  /* 亮度上限：亮云能提到更亮 */
@@ -28090,6 +30929,9 @@ Value vpCloudBody(Interpreter&, vector<Value>& a, int line) {
        所以云性只能落在**渲染端的色调系数**上：同一套几何，只换反射率。 */
     double tone11 = 1.00;
     int cr = (cc >> 16) & 255, cg = (cc >> 8) & 255, cb = cc & 255;
+    /* 云的颜色不该跟着传进来的色调走——那个值本身偏蓝，所以不管光照怎么调，
+       云永远是蓝的。型26 直接钉成中性白（略偏冷一点点，避免死白）。 */
+    if (variant == 26) { cr = 248; cg = 249; cb = 251; }
 
     /* 云体所在的盒子。X/Z 是地面两个方向，Y 是高度——云就在这个盒子里长。 */
     /* 盒子要近似立方。原来是 2.9 宽 × 0.92 高，云被这个比例摊成一张薄片，
@@ -28097,9 +30939,9 @@ Value vpCloudBody(Interpreter&, vector<Value>& a, int line) {
     /* 观察盒：水平 4.4 x 4.4（原来 2 x 2），竖直 0.30~2.60（原 0.30~1.90）。
        盒子太小，巨型云塞满就成一面墙；扩盒之后巨型云才有地方摊开成一片云层。
        单朵云的世界尺寸没变，所以型0~16 的成像不受影响，只有触到旧盒边的型会变。 */
-    const double BX0 = (variant == 26) ? -30.00 : -6.50, BX1 = (variant == 26) ? 30.00 : 6.50;
-    const double BY0 = (variant == 26) ? 13.00 : 0.30,  BY1 = (variant == 26) ? 38.00 : 7.60;
-    const double BZ0 = (variant == 26) ? -14.00 : -6.50, BZ1 = (variant == 26) ? 40.00 : 6.50;
+    const double BX0 = (variant == 26) ? -80.00 : -6.50, BX1 = (variant == 26) ? 80.00 : 6.50;
+    const double BY0 = (variant == 26) ? 10.00 : 0.30,  BY1 = (variant == 26) ? 90.00 : 7.60;
+    const double BZ0 = (variant == 26) ? 10.00 : -6.50, BZ1 = (variant == 26) ? 175.00 : 6.50;
     /* GY 决定了云在竖直方向有多少层。72 层时 y 层间距 0.022，
        和颜色分离量同量级，表面就被量化成一圈圈横纹——那正是“片片”的来源。
        提到 104 层，层间距 0.015，横纹落到看不出。渲染步数不变，只是场变细。 */
@@ -28356,7 +31198,9 @@ static std::vector<float> den;
         /* 型26 要的是真积云那种强对比：顶几乎纯白，底压到灰。
            之前 0.78/0.55 的区间太窄，整朵云都落在同一个米色上 ——
            看着像旧棉花，不像被太阳直射的云。 */
-        if (variant == 26) { litb11 = 0.99; litlo11 = 0.34; lithm11 = 1.26; }
+        /* 底光太高（0.30）会把背光面也垫亮，整朵云一起被烤白，明暗差被压平。
+   压到 0.10：背光面只剩极淡的环境光，正面靠 2.05*f^2 单独支撑，对比拉开。 */
+    if (variant == 26) { litb11 = 0.10; litlo11 = 0.16; lithm11 = 1.10; }
         if (variant == 16) { dens11 = 0.62; tone11 = 1.10; litlo11 = 0.66; lithm11 = 1.30; }
         if (variant >= 11 && variant < 25) {
             /* 下大：底层三团，宽而扁，铺到半个盒子，三团互相咬合成一整片底。 */
@@ -28960,7 +31804,7 @@ static std::vector<float> den;
             const double q26x[40] = { -0.40, -0.20, 0.00, 0.20, 0.40, -0.30, -0.10, 0.10, 0.30, -0.40, 0.00, 0.40, -0.36, -0.12,
                                        0.12, 0.36, -0.24, 0.00, 0.24, -0.42, 0.42, -0.18, 0.18, -0.30, 0.06, 0.30, -0.28, -0.06, 0.16, 0.34, -0.35, 0.05, 0.25, -0.15, -0.18, 0.02, 0.20, -0.30, 0.10, 0.30 };
             const double q26y[40] = { 0.70, 0.70, 0.70, 0.70, 0.70, 0.70, 0.70, 0.70, 0.70, 0.70, 0.70, 0.70, 0.98, 1.02,
-                                       0.96, 1.05, 1.10, 1.08, 1.03, 0.94, 1.00, 1.12, 1.06, 0.99, 1.14, 1.09, 1.30, 1.34, 1.32, 1.36, 1.28, 1.33, 1.38, 1.30, 1.46, 1.50, 1.48, 1.52, 1.55, 1.50 };
+                                       0.96, 1.05, 1.10, 1.08, 1.03, 0.94, 1.00, 1.12, 1.06, 0.99, 1.14, 1.09, 1.24, 1.28, 1.26, 1.20, 1.18, 1.34, 1.28, 1.42, 1.50, 1.30, 1.38, 1.46, 1.32, 1.26 };
             const double q26z[40] = { -0.10, -0.20, -0.05, -0.15, 0.00, 0.20, 0.15, 0.25, 0.10, 0.35, 0.30, 0.40, -0.20, -0.30,
                                        -0.25, -0.15, 0.10, 0.20, 0.15, 0.30, 0.35, 0.40, 0.42, -0.40, 0.38, 0.05, -0.10, -0.20, -0.12, 0.02, 0.25, 0.30, 0.20, 0.35, -0.05, 0.10, 0.00, 0.20, 0.30, 0.15 };
             /* 团半径 / 团间距 决定“分瓣”还是“一坨”。老表半径 0.50，
@@ -28968,9 +31812,28 @@ static std::vector<float> den;
                相邻两团完全重叠，十八团就被高斯尾并成一个大球，表面读不出瓣。
                砍到 0.45 倍后，半径/间距 ≈ 0.75：还是一体的，但每团顶出一个小鼓包。 */
             const double q26r[40] = { 0.22, 0.20, 0.22, 0.20, 0.20, 0.18, 0.19, 0.18, 0.18, 0.17, 0.18, 0.17, 0.17, 0.16,
-                                       0.17, 0.16, 0.16, 0.17, 0.16, 0.15, 0.15, 0.14, 0.14, 0.13, 0.14, 0.15, 0.15, 0.14, 0.15, 0.14, 0.13, 0.13, 0.13, 0.12, 0.13, 0.12, 0.12, 0.11, 0.11, 0.10 };
+                                       0.17, 0.16, 0.16, 0.17, 0.16, 0.15, 0.15, 0.14, 0.14, 0.13, 0.14, 0.15, 0.15, 0.14, 0.15, 0.14, 0.13, 0.30, 0.30, 0.34, 0.32, 0.32, 0.30, 0.32, 0.30, 0.32 };
             /* 每朵 12 宽。之前 2.60 只有 7 宽，塞在 26 的盒里就是“一小颗一小颗”。 */
-            const double s26a[6] = { 12.00, 11.00, 7.20, 6.90, 6.40, 6.60 };
+            /* 照片里是三朵大的撑主体、三个小的散在边上，不是六朵一样大。
+   均匀尺寸会连成一条，大小混合才有层次和空隙。 */
+    /* 左边三朵是脱离主体的孤块，既不够远成独立一朵，又不够近接上主体，
+       看着就是三个不明物体。缩到 0.1 让它们不生成，画面只留右侧这组主云。 */
+/* 只留画面右半：P26X 的前三朵（-20/-13/-6）在左半边，缩到 0.1 不生成；
+       右侧 3/13/23 三朵保留，其中 23 那朵是小朵。 */
+/* 只剩一大一小会像一座孤峰。在左侧补一朵中等尺寸的辅助云，
+       把轮廓撑开，形成主峰 + 左副云 + 右小朵的三段结构。 */
+/* 六朵要有形态差异：一朵低矮大范围铺开，两朵高的塔，三朵小的散在边上。
+       尺寸均匀会连成一条，全是高塔会变成山峰，全是低矮会成平地。 */
+/* 小云不该另起一套参数，应当是同一朵云按比例缩出来的。
+       按 0.72 等比递减：20 / 14.4 / 10.4 / 7.5 / 5.4 / 3.9，形态同源，只是尺度不同。 */
+/* 铺满不能靠把六个小块散开——散开就成了一排柱子。
+       做法是把每朵放大 1.45 倍，仍旧聚在一起，用体量盖住视野。 */
+/* 用户的原话是「不够高、不够厚、不够大，又显肥」——这几条合起来只有一个方向：
+       瘦高。横向收窄、纵向拉长，盒顶抬到 72 给高度留位置。 */
+/* 大范围扩散 + 云要更高：整体再放大 1.5 倍，盒顶抬到 95 给高度留出空间。 */
+/* 要扩散、要随机散布：多朵不同尺寸错落摆开，尺寸最小的也留在 12 以上，
+       因为再小用满 40 团会堆成实心方块。 */
+    const double s26a[6] = { 46.00, 36.00, 18.00, 14.00, 0.10, 0.10 };
             for (int iz = 0; iz < GZ; ++iz) {
                 double z = BZ0 + (BZ1 - BZ0) * ((double)iz + 0.5) / (double)GZ;
                 for (int iy = 0; iy < GY; ++iy) {
@@ -28984,16 +31847,33 @@ static std::vector<float> den;
                             double lz = (z - P26Z[ci]) / s26;
                             if (lx < -1.30 || lx > 1.30) continue;
                             if (lz < -1.30 || lz > 1.30) continue;
-                            double ly = (y - (P26Y[ci] - 0.62 * s26)) / (s26 * 1.55);
+                            double ly = (y - (P26Y[ci] - 0.62 * s26)) / (s26 * 1.20);
                             if (ly < 0.0) continue;   /* 底平切，不再往地下长 */
                             if (ly < 0.0 || ly > 1.0) continue;
                             /* 型11 的团在归一化高度上占 0.58~1.50，映射到 ly 的 0~1。 */
                             double g26 = 0.58 + ly * 0.92;
                             double acc26 = 0.0;
-                            for (int k26 = 0; k26 < NP26; ++k26) {
-                                double dx = (lx - q26x[k26]) / q26r[k26];
-                                double dy = (g26 - q26y[k26]) / (q26r[k26] * 0.50);
-                                double dz = (lz - q26z[k26]) / q26r[k26];
+                            int nw26 = NP26;
+                            if (s26 < 24.0) {
+                                nw26 = (int)((double)NP26 * (s26 / 24.0));
+                                if (nw26 < 12) nw26 = 12;
+                            }
+                            for (int k26 = 0; k26 < nw26; ++k26) {
+                                int kk26 = (int)((double)k26 * (double)NP26 / (double)nw26);
+                                if (kk26 > NP26 - 1) kk26 = NP26 - 1;
+                                /* 梯形：团越大越高，半径越收。真实积云顶部一定是收窄的，
+                                   不收就是一根等粗的柱子。 */
+                                double rk26 = q26r[kk26] * ((nw26 < NP26) ? 1.16 : 1.0);
+                                { double ht26 = q26y[kk26] - 1.00;
+                                  if (ht26 > 0.0) { if (ht26 > 1.0) ht26 = 1.0; rk26 *= 1.0 - 0.10 * ht26; } }
+                                double dx = (lx - q26x[kk26]) / rk26;
+                                /* 竖向半径原来只有横向的一半（分母 q26r*0.50），等于每团云都被压扁一半，
+   所以从任何角度看都平，俯视更看不到厚度。改成 1.30，让竖半径略大于横半径。 */
+                                /* 每个团体纵向拉长 1.3 倍，40 个叠起来就是一根柱子——柱子感就是这里来的。
+               云的孩子是球，先把团拉回接近球形。 */
+            double dyK26 = (kk26 < 12) ? 2.30 : 1.05;
+            double dy = (g26 - q26y[kk26]) / (rk26 * dyK26);
+                                double dz = (lz - q26z[kk26]) / (rk26 * 1.38);
                                 double d2 = dx * dx + dy * dy + dz * dz;
                                 if (d2 > 6.0) continue;
                                 /* 顶塔（k>=10）权重加大：它们只有 0.17~0.20 的半径，
@@ -29001,7 +31881,7 @@ static std::vector<float> den;
                                 /* 衰减系数 1.55 -> 2.90：团与团之间的高斯尾巴越短，越不容易靠尾部
                                互相搭桥。尾巴一搭桥，十八个团就并成一个大球，
                                分瓣全消失 —— 那就是“不像云”的来源。 */
-                                acc26 += ((k26 >= 34) ? 1.55 : 1.00) * exp(-d2 * 2.90);
+                                acc26 += ((k26 >= 34) ? 2.30 : 1.50) * exp(-d2 * 1.10);
                             }
                             if (acc26 <= 0.0) continue;
                             /* 18 团叠加的高度就是型11 的雾态密度：有平台、不透明、有层次。 */
@@ -29013,12 +31893,41 @@ static std::vector<float> den;
                             double v = 1.0 - exp(-acc26 * 2.40);
                             /* 噪声只调厚薄，不参与塑形；一塑形就碎成雪花。 */
                             double ph26 = (double)ci * 37.3 + 11.7;
-                            double n26 = fbm3(x * 0.60 + ph26, y * 0.70 + ph26 * 0.7, z * 0.60 + ph26 * 1.3);
+                            double n26 = fbm3(x * 1.60 + ph26, y * 1.80 + ph26 * 0.7, z * 1.60 + ph26 * 1.3);
                             /* 三层颗粒：型11 的云之所以不像塑料球，就是表面有这层颗粒。 */
                             double gr1 = fbm3(x * 2.40 + ph26 * 3.1, y * 2.60 + ph26 * 1.7, z * 2.40 + ph26 * 2.3);
                             double gr2 = fbm3(x * 4.80 + ph26 * 5.2, y * 5.20 + ph26 * 2.9, z * 4.80 + ph26 * 4.1);
-                            double gran = 0.62 + 0.32 * (gr1 - 0.5) * 2.0 + 0.20 * (gr2 - 0.5) * 2.0;
-                            v *= (0.66 + 0.62 * n26) * gran;
+                            /* 0.42/0.30 的扰动太轻，表面读起来是一颗颗光滑的球 —— 这就是“假”的一半。
+                               真实的积云表面是碎絮状的，密度在亚米级上剧烈起伏。
+                               幅度提到 0.86/0.62，中值仍 0.50，不至于把云掏穿。 */
+                            double gran = 0.50 + 0.18 * (gr1 - 0.5) * 2.0 + 0.08 * (gr2 - 0.5) * 2.0;
+                            v *= (0.62 + 0.55 * n26) * gran;
+                            /* 表面高频注入：den 场是高斯融合出来的，天生平滑，法线差分只能给出恒定 dn ——
+                               云面永远是一个光滑的壳。这里只在“接近表面”的那一层（v>0.25）注入
+                               亚米级起伏，让密度本身有细节；云心不动，防止整朵云被掏碎。
+                               频率 9.5 是 n26 的近六倍，幅度 ±38%。这是预计算，不进每帧开销。 */
+                            if (v > 0.25) {
+                                double hf26 = fbm3(x * 9.5 + ph26 * 7.1, y * 10.0 + ph26 * 3.3, z * 9.5 + ph26 * 5.7);
+                                v *= (0.62 + 0.76 * hf26);
+                            }
+                            /* 镂空：MC 树叶之所以像真的，是因为它有缝隙、是离散的块，
+                               不是一个完整的曲面。云也一样——光滑等值面 + 鼓包 = 大便形状。
+                               在接近表面的那一层按噪声挖出缝隙，让它碎成团簇而不是一个壳。 */
+                            if (v > 0.14 && v < 0.92) {
+                                double hole26 = fbm3(x * 3.40 + ph26 * 9.1, y * 3.40 + ph26 * 5.3, z * 3.40 + ph26 * 7.7);
+                                if (hole26 < 0.0) v = 0.0;
+                            }
+                            /* 云是实的，不是玻璃。den 场外围那圈淡雾会被当成云画出来，                               在云外面包一层晕。给密度设下限，低于它的直接归零。 */
+                            /* 硬切（v<0.12 归零）会得到刀切一样的边，看着像塑料。
+                               云边是渐渐稀薄化开的。改成软过渡：0.20 以下按二次曲线收到 0，
+                               既不留厚雾晕，也不产生硬边。 */
+                            if (v < 0.26) { double t26 = v / 0.26; v *= t26 * t26; }
+                            /* 软过渡留下了 0.05 以下那层极淡的雾，它在云外圈形成一圈
+                               "保护罩"。再补一道低截断：柔边保留，外圈雾清掉。 */
+                            /* 0.045 只是清掉了外圈的雾，密度不足以和主体连上的碎块
+                               还会留在原地，变成画面边上"小小一粒"的孤块。
+                               抬到 0.14：低于这个密度的孤立碎块直接消失。 */
+                            if (v < 0.30) v = 0.0;
                             if (v > 1.0) v = 1.0;
                             if (v > best26) best26 = v;
                         }
@@ -29488,11 +32397,14 @@ if (variant == 25) {
     else if (progN < 480) progN = progN * 2;
     if (progN > 480) progN = 480;
     lcx = cx; lcy = cy; lcz = cz; lyaw = yaw; lpt = pitch;
-    const int NST = (variant == 26) ? (progN < 160 ? progN : 160) : 480;
+    const int NST = (variant == 26) ? (progN < 132 ? progN : 132) : 480;
     /* 2x2 块采样：四个像素共用一次 ray-march。云的边缘本来就被雾化抹平，
        块状在画面上读不出来，但成本直接降到 1/4。
        和渐进步数合起来：视角一动 32 步 × 1/4 = 几毫秒（立刻能走），
        站住不动再逐帧加密到 480 步（清晰）。 */
+    /* 云占满整片天空之后，全分辨率逐像素采样撑不住（1~4 fps）。
+       云本身边缘是软的，改到 1/2 分辨率算、再双线性铺回去，肉眼几乎看不出差别，
+       但采样量直接降到 1/4。UE5 的体积云也是缩分辨率算的。 */
     int stepPix = 1;
     /* 像素之间没有任何依赖：每一行自己查自己的表、写自己的像素。
        按行动态切给各核 —— 云占屏少，行与行的工作量差很大，
@@ -29732,16 +32644,22 @@ if (variant == 25) {
                 static const double e26z[40] = { -0.10, -0.20, -0.05, -0.15, 0.00, 0.20, 0.15, 0.25, 0.10, 0.35, 0.30, 0.40, -0.20, -0.30,
                                                   -0.25, -0.15, 0.10, 0.20, 0.15, 0.30, 0.35, 0.40, 0.42, -0.40, 0.38, 0.05, -0.10, -0.20, -0.12, 0.02, 0.25, 0.30, 0.20, 0.35, -0.05, 0.10, 0.00, 0.20, 0.30, 0.15 };
                 static const double e26r[40] = { 0.35, 0.32, 0.35, 0.32, 0.32, 0.29, 0.30, 0.29, 0.29, 0.27, 0.29, 0.27, 0.27, 0.26,
-                                                  0.27, 0.26, 0.26, 0.27, 0.26, 0.24, 0.24, 0.22, 0.22, 0.21, 0.22, 0.24, 0.24, 0.22, 0.24, 0.22, 0.21, 0.21, 0.21, 0.19, 0.21, 0.19, 0.19, 0.18, 0.18, 0.16 };
-                static const double e26s[6]  = { 12.00, 11.00, 7.20, 6.90, 6.40, 6.60 };
+                                                  0.27, 0.26, 0.26, 0.27, 0.26, 0.24, 0.24, 0.22, 0.22, 0.21, 0.22, 0.24, 0.24, 0.22, 0.24, 0.22, 0.21, 0.24, 0.24, 0.27, 0.26, 0.26, 0.25, 0.26, 0.24, 0.26 };
+                static const double e26s[6]  = { 46.00, 36.00, 18.00, 14.00, 0.10, 0.10 };
                 double eT0 = 1e9, eT1 = -1e9;
                 for (int ci5 = 0; ci5 < 6; ++ci5) {
                     double sc5 = e26s[ci5];
                     double ox5 = P26X[ci5], oy5 = P26Y[ci5], oz5 = P26Z[ci5];
                     for (int k5 = 0; k5 < 40; ++k5) {
-                        double rx5 = e26r[k5] * sc5 * 1.10;
-                        double ry5 = e26r[k5] * sc5 * 1.45;
-                        double rz5 = rx5;
+                        /* 真实积云是梯形：底部宽、顶部窄。原来所有团半径一样，
+                           云顶直接齐平截断，看着就是圆柱。让高处团的半径按高度收窄。 */
+                        double hf26 = 1.0;
+                        { double hy26 = e26y[k5];
+                          if (hy26 > 1.00) { double ht26 = (hy26 - 1.00);
+                            if (ht26 > 1.0) ht26 = 1.0; hf26 = 1.0 - 0.45 * ht26; } }
+                        double rx5 = e26r[k5] * sc5 * 1.10 * hf26;
+                        double ry5 = e26r[k5] * sc5 * 1.45 * hf26;
+                        double rz5 = rx5 * 1.38;
                         double cx5 = ox5 + e26x[k5] * sc5;
                         double cy5 = (oy5 - 0.62 * sc5) + e26y[k5] * sc5 * 1.30;
                         double cz5 = oz5 + e26z[k5] * sc5;
@@ -29833,9 +32751,9 @@ if (variant == 25) {
                         ny = y - 3.80;
                         nz = z;
                     } else {
-                        nx = -(smp(gx + 0.75, gy, gz) - smp(gx - 0.75, gy, gz));
-                        ny = -(smp(gx, gy + 0.75, gz) - smp(gx, gy - 0.75, gz));
-                        nz = -(smp(gx, gy, gz + 0.75) - smp(gx, gy, gz - 0.75));
+                        nx = -(smp(gx + 3.0, gy, gz) - smp(gx - 3.0, gy, gz));
+                        ny = -(smp(gx, gy + 3.0, gz) - smp(gx, gy - 3.0, gz));
+                        nz = -(smp(gx, gy, gz + 3.0) - smp(gx, gy, gz - 3.0));
                     }
                     double nl = sqrt(nx * nx + ny * ny + nz * nz);
                     if (nl < 1e-9) { lit = 0.85; }
@@ -29850,19 +32768,62 @@ if (variant == 25) {
                            遮挡交给 dn（法线朝光的分量）和 dk（进入云内的深度），
                            而不是把整团一起压灰。 */
                         if ((variant == 25 || variant == 26)) {
-                            lit = litb11 + 0.62 * dn + 0.18 * dv - 0.08;
+                            /* 云面不是均匀发亮：只有正对太阳的那一片被直射照亮，其余靠漫反射，
+   应该是淡的、暗的。之前写成 litb11 + 1.55*dn，背光面(dn=-1)也还剩 0.30 底光，
+   等于把整朵云烤匀了。改成先取正对分量、再平方集中，只有朝向太阳的面才真亮。 */
+                double f26 = (dn > 0.0) ? dn : 0.0;
+                lit = litb11 * 0.42 + 0.75 * f26 * f26 + 0.03 * dv;
+            /* 自阴影：鼓包投下的影子落在旁边鼓包上，这才是云面凹凸感的另一半。
+               只想法线（朝太阳就亮）永远是一块均匀白。沿太阳方向走 5 步，
+               前方有云就压暗，阴影交界的转折就会出来。 */
+            {
+                /* 从 s5=3 起步，跳过自身表面和本体厚度——从起点算起的前 27 格都还在
+                   自己身体里，那段密度会把自己挡住，在云内部撒出假阴影。
+                   只从更远处才开始检查，才是在算"别的云挡住光"。 */
+                for (int s5 = 3; s5 <= 10; ++s5) {
+                    double sv5 = smp(gx + sx3 * (double)s5 * 9.0,
+                                     gy + sy3 * (double)s5 * 9.0,
+                                     gz + sz3 * (double)s5 * 9.0);
+                    if (sv5 > 0.35) {
+                        double oc5 = (sv5 > 1.0) ? 1.0 : sv5;
+                        lit *= 1.0 - 0.10 * oc5 / (double)s5;
+                    }
+                }
+            }
+                /* 云不自发光：反射率永远小于 1，最亮处也不该顶到纯白。
+                   之前 dn=1 时 lit≈1.77，乘上云色直接 RGB 溢出截成 255，
+                   屏幕上就是一朵自己发光的云，还带出溢出的黄晕。 */
+                if (lit > 0.97) lit = 0.97;
                         } else {
                             lit = litb11 + (0.52 + (0.78 - litb11) * 0.60) * dn + 0.25 * dv;
                         }
                         if (lit < litlo11) lit = litlo11;
                         if (lit > lithm11) lit = lithm11;
+                        /* 云是扁的，表面法线几乎全朝上 —— 任何只靠法线的光照，
+                           都会把整朵云照成同一个亮度。真正能拉开层次的是高度：
+                           云底压在凝结面上、光要走完整朵云才出得来，必然暗；
+                           云顶直接晒太阳，必然白。 */
+                        if (variant == 26) {
+                            double wy = BY0 + (double)gy / (double)(GY - 1) * (BY1 - BY0);
+                            double hh = (wy - 13.0) / 18.0;
+                            if (hh < 0.0) hh = 0.0;
+                            if (hh > 1.0) hh = 1.0;
+                            /* 这里原来按 hh 压暗，但 hh 是全局世界高度，等于给所有云刷了一条水平渐变，
+   云面就出现一条横贯的分界线，看着像上下两层。
+   扁云的法线基本全朝上，dn 恒定，只靠法线会得到一块白板；明暗又必须存在。
+   折中：保留高度项但幅度从 0.26+1.00 砍到 0.55+0.55，并用 hh*hh 平滑，
+   云底到云顶是连续过渡，不再是一条横贯的硬分界线。 */
+                            /* 幅度 0.55/0.55 太强：hh 是全局世界高度，等于“站得高的云整朵更亮”，
+   顶上那朵会比别的高出一截，完全不合物理。收到 0.80/0.20，只留一点底暗。 */
+                            lit *= (0.80 + 0.20 * hh * hh);
+                        }
                     }
                 }
                 /* 消光再降一档：云边缘要软，不能像雪坡那样一刀切。 */
                 /* 消光 2.6 太强：光走进去十几步就饱和，剩下的全是“实心表面”。
                    雾态云要光能穿过去，能看到内部结构，才会读作雾而不是石头。 */
                 /* 密度降了，消光要补回来，否则整团会淡成看不见。 */
-                double op = 1.0 - exp(-dv * dt * ((variant == 25) ? 5.00 : ((variant == 26) ? 1.90 : 1.85)));
+                double op = 1.0 - exp(-dv * dt * ((variant == 25) ? 5.00 : ((variant == 26) ? 2.10 : 1.85)));
                 if (op > 1.0) op = 1.0;
                 double wgt = (1.0 - acc) * op;
                 /* 厚度的读法来自内部暗部：光越往里越出不来，深处必须压暗，
@@ -29875,7 +32836,9 @@ if (variant == 25) {
                    放大档降到 0.15：厚的地方仍然暗，但不会出现灰洞。 */
                 /* tree11 = (variant > 19) 把型 25 一起圈进去了，所以型 25 的判断必须写在它前面，
                    否则永远拿到 0.15 —— 云心完全不压暗，整团就是一块均匀的米色。 */
-                double kdk = (variant == 25) ? 0.46 : ((variant == 26) ? 0.30 : ((tree11) ? 0.15 : 0.30));
+                /* 26 分支消光 0.30 太弱，薄云体让太阳光直接穿到背面，看着像半透明纸片。
+                   提到 0.55：光进去一段就被吃掉，背面不再透亮。 */
+                double kdk = (variant == 25) ? 0.46 : ((variant == 26) ? 0.55 : ((tree11) ? 0.15 : 0.30));
                 double dk = 1.0 - kdk * acc;
                 /* 云性（亮云/乌云）在合成处按型号直接算：写在这里不经过任何块作用域，
                    一定生效。乌云 = 降低反射率（云整体压灰），亮云 = 略微提亮。 */
@@ -29891,7 +32854,41 @@ if (variant == 25) {
                 /* 内核遮挡剔除：云心密度早就饱和，光进不去也穿不过来，
                    后面的步数全是白算。型26 到 0.55 就停 —— 外观由外层决定，
                    内核在屏幕上本来就是看不见的。 */
-                if (acc > ((variant == 25) ? 0.975 : ((variant == 26) ? 0.55 : 0.88))) break;
+                /* 表面着色：第一个足够不透明的点直接决定颜色，之后的累积不再参与。
+                   体积合成里 lit 被 (1-acc) 和 dk 双重稀释，云内部的明暗
+                   根本进不了最终颜色 —— 屏幕上永远是一个均匀的塑料壳。
+                   改成只认可见表面，明暗由该点的法线和高度决定，不稀释。 */
+                if (variant == 26 && acc > 0.32) {
+                    /* 云是中性白的散射体，不该跟着日辉的暖色一起变黄。
+                       正午跑同一套参数云是白的，说明错在色温不在亮度：
+                       这里按比例把暖染拉回中性，亮度和 dk 一概不动。 */
+                    /* 单次散射把云当实心料，边缘一刀切 —— 这就是“三渲二”的来源。
+                       真实云的边是薄的：光能穿过去，那里比中心亮。
+                       用当前点密度做透光：dv 小＝薄＝亮，dv 大＝厚＝保持原色。 */
+                    /* 云表面的暗不是一整块灰面，是无数水滴各自挡光叠出来的，
+                       所以是碎的、淡的、雾状的。这里用高频噪声调制亮度，
+                       模拟“这一小块水滴密一点、那一小块稀一点”的颗粒感。
+                       频率 ×16 是世界约 6cm 级，比格距细，但这是着色阶段的
+                       解析噪声，不依赖 den 场分辨率，所以不会被抹平。 */
+                    /* 用格点哈希取一个 0~1 的值：频率 4 意味着每 4 个场格（约 1 世界单位）
+                       换一个随机数 —— 云面上大约切成十几个颗粒，尺寸落在 8 像素左右，
+                       正好是“水滴团”的尺度。频率再高就变成屏幕噪点，再低又回到一整块。 */
+                    unsigned u26 = ((unsigned)(int)(gx * 2.0) * 73856093u)
+                                 ^ ((unsigned)(int)(gy * 2.0) * 19349663u)
+                                 ^ ((unsigned)(int)(gz * 2.0) * 83492791u);
+                    double par26 = (double)(u26 & 1023u) / 1023.0;
+                    par26 = 0.5 + (par26 - 0.5) * 0.85;
+                    /* 颗粒只该出现在暗部：受光面是干净的白，背光处才碎成雾粒。
+                       所以先算暗度 dl26（受光面为 0），再用它当颗粒的权重。 */
+                    double dl26 = 1.0 - (lit > 1.0 ? 1.0 : (lit < 0.0 ? 0.0 : lit));
+                    lit *= (1.0 - 0.34 * dl26 * (1.0 - par26));
+                    ar = (double)cr * lit * dk * tn11 * 1.00;
+                    ag = (double)cg * lit * dk * tn11 * 1.00;
+                    ab = (double)cb * lit * dk * tn11 * 1.00;
+                    acc = 1.0;
+                    break;
+                }
+                if (acc > ((variant == 25) ? 0.975 : ((variant == 26) ? 0.965 : 0.88))) break;
             }
             if (acc < 0.004) continue;
             int o = (py * w + px) * 3;
@@ -30545,8 +33542,24 @@ static Value uiSize(Interpreter&, vector<Value>&, int) {
 static Value uiClose(Interpreter&, vector<Value>&, int) { return vNone(); }
 #endif
 
+// --等回车：走文件关联双击时，跑完别让窗口一闪就没
+static bool gWaitEnter = false;
+static void waitEnterAtExit() {
+    std::cout << "\n按回车退出..." << std::flush;
+    std::string line;
+    std::getline(std::cin, line);
+}
+
 static int runMain(vector<string> args) {
     if (args.size() > 1 && args[1] == "--不快") { gNoFast = true; args.erase(args.begin() + 1); }
+    if (args.size() > 1 && (args[1] == "--不联网" || args[1] == "--offline")) {
+        gNoNetLib = true; args.erase(args.begin() + 1);
+    }
+    if (args.size() > 1 && args[1] == "--等回车") {
+        gWaitEnter = true;
+        std::atexit(waitEnterAtExit);
+        args.erase(args.begin() + 1);
+    }
     if (args.size() > 1 && (args[1] == "--无字节码" || args[1] == "--no-bytecode")) {
         gNoBytecode = true; args.erase(args.begin() + 1);
     }
@@ -30582,9 +33595,29 @@ static int runMain(vector<string> args) {
         startRuntimeLimit();
     }
     if (args.size() <= 1) {
+        // 打包产物：脚本在身上，不给参数就直接跑
+        string packed;
+        if (loadPackagedSource(packed)) return runSourceString(packed, "<打包>");
         Interpreter vm;
         repl(vm);
         return 0;
+    }
+    // 轻量包（.wzp/.wenp）：包里就是脚本，直接跑，不需要对面有 exe
+    if (args.size() >= 2) {
+        std::error_code ec0;
+        if (fs::exists(fs::u8path(args[1]), ec0) && !ec0) {
+            string ext = fs::u8path(args[1]).extension().u8string();
+            std::transform(ext.begin(), ext.end(), ext.begin(),
+                           [](unsigned char c) { return (char)std::tolower(c); });
+            if (ext == ".wzp" || ext == ".wenp" || ext == ".wenpack") {
+                string src;
+                if (!loadPackagedSourceFrom(args[1], src)) {
+                    std::cerr << "这个包里没有脚本：" << args[1] << "\n";
+                    return 1;
+                }
+                return runSourceString(src, "<包 " + args[1] + ">");
+            }
+        }
     }
     for (auto it = args.begin() + 1; it != args.end();) {
         if (*it == "--不查名字") { gNoNameCheck = true; it = args.erase(it); }
@@ -30598,12 +33631,23 @@ static int runMain(vector<string> args) {
     for (const auto& a : args) {
         if (a == "--json" || a == "--诊断JSON") gJsonDiagnostics = true;
     }
+    if (cmd == "--载荷") {
+        string p;
+        bool ok = loadPackagedSource(p);
+        std::cout << (ok ? "有载荷" : "没有载荷") << " " << p.size() << " 字节\n";
+        if (ok) {
+            string first = p.substr(0, p.find('\n') == string::npos ? p.size() : p.find('\n'));
+            std::cout << "首行：" << first << "\n";
+            std::cout << "第二行：" << p.substr(first.size() + 1, 24) << "\n";
+        }
+        return 0;
+    }
     if (cmd == "--快照版本") {
-        std::cout << "文语言 0.2.0-snapshot\n";
+        std::cout << "文语言 0.3.0-snapshot\n";
         return 0;
     }
     if (cmd == "--自述" || cmd == "--规范") {
-        std::cout << "文语言 0.2.0-snapshot\n";
+        std::cout << "文语言 0.3.0-snapshot\n";
         std::cout << "语义根：语法.ebnf\n";
         std::cout << "用户文档：使用教程.md、使用规范.md、语法总表.md、语言规范.md\n";
         std::cout << "错误协议：错误协议.md（code/rule/frames）\n";
@@ -30611,14 +33655,58 @@ static int runMain(vector<string> args) {
         std::cout << "宿主契约：平台接口.md\n";
         return 0;
     }
+    if (cmd == "--安装" || cmd == "--install") {
+#ifdef _WIN32
+        return installRuntime(false);
+#else
+        std::cerr << "安装只支持 Windows\n";
+        return 1;
+#endif
+    }
+    if (cmd == "--卸载" || cmd == "--uninstall") {
+#ifdef _WIN32
+        return installRuntime(true);
+#else
+        std::cerr << "卸载只支持 Windows\n";
+        return 1;
+#endif
+    }
+    if (cmd == "--库源") {
+        for (const auto& t : libSourceList()) std::cout << t << "\n";
+        if (libSourceList().empty()) std::cout << "（库源已关闭）\n";
+        return 0;
+    }
+    if ((cmd == "--取库" || cmd == "--fetch") && args.size() >= 3) {
+        string got, url, err;
+        string target = args[2];
+        bool byUrl = target.rfind("http://", 0) == 0 || target.rfind("https://", 0) == 0 ||
+                     fs::exists(fs::u8path(target)) ||
+                     (target.size() > 4 && target.compare(target.size() - 4, 4, ".wen") == 0);
+        bool ok = byUrl ? fetchLibraryFromUrl(target, got, url, err)
+                        : fetchLibraryToDisk(target, got, url, err);
+        if (ok && !got.empty()) {
+            string shown = fs::u8path(got).stem().u8string();
+            std::cout << "已取库：「" << shown << "」\n  ← " << url << "\n  存到 " << got << "\n";
+            return 0;
+        }
+        std::cerr << "取库失败：" << (err.empty() ? "没有可用的库源" : err) << "\n";
+        return 1;
+    }
     if (cmd == "--帮助" || cmd == "-h" || cmd == "帮助") {
         std::cout <<
-            "文语言 0.2.0-snapshot\n"
+            "文语言 0.3.0-snapshot\n"
             "用法：\n"
             "  wen.exe 文件.wen                 运行\n"
             "  wen.exe --检查 文件.wen         只做词法/语法/静态检查\n"
             "  wen.exe --查 关键词             在教程/规范/错误说明里找答案\n"
             "  wen.exe --编译 文件.wen         编译成原生 exe\n"
+            "  wen.exe --打包 文件.wen 产物.exe 打包成单文件 exe（不需要安装 wen.exe）\n"
+            "  wen.exe --取库 库名|网址          按名字取库，或直接给一条网址/本地文件\n"
+            "  wen.exe --安装                   装一次运行时：关联 .wen/.wzp，双击就能跑，也不用带 exe\n"
+            "  wen.exe --卸载                   撤掉关联和 PATH，删掉装的运行时\n"
+            "  wen.exe --打包 文件.wen 产物.wzp 轻量包（只放脚本，KB 级，装过运行时就能跑）\n"
+            "  wen.exe --库源                   打印当前库源地址\n"
+            "  wen.exe --不联网                 关掉依赖自动下载（审计/离线发布用）\n"
             "  wen.exe --翻译 文件.wen 目标    翻译（python/javascript/json/java/字节码/C++/汇编）\n"
             "  wen.exe --验证                   自检\n"
             "  wen.exe --帮助                   本页\n"
@@ -30678,7 +33766,7 @@ static int runMain(vector<string> args) {
         return 0;
     }
     if (cmd == "--版本" || cmd == "-v") {
-        std::cout << "文语言 v0.3 · 作者 Akm / 筑宸科技 · 2026-11-04 快照\n";
+        std::cout << "文语言 v0.3 · 作者 Akm / 筑宸科技 · 2026-11-19 快照\n";
         std::cout << "版本: " << WEN_VERSION << "\n";
         return 0;
     }
@@ -31001,6 +34089,20 @@ static int runMain(vector<string> args) {
             return 1;
         }
         return compileFile(args[2], args.size() >= 4 ? args[3] : "", true);
+    }
+    if (cmd == "--打包" || cmd == "-p") {
+        if (args.size() < 3) {
+            std::cerr << "用法：wen.exe --打包 文件.wen [输出.exe|输出.wzp] [--明文|--轻量]\n";
+            return 1;
+        }
+        bool plain = false, thin = false;
+        string out;
+        for (size_t i = 3; i < args.size(); ++i) {
+            if (args[i] == "--明文") plain = true;
+            else if (args[i] == "--轻量" || args[i] == "--thin") thin = true;
+            else if (out.empty()) out = args[i];
+        }
+        return packExecutable(args[2], out, plain, thin);
     }
     if (cmd == "--生成C++") {
         if (args.size() < 3) {

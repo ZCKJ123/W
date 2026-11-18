@@ -17,8 +17,11 @@ $content = $content.Replace('__OUT__', $exe)
 $content | Set-Content -Path $src -Encoding UTF8
 & .\wen.exe $src | Out-Null
 if ($LASTEXITCODE -ne 0) { throw '自举显示 PE 生成失败' }
+if (-not (Test-Path -LiteralPath $exe)) { throw '自举显示 PE 未生成' }
+if ((Get-Item -LiteralPath $exe).Length -lt 1024) { throw '自举显示 PE 产物过小（写坏或没写全）' }
 $p = Start-Process -FilePath $exe -PassThru
-Start-Sleep -Milliseconds 600
+# 原来固定睡 600ms 就去枚举窗口，机器忙/防病毒扫新 exe 时窗口还没建出来，
+# 就报「窗口标题错误」的假红。改成最多等 5 秒，看到标题就继续。
 Add-Type @'
 using System;
 using System.Text;
@@ -31,6 +34,7 @@ public class WEnum {
 }
 '@
 $titles = New-Object System.Collections.Generic.List[string]
+$截止 = (Get-Date).AddSeconds(5)
 $cb = [WEnum+EnumProc]{
     param($h, $l)
     $id = 0
@@ -42,8 +46,13 @@ $cb = [WEnum+EnumProc]{
     }
     return $true
 }
-[WEnum]::EnumWindows($cb, [IntPtr]::Zero) | Out-Null
-Stop-Process -Id $p.Id -Force
+while ((Get-Date) -lt $截止) {
+    $titles.Clear()
+    [WEnum]::EnumWindows($cb, [IntPtr]::Zero) | Out-Null
+    if ($titles.Count -gt 0) { break }
+    Start-Sleep -Milliseconds 100
+}
+Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
 Remove-Item $exe, $src -Force -ErrorAction SilentlyContinue
 if (-not ($titles -contains '文言')) { throw "自举显示窗口标题错误：$($titles -join ',')" }
 Write-Output '自举显示 PE：编译器生成中文 MessageBoxW、标题/文本、无 C 运行时 通过'
