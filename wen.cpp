@@ -2777,8 +2777,8 @@ static bool valueEquals(const Value& a, const Value& b, int depth = 0) {
 
 static double needNum(const Value& v, const string& where, int line) {
     if (v.type == VT::Big) { try { return std::stod(v.big); } catch (...) { throw WenError("运行时错误", line, 0, "大整数不能转成小数"); } }
-    if (v.type == VT::Int) return (double)intSigned(v);
-    if (v.type == VT::Int) return (double)intSigned(v);
+    if (v.type == VT::Int)
+        return v.isSigned ? (double)intSigned(v) : (double)(v.i & intMask(v.width));
     if (v.type != VT::Num)
         throw WenError("运行时错误", line, 0,
                        "「" + where + "」需要数字，收到" + typeName(v));
@@ -3877,6 +3877,15 @@ static std::function<Value(const std::string&, const Value&, const Value&, int)>
     }
     if ((a.type == VT::Int) != (b.type == VT::Int) &&
         (a.type == VT::Int || b.type == VT::Int)) {
+        // 普通数字若本身是整数，就提升成 Int 再算：否则 u64 这类无符号值会被 double 化，
+        // 2^64-1 会变成 -1，减一得 -2、比零还假。
+        const Value& iv = (a.type == VT::Int) ? a : b;
+        const Value& nv = (a.type == VT::Int) ? b : a;
+        if (nv.type == VT::Num && nv.num == std::floor(nv.num) && std::fabs(nv.num) < 9.2e18) {
+            Value lifted = vInt((uint64_t)(long long)nv.num, iv.width, true);
+            if (a.type == VT::Int) return applyBinary(op, a, lifted, line);
+            return applyBinary(op, lifted, b, line);
+        }
         return applyBinary(op, vNum(needNum(a, "运算", line)), vNum(needNum(b, "运算", line)), line);
     }
     if (a.type == VT::Int && b.type == VT::Int) {
