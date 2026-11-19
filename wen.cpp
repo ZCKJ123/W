@@ -7101,6 +7101,11 @@ Value Interpreter::getIndex(const Value& obj, const Value& idx, int line) {
         if (i < 0 || i >= n) rtError(line, "范围下标越界");
         return vNum(obj.rstart + (double)i * obj.rstep);
     }
+    if (obj.type == VT::Vol)
+        rtError(line,
+                "体不能用 [ ] 取下标：体是按坐标取值的，用 体读(体, 层, 行, 列) / "
+                "体写(体, 层, 行, 列, 值)，别用 体[层]。另外，写过「依赖 体数据」或「依赖 分块体」"
+                "之后，那两个同名函数换成了字典体/块表版本，传 体新建 出来的体会撞这条错。");
     rtError(line, typeName(obj) + "不能用 [ ] 取下标");
 }
 
@@ -30112,6 +30117,7 @@ static string errorRule(const WenError& e) {
             return "unknown.preset";
         if (r.find("粗糙度必须") != string::npos || r.find("金属度必须") != string::npos ||
             r.find("折射率必须") != string::npos) return "runtime.material_range";
+        if (r.find("体不能用 [ ] 取下标") != string::npos) return "runtime.body_as_container";
         if (r.find("除数") != string::npos) return "runtime.divide_zero";
         if (r.find("下标") != string::npos) return "runtime.index";
         if (r.find("参数") != string::npos) return "runtime.arity";
@@ -30166,6 +30172,9 @@ static string errorSuggestion(const WenError& e) {
     if (rule == "syntax.missing_then") return "条件后补「则」。";
     if (rule == "static.undefined_name") return "先赋值或定义，再引用；检查名字有没有写错。";
     if (rule == "static.name_needs_lib") return "在文件开头补「依赖 库名」，并确认库名拼写。";
+    if (rule == "runtime.body_as_container")
+        return "体按坐标取值：体读(体, 层, 行, 列) / 体写(体, 层, 行, 列, 值)。"
+        "依赖过 体数据 / 分块体 的话，它们的同名函数换成了字典体 / 块表版本，喂 体新建 的体会撞这条。";
     if (rule == "static.default_param_order") return "把默认参数移到参数表末尾。";
     if (rule == "static.arity") return "按函数定义的参数个数传参。";
     if (rule == "static.call_non_function") return "只有函数能调用；检查括号前的名字。";
