@@ -4082,7 +4082,7 @@ static const std::map<string, string>& functionModules() {
         {"新建神经层", "神经网络库"}, {"神经链", "神经网络库"}, {"前向", "神经网络库"},
         {"颜色", "视口库"}, {"新建视口", "视口库"}, {"视口清空", "视口库"}, {"视口画点", "视口库"},
         {"视口画线", "视口库"}, {"视口画三角形", "视口库"}, {"视口尺寸", "视口库"}, {"视口保存", "视口库"},
-        {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"}, {"视口显示", "视口库"}, {"玩家视口", "视口库"}, {"大气预设", "视口库"}, {"媒体信息", "媒体库"}, {"媒体播放", "媒体库"}, {"媒体停止", "媒体库"}, {"声音播放", "媒体库"}, {"音频设备", "媒体库"}, {"音频录制", "媒体库"}, {"音频兼容检查", "媒体库"}, {"媒体格式支持", "媒体库"}, {"音频解析", "媒体库"}, {"音频判定", "媒体库"}, {"音频频谱", "媒体库"}, {"音频轨道", "媒体库"}, {"网格新建", "三维库"}, {"网格三角", "三维库"}, {"网格平移", "三维库"}, {"网格缩放", "三维库"}, {"网格旋转", "三维库"}, {"网格合并", "三维库"}, {"网格三角形数", "三维库"}, {"视口加载模型", "视口库"}, {"光追渲染", "视口库"}, {"体积云渲染", "视口库"}, {"材质检查", "视口库"}, {"材质预设", "视口库"}, {"视口取色", "视口库"},
+        {"视口画字", "视口库"}, {"视口量字", "视口库"}, {"视口画矩形", "视口库"}, {"视口画圆", "视口库"}, {"视口画椭圆", "视口库"}, {"视口画多边形", "视口库"}, {"视口画线粗", "视口库"}, {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"}, {"视口显示", "视口库"}, {"玩家视口", "视口库"}, {"大气预设", "视口库"}, {"媒体信息", "媒体库"}, {"媒体播放", "媒体库"}, {"媒体停止", "媒体库"}, {"声音播放", "媒体库"}, {"音频设备", "媒体库"}, {"音频录制", "媒体库"}, {"音频兼容检查", "媒体库"}, {"媒体格式支持", "媒体库"}, {"音频解析", "媒体库"}, {"音频判定", "媒体库"}, {"音频频谱", "媒体库"}, {"音频轨道", "媒体库"}, {"网格新建", "三维库"}, {"网格三角", "三维库"}, {"网格平移", "三维库"}, {"网格缩放", "三维库"}, {"网格旋转", "三维库"}, {"网格合并", "三维库"}, {"网格三角形数", "三维库"}, {"视口加载模型", "视口库"}, {"光追渲染", "视口库"}, {"体积云渲染", "视口库"}, {"材质检查", "视口库"}, {"材质预设", "视口库"}, {"视口取色", "视口库"},
         {"硬件信息", "硬件库"}, {"高精度计时", "硬件库"}, {"内存状态", "硬件库"}, {"屏幕尺寸", "硬件库"}, {"磁盘空间", "硬件库"},
         {"大整数幂", "大整数库"}, {"大整数乘", "大整数库"}, {"大整数加", "大整数库"}, {"大整数阶乘", "大整数库"},
         {"阶乘位数", "大整数库"}, {"阶乘末尾零", "大整数库"}, {"阶乘概览", "大整数库"},
@@ -7661,7 +7661,205 @@ static LRESULT CALLBACK vpWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 #endif
+// PNG 编码（8 位灰度 / RGB，CRC32 + Adler32 自算，deflate 用固定 Huffman + LZ77）
+static Value wenWritePng(const string& path, int W, int H, const unsigned char* data, int ch, int line) {
+        static unsigned int tab[256];
+        static bool tabInit = false;
+        if (!tabInit) {
+            for (unsigned int i = 0; i < 256; ++i) {
+                unsigned int c = i;
+                for (int k = 0; k < 8; ++k) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+                tab[i] = c;
+            }
+            tabInit = true;
+        }
+        auto crc32Of = [](const unsigned char* p, size_t n) -> unsigned int {
+            unsigned int c = 0xFFFFFFFFu;
+            for (size_t i = 0; i < n; ++i) c = tab[(c ^ p[i]) & 0xFF] ^ (c >> 8);
+            return c ^ 0xFFFFFFFFu;
+        };
+        size_t rowBytes = (size_t)W * (size_t)ch;
+        std::string raw;
+        raw.reserve((size_t)H * (rowBytes + 1));
+        for (int y = 0; y < H; ++y) {
+            raw.push_back('\0');
+            raw.append(reinterpret_cast<const char*>(data) + (size_t)y * rowBytes, rowBytes);
+        }
+        static const int lenBase[29] = {3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258};
+        static const int lenExtra[29] = {0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0};
+        static const int distBase[30] = {1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577};
+        static const int distExtra[30] = {0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13};
+        std::vector<unsigned char> z;
+        unsigned int bitBuf = 0;
+        int bitCnt = 0;
+        auto putBits = [&](unsigned int v, int n) {
+            bitBuf |= (v << bitCnt);
+            bitCnt += n;
+            while (bitCnt >= 8) { z.push_back((unsigned char)(bitBuf & 0xFF)); bitBuf >>= 8; bitCnt -= 8; }
+        };
+        auto revBits = [](unsigned int v, int n) -> unsigned int {
+            unsigned int r = 0;
+            for (int i = 0; i < n; ++i) { r = (r << 1) | (v & 1); v >>= 1; }
+            return r;
+        };
+        auto putLit = [&](unsigned int sym) {
+            if (sym <= 143) putBits(revBits(0x30 + sym, 8), 8);
+            else if (sym <= 255) putBits(revBits(0x190 + (sym - 144), 9), 9);
+            else if (sym <= 279) putBits(revBits(sym - 256, 7), 7);
+            else putBits(revBits(0xC0 + (sym - 280), 8), 8);
+        };
+        auto putLen = [&](int len) {
+            int ci = 28;
+            for (int i = 0; i < 29; ++i) {
+                int next = (i == 28) ? 1000000 : lenBase[i + 1];
+                if (len < next) { ci = i; break; }
+            }
+            putLit(257 + ci);
+            if (lenExtra[ci]) putBits((unsigned int)(len - lenBase[ci]), lenExtra[ci]);
+        };
+        auto putDist = [&](int dist) {
+            int ci = 29;
+            for (int i = 0; i < 30; ++i) {
+                int next = (i == 29) ? 1000000 : distBase[i + 1];
+                if (dist < next) { ci = i; break; }
+            }
+            putBits(revBits((unsigned int)ci, 5), 5);
+            if (distExtra[ci]) putBits((unsigned int)(dist - distBase[ci]), distExtra[ci]);
+        };
+        putBits(1, 1);
+        putBits(1, 2);
+        const int WIN = 32768;
+        std::vector<int> head(65536, -1);
+        std::vector<int> prev(raw.size() + 1, -1);
+        size_t i = 0;
+        size_t n = raw.size();
+        while (i < n) {
+            int bestLen = 0, bestDist = 0;
+            if (i + 2 < n) {
+                unsigned int key = (((unsigned char)raw[i] << 10) ^ ((unsigned char)raw[i + 1] << 5) ^ (unsigned char)raw[i + 2]) & 65535;
+                int cand = head[key];
+                int steps = 0;
+                int maxLen = (int)std::min<size_t>(258, n - i);
+                while (cand >= 0 && steps < 128 && (int)i - cand <= WIN) {
+                    int len = 0;
+                    while (len < maxLen && raw[(size_t)cand + len] == raw[i + len]) ++len;
+                    if (len > bestLen) { bestLen = len; bestDist = (int)i - cand; if (len >= maxLen) break; }
+                    cand = prev[(size_t)cand];
+                    ++steps;
+                }
+            }
+            if (bestLen >= 3) {
+                putLen(bestLen);
+                putDist(bestDist);
+                for (int k = 0; k < bestLen; ++k) {
+                    if (i + 2 < n) {
+                        unsigned int key = (((unsigned char)raw[i] << 10) ^ ((unsigned char)raw[i + 1] << 5) ^ (unsigned char)raw[i + 2]) & 65535;
+                        prev[i] = head[key];
+                        head[key] = (int)i;
+                    }
+                    ++i;
+                }
+            } else {
+                putLit((unsigned char)raw[i]);
+                if (i + 2 < n) {
+                    unsigned int key = (((unsigned char)raw[i] << 10) ^ ((unsigned char)raw[i + 1] << 5) ^ (unsigned char)raw[i + 2]) & 65535;
+                    prev[i] = head[key];
+                    head[key] = (int)i;
+                }
+                ++i;
+            }
+        }
+        putLit(256);
+        if (bitCnt > 0) { z.push_back((unsigned char)(bitBuf & 0xFF)); bitBuf = 0; bitCnt = 0; }
+        auto adler32Of = [](const unsigned char* p, size_t n) -> unsigned int {
+            unsigned int s1 = 1, s2 = 0;
+            for (size_t i = 0; i < n; ++i) { s1 = (s1 + p[i]) % 65521; s2 = (s2 + s1) % 65521; }
+            return (s2 << 16) | s1;
+        };
+        unsigned int ad = adler32Of(reinterpret_cast<const unsigned char*>(raw.data()), raw.size());
+        std::string zs;
+        zs.push_back('\x78'); zs.push_back('\x01');
+        zs.append(reinterpret_cast<const char*>(z.data()), z.size());
+        zs.push_back((char)(ad >> 24)); zs.push_back((char)(ad >> 16)); zs.push_back((char)(ad >> 8)); zs.push_back((char)ad);
+        std::string out("\x89PNG\r\n\x1A\n", 8);
+        auto put32 = [](std::string& s, unsigned int v) {
+            s.push_back((char)((v >> 24) & 0xFF)); s.push_back((char)((v >> 16) & 0xFF));
+            s.push_back((char)((v >> 8) & 0xFF)); s.push_back((char)(v & 0xFF));
+        };
+        auto chunk = [&](const char* type, const std::string& data) {
+            put32(out, (unsigned int)data.size());
+            std::string body(type, 4);
+            body += data;
+            out += body;
+            put32(out, crc32Of(reinterpret_cast<const unsigned char*>(body.data()), body.size()));
+        };
+        std::string ihdr;
+        put32(ihdr, (unsigned int)W); put32(ihdr, (unsigned int)H);
+        ihdr.push_back(8); ihdr.push_back(ch == 3 ? 2 : 0);
+        ihdr.push_back(0); ihdr.push_back(0); ihdr.push_back(0);
+        chunk("IHDR", ihdr);
+        chunk("IDAT", zs);
+        chunk("IEND", std::string());
+        try { writeWholeFile(path, out, false); }
+        catch (IoError& e) { throw WenError("文件错误", line, 0, e.what()); }
+        return vStr(path);
+}
+static int vpParseColorText(const string& raw, int line) {
+    string t;
+    for (char ch : raw)
+        if (!std::isspace((unsigned char)ch)) t += ch;
+    auto hexDig = [](char ch) -> int {
+        if (ch >= '0' && ch <= '9') return ch - '0';
+        if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+        if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+        return -1;
+    };
+    if (!t.empty() && t[0] == '#') {
+        string h = t.substr(1);
+        if (h.size() == 3 || h.size() == 4) {
+            int r = hexDig(h[0]), g = hexDig(h[1]), b = hexDig(h[2]);
+            if (r < 0 || g < 0 || b < 0)
+                throw WenError("运行时错误", line, 0, "颜色「" + raw + "」写错了，用 \"#rgb\" 或 \"#rrggbb\"");
+            return ((r * 17) << 16) | ((g * 17) << 8) | (b * 17);
+        }
+        if (h.size() == 6 || h.size() == 8) {
+            int v = 0;
+            for (int i = 0; i < 6; ++i) {
+                int d = hexDig(h[i]);
+                if (d < 0)
+                    throw WenError("运行时错误", line, 0, "颜色「" + raw + "」里出现了非十六进制字符");
+                v = (v << 4) | d;
+            }
+            return v;
+        }
+        throw WenError("运行时错误", line, 0, "颜色「" + raw + "」写错了，用 \"#rgb\" 或 \"#rrggbb\"");
+    }
+    static const std::map<string, int> names = {
+        {"黑", 0x000000}, {"白", 0xFFFFFF}, {"红", 0xFF0000}, {"绿", 0x00FF00}, {"蓝", 0x0000FF},
+        {"黄", 0xFFFF00}, {"青", 0x00FFFF}, {"品红", 0xFF00FF}, {"灰", 0x808080}, {"橙", 0xFF8000},
+        {"紫", 0x8000FF}, {"粉", 0xFF80C0}, {"棕", 0x804000}, {"金", 0xD4AF37}, {"银", 0xC0C0C0},
+        {"黑体", 0x000000}, {"白体", 0xFFFFFF},
+        {"black", 0x000000}, {"white", 0xFFFFFF}, {"red", 0xFF0000}, {"green", 0x00FF00},
+        {"blue", 0x0000FF}, {"yellow", 0xFFFF00}, {"cyan", 0x00FFFF}, {"magenta", 0xFF00FF},
+        {"gray", 0x808080}, {"grey", 0x808080}, {"orange", 0xFF8000}, {"purple", 0x8000FF},
+        {"pink", 0xFF80C0}, {"brown", 0x804000}, {"gold", 0xD4AF37}, {"silver", 0xC0C0C0}};
+    auto it = names.find(t);
+    if (it != names.end()) return it->second;
+    // 纯数字文本（"16711680"）也认
+    bool allNum = !t.empty();
+    for (char ch : t)
+        if (!(ch >= '0' && ch <= '9')) { allNum = false; break; }
+    if (allNum) {
+        long long c = 0;
+        try { c = std::stoll(t); } catch (...) { c = 0; }
+        if (c > 0xFFFFFF) c &= 0xFFFFFF;
+        return (int)c;
+    }
+    throw WenError("运行时错误", line, 0,
+                   "看不懂的颜色「" + raw + "」，可以写 \"#ff0000\"、\"红\" 或 0xFF0000 这样的数字");
+}
 static int vpColor(const Value& v, int line) {
+    if (v.type == VT::Str) return vpParseColorText(v.str, line);
     long long c = (long long)needNum(v, "视口颜色", line);
     if (c < 0) c = 0;
     if (c > 0xFFFFFF) c &= 0xFFFFFF;
@@ -19958,11 +20156,228 @@ Interpreter::Interpreter() {
         l->items.push_back(d->items.at("高"));
         return vList(l);
     });
+    registerBuiltin("视口画字", 5, 6, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto d = vpDict(a[0], line);
+        int x = (int)needIndex(a[1], "视口画字", line);
+        int y = (int)needIndex(a[2], "视口画字", line);
+        string text = needStr(a[3], "视口画字", line);
+        int c = vpColor(a[4], line);
+        int size = a.size() > 5 ? (int)needIndex(a[5], "视口画字", line) : 16;
+        if (size < 6) size = 6;
+        if (size > 512) size = 512;
+        if (text.empty()) return a[0];
+        std::wstring wt = utf8ToWide(text);
+        HDC screen = GetDC(nullptr);
+        HDC mem = CreateCompatibleDC(screen);
+        HFONT font = CreateFontW(-size, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                 DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                 ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"微软雅黑");
+        SelectObject(mem, font);
+        SIZE sz{};
+        GetTextExtentPoint32W(mem, wt.c_str(), (int)wt.size(), &sz);
+        int tw = std::max(1, (int)sz.cx + 2);
+        int th = std::max(1, (int)sz.cy + 2);
+        BITMAPINFO bi{};
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = tw;
+        bi.bmiHeader.biHeight = -th;
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        void* bits = nullptr;
+        HBITMAP bmp = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        HGDIOBJ oldBmp = SelectObject(mem, bmp);
+        RECT rc{0, 0, tw, th};
+        FillRect(mem, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+        SetBkMode(mem, TRANSPARENT);
+        SetTextColor(mem, RGB(255, 255, 255));
+        TextOutW(mem, 1, 1, wt.c_str(), (int)wt.size());
+        auto* px = (unsigned char*)bits;
+        if (px) {
+            for (int j = 0; j < th; ++j) {
+                for (int i = 0; i < tw; ++i) {
+                    size_t o = ((size_t)j * (size_t)tw + (size_t)i) * 4;
+                    int lum = ((int)px[o + 2] * 77 + (int)px[o + 1] * 150 + (int)px[o] * 29) >> 8;
+                    if (lum > 72) vpPut(d, x + i, y + j, c);
+                }
+            }
+        }
+        SelectObject(mem, oldBmp);
+        DeleteObject(bmp);
+        DeleteObject(font);
+        DeleteDC(mem);
+        ReleaseDC(nullptr, screen);
+        return a[0];
+    });
+    registerBuiltin("视口量字", 2, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        string text = needStr(a[1], "视口量字", line);
+        int size = a.size() > 2 ? (int)needIndex(a[2], "视口量字", line) : 16;
+        if (size < 6) size = 6;
+        std::wstring wt = utf8ToWide(text);
+        HDC screen = GetDC(nullptr);
+        HDC mem = CreateCompatibleDC(screen);
+        HFONT font = CreateFontW(-size, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                 DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                 ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"微软雅黑");
+        SelectObject(mem, font);
+        SIZE sz{};
+        GetTextExtentPoint32W(mem, wt.c_str(), (int)wt.size(), &sz);
+        DeleteObject(font);
+        DeleteDC(mem);
+        ReleaseDC(nullptr, screen);
+        auto l = std::make_shared<List>();
+        l->items.push_back(vNum((double)sz.cx + 2));
+        l->items.push_back(vNum((double)sz.cy + 2));
+        return vList(l);
+    });
+    registerBuiltin("视口画矩形", 6, 7, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto d = vpDict(a[0], line);
+        int x = (int)needIndex(a[1], "视口画矩形", line);
+        int y = (int)needIndex(a[2], "视口画矩形", line);
+        int bw = (int)needIndex(a[3], "视口画矩形", line);
+        int bh = (int)needIndex(a[4], "视口画矩形", line);
+        int c = vpColor(a[5], line);
+        bool fill = a.size() > 6 ? truthy(a[6]) : true;
+        if (bw < 0) { x += bw; bw = -bw; }
+        if (bh < 0) { y += bh; bh = -bh; }
+        if (fill) {
+            for (int j = y; j < y + bh; ++j)
+                for (int i = x; i < x + bw; ++i) vpPut(d, i, j, c);
+        } else {
+            for (int i = x; i < x + bw; ++i) { vpPut(d, i, y, c); vpPut(d, i, y + bh - 1, c); }
+            for (int j = y; j < y + bh; ++j) { vpPut(d, x, j, c); vpPut(d, x + bw - 1, j, c); }
+        }
+        return a[0];
+    });
+    registerBuiltin("视口画椭圆", 6, 7, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto d = vpDict(a[0], line);
+        double cx = needNum(a[1], "视口画椭圆", line);
+        double cy = needNum(a[2], "视口画椭圆", line);
+        double rx = needNum(a[3], "视口画椭圆", line);
+        double ry = needNum(a[4], "视口画椭圆", line);
+        int c = vpColor(a[5], line);
+        bool fill = a.size() > 6 ? truthy(a[6]) : true;
+        if (rx < 0) rx = -rx;
+        if (ry < 0) ry = -ry;
+        if (rx < 0.0001 && ry < 0.0001) { vpPut(d, (int)cx, (int)cy, c); return a[0]; }
+        int y1 = (int)std::floor(cy - ry), y2 = (int)std::ceil(cy + ry);
+        for (int j = y1; j <= y2; ++j) {
+            double dy = ry < 0.0001 ? 0.0 : (j - cy) / ry;
+            if (std::fabs(dy) > 1.0) continue;
+            double half = rx * std::sqrt(std::max(0.0, 1.0 - dy * dy));
+            int xa = (int)std::ceil(cx - half), xb = (int)std::floor(cx + half);
+            if (fill) {
+                for (int i = xa; i <= xb; ++i) vpPut(d, i, j, c);
+            } else {
+                vpPut(d, xa, j, c);
+                vpPut(d, xb, j, c);
+            }
+        }
+        return a[0];
+    });
+    registerBuiltin("视口画圆", 5, 6, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto d = vpDict(a[0], line);
+        double cx = needNum(a[1], "视口画圆", line);
+        double cy = needNum(a[2], "视口画圆", line);
+        double r = std::fabs(needNum(a[3], "视口画圆", line));
+        int c = vpColor(a[4], line);
+        bool fill = a.size() > 5 ? truthy(a[5]) : true;
+        int y1 = (int)std::floor(cy - r), y2 = (int)std::ceil(cy + r);
+        for (int j = y1; j <= y2; ++j) {
+            double dy = r < 0.0001 ? 0.0 : (j - cy) / r;
+            if (std::fabs(dy) > 1.0) continue;
+            double half = r * std::sqrt(std::max(0.0, 1.0 - dy * dy));
+            int xa = (int)std::ceil(cx - half), xb = (int)std::floor(cx + half);
+            if (fill) {
+                for (int i = xa; i <= xb; ++i) vpPut(d, i, j, c);
+            } else {
+                vpPut(d, xa, j, c);
+                vpPut(d, xb, j, c);
+            }
+        }
+        return a[0];
+    });
+    registerBuiltin("视口画多边形", 3, 4, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto d = vpDict(a[0], line);
+        auto vl = needList(a[1], "视口画多边形", line);
+        int c = vpColor(a[2], line);
+        bool fill = a.size() > 3 ? truthy(a[3]) : true;
+        vector<std::pair<double, double>> pts;
+        for (const auto& v : vl->items) {
+            auto p = needList(v, "视口画多边形", line);
+            if (p->items.size() < 2) throw WenError("运行时错误", line, 0, "顶点要写成 [x, y]");
+            pts.push_back({needNum(p->items[0], "视口画多边形", line), needNum(p->items[1], "视口画多边形", line)});
+        }
+        if (pts.size() < 3) throw WenError("运行时错误", line, 0, "多边形至少要 3 个顶点");
+        if (fill) {
+            double ylo = pts[0].second, yhi = pts[0].second;
+            for (auto& p : pts) { ylo = std::min(ylo, p.second); yhi = std::max(yhi, p.second); }
+            vector<double> xs;
+            for (int j = (int)std::floor(ylo); j <= (int)std::ceil(yhi); ++j) {
+                double scanY = j + 0.5;
+                xs.clear();
+                for (size_t i = 0; i < pts.size(); ++i) {
+                    auto& A = pts[i];
+                    auto& B = pts[(i + 1) % pts.size()];
+                    if ((A.second <= scanY && B.second > scanY) || (B.second <= scanY && A.second > scanY)) {
+                        double t = (scanY - A.second) / (B.second - A.second);
+                        xs.push_back(A.first + t * (B.first - A.first));
+                    }
+                }
+                std::sort(xs.begin(), xs.end());
+                for (size_t k = 0; k + 1 < xs.size(); k += 2) {
+                    int xa = (int)std::ceil(xs[k]), xb = (int)std::floor(xs[k + 1]);
+                    for (int i = xa; i <= xb; ++i) vpPut(d, i, j, c);
+                }
+            }
+        }
+        for (size_t i = 0; i < pts.size(); ++i) {
+            auto& A = pts[i];
+            auto& B = pts[(i + 1) % pts.size()];
+            double dx = B.first - A.first, dy = B.second - A.second;
+            int steps = (int)std::max(std::fabs(dx), std::fabs(dy));
+            if (steps < 1) steps = 1;
+            for (int t = 0; t <= steps; ++t) {
+                double u = (double)t / steps;
+                vpPut(d, (int)std::lround(A.first + dx * u), (int)std::lround(A.second + dy * u), c);
+            }
+        }
+        return a[0];
+    });
+    registerBuiltin("视口画线粗", 7, 7, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto d = vpDict(a[0], line);
+        double x1 = needNum(a[1], "视口画线粗", line), y1 = needNum(a[2], "视口画线粗", line);
+        double x2 = needNum(a[3], "视口画线粗", line), y2 = needNum(a[4], "视口画线粗", line);
+        int wide = (int)needIndex(a[5], "视口画线粗", line);
+        int c = vpColor(a[6], line);
+        if (wide < 1) wide = 1;
+        double dx = x2 - x1, dy = y2 - y1;
+        double len = std::sqrt(dx * dx + dy * dy);
+        if (len < 1e-9) { vpPut(d, (int)x1, (int)y1, c); return a[0]; }
+        double nx = -dy / len, ny = dx / len;
+        double half = (wide - 1) / 2.0;
+        int steps = (int)std::max(std::fabs(dx), std::fabs(dy));
+        if (steps < 1) steps = 1;
+        for (int t = 0; t <= steps; ++t) {
+            double u = (double)t / steps;
+            double px = x1 + dx * u, py = y1 + dy * u;
+            for (int k = -(int)half; k <= (int)half; ++k)
+                vpPut(d, (int)std::lround(px + nx * k), (int)std::lround(py + ny * k), c);
+        }
+        return a[0];
+    });
     registerBuiltin("视口保存", 2, 2, [](Interpreter&, vector<Value>& a, int line) -> Value {
         auto d = vpDict(a[0], line);
         string path = needStr(a[1], "视口保存", line);
         int w = (int)needNum(d->items.at("宽"), "视口", line);
         int h = (int)needNum(d->items.at("高"), "视口", line);
+        string ext;
+        if (path.size() > 4) {
+            for (size_t i = path.size() - 4; i < path.size(); ++i)
+                ext += (char)std::tolower((unsigned char)path[i]);
+        }
+        if (ext == ".png")
+            return wenWritePng(path, w, h, vpPixels(d).data(), 3, line);
         int row = (w * 3 + 3) & ~3;
         string bmp(54 + (size_t)row * h, '\0');
         bmp[0] = 'B'; bmp[1] = 'M';
@@ -21129,146 +21544,8 @@ Interpreter::Interpreter() {
     // 图像存 PNG：8 位灰度，zlib 用 stored 块（不压缩但合法），自带 CRC32 / Adler32
     // 通用 PNG 编码：ch=1 灰度 / ch=3 RGB，deflate 用固定 Huffman + LZ77
     auto writePngFile = [](const string& path, int W, int H, const unsigned char* data, int ch, int line) {
-        static unsigned int tab[256];
-        static bool tabInit = false;
-        if (!tabInit) {
-            for (unsigned int i = 0; i < 256; ++i) {
-                unsigned int c = i;
-                for (int k = 0; k < 8; ++k) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-                tab[i] = c;
-            }
-            tabInit = true;
-        }
-        auto crc32Of = [](const unsigned char* p, size_t n) -> unsigned int {
-            unsigned int c = 0xFFFFFFFFu;
-            for (size_t i = 0; i < n; ++i) c = tab[(c ^ p[i]) & 0xFF] ^ (c >> 8);
-            return c ^ 0xFFFFFFFFu;
-        };
-        size_t rowBytes = (size_t)W * (size_t)ch;
-        std::string raw;
-        raw.reserve((size_t)H * (rowBytes + 1));
-        for (int y = 0; y < H; ++y) {
-            raw.push_back('\0');
-            raw.append(reinterpret_cast<const char*>(data) + (size_t)y * rowBytes, rowBytes);
-        }
-        static const int lenBase[29] = {3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258};
-        static const int lenExtra[29] = {0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0};
-        static const int distBase[30] = {1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577};
-        static const int distExtra[30] = {0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13};
-        std::vector<unsigned char> z;
-        unsigned int bitBuf = 0;
-        int bitCnt = 0;
-        auto putBits = [&](unsigned int v, int n) {
-            bitBuf |= (v << bitCnt);
-            bitCnt += n;
-            while (bitCnt >= 8) { z.push_back((unsigned char)(bitBuf & 0xFF)); bitBuf >>= 8; bitCnt -= 8; }
-        };
-        auto revBits = [](unsigned int v, int n) -> unsigned int {
-            unsigned int r = 0;
-            for (int i = 0; i < n; ++i) { r = (r << 1) | (v & 1); v >>= 1; }
-            return r;
-        };
-        auto putLit = [&](unsigned int sym) {
-            if (sym <= 143) putBits(revBits(0x30 + sym, 8), 8);
-            else if (sym <= 255) putBits(revBits(0x190 + (sym - 144), 9), 9);
-            else if (sym <= 279) putBits(revBits(sym - 256, 7), 7);
-            else putBits(revBits(0xC0 + (sym - 280), 8), 8);
-        };
-        auto putLen = [&](int len) {
-            int ci = 28;
-            for (int i = 0; i < 29; ++i) {
-                int next = (i == 28) ? 1000000 : lenBase[i + 1];
-                if (len < next) { ci = i; break; }
-            }
-            putLit(257 + ci);
-            if (lenExtra[ci]) putBits((unsigned int)(len - lenBase[ci]), lenExtra[ci]);
-        };
-        auto putDist = [&](int dist) {
-            int ci = 29;
-            for (int i = 0; i < 30; ++i) {
-                int next = (i == 29) ? 1000000 : distBase[i + 1];
-                if (dist < next) { ci = i; break; }
-            }
-            putBits(revBits((unsigned int)ci, 5), 5);
-            if (distExtra[ci]) putBits((unsigned int)(dist - distBase[ci]), distExtra[ci]);
-        };
-        putBits(1, 1);
-        putBits(1, 2);
-        const int WIN = 32768;
-        std::vector<int> head(65536, -1);
-        std::vector<int> prev(raw.size() + 1, -1);
-        size_t i = 0;
-        size_t n = raw.size();
-        while (i < n) {
-            int bestLen = 0, bestDist = 0;
-            if (i + 2 < n) {
-                unsigned int key = (((unsigned char)raw[i] << 10) ^ ((unsigned char)raw[i + 1] << 5) ^ (unsigned char)raw[i + 2]) & 65535;
-                int cand = head[key];
-                int steps = 0;
-                int maxLen = (int)std::min<size_t>(258, n - i);
-                while (cand >= 0 && steps < 128 && (int)i - cand <= WIN) {
-                    int len = 0;
-                    while (len < maxLen && raw[(size_t)cand + len] == raw[i + len]) ++len;
-                    if (len > bestLen) { bestLen = len; bestDist = (int)i - cand; if (len >= maxLen) break; }
-                    cand = prev[(size_t)cand];
-                    ++steps;
-                }
-            }
-            if (bestLen >= 3) {
-                putLen(bestLen);
-                putDist(bestDist);
-                for (int k = 0; k < bestLen; ++k) {
-                    if (i + 2 < n) {
-                        unsigned int key = (((unsigned char)raw[i] << 10) ^ ((unsigned char)raw[i + 1] << 5) ^ (unsigned char)raw[i + 2]) & 65535;
-                        prev[i] = head[key];
-                        head[key] = (int)i;
-                    }
-                    ++i;
-                }
-            } else {
-                putLit((unsigned char)raw[i]);
-                if (i + 2 < n) {
-                    unsigned int key = (((unsigned char)raw[i] << 10) ^ ((unsigned char)raw[i + 1] << 5) ^ (unsigned char)raw[i + 2]) & 65535;
-                    prev[i] = head[key];
-                    head[key] = (int)i;
-                }
-                ++i;
-            }
-        }
-        putLit(256);
-        if (bitCnt > 0) { z.push_back((unsigned char)(bitBuf & 0xFF)); bitBuf = 0; bitCnt = 0; }
-        auto adler32Of = [](const unsigned char* p, size_t n) -> unsigned int {
-            unsigned int s1 = 1, s2 = 0;
-            for (size_t i = 0; i < n; ++i) { s1 = (s1 + p[i]) % 65521; s2 = (s2 + s1) % 65521; }
-            return (s2 << 16) | s1;
-        };
-        unsigned int ad = adler32Of(reinterpret_cast<const unsigned char*>(raw.data()), raw.size());
-        std::string zs;
-        zs.push_back('\x78'); zs.push_back('\x01');
-        zs.append(reinterpret_cast<const char*>(z.data()), z.size());
-        zs.push_back((char)(ad >> 24)); zs.push_back((char)(ad >> 16)); zs.push_back((char)(ad >> 8)); zs.push_back((char)ad);
-        std::string out("\x89PNG\r\n\x1A\n", 8);
-        auto put32 = [](std::string& s, unsigned int v) {
-            s.push_back((char)((v >> 24) & 0xFF)); s.push_back((char)((v >> 16) & 0xFF));
-            s.push_back((char)((v >> 8) & 0xFF)); s.push_back((char)(v & 0xFF));
-        };
-        auto chunk = [&](const char* type, const std::string& data) {
-            put32(out, (unsigned int)data.size());
-            std::string body(type, 4);
-            body += data;
-            out += body;
-            put32(out, crc32Of(reinterpret_cast<const unsigned char*>(body.data()), body.size()));
-        };
-        std::string ihdr;
-        put32(ihdr, (unsigned int)W); put32(ihdr, (unsigned int)H);
-        ihdr.push_back(8); ihdr.push_back(ch == 3 ? 2 : 0);
-        ihdr.push_back(0); ihdr.push_back(0); ihdr.push_back(0);
-        chunk("IHDR", ihdr);
-        chunk("IDAT", zs);
-        chunk("IEND", std::string());
-        try { writeWholeFile(path, out, false); }
-        catch (IoError& e) { throw WenError("文件错误", line, 0, e.what()); }
-        return vStr(path);
+        return wenWritePng(path, W, H, data, ch, line);
+
     };
     // 视差定深：两幅左右视图做块匹配，返回视差图（0..255，越大越近）
     registerBuiltin("视差深度", 5, 6, [&](Interpreter&, vector<Value>& a, int line) -> Value {
