@@ -4265,6 +4265,16 @@ static bool compilePureExpr(const ExprPtr& e, const std::vector<SymId>& ps,
     return false;
 }
 
+// 名字 -> 库名 反查表：静态检查报「没有定义名字」时用它提示该补哪个依赖。
+extern std::map<string, string> gNameOwner;
+// 库常量名 -> 库名（常量不是普通内置函数，单独一张表）
+static const std::map<string, string>& constLibOf() {
+    static const std::map<string, string> t = {
+        {"圆周率", "数学库"}, {"π", "数学库"}, {"自然常数", "数学库"},
+        {"重力加速度", "物理库"}, {"光速", "物理库"},
+        {"万有引力常数", "物理库"}, {"声速", "物理库"}};
+    return t;
+}
 class Interpreter {
 public:
     shared_ptr<Scope> globals;
@@ -4388,12 +4398,8 @@ public:
                                "「" + name + "」属于「" + kv.first +
                                    "」，请先在使用前写「依赖 " + kv.first + "」");
         }
-        static const std::map<string, string> constLib = {
-            {"圆周率", "数学库"}, {"π", "数学库"}, {"自然常数", "数学库"},
-            {"重力加速度", "物理库"}, {"光速", "物理库"},
-            {"万有引力常数", "物理库"}, {"声速", "物理库"}};
-        auto ci = constLib.find(name);
-        if (ci != constLib.end())
+        auto ci = constLibOf().find(name);
+        if (ci != constLibOf().end())
             throw WenError("运行时错误", line, 0,
                            "「" + name + "」属于「" + ci->second +
                                "」，请先在使用前写「依赖 " + ci->second + "」");
@@ -4402,6 +4408,8 @@ public:
                        (hint.empty() ? "" : "；你是不是要找「" + hint + "」？"));
     }
 };
+
+std::map<string, string> gNameOwner;
 
 // ============================================================
 // 9. 解释器实现
@@ -29401,6 +29409,7 @@ Interpreter::Interpreter() {
         auto it = globals->vars.find(kv.first);
         if (it == globals->vars.end()) continue;
         libraryFunctions[kv.second][kv.first] = it->second;
+        gNameOwner[kv.first] = kv.second;
         globals->vars.erase(it);
         globals->idVars.erase(internSymbol(kv.first));
     }
@@ -30087,7 +30096,11 @@ static string errorRule(const WenError& e) {
         return "syntax.invalid";
     }
     if (k == "静态错误") {
-        if (r.find("没有定义名字") != string::npos) return "static.undefined_name";
+        if (r.find("没有定义名字") != string::npos) {
+            if (r.find("属于「") != string::npos && r.find("依赖") != string::npos)
+                return "static.name_needs_lib";
+            return "static.undefined_name";
+        }
         if (r.find("不能调用") != string::npos) return "static.call_non_function";
         if (r.find("默认参数") != string::npos) return "static.default_param_order";
         if (r.find("参数") != string::npos) return "static.arity";
@@ -30152,6 +30165,7 @@ static string errorSuggestion(const WenError& e) {
     if (rule == "syntax.missing_end") return "在「如果/函数/对于/尝试」块末尾补「结束」。";
     if (rule == "syntax.missing_then") return "条件后补「则」。";
     if (rule == "static.undefined_name") return "先赋值或定义，再引用；检查名字有没有写错。";
+    if (rule == "static.name_needs_lib") return "在文件开头补「依赖 库名」，并确认库名拼写。";
     if (rule == "static.default_param_order") return "把默认参数移到参数表末尾。";
     if (rule == "static.arity") return "按函数定义的参数个数传参。";
     if (rule == "static.call_non_function") return "只有函数能调用；检查括号前的名字。";
@@ -30719,8 +30733,20 @@ static void checkExprNames(const ExprPtr& e, const std::set<string>& vars,
         static const std::set<string> builtinVars = {"π", "圆周率", "自然常数"};
         if (!skipUndefined && !vars.count(e->text) && !gCallableNames.count(e->text) &&
             !builtinVars.count(e->text)) {
-            errors.push_back(WenError("静态错误", e->line, 0,
-                "没有定义名字「" + e->text + "」；先赋值，或检查拼写"));
+            string dep;
+            auto ci = constLibOf().find(e->text);
+            if (ci != constLibOf().end()) {
+                dep = ci->second;
+            } else {
+                auto oi = gNameOwner.find(e->text);
+                if (oi != gNameOwner.end()) dep = oi->second;
+            }
+            string msg = "没有定义名字「" + e->text + "」";
+            if (!dep.empty())
+                msg += "；「" + e->text + "」属于「" + dep + "」，在文件开头补「依赖 " + dep + "」";
+            else
+                msg += "；先赋值，或检查拼写";
+            errors.push_back(WenError("静态错误", e->line, 0, msg));
         }
     }
     if (e->k == Expr::K::Call && !e->args.empty() && e->args[0] &&
