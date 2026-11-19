@@ -4082,7 +4082,7 @@ static const std::map<string, string>& functionModules() {
         {"新建神经层", "神经网络库"}, {"神经链", "神经网络库"}, {"前向", "神经网络库"},
         {"颜色", "视口库"}, {"新建视口", "视口库"}, {"视口清空", "视口库"}, {"视口画点", "视口库"},
         {"视口画线", "视口库"}, {"视口画三角形", "视口库"}, {"视口尺寸", "视口库"}, {"视口保存", "视口库"},
-        {"视口画字", "视口库"}, {"视口量字", "视口库"}, {"视口画矩形", "视口库"}, {"视口画圆", "视口库"}, {"视口画椭圆", "视口库"}, {"视口画多边形", "视口库"}, {"视口画线粗", "视口库"}, {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"}, {"视口显示", "视口库"}, {"玩家视口", "视口库"}, {"大气预设", "视口库"}, {"媒体信息", "媒体库"}, {"媒体播放", "媒体库"}, {"媒体停止", "媒体库"}, {"声音播放", "媒体库"}, {"音频设备", "媒体库"}, {"音频录制", "媒体库"}, {"音频兼容检查", "媒体库"}, {"媒体格式支持", "媒体库"}, {"音频解析", "媒体库"}, {"音频判定", "媒体库"}, {"音频频谱", "媒体库"}, {"音频轨道", "媒体库"}, {"网格新建", "三维库"}, {"网格三角", "三维库"}, {"网格平移", "三维库"}, {"网格缩放", "三维库"}, {"网格旋转", "三维库"}, {"网格合并", "三维库"}, {"网格三角形数", "三维库"}, {"视口加载模型", "视口库"}, {"光追渲染", "视口库"}, {"体积云渲染", "视口库"}, {"材质检查", "视口库"}, {"材质预设", "视口库"}, {"视口取色", "视口库"},
+        {"视口画字", "视口库"}, {"视口量字", "视口库"}, {"视口贴图", "视口库"}, {"视口画矩形", "视口库"}, {"视口画圆", "视口库"}, {"视口画椭圆", "视口库"}, {"视口画多边形", "视口库"}, {"视口画线粗", "视口库"}, {"视口画三角形Z", "视口库"}, {"视口画三维三角形", "视口库"}, {"视口画三角形渐变", "视口库"}, {"视口显示", "视口库"}, {"玩家视口", "视口库"}, {"大气预设", "视口库"}, {"媒体信息", "媒体库"}, {"媒体播放", "媒体库"}, {"媒体停止", "媒体库"}, {"声音播放", "媒体库"}, {"音频设备", "媒体库"}, {"音频录制", "媒体库"}, {"音频兼容检查", "媒体库"}, {"媒体格式支持", "媒体库"}, {"音频解析", "媒体库"}, {"音频判定", "媒体库"}, {"音频频谱", "媒体库"}, {"音频轨道", "媒体库"}, {"网格新建", "三维库"}, {"网格三角", "三维库"}, {"网格平移", "三维库"}, {"网格缩放", "三维库"}, {"网格旋转", "三维库"}, {"网格合并", "三维库"}, {"网格三角形数", "三维库"}, {"视口加载模型", "视口库"}, {"光追渲染", "视口库"}, {"体积云渲染", "视口库"}, {"材质检查", "视口库"}, {"材质预设", "视口库"}, {"视口取色", "视口库"},
         {"硬件信息", "硬件库"}, {"高精度计时", "硬件库"}, {"内存状态", "硬件库"}, {"屏幕尺寸", "硬件库"}, {"磁盘空间", "硬件库"},
         {"大整数幂", "大整数库"}, {"大整数乘", "大整数库"}, {"大整数加", "大整数库"}, {"大整数阶乘", "大整数库"},
         {"阶乘位数", "大整数库"}, {"阶乘末尾零", "大整数库"}, {"阶乘概览", "大整数库"},
@@ -20230,6 +20230,87 @@ Interpreter::Interpreter() {
         l->items.push_back(vNum((double)sz.cy + 2));
         return vList(l);
     });
+    registerBuiltin("视口贴图", 4, 5, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        auto d = vpDict(a[0], line);
+        auto img = needDict(a[1], "视口贴图", line);
+        int x0 = (int)needIndex(a[2], "视口贴图", line);
+        int y0 = (int)needIndex(a[3], "视口贴图", line);
+        if (!img->items.count("像素") || !img->items.count("宽") || !img->items.count("高"))
+            throw WenError("运行时错误", line, 0, "视口贴图：第二个参数要传 图像读PNG 的结果或另一个视口");
+        int sw = (int)needNum(img->items.at("宽"), "视口贴图", line);
+        int sh = (int)needNum(img->items.at("高"), "视口贴图", line);
+        int sch = img->items.count("通道") ? (int)needNum(img->items.at("通道"), "视口贴图", line) : 3;
+        if (sch < 1 || sch > 4) sch = 3;
+        const auto& sb = *img->items.at("像素").bytes;
+        if (sw <= 0 || sh <= 0 || (long long)sb.size() < (long long)sw * sh * sch)
+            throw WenError("运行时错误", line, 0, "视口贴图：源图像尺寸与像素数据对不上");
+        double scale = a.size() > 4 ? needNum(a[4], "视口贴图", line) : 1.0;
+        if (!(scale > 0.0) || scale > 64.0)
+            throw WenError("运行时错误", line, 0, "视口贴图：缩放要在 0 到 64 之间");
+        int dstW = (int)needNum(d->items.at("宽"), "视口", line);
+        int dstH = (int)needNum(d->items.at("高"), "视口", line);
+        int dw = (int)(sw * scale + 0.5);
+        int dh = (int)(sh * scale + 0.5);
+        if (dw < 1) dw = 1;
+        if (dh < 1) dh = 1;
+        auto& dp = vpPixels(d);
+        auto fetch = [&](int sx, int sy, double& r, double& g, double& b, double& al) {
+            size_t o = ((size_t)sy * (size_t)sw + (size_t)sx) * (size_t)sch;
+            if (sch == 1) { r = g = b = (double)sb[o]; al = 255.0; }
+            else if (sch == 2) { r = g = b = (double)sb[o]; al = (double)sb[o + 1]; }
+            else if (sch == 3) { r = (double)sb[o]; g = (double)sb[o + 1]; b = (double)sb[o + 2]; al = 255.0; }
+            else { r = (double)sb[o]; g = (double)sb[o + 1]; b = (double)sb[o + 2]; al = (double)sb[o + 3]; }
+        };
+        for (int j = 0; j < dh; ++j) {
+            int py = y0 + j;
+            if (py < 0 || py >= dstH) continue;
+            double fy = (j + 0.5) / scale - 0.5;
+            int yA = (int)std::floor(fy);
+            int yB = yA + 1;
+            double wy = fy - yA;
+            if (yA < 0) { yA = 0; wy = 0.0; }
+            if (yA > sh - 1) yA = sh - 1;
+            if (yB < 0) yB = 0;
+            if (yB > sh - 1) yB = sh - 1;
+            for (int i = 0; i < dw; ++i) {
+                int px = x0 + i;
+                if (px < 0 || px >= dstW) continue;
+                double fx = (i + 0.5) / scale - 0.5;
+                int xA = (int)std::floor(fx);
+                int xB = xA + 1;
+                double wx = fx - xA;
+                if (xA < 0) { xA = 0; wx = 0.0; }
+                if (xA > sw - 1) xA = sw - 1;
+                if (xB < 0) xB = 0;
+                if (xB > sw - 1) xB = sw - 1;
+                double wts[4] = {(1 - wx) * (1 - wy), wx * (1 - wy), (1 - wx) * wy, wx * wy};
+                int xs[4] = {xA, xB, xA, xB};
+                int ys[4] = {yA, yA, yB, yB};
+                double rr = 0, gg = 0, bb = 0, aa = 0, tw = 0;
+                for (int k = 0; k < 4; ++k) {
+                    if (wts[k] <= 0.0) continue;
+                    double r = 0, g = 0, b = 0, al = 0;
+                    fetch(xs[k], ys[k], r, g, b, al);
+                    rr += wts[k] * r; gg += wts[k] * g; bb += wts[k] * b; aa += wts[k] * al;
+                    tw += wts[k];
+                }
+                if (tw <= 0.0) continue;
+                rr /= tw; gg /= tw; bb /= tw; aa /= tw;
+                double k2 = aa / 255.0;
+                if (k2 < 0.0) k2 = 0.0;
+                if (k2 > 1.0) k2 = 1.0;
+                if (k2 <= 0.0) continue;
+                size_t di = ((size_t)py * (size_t)dstW + (size_t)px) * 3;
+                double nr = dp[di] * (1 - k2) + rr * k2;
+                double ng = dp[di + 1] * (1 - k2) + gg * k2;
+                double nb = dp[di + 2] * (1 - k2) + bb * k2;
+                dp[di] = (unsigned char)(nr < 0 ? 0 : (nr > 255 ? 255 : nr));
+                dp[di + 1] = (unsigned char)(ng < 0 ? 0 : (ng > 255 ? 255 : ng));
+                dp[di + 2] = (unsigned char)(nb < 0 ? 0 : (nb > 255 ? 255 : nb));
+            }
+        }
+        return a[0];
+    });
     registerBuiltin("视口画矩形", 6, 7, [](Interpreter&, vector<Value>& a, int line) -> Value {
         auto d = vpDict(a[0], line);
         int x = (int)needIndex(a[1], "视口画矩形", line);
@@ -27466,19 +27547,37 @@ Interpreter::Interpreter() {
         string color = a.size() > 5 ? needStr(a[5], "新建球", line) : "#f0a040";
         return make3Sphere(x, y, z, r, segs, color);
     });
-    registerBuiltin("渲染三维", 3, 3, [](Interpreter&, vector<Value>& a, int line) -> Value {
+    registerBuiltin("渲染三维", 3, 4, [](Interpreter&, vector<Value>& a, int line) -> Value {
         vector<Value> faces;
         collect3Faces(a[0], faces, line);
         double cam = needNum(a[1], "渲染三维", line);
         if (cam <= 0.1) throw WenError("运行时错误", line, 0, "相机距离必须大于 0.1");
         string path = needStr(a[2], "渲染三维", line);
+        int cw = 800, chh = 600;
+        if (a.size() > 3) {
+            if (a[3].type == VT::List) {
+                auto l = needList(a[3], "渲染三维尺寸", line);
+                if (l->items.size() < 2)
+                    throw WenError("运行时错误", line, 0, "尺寸要写成 [宽, 高]");
+                cw = (int)needIndex(l->items[0], "渲染三维尺寸", line);
+                chh = (int)needIndex(l->items[1], "渲染三维尺寸", line);
+            } else {
+                chh = (int)needNum(a[3], "渲染三维尺寸", line);
+                cw = chh * 4 / 3;
+            }
+        }
+        if (cw < 32) cw = 32;
+        if (chh < 32) chh = 32;
+        if (cw > 4096) cw = 4096;
+        if (chh > 4096) chh = 4096;
+        double cxf = cw / 2.0, cyf = chh / 2.0;
         struct Proj {
             vector<std::pair<double, double>> pts;
             double z = 0;
             string color;
         };
         vector<Proj> out;
-        const double f = 520.0;
+        const double f = 520.0 * (chh / 600.0);
         for (const auto& fv : faces) {
             auto d = needDict(fv, "三维面", line);
             auto pts = render3Vertices(d->items.at("顶点"), line);
@@ -27491,7 +27590,7 @@ Interpreter::Interpreter() {
             for (const auto& v : pts) {
                 double zz = v.z + cam;
                 if (zz <= 0.1) { ok = false; break; }
-                p.pts.push_back({400.0 + v.x * f / zz, 300.0 - v.y * f / zz});
+                p.pts.push_back({cxf + v.x * f / zz, cyf - v.y * f / zz});
                 zsum += zz;
             }
             if (!ok) continue;
@@ -27500,8 +27599,9 @@ Interpreter::Interpreter() {
         }
         std::sort(out.begin(), out.end(), [](const Proj& x, const Proj& y) { return x.z > y.z; });
         std::ostringstream svg;
-        svg << "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"800\" height=\"600\" "
-               "viewBox=\"0 0 800 600\">\n<rect width=\"800\" height=\"600\" fill=\"#0e1218\"/>\n";
+        svg << "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" << cw << "\" height=\"" << chh
+            << "\" viewBox=\"0 0 " << cw << " " << chh << "\">\n<rect width=\"" << cw
+            << "\" height=\"" << chh << "\" fill=\"#0e1218\"/>\n";
         for (const auto& p : out) {
             auto rgb = renderHexRgb(p.color);
             double lum = 0.55;
