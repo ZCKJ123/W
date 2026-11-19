@@ -20166,17 +20166,79 @@ Interpreter::Interpreter() {
         if (size < 6) size = 6;
         if (size > 512) size = 512;
         if (text.empty()) return a[0];
-        std::wstring wt = utf8ToWide(text);
+        int vw = (int)needNum(d->items.at("宽"), "视口", line);
+
+        std::vector<string> raw;
+        {
+            string cur;
+            for (size_t i = 0; i < text.size(); ++i) {
+                char ch = text[i];
+                if (ch == '\r') {
+                    if (i + 1 < text.size() && text[i + 1] == '\n') ++i;
+                    raw.push_back(cur);
+                    cur.clear();
+                } else if (ch == '\n') {
+                    raw.push_back(cur);
+                    cur.clear();
+                } else {
+                    cur.push_back(ch);
+                }
+            }
+            raw.push_back(cur);
+        }
+
         HDC screen = GetDC(nullptr);
         HDC mem = CreateCompatibleDC(screen);
         HFONT font = CreateFontW(-size, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                  DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
                                  ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"微软雅黑");
         SelectObject(mem, font);
-        SIZE sz{};
-        GetTextExtentPoint32W(mem, wt.c_str(), (int)wt.size(), &sz);
-        int tw = std::max(1, (int)sz.cx + 2);
-        int th = std::max(1, (int)sz.cy + 2);
+
+        int avail = vw - x;
+        if (avail < 8) avail = 8;
+        auto charPx = [&](wchar_t wc) -> int {
+            SIZE s1{};
+            GetTextExtentPoint32W(mem, &wc, 1, &s1);
+            return (int)s1.cx;
+        };
+        SIZE szH{};
+        GetTextExtentPoint32W(mem, L"国", 1, &szH);
+        int lineH = (int)(szH.cy * 1.28);
+        if (lineH < size) lineH = size;
+
+        std::vector<std::wstring> out;
+        for (const auto& r : raw) {
+            std::wstring wr = utf8ToWide(r);
+            if (wr.empty()) {
+                out.push_back(std::wstring());
+                continue;
+            }
+            std::wstring cur;
+            int cw = 0;
+            for (size_t i = 0; i < wr.size(); ++i) {
+                int px = charPx(wr[i]);
+                if (cw + px > avail && !cur.empty()) {
+                    out.push_back(cur);
+                    cur.clear();
+                    cw = 0;
+                }
+                cur.push_back(wr[i]);
+                cw += px;
+            }
+            if (!cur.empty()) out.push_back(cur);
+        }
+        if (out.empty()) out.push_back(std::wstring());
+
+        int maxW = 1;
+        for (const auto& w : out) {
+            if (w.empty()) continue;
+            SIZE s2{};
+            GetTextExtentPoint32W(mem, w.c_str(), (int)w.size(), &s2);
+            if ((int)s2.cx + 2 > maxW) maxW = (int)s2.cx + 2;
+        }
+        int tw = maxW;
+        int th = (int)out.size() * lineH + 2;
+
         BITMAPINFO bi{};
         bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
         bi.bmiHeader.biWidth = tw;
@@ -20191,7 +20253,10 @@ Interpreter::Interpreter() {
         FillRect(mem, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
         SetBkMode(mem, TRANSPARENT);
         SetTextColor(mem, RGB(255, 255, 255));
-        TextOutW(mem, 1, 1, wt.c_str(), (int)wt.size());
+        for (size_t k = 0; k < out.size(); ++k) {
+            if (out[k].empty()) continue;
+            TextOutW(mem, 1, 1 + (int)k * lineH, out[k].c_str(), (int)out[k].size());
+        }
         auto* px = (unsigned char*)bits;
         if (px) {
             for (int j = 0; j < th; ++j) {
@@ -20213,21 +20278,48 @@ Interpreter::Interpreter() {
         string text = needStr(a[1], "视口量字", line);
         int size = a.size() > 2 ? (int)needIndex(a[2], "视口量字", line) : 16;
         if (size < 6) size = 6;
-        std::wstring wt = utf8ToWide(text);
+        if (size > 512) size = 512;
+        std::vector<string> raw;
+        {
+            string cur;
+            for (size_t i = 0; i < text.size(); ++i) {
+                char ch = text[i];
+                if (ch == '\r') {
+                    if (i + 1 < text.size() && text[i + 1] == '\n') ++i;
+                    raw.push_back(cur);
+                    cur.clear();
+                } else if (ch == '\n') {
+                    raw.push_back(cur);
+                    cur.clear();
+                } else {
+                    cur.push_back(ch);
+                }
+            }
+            raw.push_back(cur);
+        }
         HDC screen = GetDC(nullptr);
         HDC mem = CreateCompatibleDC(screen);
         HFONT font = CreateFontW(-size, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                  DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
                                  ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"微软雅黑");
         SelectObject(mem, font);
-        SIZE sz{};
-        GetTextExtentPoint32W(mem, wt.c_str(), (int)wt.size(), &sz);
+        SIZE szH{};
+        GetTextExtentPoint32W(mem, L"国", 1, &szH);
+        int lineH = (int)(szH.cy * 1.28);
+        if (lineH < size) lineH = size;
+        int maxW = 1;
+        for (const auto& r : raw) {
+            std::wstring wt = utf8ToWide(r);
+            SIZE s{};
+            if (!wt.empty()) GetTextExtentPoint32W(mem, wt.c_str(), (int)wt.size(), &s);
+            if ((int)s.cx + 2 > maxW) maxW = (int)s.cx + 2;
+        }
         DeleteObject(font);
         DeleteDC(mem);
         ReleaseDC(nullptr, screen);
         auto l = std::make_shared<List>();
-        l->items.push_back(vNum((double)sz.cx + 2));
-        l->items.push_back(vNum((double)sz.cy + 2));
+        l->items.push_back(vNum((double)maxW));
+        l->items.push_back(vNum((double)((int)raw.size() * lineH + 2)));
         return vList(l);
     });
     registerBuiltin("视口贴图", 4, 5, [](Interpreter&, vector<Value>& a, int line) -> Value {
