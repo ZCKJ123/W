@@ -30089,6 +30089,10 @@ private:
                     globals_[s->name] = cppVarName(s->name);
                 for (const auto& st : s->body) collectTop(st, false);
                 break;
+            case Stmt::K::ParLine:
+                // 并行行在编译模式下按顺序生成，里面的赋值照样要登记成全局
+                for (const auto& st : s->body) collectTop(st, top);
+                break;
             case Stmt::K::Func:
                 if (!top) err(s->line, "编译模式要求函数定义写在顶层");
                 break;
@@ -30130,6 +30134,9 @@ private:
                 break;
             case Stmt::K::For:
                 addLocal(fi, s->name);
+                for (const auto& st : s->body) collectLocal(st, fi);
+                break;
+            case Stmt::K::ParLine:
                 for (const auto& st : s->body) collectLocal(st, fi);
                 break;
             case Stmt::K::Func:
@@ -30460,6 +30467,12 @@ private:
                 err(s->line, "编译模式暂不支持「匹配」");
             case Stmt::K::ExprStmt:
                 return ind + "(void)(" + expr(s->expr) + ");\n";
+            case Stmt::K::ParLine: {
+                // 编译模式不并行：按顺序生成，结果与解释器一致，只是不提速
+                string out;
+                for (const auto& st : s->body) out += stmt(st, indent);
+                return out;
+            }
         }
         return "";
     }
@@ -36841,9 +36854,9 @@ static bool padIsWordChar(wchar_t c) {
 
 static bool padIsKeyword(const std::wstring& w) {
     static const wchar_t* kw[] = {
-        L"将", L"变成", L"打印", L"复印", L"如果", L"则", L"否则", L"结束", L"当",
+        L"将", L"变成", L"并行跑", L"局部", L"打印", L"复印", L"输出", L"如果", L"则", L"否则", L"结束", L"当",
         L"函数", L"返回", L"对于", L"在", L"中", L"依赖", L"尝试", L"捕获", L"最终",
-        L"中断", L"继续", L"真", L"假", L"空", L"集合", L"点阵", L"频道", L"概率分配",
+        L"匹配", L"情形", L"情况", L"导出", L"中断", L"继续", L"真", L"假", L"空", L"集合", L"点阵", L"频道", L"概率分配",
         L"输入值", L"注入值", L"否则如果", L"每一个", L"的平方", L"的立方", L"平方",
         L"立方", L"根号", L"度", L"加", L"减", L"乘", L"除以"
     };
