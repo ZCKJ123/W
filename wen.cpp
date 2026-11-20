@@ -4983,17 +4983,15 @@ void Interpreter::加载外部库(const string& name, int line) {
     }
 
     fs::path found;
-    for (const auto& p : candidates) {
-        if (fs::exists(p, ec) && !ec) {
-            found = p;
-            break;
+    // 打包产物自带库：内嵌那份是打包当时的版本，优先用，不找盘、不联网
+    bool fromPack = gPackedLibs.find(name) != gPackedLibs.end();
+    if (!fromPack) {
+        for (const auto& p : candidates) {
+            if (fs::exists(p, ec) && !ec) {
+                found = p;
+                break;
+            }
         }
-    }
-    // 打包产物自带库：直接用内嵌那份，不找盘、不联网
-    bool fromPack = false;
-    if (found.empty()) {
-        auto pit = gPackedLibs.find(name);
-        if (pit != gPackedLibs.end()) fromPack = true;
     }
     if (found.empty() && !fromPack && !gNoNetLib) {
         // 本地没有：按库源取回来，装进 库/名字.wen，再把候选重扫一遍
