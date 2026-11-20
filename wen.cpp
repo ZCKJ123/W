@@ -4275,6 +4275,9 @@ static const std::map<string, string>& constLibOf() {
         {"万有引力常数", "物理库"}, {"声速", "物理库"}};
     return t;
 }
+// 打包进产物的库：名字 -> 源码。打包段填充，加载外部库时优先查这里
+std::map<string, string> gPackedLibs;
+
 class Interpreter {
 public:
     shared_ptr<Scope> globals;
@@ -4986,7 +4989,13 @@ void Interpreter::加载外部库(const string& name, int line) {
             break;
         }
     }
-    if (found.empty() && !gNoNetLib) {
+    // 打包产物自带库：直接用内嵌那份，不找盘、不联网
+    bool fromPack = false;
+    if (found.empty()) {
+        auto pit = gPackedLibs.find(name);
+        if (pit != gPackedLibs.end()) fromPack = true;
+    }
+    if (found.empty() && !fromPack && !gNoNetLib) {
         // 本地没有：按库源取回来，装进 库/名字.wen，再把候选重扫一遍
         string got, url, err;
         if (fetchLibraryToDisk(name, got, url, err) && !got.empty()) {
@@ -4997,7 +5006,7 @@ void Interpreter::加载外部库(const string& name, int line) {
             std::cerr << "联网取库没成功：「" << name << "」 " << err << "\n";
         }
     }
-    if (found.empty()) {
+    if (found.empty() && !fromPack) {
         throw WenError("运行时错误", line, 0,
                        "找不到库「" + name +
                        "」：不是内置库，本地 库/" + name +
@@ -5015,9 +5024,9 @@ void Interpreter::加载外部库(const string& name, int line) {
     inLibrary_ = true;
     moduleExports.clear();
     try {
-        string src = readWholeFile(found.u8string());
+        string src = fromPack ? gPackedLibs[name] : readWholeFile(found.u8string());
         src = normalizeWenSource(src);
-        filename = found.u8string();
+        filename = fromPack ? ("<打包:" + name + ">") : found.u8string();
         sourceLines = splitLines(src);
         auto program = parseSource(src);
         auto moduleScope = std::make_shared<Scope>(globals);
@@ -8266,14 +8275,16 @@ static long long wenVolumetric(const shared_ptr<Dict>& vp, const shared_ptr<List
                     }
                 }
                 if (!inShadow) {
+                    // k∈[1,steps]、invSteps=1/steps，att=1-k/steps 恒 ≥0，无需下界截断。
                     double att = 1.0 - k * invSteps;
-                    if (att < 0.0) att = 0.0;
                     att = att * att;
                     // 固定高度分层尘埃密度：近地面浓、向上递减，静态解析（不动态生成/剔除）。
                     double th = th0 + kth * t;
-                    if (th < 0.0) th = 0.0; if (th > 1.0) th = 1.0;
-                    double layer = 1.0 - th; layer = layer * layer;
-                    acc += coeff * (0.15 + 0.85 * layer) * att;
+                    double dens;
+                    if (th >= 1.0) dens = 0.15;              // 高于尘高：高空无尘，仅基底
+                    else if (th <= 0.0) dens = 1.0;          // 贴地：满层尘埃
+                    else { double layer = 1.0 - th; dens = 0.15 + 0.85 * layer * layer; }
+                    acc += coeff * dens * att;
                 }
             }
             if (acc <= 1e-6) continue;
@@ -31093,6 +31104,95 @@ static HANDLE packOpenRead(const string& utf8Path) {
                        nullptr, OPEN_EXISTING, 0, nullptr);
 }
 
+// 载荷首字节：0/1 = 旧版单脚本（0 明文 1 混淆）；2/3 = 归档（脚本 + 若干库文件）
+// 从脚本里切出「依赖 A, B」的名字
+static vector<string> packDepNames(const string& src) {
+    vector<string> out;
+    auto lines = splitLines(src);
+    for (const auto& rawLine : lines) {
+        string t = trimText(rawLine);
+        if (t.rfind("依赖", 0) != 0) continue;
+        string rest = trimText(t.substr(6));
+        while (true) { size_t k = rest.find("，"); if (k == string::npos) break; rest.replace(k, 3, ","); }
+        while (true) { size_t k = rest.find("、"); if (k == string::npos) break; rest.replace(k, 3, ","); }
+        std::istringstream ds(rest);
+        string item;
+        while (std::getline(ds, item, ',')) {
+            string v = trimText(item);
+            if (!v.empty()) out.push_back(v);
+        }
+    }
+    return out;
+}
+
+// 在候选目录里找一个库文件（单文件库，或目录库 库/名字/主.wen）
+static fs::path packFindLib(const string& name, const vector<fs::path>& dirs) {
+    static const char* suffixes[] = {".库", ".wenlib", ".wen"};
+    for (const auto& dir : dirs) {
+        std::error_code ec;
+        fs::path p0 = dir / fs::u8path(name) / fs::u8path("主.wen");
+        if (fs::exists(p0, ec) && !ec) return p0;
+        for (const char* suf : suffixes) {
+            fs::path p = dir / fs::u8path(name + suf);
+            if (fs::exists(p, ec) && !ec) return p;
+        }
+    }
+    return fs::path();
+}
+
+// 顺着 依赖 链把库源码收全（找不到的跳过，留给运行时的内置库或正常报错）
+static void packCollectLibs(const string& src, const vector<fs::path>& dirs,
+                            std::map<string, string>& libs) {
+    vector<string> queue = packDepNames(src);
+    std::set<string> seen;
+    while (!queue.empty()) {
+        string name = queue.back();
+        queue.pop_back();
+        if (name.empty() || !seen.insert(name).second) continue;
+        fs::path p = packFindLib(name, dirs);
+        if (p.empty()) continue;
+        string body;
+        try { body = normalizeWenSource(readWholeFile(p.u8string())); }
+        catch (...) { continue; }
+        libs[name] = body;
+        for (const auto& d : packDepNames(body)) queue.push_back(d);
+    }
+}
+
+// 解析归档载荷（首字节已经剥掉）
+static bool packParseArchive(const string& body, string& script) {
+    size_t p = 0;
+    auto avail = [&](size_t n) { return p + n <= body.size(); };
+    if (!avail(8)) return false;
+    unsigned long long sl = 0;
+    for (int i = 0; i < 8; ++i) sl |= ((unsigned long long)(unsigned char)body[p + i]) << (8 * i);
+    p += 8;
+    if (!avail((size_t)sl)) return false;
+    script = body.substr(p, (size_t)sl);
+    p += (size_t)sl;
+    if (!avail(4)) return !script.empty();
+    unsigned long long ln = 0;
+    for (int i = 0; i < 4; ++i) ln |= ((unsigned long long)(unsigned char)body[p + i]) << (8 * i);
+    p += 4;
+    for (unsigned long long k = 0; k < ln; ++k) {
+        if (!avail(2)) break;
+        unsigned short nl = (unsigned short)((unsigned char)body[p] |
+                                             ((unsigned char)body[p + 1] << 8));
+        p += 2;
+        if (!avail(nl)) break;
+        string name = body.substr(p, nl);
+        p += nl;
+        if (!avail(4)) break;
+        unsigned long long bl = 0;
+        for (int i = 0; i < 4; ++i) bl |= ((unsigned long long)(unsigned char)body[p + i]) << (8 * i);
+        p += 4;
+        if (!avail((size_t)bl)) break;
+        gPackedLibs[name] = body.substr(p, (size_t)bl);
+        p += (size_t)bl;
+    }
+    return !script.empty();
+}
+
 // 打包：默认把运行时原样抄一份（单文件 exe）；--轻量 或输出后缀 .wzp/.wenp 时只写脚本（KB 级）
 static int packExecutable(const string& srcPath, const string& outPath, bool plain, bool thin) {
     string src;
@@ -31137,10 +31237,56 @@ static int packExecutable(const string& srcPath, const string& outPath, bool pla
         if (!okRead) { std::cerr << "读运行时不完整\n"; return 1; }
     }
 
+    // 非轻量包：把 依赖 链上的库文件一起收进来，产物就不必联网取库
+    std::map<string, string> libs;
+    size_t libBytes = 0;
+    if (!thin) {
+        std::vector<fs::path> dirs;
+        std::error_code ec0;
+        dirs.push_back(srcP.parent_path());
+        dirs.push_back(srcP.parent_path() / fs::u8path("库"));
+        dirs.push_back(fs::current_path(ec0) / fs::u8path("库"));
+        dirs.push_back(fs::current_path(ec0));
+        string selfExe = selfExePath();
+        if (!selfExe.empty()) {
+            std::error_code ec1;
+            fs::path ed = fs::u8path(selfExe).parent_path();
+            dirs.push_back(ed / fs::u8path("库"));
+            dirs.push_back(ed);
+        }
+        packCollectLibs(src, dirs, libs);
+        for (const auto& kv : libs) libBytes += kv.second.size();
+    }
+
     string payload;
-    payload.push_back(plain ? 0 : 1);
-    payload += src;
-    if (!plain) maskStream(payload);
+    if (thin) {
+        payload.push_back(plain ? 0 : 1);
+        payload += src;
+    } else {
+        payload.push_back(plain ? 2 : 3);
+        unsigned long long sl = (unsigned long long)src.size();
+        for (int i = 0; i < 8; ++i) payload.push_back((char)(unsigned char)((sl >> (8 * i)) & 0xFF));
+        payload += src;
+        unsigned long long ln = (unsigned long long)libs.size();
+        for (int i = 0; i < 4; ++i) payload.push_back((char)(unsigned char)((ln >> (8 * i)) & 0xFF));
+        for (const auto& kv : libs) {
+            unsigned short nl = (unsigned short)kv.first.size();
+            payload.push_back((char)(unsigned char)(nl & 0xFF));
+            payload.push_back((char)(unsigned char)((nl >> 8) & 0xFF));
+            payload += kv.first;
+            unsigned long long bl = (unsigned long long)kv.second.size();
+            for (int i = 0; i < 4; ++i)
+                payload.push_back((char)(unsigned char)((bl >> (8 * i)) & 0xFF));
+            payload += kv.second;
+        }
+    }
+    if (!plain) {
+        // 首字节（格式标志）不参与混淆，其余部分才混淆；否则读端连格式都认不出来
+        string tail = payload.substr(1);
+        maskStream(tail);
+        payload.resize(1);
+        payload += tail;
+    }
     unsigned long long plen = (unsigned long long)payload.size();
     string trailer(kPackMagic, 8);
     for (int i2 = 0; i2 < 8; ++i2) trailer.push_back((char)(unsigned char)((plen >> (8 * i2)) & 0xFF));
@@ -31165,8 +31311,10 @@ static int packExecutable(const string& srcPath, const string& outPath, bool pla
 
     std::cout << (thin ? "已打轻量包：" : "已打包：") << out.u8string() << "\n";
     std::cout << "  脚本 " << src.size() << " 字节，产物 " << all.size()
-              << " 字节，方式：" << (plain ? "明文" : "混淆")
-              << (thin ? "（不含运行时，运行时装一次就能直接跑）" : "") << "\n";
+              << " 字节，方式：" << (plain ? "明文" : "混淆");
+    if (thin) std::cout << "（不含运行时，运行时装一次就能直接跑）";
+    else std::cout << "（含运行时 + " << libs.size() << " 个库，库源码 " << libBytes << " 字节）";
+    std::cout << "\n";
     return 0;
 }
 
@@ -31197,9 +31345,11 @@ static bool loadPackagedSourceFrom(const string& filePath, string& out) {
                         DWORD rd = 0;
                         if (ReadFile(h, payload.data(), (DWORD)plen, &rd, nullptr) && rd == plen) {
                             if (!payload.empty()) {
-                                if (payload[0] != 0) maskStream(payload);  // 先整体反混淆，标志位才看得懂
-                                out = payload.substr(1);
-                                ok = !out.empty();
+                                unsigned char fl = (unsigned char)payload[0];
+                                string body = payload.substr(1);
+                                if (fl == 1 || fl == 3) maskStream(body);  // 单脚本混淆、归档混淆
+                                if (fl == 2 || fl == 3) ok = packParseArchive(body, out);
+                                else { out = body; ok = !out.empty(); }
                             }
                         }
                     }
@@ -37628,7 +37778,7 @@ static int runMain(vector<string> args) {
             "  wen.exe --查 关键词             在教程/规范/错误说明里找答案\n"
             "  wen.exe --编译 文件.wen         编译成原生 exe\n"
             "  wen.exe --进程编译 文件.wen 产物.exe 一条命令出独立进程（C++ 静态，不依赖 wen.exe）\n"
-            "  wen.exe --打包 文件.wen 产物.exe 打包成单文件 exe（不需要安装 wen.exe）\n"
+            "  wen.exe --打包 文件.wen 产物.exe 打包成单文件 exe（自带运行时和依赖的库，换台机器直接跑）\n"
             "  wen.exe --取库 库名|网址          按名字取库，或直接给一条网址/本地文件\n"
             "  wen.exe --安装                   装一次运行时：关联 .wen/.wzp，双击就能跑，也不用带 exe\n"
             "  wen.exe --卸载                   撤掉关联和 PATH，删掉装的运行时\n"
