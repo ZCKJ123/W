@@ -16581,14 +16581,31 @@ Interpreter::Interpreter() {
     registerBuiltin("并行", 2, -1, [](Interpreter& vm, vector<Value>& a, int line) -> Value {
         if (a[0].type != VT::Func || !a[0].callable)
             throw WenError("运行时错误", line, 0, "并行需要函数");
+        // 以前这里只放行「同库纯函数」（Builtin 且 cacheable），脚本函数、闭包一律被拒，
+        // 等于并行只能拿数学库算数。现在放开：脚本函数走「每线程一份隔离 vm」——
+        // 各线程有自己的 retFlag/输出/局部帧，globals 拷一份（写全局不回流，
+        // 要汇合结果就用返回值，或者用频道）。
         auto b = std::dynamic_pointer_cast<Builtin>(a[0].callable);
-        if (!b || !b->cacheable())
-            throw WenError("运行时错误", line, 0,
-                           "并行只支持同一库的纯函数（数学/物理/概率等）");
         vector<vector<Value>> calls;
+        // 脚本函数没有 Builtin 描述符：一份参数位对应一组参数；
+        // 以前这里直接摸 b->maxArgs，脚本函数一进来就是空指针，崩在 0xC0000005。
+        int shaped = 1;
+        if (b) {
+            shaped = b->maxArgs;
+        } else if (a[0].callable) {
+            // 脚本函数：形参多于一个（幂 那种两参函数）时，列表参数按位配对
+            auto fn = std::dynamic_pointer_cast<Function>(a[0].callable);
+            if (fn && fn->params.size() > 1) shaped = (int)fn->params.size();
+        }
         for (size_t i = 1; i < a.size(); ++i) {
-            if (b->maxArgs != 1 && a[i].type == VT::List && a[i].list) {
-                calls.push_back(a[i].list->items);
+            if (a[i].type == VT::List && a[i].list) {
+                if (shaped > 1) {
+                    // 能吃的参数多于一个：整个列表就是一组参数（幂(2,3) 这种）
+                    calls.push_back(a[i].list->items);
+                } else {
+                    // 单参：列表每个元素各跑一次（要把整个列表当一个参数，套一层 [[…]]）
+                    for (auto& item : a[i].list->items) calls.push_back({item});
+                }
             } else {
                 calls.push_back({a[i]});
             }
@@ -16601,11 +16618,28 @@ Interpreter::Interpreter() {
         size_t threads = std::max(1u, std::min<unsigned>(hw ? hw : 1, (unsigned)calls.size()));
         threads = std::min<size_t>(threads, 8);
         vector<std::thread> pool;
+        bool plainBuiltin = b && b->cacheable();
+        // 两个诊断开关，只在排查并发问题时用：
+        //   WEN_PAR_SEQ=1     强制单线程（看是不是并发本身的问题）
+        //   WEN_PAR_NOCOPY=1  不拷解释器副本，所有分支共用主解释器（看是不是拷贝的问题）
+        if (getenv("WEN_PAR_SEQ")) threads = 1;
+        bool noCopy = getenv("WEN_PAR_NOCOPY") != nullptr;
         for (size_t t = 0; t < threads; ++t) {
             pool.emplace_back([&, t]() {
+                // 纯库函数不碰 vm，直接共用；脚本函数每线程拷一份 vm，
+                // retFlag / 调用帧 / rng / 输出缓冲都是线程自己的。
+                std::unique_ptr<Interpreter> local;
+                if (!plainBuiltin && !noCopy) {
+                    local.reset(new Interpreter(vm));
+                    local->retFlag = false;
+                    local->vmRetFlag = 0;
+                    if (vm.globals) local->globals = std::make_shared<Scope>(*vm.globals);
+                }
+                Interpreter& use = (plainBuiltin || noCopy) ? vm : *local;
                 for (size_t i = t; i < calls.size(); i += threads) {
                     try {
-                        results[i] = b->fn(vm, calls[i], line);
+                        results[i] = plainBuiltin ? b->fn(use, calls[i], line)
+                                                  : a[0].callable->call(use, calls[i], line);
                     } catch (WenError& e) {
                         errors[i] = e.what();
                     } catch (std::exception& e) {
