@@ -2438,10 +2438,15 @@ struct Function : Callable {
 
 static thread_local int gNativeError = 0;
 
+// 机器函数的返回值按「高 3 位标签 + 低 61 位负载」打包（自举库 生成码的约定）：
+// 010 文本（指向 [长度 u64][字节…][0]）、111 特殊（0 空 / 1 真 / 2 假）。
+static Value decodeTaggedWord(double d, int line);
+
 struct NativeFunction : Callable {
     void* code = nullptr;
     size_t codeSize = 0;
     int arity = 0;
+    bool tagged = false;   // 机器函数（自举库 生成码）返回值带标签；原生函数是裸 double
     ~NativeFunction() override {
 #if defined(_WIN32) && (defined(_M_X64) || defined(_M_IX86))
         if (code) VirtualFree(code, 0, MEM_RELEASE);
@@ -2461,6 +2466,7 @@ struct NativeFunction : Callable {
         gNativeError = 0;
         double result = ((Fn)code)(x[0],x[1],x[2],x[3]);
         if (gNativeError) throw WenError("运行时错误", line, 0, "除数不能为 0");
+        if (tagged) return decodeTaggedWord(result, line);
         Value out; out.type = VT::Num; out.num = result;
         return out;
 #else
@@ -2502,6 +2508,53 @@ static Value vBytes(shared_ptr<vector<unsigned char>> b) { Value v; v.type = VT:
 static Value vVol(int k, long long id) { Value v; v.type = VT::Vol; v.vol = std::make_shared<VolRef>(); v.vol->kind = k; v.vol->id = id; return v; }
 static Value vRange(double a, double b, double c) { Value v; v.type = VT::Range; v.rstart = a; v.rstop = b; v.rstep = c; return v; }
 static uint64_t intMask(int w) { return w >= 64 ? ~0ULL : ((1ULL << w) - 1); }
+static bool jitReadable(const void* p, size_t n) {
+    if (!p || n == 0) return false;
+#if defined(_WIN32)
+    if (IsBadReadPtr(p, n)) return false;
+#endif
+    return true;
+}
+
+static bool jitTextSpan(uint64_t v, const char** p, uint64_t* len) {
+    if ((v >> 61) != 2) return false;
+    uint64_t pay = v & 0x1FFFFFFFFFFFFFFFULL;
+    if (!pay || IsBadReadPtr((void*)pay, 8)) return false;
+    uint64_t n = 0;
+    std::memcpy(&n, (void*)pay, 8);
+    if (n > (1ULL << 26) || IsBadReadPtr((void*)(pay + 8), (size_t)n + 1)) return false;
+    *p = (const char*)(pay + 8); *len = n; return true;
+}
+
+static Value decodeTaggedWord(double d, int line) {
+    uint64_t bits = 0;
+    std::memcpy(&bits, &d, 8);
+    uint64_t tag = bits >> 61;
+    uint64_t pay = bits & 0x1FFFFFFFFFFFFFFFULL;
+    if (tag == 2 && pay && jitReadable((const void*)pay, 8)) {   // 文本
+        uint64_t len = 0;
+        std::memcpy(&len, (const void*)pay, 8);
+        if (getenv("WEN_JIT_DEBUG"))
+            fprintf(stderr, "[jit] tag2 pay=%llx len=%llu\n", (unsigned long long)pay, (unsigned long long)len);
+        if (len <= (1ULL << 26) && jitReadable((const void*)(pay + 8), (size_t)len + 1))
+            return vStr(string((const char*)(pay + 8), (size_t)len));
+    }
+    if (getenv("WEN_JIT_DEBUG"))
+        fprintf(stderr, "[jit] raw bits=%llx tag=%llu num=%g\n", (unsigned long long)bits, (unsigned long long)tag, d);
+    // 负整数在 JIT 里是 64 位补码，最高位全 1 —— 会落进 111 标签段，
+    // 必须排在「特殊」之前判，否则 返回 0-4 会被当成错误值。
+    if (tag == 0 || bits >= 0xF000000000000000ULL) {
+        Value out; out.type = VT::Num; out.num = (double)(int64_t)bits; return out;
+    }
+    if (tag == 7) {                       // 特殊
+        if (pay == 0 && bits == 0xE000000000000000ULL) return vNone();
+        if (pay == 1 && bits == 0xE000000000000001ULL) return vBool(true);
+        if (pay == 2 && bits == 0xE000000000000002ULL) return vBool(false);
+        throw WenError("运行时错误", line, 0, "机器函数返回了错误值");
+    }
+    Value out; out.type = VT::Num; out.num = d; return out;
+}
+
 static Value vBig(string s) { Value v; v.type = VT::Big; v.big = std::move(s); return v; }
 static Value vInt(uint64_t bits, int w, bool s) { Value v; v.type = VT::Int; v.width = w; v.isSigned = s; v.i = bits & intMask(w); return v; }
 static int64_t intSigned(const Value& v) {
@@ -2512,21 +2565,54 @@ static int64_t intSigned(const Value& v) {
     if (b & sign) b |= ~intMask(v.width);
     return (int64_t)b;
 }
+static string trimNumericText(const string& s);
 static uint64_t intFromValue(const Value& v, int width, bool sign, int line) {
     if (v.type == VT::Int) return v.i & intMask(width);
     if (v.type == VT::Num) {
+        // 数字转定宽保持「按位宽回绕」：PE 生成链拿 i16/u32 装机器码和偏移，
+        // 56定宽布局 也专门验过 布局写(u8, 300) 读回 44。严格报错只放在文本路径，
+        // 那边是写错字的概率远大于故意回绕。
         double d = v.num;
         if (sign) return (uint64_t)(int64_t)d;
         return (uint64_t)d;
     }
     if (v.type == VT::Bool) return v.b ? 1 : 0;
     if (v.type == VT::Str) {
-        try {
-            if (sign) return (uint64_t)std::stoll(v.str, nullptr, 0);
-            return std::stoull(v.str, nullptr, 0);
-        } catch (...) {
+        string t = trimNumericText(v.str);
+        if (t.empty()) throw WenError("运行时错误", line, 0, "空文本不能转成整数");
+        errno = 0;
+        char* endp = nullptr;
+        long long sx = 0; unsigned long long ux = 0;
+        if (sign) sx = std::strtoll(t.c_str(), &endp, 0);
+        else     ux = std::strtoull(t.c_str(), &endp, 0);
+        if (endp == t.c_str() || *endp != '\0')
             throw WenError("运行时错误", line, 0, "不是有效整数：" + v.str);
+        // strtoull 会把 "-1" 当成合法输入再回绕成 2^64-1，这里直接拦掉：
+        // 无符号类型给负数属于写法错误，不该悄悄变成最大值。
+        if (!sign && t[0] == '-')
+            throw WenError("运行时错误", line, 0, "无符号整数不能是负数：" + v.str);
+        if (errno == ERANGE)
+            throw WenError("运行时错误", line, 0,
+                std::string(sign ? "有符号" : "无符号") + std::to_string(width) +
+                " 位整数放不下这个值：" + v.str);
+        uint64_t raw = sign ? (uint64_t)sx : (uint64_t)ux;
+        uint64_t mask = intMask(width);
+        if (sign) {
+            int64_t x = (int64_t)raw;
+            if (width < 64) {
+                int64_t lim = (int64_t)1 << (width - 1);
+                if (x < -lim || x > lim - 1)
+                    throw WenError("运行时错误", line, 0,
+                        std::string("有符号") + std::to_string(width) +
+                        " 位整数放不下这个值：" + v.str);
+            }
+            return (uint64_t)x & mask;
         }
+        if (width < 64 && raw > mask)
+            throw WenError("运行时错误", line, 0,
+                std::string("无符号") + std::to_string(width) +
+                " 位整数放不下这个值：" + v.str);
+        return raw & mask;
     }
     throw WenError("运行时错误", line, 0, "不能转成整数：值类型不匹配");
 }
@@ -2595,7 +2681,9 @@ static string typeName(const Value& v) {
         case VT::Bytes: return "缓冲";
         case VT::Vol: return "体";
         case VT::Range: return "范围";
-        case VT::Int: return (v.isSigned ? "i" : "u") + std::to_string(v.width);
+        // 定宽整数在脚本口径里就是「数字」，位宽另由 位宽()/有符号() 取；
+        // 之前这里返回 u64/i32，库里 8 处「类型(x) 不等于 数字」的守卫会把它们整片拒掉。
+        case VT::Int: return "数字";
         case VT::Big: return "大整数";
     }
     return "未知";
@@ -13347,7 +13435,31 @@ Interpreter::Interpreter() {
         auto list = needList(a[1], "调用", line);
         vector<Value> args = list->items;
         return vm.callValue(a[0], args, line);
-    });    registerBuiltin("数值文本", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+    });
+    registerBuiltin("位宽", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        const Value& v = a[0];
+        if (v.type == VT::Int) return vNum((double)v.width);
+        if (v.type == VT::Num) return vNum(64.0);
+        throw WenError("运行时错误", line, 0, "「位宽」不支持" + typeName(v) + "这种类型");
+    });
+    registerBuiltin("有符号", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        const Value& v = a[0];
+        if (v.type == VT::Int) return vBool(v.isSigned);
+        if (v.type == VT::Num) return vBool(true);
+        throw WenError("运行时错误", line, 0, "「有符号」不支持" + typeName(v) + "这种类型");
+    });
+    registerBuiltin("数值文本", 1, 1, [](Interpreter&, vector<Value>& a, int line) -> Value {
+        if (a[0].type == VT::Int) {
+            // 定宽整数先转十进制文本，不能绕 double —— 2^64-1 经过 double 会变成
+            // 1.8446744073709552e+19，低位全丢。
+            const Value& v = a[0];
+            if (v.isSigned) {
+                int64_t x = (int64_t)v.i;
+                if (v.width < 64) x = (int64_t)(v.i << (64 - v.width)) >> (64 - v.width);
+                return vStr(std::to_string(x));
+            }
+            return vStr(std::to_string(v.i));
+        }
         std::ostringstream ss;
         ss << std::setprecision(17) << needNum(a[0], "数值文本", line);
         return vStr(ss.str());
@@ -16165,6 +16277,40 @@ Interpreter::Interpreter() {
         +[](size_t n) -> void* { return std::malloc(n ? n : 1); };
     static void* (*const selfZeroFn)(void*, int, size_t) =
         +[](void* p, int, size_t n) -> void* { std::memset(p, 0, n); return p; };
+    // JIT 侧新增的三个槽位（0xC20A8 加法 / 0xC20B0 打印值 / 0xC20B8 换行）。
+    // 生成码把「高 3 位标签 + 低 61 位负载」的字直接当 uint64 传来传去，
+    // 这里按同样的 ABI 解，省得在生成器里拼一段 malloc+memcpy 的机器码。
+    static uint64_t (*const selfAddFn)(uint64_t, uint64_t) =
+        +[](uint64_t a, uint64_t b) -> uint64_t {
+            const char* pa; const char* pb; uint64_t la = 0, lb = 0;
+            if (jitTextSpan(a, &pa, &la) && jitTextSpan(b, &pb, &lb)) {
+                uint64_t tot = la + lb;
+                uint64_t* buf = (uint64_t*)std::malloc((size_t)tot + 9);
+                if (!buf) return 0;
+                buf[0] = tot;
+                if (la) std::memcpy((char*)buf + 8, pa, (size_t)la);
+                if (lb) std::memcpy((char*)buf + 8 + la, pb, (size_t)lb);
+                ((char*)buf)[8 + tot] = 0;
+                return ((uint64_t)buf) | 0x4000000000000000ULL;
+            }
+            return a + b;
+        };
+    static uint64_t (*const selfWriteFn)(uint64_t) =
+        +[](uint64_t v) -> uint64_t {
+            const char* p; uint64_t n = 0;
+            if (jitTextSpan(v, &p, &n)) { if (n) std::fwrite(p, 1, (size_t)n, stdout); }
+            else if ((v >> 61) == 0) {
+                int64_t x = ((int64_t)(v << 3)) >> 3;
+                std::fprintf(stdout, "%lld", (long long)x);
+            } else {
+                double d; std::memcpy(&d, &v, 8);
+                std::fprintf(stdout, "%g", d);
+            }
+            std::fflush(stdout);
+            return 0;
+        };
+    static uint64_t (*const selfNewlineFn)(uint64_t) =
+        +[](uint64_t) -> uint64_t { std::fputc('\n', stdout); std::fflush(stdout); return 0; };
     registerBuiltin("机器函数", 1, 2, [this](Interpreter&, vector<Value>& a, int line) -> Value {
 #if !defined(_WIN32) || !defined(_M_X64)
         throw WenError("运行时错误", line, 0, "机器函数只支持 Windows x64");
@@ -16204,9 +16350,13 @@ Interpreter::Interpreter() {
         putSlot(0xC2090, (void*)&WriteFile);       // 写句柄
         putSlot(0xC2098, (void*)&IsBadReadPtr);    // 可读地址
         putSlot(0xC20A0, (void*)&GetCommandLineW); // 命令行原始
+        putSlot(0xC20A8, (void*)selfAddFn);        // 加法（文本则拼接）
+        putSlot(0xC20B0, (void*)selfWriteFn);      // 打印一个值
+        putSlot(0xC20B8, (void*)selfNewlineFn);    // 输出换行
         FlushInstructionCache(GetCurrentProcess(),mem,bytes.size());
         auto fn=std::make_shared<NativeFunction>();
         fn->name="机器函数"; fn->code=mem; fn->codeSize=bytes.size(); fn->arity=arity;
+        fn->tagged = true;   // 自举库 的生成码按标签返回
         return vFunc(fn);
 #endif
     });
@@ -20786,6 +20936,12 @@ Interpreter::Interpreter() {
             if (needStr(f->items.at("名字"), "名字", line) != name) continue;
             long long off = (long long)needNum(f->items.at("偏移"), "偏移", line);
             int width = (int)needNum(f->items.at("大小"), "大小", line);
+            if (width <= 0 || width > 8)
+                throw WenError("运行时错误", line, 0, "布局写：字段「" + name + "」的大小只能是 1..8 字节，现在是 " + std::to_string(width));
+            if (off < 0 || (size_t)(off + width) > b->size())
+                throw WenError("运行时错误", line, 0, "布局写：字段「" + name + "」越界，偏移 " +
+                    std::to_string(off) + " 加 " + std::to_string(width) + " 字节，缓冲只有 " +
+                    std::to_string(b->size()) + " 字节");
             if (truthy(f->items.at("浮点"))) {
                 double x = needNum(a[3], "布局写", line);
                 if (width == 4) { float y=(float)x; uint32_t u; std::memcpy(&u,&y,4); writeFixed(*b,(size_t)off,4,u,false); }
