@@ -1201,7 +1201,9 @@ private:
         if (at(TT::Newline) || at(TT::End)) return true;
         if (atOp(";")) return true;
         if (peek().type == TT::Keyword &&
-            (peek().text == "结束" || peek().text == "否则" || peek().text == "否则如果")) {
+            (peek().text == "结束" || peek().text == "否则" || peek().text == "否则如果" ||
+             peek().text == "捕获" || peek().text == "最终" ||
+             peek().text == "情形" || peek().text == "情况")) {
             return true;
         }
         return false;
@@ -1214,7 +1216,9 @@ private:
         }
         if (at(TT::End)) return;
         if (peek().type == TT::Keyword &&
-            (peek().text == "结束" || peek().text == "否则" || peek().text == "否则如果")) {
+            (peek().text == "结束" || peek().text == "否则" || peek().text == "否则如果" ||
+             peek().text == "捕获" || peek().text == "最终" ||
+             peek().text == "情形" || peek().text == "情况")) {
             return;
         }
         err(peek(), "语句之间需要换行或分号");
@@ -1465,7 +1469,7 @@ private:
         ++idx_;
         auto subject = parseExpr();
         expectKw("则");
-        endStmt();
+        skipNewlines();   // 允许「匹配 甲 则 情形 1 则 …」写在同一行
         auto s = std::make_shared<Stmt>();
         s->k = Stmt::K::Match;
         s->expr = subject;
@@ -1474,12 +1478,12 @@ private:
             ++idx_;
             auto pat = parseExpr();
             expectKw("则");
-            endStmt();
+            skipNewlines();   // 情形后面也允许直接跟语句
             auto body = parseBlock({"情形", "情况", "否则", "结束"});
             s->branches.emplace_back(pat, body);
         }
         if (matchKw("否则")) {
-            endStmt();
+            skipNewlines();   // 否则后面允许直接跟语句
             s->elseBody = parseBlock({"结束"});
         }
         expectKw("结束");
