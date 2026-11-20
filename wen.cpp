@@ -31447,7 +31447,7 @@ static int installRuntime(bool uninstall) {
     std::wstring dirW = dir.wstring();
 
     if (uninstall) {
-        for (const wchar_t* ext : {L".wen", L".wzp", L".wenp"}) {
+        for (const wchar_t* ext : {L".wen", L".wzp", L".wenp", L".wenpack"}) {
             std::wstring sub = std::wstring(L"Software\\Classes\\") + ext;
             std::wstring cur = regGetStr(HKEY_CURRENT_USER, sub, L"", nullptr);
             if (_wcsicmp(cur.c_str(), L"WenLang.Script") == 0 ||
@@ -36411,7 +36411,7 @@ static int padLangOf(const std::wstring& p) {
         size_t n = wcslen(e);
         return low.size() >= n && low.compare(low.size() - n, n, e) == 0;
     };
-    if (ends(L".wen")) return 0;
+    if (ends(L".wen") || ends(L".脚本") || ends(L".程序")) return 0;
     if (ends(L".json") || ends(L".jsonc")) return 2;
     if (ends(L".html") || ends(L".htm") || ends(L".xml") || ends(L".svg") || ends(L".xaml")) return 3;
     if (ends(L".md") || ends(L".markdown")) return 4;
