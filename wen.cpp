@@ -258,7 +258,7 @@ struct Token {
 
 static const std::set<string>& keywords() {
     static const std::set<string> kw = {
-        "将", "变成", "局部", "打印", "输出", "如果", "则", "否则如果", "否则", "结束",
+        "将", "变成", "局部", "打印", "输出", "并行跑", "如果", "则", "否则如果", "否则", "结束",
         "当", "对于", "在", "中", "函数", "返回", "依赖",
         "中断", "继续", "真", "假", "空", "且", "或", "非", "导出",
         "尝试", "捕获", "最终", "匹配", "情形", "情况"
@@ -392,6 +392,13 @@ public:
                 throw WenError("词法错误", line_, col_, "多余的右引号");
             }
 
+            // 并行分隔：‖（双竖线）
+            if (startsWith(src_, pos_, "‖")) {
+                add(TT::Op, "‖", line_, col_);
+                pos_ += 3;
+                ++col_;
+                continue;
+            }
             // 中文/数学符号
             if (tryUnicodeMath()) continue;
             if (tryFullWidth()) continue;
@@ -915,7 +922,7 @@ using StmtPtr = shared_ptr<Stmt>;
 struct Stmt {
     enum class K {
         Assign, Print, If, While, For, Func, Return,
-        Break, Continue, ExprStmt, Import, Export, Try, Match
+        Break, Continue, ExprStmt, Import, Export, Try, Match, ParLine
     };
     K k = K::ExprStmt;
     bool declareLocal = false;   // 「局部 名 变成 …」：强制写当前函数帧
@@ -1071,6 +1078,21 @@ public:
     const vector<WenError>& errors() const { return errors_; }
     std::map<string, int> funcMinArity_;
 
+    // 一条语句后面跟着 ‖ / 并行跑 就继续收集，整串包成一个并行行
+    StmtPtr parseParLineGroup() {
+        StmtPtr first = parseStatement();
+        if (!atOp("‖") && !atKw("并行跑")) return first;
+        auto ps = std::make_shared<Stmt>();
+        ps->k = Stmt::K::ParLine;
+        ps->line = first->line;
+        ps->body.push_back(first);
+        while (atOp("‖") || atKw("并行跑")) {
+            ++idx_;                       // 吃掉分隔符
+            ps->body.push_back(parseStatement());
+        }
+        return ps;
+    }
+
     vector<StmtPtr> parseProgram() {
         try {
             skipSeparators();
@@ -1083,7 +1105,7 @@ public:
         while (!at(TT::End)) {
             size_t before = idx_;
             try {
-                body.push_back(parseStatement());
+                body.push_back(parseParLineGroup());
                 skipSeparators();
             } catch (WenError& e) {
                 if (!recover_) throw;
@@ -1201,6 +1223,7 @@ private:
     bool atStmtEnd() const {
         if (at(TT::Newline) || at(TT::End)) return true;
         if (atOp(";")) return true;
+        if (atOp("‖") || atKw("并行跑")) return true;
         if (peek().type == TT::Keyword &&
             (peek().text == "结束" || peek().text == "否则" || peek().text == "否则如果" ||
              peek().text == "捕获" || peek().text == "最终" ||
@@ -1211,6 +1234,7 @@ private:
     }
 
     void endStmt() {
+        if (atOp("‖") || atKw("并行跑")) return;   // 这里是并行行的分隔点，交给外层收集
         if (at(TT::Newline) || atOp(";")) {
             skipSeparators();
             return;
@@ -1238,7 +1262,7 @@ private:
             if (peek().type == TT::Keyword && terminators.count(peek().text)) break;
             size_t before = idx_;
             try {
-                body.push_back(parseStatement());
+                body.push_back(parseParLineGroup());
                 skipSeparators();
             } catch (WenError& e) {
                 if (!recover_) throw;
@@ -2437,6 +2461,51 @@ struct Callable {
     virtual bool cacheable() const { return false; }
     virtual string memoKey() const { return ""; }
 };
+
+// 值比较：只用来判断"有没有被改过"，标量逐值比，引用类型看指针
+static bool sameValue(const Value& a, const Value& b) {
+    if (a.type != b.type) return false;
+    switch (a.type) {
+        case VT::None: return true;
+        case VT::Bool: return a.b == b.b;
+        case VT::Num:  return a.num == b.num;
+        case VT::Int:  return a.i == b.i && a.width == b.width && a.isSigned == b.isSigned;
+        case VT::Str:  return a.str == b.str;
+        case VT::Big:  return a.big == b.big;
+        case VT::Range: return a.rstart == b.rstart && a.rstop == b.rstop && a.rstep == b.rstep;
+        case VT::Vol:  return a.vol == b.vol;
+        default:       return a.list == b.list && a.dict == b.dict &&
+                              a.callable == b.callable && a.bytes == b.bytes;
+    }
+}
+
+// 一个作用域跑完之后"变了哪些变量"
+struct ScopeDelta {
+    vector<std::pair<int, Value>> slots;        // 全局快槽
+    vector<std::pair<SymId, Value>> ids;        // 符号变量
+    vector<std::pair<std::string, Value>> vars; // 名字变量
+};
+
+static ScopeDelta scopeDelta(const Scope& before, const Scope& after) {
+    ScopeDelta d;
+    for (size_t i = 0; i < after.fast.size(); ++i) {
+        if (i >= after.fastDefined.size() || !after.fastDefined[i]) continue;
+        bool had = i < before.fast.size() && i < before.fastDefined.size() && before.fastDefined[i];
+        if (!had || !sameValue(before.fast[i], after.fast[i]))
+            d.slots.emplace_back((int)i, after.fast[i]);
+    }
+    for (const auto& kv : after.idVars) {
+        auto it = before.idVars.find(kv.first);
+        if (it == before.idVars.end() || !sameValue(it->second, kv.second))
+            d.ids.emplace_back(kv.first, kv.second);
+    }
+    for (const auto& kv : after.vars) {
+        auto it = before.vars.find(kv.first);
+        if (it == before.vars.end() || !sameValue(it->second, kv.second))
+            d.vars.emplace_back(kv.first, kv.second);
+    }
+    return d;
+}
 
 struct Function : Callable {
     vector<string> params;
@@ -6453,6 +6522,100 @@ void Interpreter::exec(const StmtPtr& s, const shared_ptr<Scope>& scope) {
     if (s->k != Stmt::K::ExprStmt) lastWasExpr = false;
 
     switch (s->k) {
+        case Stmt::K::ParLine: {
+            if (s->body.empty()) break;
+            if (s->body.size() == 1) { exec(s->body[0], scope); break; }
+            if (s->body.size() > 8)
+                throw WenError("运行时错误", s->line, 0,
+                               "一行里并行跑最多 8 条语句；要跑更多组请用「并行(函数, 参数…)」");
+            size_t n = s->body.size();
+            vector<ScopeDelta> deltas(n);
+            vector<string> errs(n);
+            {
+                vector<std::thread> th;
+                for (size_t i = 0; i < n; ++i) {
+                    th.emplace_back([&, i]() {
+                        try {
+                            // 每条语句一份解释器副本 + 一份全局快照，跑在快照上
+                            Interpreter sub(*this);
+                            sub.globalsOrig = globals;
+                            sub.globals = std::make_shared<Scope>(*globals);
+                            sub.retFlag = false;
+                            sub.vmRetFlag = 0;
+                            // 顶层直接在全局快照上跑；函数内给一份当前帧的拷贝，
+                            // 局部变量只读能看到，改了也不回流（回流只认全局）
+                            auto runFrame = sub.globals;
+                            if (scope && scope.get() != globals.get()) {
+                                runFrame = std::make_shared<Scope>(*scope);
+                                runFrame->parent = sub.globals;
+                                // 帧里的变量分散在 svars / idVars / fast 快槽 / lnum 数字快槽，
+                                // 统一摊进名字表，语句按哪个名字都能读到
+                                runFrame->vars.clear();
+                                for (const auto& kv : scope->svars)
+                                    runFrame->vars[symbolName(kv.first)] = kv.second;
+                                for (const auto& kv : scope->idVars)
+                                    runFrame->vars[symbolName(kv.first)] = kv.second;
+                                for (const auto& kv : scope->idSlot)
+                                    if ((size_t)kv.second < scope->fast.size() &&
+                                        (size_t)kv.second < scope->fastDefined.size() &&
+                                        scope->fastDefined[(size_t)kv.second])
+                                        runFrame->vars[symbolName(kv.first)] = scope->fast[(size_t)kv.second];
+                                for (size_t k = 0; k < scope->lorder.size(); ++k)
+                                    if (k < scope->lnumDef.size() && scope->lnumDef[k] && k < scope->lnum.size()) {
+                                        Value sv;
+                                        sv.type = VT::Num;
+                                        sv.num = scope->lnum[k];
+                                        runFrame->vars[symbolName(scope->lorder[k])] = sv;
+                                    }
+                                // 空符号位不占名字表
+                                runFrame->trackNames = true;
+                                runFrame->smallMode = false;
+                                runFrame->fast.clear();
+                                runFrame->fastDefined.clear();
+                                runFrame->idSlot.clear();
+                            }
+                            sub.exec(s->body[i], runFrame);
+                            deltas[i] = scopeDelta(*globals, *sub.globals);
+                        } catch (WenError& e) {
+                            errs[i] = e.what();
+                        } catch (std::exception& e) {
+                            errs[i] = e.what();
+                        }
+                    });
+                }
+                for (auto& t : th) t.join();
+            }
+            for (size_t i = 0; i < n; ++i)
+                if (!errs[i].empty())
+                    throw WenError("运行时错误", s->line, 0,
+                                   "第 " + std::to_string(i + 1) + " 条并行语句失败：" + errs[i]);
+            // 改动合并回主作用域；两条语句改同一个变量就报错，不猜谁赢
+            std::map<std::string, size_t> touched;
+            auto claim = [&](const std::string& key, size_t i) {
+                auto it = touched.find(key);
+                if (it != touched.end())
+                    throw WenError("运行时错误", s->line, 0,
+                                   "并行语句里第 " + std::to_string(it->second + 1) + " 条和第 " +
+                                   std::to_string(i + 1) + " 条改了同一个变量；并行语句不允许写同一个名字，" +
+                                   "要汇总请用「并行」拿返回值");
+                touched[key] = i;
+            };
+            for (size_t i = 0; i < n; ++i) {
+                for (auto& kv : deltas[i].slots) {
+                    claim("slot:" + std::to_string(kv.first), i);
+                    globals->fastSet(kv.first, kv.second);
+                }
+                for (auto& kv : deltas[i].ids) {
+                    claim("id:" + std::to_string((unsigned long long)kv.first), i);
+                    globals->idVars[kv.first] = kv.second;
+                }
+                for (auto& kv : deltas[i].vars) {
+                    claim("var:" + kv.first, i);
+                    globals->vars[kv.first] = kv.second;
+                }
+            }
+            break;
+        }
         case Stmt::K::Assign: {
             Value v = eval(s->expr, scope);
             if (s->declareLocal && s->target && s->target->k == Expr::K::Var && s->target->gslot < 0) {
