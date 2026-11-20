@@ -31504,6 +31504,7 @@ static int installRuntime(bool uninstall) {
     std::cout << "已关联：.wen → 文语言脚本，.wzp → 文语言轻量包（双击即可运行）\n";
     std::cout << "PATH：" << (pathOk ? "已加入（新开的终端里可直接用 wen）" : "写入失败，手动把上面的 bin 目录加进 PATH")
               << "\n";
+    std::cout << "重编译语言之后要再跑一次 --安装，装的那份才会换成新的\n";
     return 0;
 }
 #endif
