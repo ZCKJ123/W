@@ -39,6 +39,7 @@
 #include <omp.h>
 #endif
 #include <thread>
+#include <mutex>
 #include <future>
 #include <vector>
 
@@ -2020,6 +2021,41 @@ struct Value {
 
 struct List { vector<Value> items; vector<float> compact; };
 struct Dict { map<string, Value> items; };
+
+// 并行分支专用：列表/字典/集合/缓冲整份复制。
+// 不复制的话两个分支用同一个 shared_ptr 往里写就是数据竞争，
+// 实测 8 个分支各插 5000 条会直接把进程写崩。
+static Value deepCopyValue(const Value& v) {
+    switch (v.type) {
+        case VT::List:
+        case VT::Set: {
+            if (!v.list) return v;
+            auto l = std::make_shared<List>();
+            l->items.reserve(v.list->items.size());
+            for (const auto& it : v.list->items) l->items.push_back(deepCopyValue(it));
+            l->compact = v.list->compact;
+            Value out = v;
+            out.list = std::move(l);
+            return out;
+        }
+        case VT::Dict: {
+            if (!v.dict) return v;
+            auto d = std::make_shared<Dict>();
+            for (const auto& kv : v.dict->items) d->items[kv.first] = deepCopyValue(kv.second);
+            Value out = v;
+            out.dict = std::move(d);
+            return out;
+        }
+        case VT::Bytes: {
+            if (!v.bytes) return v;
+            Value out = v;
+            out.bytes = std::make_shared<std::vector<unsigned char>>(*v.bytes);
+            return out;
+        }
+        default:
+            return v;
+    }
+}
 
 
 static std::set<string> gCallableNames;
@@ -4373,6 +4409,13 @@ std::map<string, string> gPackedLibs;
 class Interpreter {
 public:
     shared_ptr<Scope> globals;
+    // 主 globals 的原指针。并行分支会把 globals 换成线程私有副本，
+    // 而全局函数的 closure 还指着主 globals；建帧时认出来就改指副本，
+    // 这样分支里读写全局都落在自己那份上，不会串到主线程。
+    shared_ptr<Scope> globalsOrig;
+    // closure 是主 globals 的下一层（脚本顶层作用域）时，克隆一份本线程的，
+    // 缓存按原指针查，同一线程里只克隆一次。
+    std::unordered_map<const Scope*, shared_ptr<Scope>> closureRedirect;
     // 「返回」不靠抛异常：设标志 + 值，逐层检查，省掉每次函数调用一次 throw/catch
     bool retFlag = false;
     Value retVal;
@@ -7234,6 +7277,9 @@ void Interpreter::setIndex(Value& obj, const Value& idx, const Value& val, int l
 // 就原地丢弃、不进池，所以复用永远不会让两个调用共用一份局部变量。
 static thread_local std::vector<shared_ptr<Scope>> gFramePool;
 
+// 打印锁：并行分支共用 stdout，一行要么整行出现、要么不出现
+static std::mutex gOutMutex;
+
 static shared_ptr<Scope> takeFrame(const shared_ptr<Scope>& closure) {
     auto& pool = gFramePool;
     shared_ptr<Scope> s;
@@ -7308,7 +7354,22 @@ Value Function::callSpan(Interpreter& vm, const Value* a, int n, int callLine) {
             default: break;
         }
     }
-    FrameHold frame(takeFrame(closure));
+    // 并行分支：closure 落在主 globals 那一层（或它的下一层）时，改用本线程的副本
+    auto frameClosure = closure;
+    if (closure && vm.globalsOrig) {
+        if (closure.get() == vm.globalsOrig.get()) {
+            frameClosure = vm.globals;
+        } else if (closure->parent.get() == vm.globalsOrig.get()) {
+            auto it = vm.closureRedirect.find(closure.get());
+            if (it == vm.closureRedirect.end()) {
+                auto cl = std::make_shared<Scope>(*closure);
+                cl->parent = vm.globals;      // 顶层作用域挂到线程自己的全局层
+                it = vm.closureRedirect.emplace(closure.get(), cl).first;
+            }
+            frameClosure = it->second;
+        }
+    }
+    FrameHold frame(takeFrame(frameClosure));
     Scope& S = *frame.s;
     // 帧内局部槽：把编译期排好的槽表灌进来，函数体里的数字读写就只碰 8 字节。
     if (!localOrder.empty()) {
@@ -14341,11 +14402,18 @@ Interpreter::Interpreter() {
                 int n = (int)needIndex(arg("n"), "字节码 print", line);
                 vector<Value> vals;
                 for (int i = 0; i < n; ++i) vals.push_back(pop());
+                // 整行先拼成一份再输出：并行分支里打印不会互相插进半行
+                std::string oneLine;
                 for (int i = n - 1; i >= 0; --i) {
-                    if (i != n - 1) std::cout << " ";
-                    std::cout << toText(vals[(size_t)i]);
+                    if (i != n - 1) oneLine += " ";
+                    oneLine += toText(vals[(size_t)i]);
                 }
-                std::cout << "\n";
+                oneLine += "\n";
+                {
+                    std::lock_guard<std::mutex> lk(gOutMutex);
+                    std::cout << oneLine;
+                    std::cout.flush();
+                }
             } else if (op == "jz") {
                 Value cond = pop();
                 if (!truthy(cond)) {
@@ -16597,26 +16665,35 @@ Interpreter::Interpreter() {
             auto fn = std::dynamic_pointer_cast<Function>(a[0].callable);
             if (fn && fn->params.size() > 1) shaped = (int)fn->params.size();
         }
+        bool multi = (shaped > 1 || shaped < 0);
         for (size_t i = 1; i < a.size(); ++i) {
-            if (a[i].type == VT::List && a[i].list) {
-                if (shaped > 1) {
-                    // 能吃的参数多于一个：整个列表就是一组参数（幂(2,3) 这种）
-                    calls.push_back(a[i].list->items);
-                } else {
-                    // 单参：列表每个元素各跑一次（要把整个列表当一个参数，套一层 [[…]]）
-                    for (auto& item : a[i].list->items) calls.push_back({item});
-                }
+            if (multi) {
+                // 要多个参数：每个列表就是一组完整参数（幂(2,3) 这种）
+                if (a[i].type != VT::List || !a[i].list)
+                    throw WenError("运行时错误", line, 0,
+                                   "这个函数要 " + (shaped < 0 ? std::string("多个") : std::to_string(shaped)) +
+                                   " 个参数，并行时每组要写成 [参数1, 参数2, …]；直接传单个值会被当成一组不完整的参数");
+                calls.push_back(a[i].list->items);
+            } else if (a[i].type == VT::List && a[i].list) {
+                // 单参：列表每个元素各跑一次；要把整个列表当一个参数就套一层 [[…]]
+                for (auto& item : a[i].list->items) calls.push_back({item});
             } else {
                 calls.push_back({a[i]});
             }
         }
-        if (calls.size() > 64)
-            throw WenError("运行时错误", line, 0, "并行最多 64 组");
+        // 分支拿到的是自己一份，改不到主线程那份
+        for (auto& c : calls)
+            for (auto& val : c) val = deepCopyValue(val);
+        if (calls.size() > 256)
+            throw WenError("运行时错误", line, 0, "并行最多 256 组");
         vector<Value> results(calls.size());
         vector<string> errors(calls.size());
         unsigned hw = std::thread::hardware_concurrency();
         size_t threads = std::max(1u, std::min<unsigned>(hw ? hw : 1, (unsigned)calls.size()));
         threads = std::min<size_t>(threads, 8);
+        // 嵌套并行（分支里再调 并行）时线程减半，避免 8×8×8 把机器压死
+        static thread_local int gParNest = 0;
+        if (gParNest > 0) threads = std::max<size_t>(1, threads / 2);
         vector<std::thread> pool;
         bool plainBuiltin = b && b->cacheable();
         // 两个诊断开关，只在排查并发问题时用：
@@ -16624,6 +16701,8 @@ Interpreter::Interpreter() {
         //   WEN_PAR_NOCOPY=1  不拷解释器副本，所有分支共用主解释器（看是不是拷贝的问题）
         if (getenv("WEN_PAR_SEQ")) threads = 1;
         bool noCopy = getenv("WEN_PAR_NOCOPY") != nullptr;
+        // 任务动态派发：谁空下来谁取下一组，避免"一组长任务拖住整批"
+        std::atomic<size_t> next{0};
         for (size_t t = 0; t < threads; ++t) {
             pool.emplace_back([&, t]() {
                 // 纯库函数不碰 vm，直接共用；脚本函数每线程拷一份 vm，
@@ -16633,19 +16712,30 @@ Interpreter::Interpreter() {
                     local.reset(new Interpreter(vm));
                     local->retFlag = false;
                     local->vmRetFlag = 0;
-                    if (vm.globals) local->globals = std::make_shared<Scope>(*vm.globals);
                 }
                 Interpreter& use = (plainBuiltin || noCopy) ? vm : *local;
-                for (size_t i = t; i < calls.size(); i += threads) {
+                ++gParNest;
+                size_t i;
+                while ((i = next.fetch_add(1)) < calls.size()) {
+                    // 每组都从主线程的同一份全局快照出发：
+                    // 同一线程连跑几组时，上一组往全局写的东西不能漏给下一组。
+                    if (!plainBuiltin && !noCopy && vm.globals) {
+                        use.globalsOrig = vm.globals;
+                        use.globals = std::make_shared<Scope>(*vm.globals);
+                        use.closureRedirect.clear();
+                        use.retFlag = false;
+                        use.vmRetFlag = 0;
+                    }
                     try {
                         results[i] = plainBuiltin ? b->fn(use, calls[i], line)
                                                   : a[0].callable->call(use, calls[i], line);
                     } catch (WenError& e) {
-                        errors[i] = e.what();
+                        errors[i] = "第 " + std::to_string(i + 1) + " 组：" + e.what();
                     } catch (std::exception& e) {
-                        errors[i] = e.what();
+                        errors[i] = "第 " + std::to_string(i + 1) + " 组：" + e.what();
                     }
                 }
+                --gParNest;
             });
         }
         for (auto& th : pool) th.join();
